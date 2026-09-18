@@ -194,8 +194,8 @@ pub(crate) fn upstream_request_id_from_headers(headers: &HeaderMap) -> Option<St
         .and_then(bounded_upstream_request_id)
 }
 
-/// 部分第三方 thinking 模式要求把上一轮的 reasoning 明文原样回传，请求缺少
-/// 明文字段时上游拒绝整条请求。识别该错误后由调用方补齐占位明文再重发一次。
+/// 部分第三方 thinking 模式要求把上一轮的 reasoning 明文原样回传。
+/// 明文字段缺失或 opaque 状态失效时上游拒绝请求；由调用方选择兼容方式重试一次。
 pub(crate) fn requires_reasoning_text_fallback(body: &[u8]) -> bool {
     String::from_utf8_lossy(body).contains("reasoning_text")
 }

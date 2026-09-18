@@ -1844,10 +1844,9 @@ impl RouterServer {
                     .await;
             }
         };
-        // 部分第三方 thinking 线路要求把上一轮的 reasoning 明文原样回传，而 Codex
-        // 回放历史时只保留加密字段。首次仍按原样发送，只有上游明确报出
-        // reasoning_text 缺失时才补齐占位明文重发一次。官方线路沿用加密推理语义，
-        // 不参与该回退。
+        // 第三方中断响应的 opaque 推理状态可能失效，即使明文仍在也会报错。
+        // 首次原样发送；仅在明确 reasoning_text 错误后优先按已有明文重放一次。
+        // 没有可重放明文时保留原有缺失标记兼容路径，官方线路不参与回退。
         let reasoning_text_retry_allowed = bridge == ProtocolBridge::NativeResponses
             && request_kind == ResponsesRequestKind::Create
             && !compacting
@@ -1984,14 +1983,26 @@ impl RouterServer {
                 }
                 Ok(Err(error)) | Err(error) => return Err(error),
             };
-            if requires_reasoning_text_fallback(&body)
-                && let Some(retryable_body) = retryable_body.as_mut()
-                && fill_missing_reasoning_text(retryable_body)
+            let fallback_reason = if requires_reasoning_text_fallback(&body) {
+                retryable_body.as_mut().and_then(|body| {
+                    if prefer_plaintext_reasoning(body) {
+                        Some("reasoning_text_replay_retry")
+                    } else if fill_missing_reasoning_text(body) {
+                        Some("reasoning_text_placeholder_retry")
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+            if let Some(fallback_reason) = fallback_reason
+                && let Some(retryable_body) = retryable_body.as_ref()
             {
                 let encoded = serde_json::to_vec(retryable_body)
-                    .context("序列化补齐 reasoning 明文的 Responses 请求失败")?;
+                    .context("序列化重放 reasoning 明文的 Responses 请求失败")?;
                 if let Some(probe) = downstream.request_log_probe() {
-                    probe.mark_fallback("reasoning_text_placeholder_retry");
+                    probe.mark_fallback(fallback_reason);
                     probe.mark_upstream_send(if upstream_stream_requested {
                         UpstreamTransport::HttpSse
                     } else {

@@ -227,8 +227,38 @@ pub(crate) fn normalize_native_responses_context(
     changed
 }
 
-// 第三方 thinking 模式只校验 reasoning 明文是否存在，占位文本不影响后续回答。
+// 旧兼容路径使用的缺失明文标记；不能代替真实推理内容或恢复上游状态。
 pub(crate) const MISSING_REASONING_TEXT_PLACEHOLDER: &str = "(thinking unavailable)";
+
+/// 第三方中断响应的 opaque 状态可能失效；仅在已有真实明文时移除该字段，
+/// 让上游按明文重放。调用方只在明确的 reasoning_text 错误后重试一次。
+pub(crate) fn prefer_plaintext_reasoning(body: &mut Value) -> bool {
+    let rewrite = |item: &mut Value| {
+        let Some(object) = item.as_object_mut() else {
+            return false;
+        };
+        if object.get("type").and_then(Value::as_str) != Some("reasoning") {
+            return false;
+        }
+        let has_text = match object.get("content") {
+            Some(Value::Array(parts)) => parts.iter().any(reasoning_part_has_text),
+            Some(part @ Value::Object(_)) => reasoning_part_has_text(part),
+            _ => false,
+        };
+        has_text && object.remove("encrypted_content").is_some()
+    };
+    match body.get_mut("input") {
+        Some(Value::Array(items)) => {
+            let mut changed = false;
+            for item in items {
+                changed |= rewrite(item);
+            }
+            changed
+        }
+        Some(item @ Value::Object(_)) => rewrite(item),
+        _ => false,
+    }
+}
 
 /// 部分第三方 thinking 模式（DeepSeek 等）要求把上一轮的 reasoning 明文原样
 /// 回传，而 Codex 回放历史时会省略 reasoning 项的明文 content，只保留
