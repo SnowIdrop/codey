@@ -81,7 +81,7 @@ test("request log controls are scoped to built-in routing and preserve logger se
   assert.match(modelSection, /\{config\.localRouterEnabled && \([\s\S]*开启日志记录/);
   assert.match(modelSection, /aria-label="开启请求日志记录"/);
   assert.match(modelSection, /查看请求日志/);
-  assert.match(modelSection, /invoke\("open_route_request_logs"\)/);
+  assert.match(modelSection, /invoke\("open_route_request_logs", \{ theme: readHostTheme\(\) \}\)/);
   assert.doesNotMatch(modelSection, /<RequestLogDialog/);
   assert.match(preview, /routeRequestLog:\s*\{/);
   assert.match(preview, /command === "query_route_request_logs"/);
@@ -145,7 +145,7 @@ test("request log viewer uses a full-screen server-paginated searchable table", 
   assert.match(viewer, /onRowAction=\{\(key\) =>[\s\S]*setSelectedItem\(record\)/);
   assert.match(viewer, /aria-label=\{`复制请求 ID：\$\{item\.requestId\}`\}/);
   assert.match(viewer, /cursorMode: true/);
-  assert.match(viewer, /result\.nextCursor/);
+  assert.match(viewer, /nextResult\.nextCursor/);
   assert.match(viewer, /query_route_request_log_stats/);
   assert.doesNotMatch(viewer, /for \(const item of result\.items\)/);
   assert.match(viewer, /总量已知/);

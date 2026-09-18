@@ -11,8 +11,10 @@ use std::sync::{
 };
 use std::time::Duration;
 
+mod config_repair;
 mod diagnostics;
 mod models;
+mod native_plugins;
 mod official_accounts;
 mod plugins;
 mod prompt_optimization;
@@ -61,10 +63,10 @@ use prompt_optimization::{
     fetch_prompt_optimization_models_command, optimize_prompt_command,
     test_prompt_optimization_command,
 };
-pub(crate) use runtime::cleanup_failed_runtime_start;
 use runtime::runtime_status_with_options;
 #[cfg(test)]
 use runtime::{begin_shutdown, launch_codey_inner};
+pub(crate) use runtime::{cleanup_failed_runtime_start, reap_runtime_child_before_exit};
 pub use runtime::{
     launch_codey_runtime, runtime_status, schedule_restart_codey_runtime, stop_codey_runtime,
 };
@@ -1211,7 +1213,9 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                 .unwrap_or(false);
             runtime_status_with_options(state, refresh_injection_status).await
         }
-        "open_route_request_logs" => open_route_request_logs(state).await,
+        "open_route_request_logs" => {
+            open_route_request_logs(state, args.get("theme").and_then(Value::as_str)).await
+        }
         "query_route_request_logs" => {
             match serde_json::from_value::<RouteRequestLogQuery>(args.clone()) {
                 Ok(query) => query_route_request_logs(state, query).await,
@@ -1250,6 +1254,7 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         "restart_codey" => schedule_restart_codey_runtime(state).await,
         "clear_diagnostic_storage" => clear_diagnostic_storage(state, &args).await,
         "repair_codex_overlays" => crate::overlay_recovery::repair().await,
+        "repair_codex_config" => config_repair::repair_codex_config(state).await,
         "repair_main_process_injection" => {
             runtime::schedule_main_process_injection_repair(state).await
         }
@@ -1331,12 +1336,23 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         },
         "plugin_marketplace_status" => plugin_marketplace_status().await,
         "repair_plugin_marketplace" => repair_plugin_marketplace().await,
+        "list_codey_plugins" => native_plugins::invoke(command, &args).await,
+        "select_codey_plugin_package" => native_plugins::invoke(command, &args).await,
+        "inspect_codey_plugin" => native_plugins::invoke(command, &args).await,
+        "install_codey_plugin" => native_plugins::invoke(command, &args).await,
+        "set_codey_plugin_enabled" => native_plugins::invoke(command, &args).await,
+        "configure_codey_plugin" => native_plugins::invoke(command, &args).await,
+        "uninstall_codey_plugin" => native_plugins::invoke(command, &args).await,
+        "invoke_codey_plugin" => native_plugins::invoke(command, &args).await,
         _ => Err(format!("未知 Codey API 命令：{command}")),
     };
     result.unwrap_or_else(api_error_message)
 }
 
-pub async fn open_route_request_logs(state: &Arc<AppState>) -> Result<Value, String> {
+pub async fn open_route_request_logs(
+    state: &Arc<AppState>,
+    theme: Option<&str>,
+) -> Result<Value, String> {
     let endpoint = state
         .runtime
         .lock()
@@ -1344,7 +1360,7 @@ pub async fn open_route_request_logs(state: &Arc<AppState>) -> Result<Value, Str
         .as_ref()
         .and_then(|runtime| runtime.local_router_endpoint())
         .ok_or_else(|| "本地路由尚未运行，无法打开请求日志".to_string())?;
-    let url = endpoint.request_log_url();
+    let url = endpoint.request_log_url(theme);
     tokio::task::spawn_blocking(move || open_system_browser(&url))
         .await
         .map_err(|error| format!("打开系统浏览器任务异常退出：{error}"))??;

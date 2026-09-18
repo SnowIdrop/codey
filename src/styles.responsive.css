@@ -9,7 +9,7 @@
   }
   .subagent-column {
     border-left: 0;
-    border-top: 1px solid rgba(0, 0, 0, 0.07);
+    border-top: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.07);
     min-height: 0;
   }
   .prompt-column {
@@ -91,6 +91,30 @@
     padding: 12px;
   }
 
+  .route-auxiliary-bar {
+    padding: 10px 12px;
+    gap: 10px;
+  }
+
+  .route-auxiliary-misc {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .route-auxiliary-combobox {
+    width: 100%;
+    flex: 1 1 100%;
+  }
+
+  .route-auxiliary-retry {
+    width: 100%;
+  }
+
+  .route-auxiliary-retry .local-router-toggle {
+    width: 100%;
+    justify-content: space-between;
+  }
+
   .provider-model-tags,
   .route-manager-current .provider-model-tags,
   .provider-model-group .provider-model-empty,
@@ -117,7 +141,7 @@
   }
 
   .notification-dialog-test {
-    border-top: 1px solid rgba(0, 0, 0, 0.08);
+    border-top: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.08);
     border-left: 0;
   }
 
@@ -130,6 +154,6 @@
 
   .route-option-item + .route-option-item {
     border-left: 0;
-    border-top: 1px solid rgba(0, 0, 0, 0.06);
+    border-top: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.06);
   }
 }

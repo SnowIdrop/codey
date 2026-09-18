@@ -528,6 +528,8 @@ fn router_subagent_runtime_config(
                 matching.next().is_some() && matching.next().is_none(),
                 "子代理角色 {role} 的模型 {routed} 无法在内置模型目录模式下安全派发：模型线路不存在或存在同名线路；请补齐 Codex 模型缓存并重启，或只启用一条提供该模型的线路"
             );
+            // 路由是否唯一与模型品牌无关。Codey 的官方展示名单不能
+            // 代表当前 Codex 或自定义 Provider 实际支持的模型范围。
             model
         };
     }
@@ -561,10 +563,28 @@ fn validate_subagent_dispatch_catalog(
     {
         anyhow::ensure!(
             ids.contains(model),
-            "子代理角色 {role} 的模型 {model} 不在本次原生派发模型目录中；不能仅凭上游线路存在就启用角色，请刷新模型目录并重启"
+            "子代理角色 {role} 的模型 {model} 未包含在本次原生派发模型目录中；不能仅凭上游线路存在就启用角色，请刷新模型目录并重启"
         );
     }
     Ok(())
+}
+
+fn validated_router_subagent_runtime_config(
+    config: &CodeyConfig,
+    route_catalog_installed: bool,
+    home: &std::path::Path,
+) -> Result<CodeyConfig> {
+    if !config.subagent_optimization {
+        return Ok(config.clone());
+    }
+    let catalog_path =
+        crate::codex_config::runtime_model_catalog_path(home, route_catalog_installed)?;
+    let runtime = router_subagent_runtime_config(config, catalog_path.is_some())?;
+    if let Some(path) = catalog_path {
+        model_catalog::validate_runtime_subagent_models(&path, &runtime.subagent_roles)?;
+    }
+    validate_subagent_dispatch_catalog(home, &runtime, route_catalog_installed)?;
+    Ok(runtime)
 }
 
 #[test]
@@ -831,22 +851,11 @@ async fn prepare_codex_startup_state(
     let mut runtime_subagent_config = config.clone();
     runtime_subagent_config.active_profile_id = current_profile.id.clone();
     subagent_policy::reconcile_with_model_state(&mut runtime_subagent_config, Some(&model_state));
-    let mut runtime_roles_config =
-        startup_router_subagent_runtime_config(&mut runtime_subagent_config, use_official_catalog);
-    if let Err(error) =
-        validate_subagent_dispatch_catalog(home, &runtime_roles_config, use_official_catalog)
-    {
-        // Keep saved preferences intact, and do not advertise unusable roles.
-        runtime_subagent_config.subagent_optimization = false;
-        runtime_roles_config.subagent_optimization = false;
-        error_log::record_failure(
-            "subagent_optimization_unavailable",
-            "validate_subagent_dispatch_catalog",
-            format!("本次启动已停用子代理增强：{error:#}"),
-            serde_json::json!({"routeCatalogInstalled": use_official_catalog}),
-        );
-        eprintln!("本次启动已停用子代理增强，原设置保持不变：{error:#}");
-    }
+    let runtime_roles_config = startup_router_subagent_runtime_config(
+        &mut runtime_subagent_config,
+        use_official_catalog,
+        home,
+    );
     let subagent_optimization = runtime_subagent_config.subagent_optimization;
     let subagent_model = runtime_roles_config.subagent_model.clone();
     let subagent_reasoning_effort = runtime_subagent_config.subagent_reasoning_effort.clone();
@@ -908,8 +917,9 @@ async fn prepare_codex_startup_state(
 fn startup_router_subagent_runtime_config(
     runtime_config: &mut CodeyConfig,
     route_catalog_installed: bool,
+    home: &std::path::Path,
 ) -> CodeyConfig {
-    match router_subagent_runtime_config(runtime_config, route_catalog_installed) {
+    match validated_router_subagent_runtime_config(runtime_config, route_catalog_installed, home) {
         Ok(roles) => roles,
         Err(error) => {
             runtime_config.subagent_optimization = false;
@@ -1917,14 +1927,11 @@ impl CodeyRuntime {
     ) -> Result<CodeyConfig> {
         self.validate_subagent_route_hot_reload(config)?;
         if self.applied_config.local_router_enabled {
-            let runtime =
-                router_subagent_runtime_config(config, self.subagent_route_catalog_installed)?;
-            validate_subagent_dispatch_catalog(
-                home,
-                &runtime,
+            validated_router_subagent_runtime_config(
+                config,
                 self.subagent_route_catalog_installed,
-            )?;
-            Ok(runtime)
+                home,
+            )
         } else {
             Ok(native_subagent_runtime_config(config))
         }
@@ -2134,6 +2141,20 @@ impl CodeyRuntime {
             ),
         )
         .await
+    }
+
+    /// 仅用于主程序最终退出：进程树清理失败后，回收仍由本实例持有的直接子进程。
+    /// 此操作不表示后代已全部退出，也不允许提前恢复配置或关闭仍可能被使用的路由。
+    pub(crate) async fn reap_owned_child_before_exit(&self) -> Result<()> {
+        stop_runtime_watcher(
+            &self.exit_watchdog_shutdown,
+            &self.exit_watchdog_task,
+            "process_watch_failed",
+            "stop_codex_exit_watcher_before_final_reap",
+            "最终退出前关闭 Codex 退出监听器失败",
+        )
+        .await;
+        process::reap_owned_child_before_exit(&self.child).await
     }
 
     async fn stop_with_cleanup(

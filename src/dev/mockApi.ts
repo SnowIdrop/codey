@@ -27,6 +27,8 @@ if (import.meta.env.DEV) {
     let previewInjectionMode = new URLSearchParams(window.location.search).get("injection") === "cli"
       ? "cli" : "node_options";
     let previewInjectionRepairUntil = 0;
+    const configRepairPreview = new URLSearchParams(window.location.search).get("configRepair");
+    let previewConfigLoadFailed = configRepairPreview === "load-failure";
     const previewEndpoints = {
       primary: "https://primary.example.invalid/v1",
       backup: "https://backup.example.invalid/v1",
@@ -502,7 +504,20 @@ if (import.meta.env.DEV) {
       // Wait a tiny bit to simulate network delay
       await new Promise((resolve) => setTimeout(resolve, 300));
 
+      if (command === "list_codey_plugins") {
+        const pluginPreview = new URLSearchParams(window.location.search).get("plugins");
+        if (pluginPreview === "error") throw new Error("预览：插件列表暂时不可用，请稍后刷新。");
+        const plugins = pluginPreview === "installed" ? [{
+          id: "dev.codey.header-demo", name: "请求头示例", version: "0.1.0",
+          description: "演示独立插件的请求头扩展能力。", enabled: false, status: "disabled",
+          config: {}, configSchema: { type: "object", properties: {} }, capabilities: ["request.beforeSend"],
+        }] : [];
+        return { plugins, platform: previewClientPlatform, arch: "aarch64" };
+      }
+      if (command === "select_codey_plugin_package") return null;
+
       if (command === "load_codey_config") {
+        if (previewConfigLoadFailed) throw new Error("预览：配置路径不存在");
         return {
           config: previewConfig,
           modelState: previewModelState,
@@ -1215,6 +1230,17 @@ if (import.meta.env.DEV) {
       if (command === "repair_main_process_injection") {
         previewInjectionRepairUntil = Date.now() + 8_000;
         return { status: "repairing" };
+      }
+      if (command === "repair_codex_config") {
+        await new Promise((resolve) => setTimeout(resolve, 1800));
+        if (configRepairPreview === "failure") throw new Error("预览：无法写入配置目录，已记录错误日志");
+        previewConfigLoadFailed = false;
+        return {
+          message: configRepairPreview === "unchanged" ? "Codex 配置检查通过，无需修改" : "Codex 配置已修复",
+          configPath: "/preview/.codex/config.toml",
+          repaired: configRepairPreview !== "unchanged",
+          backupPath: null,
+        };
       }
       if (command === "check_for_updates") {
         return {

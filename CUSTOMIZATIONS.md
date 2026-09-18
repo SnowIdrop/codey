@@ -1,6 +1,6 @@
 # 个人适配维护
 
-本 fork 为 SnowIdrop/codey，上游为 SuperGness/codey。`master` 保留上游历史；`peropero/customizations` 维护个人适配。当前适配以 `aa47907bd119aea854a82c37b23c13dbfd840aeb` 为基线，尚未合并之后的上游更新。
+本 fork 为 SnowIdrop/codey，上游为 SuperGness/codey。`master` 保留上游历史；`peropero/customizations` 维护个人适配。当前已合并上游至 `0bfd5385838feb7c044a36c84dcb9efc27392600`，个人适配继续保留在该分支。
 
 ## 已保留的适配
 
@@ -49,21 +49,21 @@ git push origin peropero/customizations
 
 ## 构建和本机部署
 
-Windows 需要 Node/npm、pnpm 11.5.2、Rust MSVC、Visual Studio C++ Build Tools 和 Windows SDK。当前已有修复构建使用 Rust 1.97.1。
+Windows 需要 Node/npm、pnpm 11.5.2、Rust MSVC、Visual Studio C++ Build Tools 和 Windows SDK。本机构建环境使用 Rust 1.98.1。
 
 ```powershell
 npx --yes pnpm@11.5.2 install --frozen-lockfile
 npm run check
-cargo build --release -p codey --bin codey --locked
+cargo build --release -p codey --bins --locked
 ```
 
-每一步成功后再继续。正常退出 Codey 及其管理的 Codex 后，备份原程序和约束文件，再将 `target/release/codey.exe` 安装到实际 Codey 安装目录，保留原目录配套文件。将 `customizations/codex-constraints/` 中全部八个文件按相对路径复制到 `%APPDATA%/Codey/Codey/config/codex-constraints/`；覆盖前核对本机后续编辑。不要手动编辑其 `runtime/` 生成目录。重新启动 Codey 并新建会话加载规则。
+每一步成功后再继续。正常退出 Codey 及其管理的 Codex 后，备份原程序和约束文件，再将 `target/release/codey.exe` 与 `target/release/codey-fastctx.exe` 安装到实际 Codey 安装目录，保留原目录配套文件。将 `customizations/codex-constraints/` 中全部八个文件按相对路径复制到 `%APPDATA%/Codey/Codey/config/codex-constraints/`；覆盖前核对本机后续编辑。不要手动编辑其 `runtime/` 生成目录。重新启动 Codey 并新建会话加载规则。
 
 模型、线路和思考深度仍由 Codey 设置页管理，不从其他机器复制路由 ID 或凭据。
 
 ## 验证边界
 
-之前的修复已通过前端静态检查和 Windows release 编译；本次迁移按文件比较确认源码与已编译工作区一致。未为发布 fork 运行自动化测试或新版运行时验收。旧测试中针对旧同步读取与补位行为的预期尚未更新，不能宣称完整测试套件通过。
+合并适配通过前端静态检查、JavaScript 测试、核心 Rust 单元回归及 Windows release 编译；同步／异步门禁、实际派发目录及明文任务错误的回归预期与当前行为一致。上游原生插件的完整卸载测试在 Windows 上存在文件占用清理失败，其余工作区测试通过。尚未完成新版重启后的运行时验收，不能宣称完整测试套件或全部客户端兼容性通过。
 
 按当前“运行测试需先获允许”的工作约定，本 fork 的 GitHub Actions 暂时禁用，避免推送自动触发测试或发布。明确授权并检查工作流后可在仓库 Settings → Actions 重新启用。
 

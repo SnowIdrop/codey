@@ -679,7 +679,7 @@ test("thread title routing prefers official Luna, route Luna, then the default m
   }
 });
 
-test("misc model routes naming, commit messages, and suggests a review fallback", async () => {
+test("misc model overrides the shared Luna constants and title selection", async () => {
   const fixture = [
     "var ij=`gpt-5.6-luna`,aj=`low`;",
     "var dj=`gpt-5.6-luna`,sae=`ambient-suggestions`;",
@@ -730,6 +730,83 @@ test("misc model routes naming, commit messages, and suggests a review fallback"
     );
   } finally {
     unset.restore();
+  }
+});
+
+test("misc model constants accept quote styles, whitespace, and repeated scoped names", async () => {
+  const runtime = await loadPatchInIsolatedContext([], {}, false, "relay/housekeeping");
+  try {
+    const fixture = [
+      'globalThis.models = [',
+      '(()=>{const a = "gpt-5.6-luna"; return a})(),',
+      "(()=>{let a = 'gpt-5.6-luna'; return a})(),",
+      '(()=>{var a\n=\n`gpt-5.6-luna`; return a})()',
+      ']; const obj={}; obj.a=`gpt-5.6-luna`;',
+    ].join("");
+    const patched = runtime.context.__CODEY_PATCH_CODEX_MISC_MODEL_CONSTANTS__(fixture);
+    vm.runInNewContext(patched, runtime.context);
+    assert.deepEqual(Array.from(runtime.context.models), Array(3).fill("relay/housekeeping"));
+    assert.match(patched, /obj\.a=`gpt-5\.6-luna`/);
+  } finally {
+    runtime.restore();
+  }
+});
+
+test("misc model leaves chunks without supported constants unchanged", async () => {
+  const runtime = await loadPatchInIsolatedContext([], {}, false, "relay/housekeeping");
+  try {
+    const patch = runtime.context.__CODEY_PATCH_CODEX_MISC_MODEL_CONSTANTS__;
+    for (const fixture of [
+      'globalThis.nativeModels=["gpt-5.6-luna"];',
+      'globalThis.nativeModel={model:"gpt-5.6-luna"};',
+      'var nativeModel="new-native-model";',
+    ]) {
+      assert.equal(patch(fixture), fixture);
+    }
+  } finally {
+    runtime.restore();
+  }
+});
+
+test("misc model patches independent chunks without treating native references as failures", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "codey-misc-chunks-"));
+  const build = join(directory, ".vite", "build");
+  await mkdir(build, { recursive: true });
+  const runtime = await loadPatchInIsolatedContext([], {}, false, "relay/housekeeping");
+  const status = runtime.context.__CODEY_CODEX_STARTUP_PATCH__;
+  const compile = async (name, source) => {
+    const filename = join(build, name);
+    await writeFile(filename, source);
+    process.getBuiltinModule("module")._extensions[".js"]({
+      _compile(patched) { vm.runInNewContext(patched, runtime.context); },
+    }, filename);
+    return filename;
+  };
+  try {
+    assert.equal(status.routeMiscModel, false);
+    await compile("src-suggestions.js", 'globalThis.nativeModels=["gpt-5.6-luna"];');
+    assert.deepEqual(Array.from(runtime.context.nativeModels), ["gpt-5.6-luna"]);
+    assert.equal(status.routeMiscModel, false);
+    assert.equal(runtime.context.__CODEY_MISC_MODEL_CONSTANTS_SOURCE_PATCHED__, false);
+    assert.equal(status.optionalMainBundlePatchFailures.length, 0);
+    await compile("src-git.js", 'var commitModel="gpt-5.6-luna"; globalThis.commitModel=commitModel;');
+    assert.equal(runtime.context.commitModel, "relay/housekeeping");
+    assert.equal(status.routeMiscModel, true);
+    assert.equal(runtime.context.__CODEY_MISC_MODEL_CONSTANTS_SOURCE_PATCHED__, true);
+    assert.equal(status.optionalMainBundlePatchFailures.length, 0);
+    await compile("src-catalog.js", 'globalThis.catalogModel={model:"gpt-5.6-luna"};');
+    assert.equal(runtime.context.catalogModel.model, "gpt-5.6-luna");
+    assert.equal(status.routeMiscModel, true);
+    assert.equal(runtime.context.__CODEY_MISC_MODEL_CONSTANTS_SOURCE_PATCHED__, true);
+    assert.equal(status.optionalMainBundlePatchFailures.length, 0);
+    await compile("src-suggestions.js", 'var suggestionModel = `gpt-5.6-luna`; globalThis.suggestionModel=suggestionModel;');
+    assert.equal(runtime.context.suggestionModel, "relay/housekeeping");
+    assert.equal(status.optionalMainBundlePatchFailures.length, 0);
+    assert.equal(status.routeMiscModel, true);
+    assert.equal(runtime.context.__CODEY_MISC_MODEL_CONSTANTS_SOURCE_PATCHED__, true);
+  } finally {
+    runtime.restore();
+    await rm(directory, { recursive: true, force: true });
   }
 });
 

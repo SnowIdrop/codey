@@ -1597,9 +1597,18 @@ impl RouterServer {
                 encoded_body = None;
             }
         } else {
-            // Chat Completions 与 Anthropic Messages 都表达不了 encrypted_content，
-            // 协议转换只能丢弃该字段。第三方线路常把协作任务正文写在这个字段里，
-            // 转换前必须先改写为可见文本，否则子代理收到的任务载荷为空。
+            // 历史恢复完成后检查密文任务，避免转换时静默丢失正文。
+            if let Err(error) = validate_adapted_agent_payloads(&body) {
+                return downstream
+                    .write_error(
+                        400,
+                        "context_not_portable",
+                        error.to_string(),
+                        Some(&resolved.route),
+                    )
+                    .await;
+            }
+            // 第三方线路写入该字段的明文任务仍恢复为可见文本。
             // encoded_body 在非原生线路上只作为大请求异步转换的体积标记，正文本身
             // 以转换结果为准，保留它可以让超大请求继续走异步转换。
             if normalize_encrypted_agent_payloads(&mut body) {
@@ -1715,13 +1724,41 @@ impl RouterServer {
                 return Ok(());
             }
         };
+        if crate::codey_plugins::has_request_plugins() {
+            let metadata = json!({
+                "requestId": current_router_request_id(),
+                "routeId": resolved.provider_id,
+                "accountId": resolved.route.official_auth.as_ref().map(|auth| auth.account_id.as_str()),
+                "requestedModel": resolved.requested_model,
+                "model": resolved.upstream_model,
+                "protocol": bridge.upstream_protocol().label(),
+                "subagent": subagent_request,
+            });
+            let visible_headers = headers
+                .iter()
+                .filter(|(name, _)| crate::codey_plugins::allowed_header_name(name.as_str()))
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_owned(), value.to_owned()))
+                })
+                .collect();
+            let patches =
+                crate::codey_plugins::dispatch_request_headers(&metadata, &visible_headers);
+            apply_codey_plugin_header_patches(&mut headers, patches);
+        }
         // 请求体的模型名已还原为上游模型名，路由提示头里的模型名必须保持一致；
         // HTTP、WebSocket 握手和压缩请求共用这份头。
         align_routing_hint_model(&mut headers, &resolved.upstream_model);
         // Commit the new binding only after the request's route compatibility,
         // payload conversion, and credentials have passed local checks. A
         // rejected switch must leave the prior route available for a retry.
-        {
+        // 自动复核是独立请求，复用主会话标识时也不能更改主会话的线路。
+        let auto_review_request =
+            model_id::equal(&resolved.upstream_model, CODEX_AUTO_REVIEW_MODEL)
+                || resolved.fallback_reason.as_deref() == Some("auto_review_misc_model");
+        if !auto_review_request {
             let refresh_session_binding = route_hint.is_some() && !subagent_request;
             self.bindings
                 .lock()
@@ -2304,6 +2341,34 @@ impl RouterServer {
             }
         };
         Ok(Some(response))
+    }
+}
+
+pub(crate) fn apply_codey_plugin_header_patches(
+    headers: &mut HeaderMap,
+    patches: Vec<crate::codey_plugins::HeaderPatch>,
+) {
+    let parsed = patches
+        .into_iter()
+        .map(|patch| {
+            if !crate::codey_plugins::allowed_header_name(&patch.name) {
+                return None;
+            }
+            let name = HeaderName::from_bytes(patch.name.as_bytes()).ok()?;
+            let value = match patch.value {
+                Some(value) => Some(HeaderValue::from_str(&value).ok()?),
+                None => None,
+            };
+            Some((name, value))
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(parsed) = parsed else { return };
+    for (name, value) in parsed {
+        if let Some(value) = value {
+            headers.insert(name, value);
+        } else {
+            headers.remove(name);
+        }
     }
 }
 

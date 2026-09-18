@@ -766,6 +766,163 @@ fn followup_task_rejects_unbound_or_terminal_targets_before_reactivation() {
 }
 
 #[test]
+fn interrupt_revokes_queued_writer_before_acknowledgement() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_test_runtime_policy(root);
+    let runtime_id = "runtime-a";
+    let session_id = "queued-interrupt-session";
+    let target = "/root/queued_writer";
+    let agent_id = "opaque-writer-thread";
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let mut spawn = input("PreToolUse", session_id);
+    spawn.turn_id = Some("root-turn-a".into());
+    spawn.cwd = Some(workspace.to_string_lossy().into_owned());
+    spawn.tool_name = Some("agents.spawn_agent".into());
+    spawn.tool_input = Some(json!({
+        "task_name": "queued_writer", "agent_type": "codey_worker",
+        "message": "Apply the bounded change."
+    }));
+    assert_eq!(
+        handle_hook_for_runtime_at(&spawn, root, runtime_id, 10).unwrap(),
+        json!({})
+    );
+    spawn.hook_event_name = "PostToolUse".into();
+    spawn.tool_response = Some(json!({"agent_id": agent_id}));
+    handle_hook_for_runtime_at(&spawn, root, runtime_id, 20).unwrap();
+    let mut started = input("SubagentStart", session_id);
+    started.agent_id = Some(agent_id.into());
+    started.agent_type = Some("codey_worker".into());
+    handle_hook_for_runtime_at(&started, root, runtime_id, 21).unwrap();
+    let marker = agent_marker_path(&session_state_dir(root, session_id), runtime_id, agent_id);
+    assert!(marker.exists());
+
+    let mut write = input("PreToolUse", session_id);
+    write.agent_id = Some(agent_id.into());
+    write.agent_type = Some("codey_worker".into());
+    write.tool_name = Some("apply_patch".into());
+    write.tool_input = Some(json!({"patch": "*** Begin Patch\n*** End Patch"}));
+    attest_test_child(&write, root, runtime_id);
+    assert_eq!(
+        handle_hook_for_runtime_at(&write, root, runtime_id, 22).unwrap(),
+        json!({})
+    );
+
+    // The provider has already queued a followup before the root interrupts.
+    let mut followup = input("PreToolUse", session_id);
+    followup.turn_id = Some("root-turn-a".into());
+    followup.tool_name = Some("agents.followup_task".into());
+    followup.tool_input =
+        Some(json!({"target": target, "message": "Continue the bounded change."}));
+    assert_eq!(
+        handle_hook_for_runtime_at(&followup, root, runtime_id, 23).unwrap(),
+        json!({})
+    );
+    let mut interrupt = input("PreToolUse", session_id);
+    interrupt.turn_id = Some("root-turn-a".into());
+    interrupt.tool_name = Some("agents.interrupt_agent".into());
+    interrupt.tool_input = Some(json!({"target": target}));
+    assert_eq!(
+        handle_hook_for_runtime_at(&interrupt, root, runtime_id, 30).unwrap(),
+        json!({})
+    );
+
+    // A queued NEW_TASK can start before PostToolUse acknowledges the interrupt.
+    handle_hook_for_runtime_at(&started, root, runtime_id, 31).unwrap();
+    for tool in ["apply_patch", "functions.exec", "exec_command"] {
+        write.tool_name = Some(tool.into());
+        let denied = handle_hook_for_runtime_at(&write, root, runtime_id, 32).unwrap();
+        assert_eq!(
+            denied["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{tool}: {denied}"
+        );
+    }
+    assert_eq!(
+        handle_hook_for_runtime_at(&followup, root, runtime_id, 33).unwrap()["hookSpecificOutput"]
+            ["permissionDecision"],
+        "deny"
+    );
+    assert_eq!(
+        active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+        1
+    );
+    let mut root_write = input("PreToolUse", session_id);
+    root_write.turn_id = Some("root-turn-a".into());
+    root_write.tool_name = Some("apply_patch".into());
+    assert_eq!(
+        handle_hook_for_runtime_at(&root_write, root, runtime_id, 34).unwrap()["hookSpecificOutput"]
+            ["permissionDecision"],
+        "deny"
+    );
+    let mut replacement = input("PreToolUse", session_id);
+    replacement.turn_id = Some("root-turn-a".into());
+    replacement.cwd = spawn.cwd.clone();
+    replacement.tool_name = Some("agents.spawn_agent".into());
+    replacement.tool_input = Some(json!({
+        "task_name": "replacement_writer", "agent_type": "codey_worker",
+        "message": "Apply the bounded change after the old attempt settles."
+    }));
+    assert_eq!(
+        handle_hook_for_runtime_at(&replacement, root, runtime_id, 34).unwrap()["hookSpecificOutput"]
+            ["permissionDecision"],
+        "deny"
+    );
+
+    // Failure cannot re-enable child writes or prematurely release the root.
+    interrupt.hook_event_name = "PostToolUse".into();
+    interrupt.tool_response = Some(json!({"isError": true, "error": "interrupt transport failed"}));
+    handle_hook_for_runtime_at(&interrupt, root, runtime_id, 35).unwrap();
+    assert_eq!(
+        active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+        1
+    );
+    assert_eq!(
+        handle_hook_for_runtime_at(&write, root, runtime_id, 36).unwrap()["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
+
+    interrupt.tool_response = Some(json!({"previous_status": "running"}));
+    handle_hook_for_runtime_at(&interrupt, root, runtime_id, 40).unwrap();
+    assert_eq!(
+        active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+        0
+    );
+    assert!(!marker.exists());
+    // Keep the opaque identity associated with the abandoned attempt, even
+    // when a delayed lifecycle event arrives without its canonical task path.
+    handle_hook_for_runtime_at(&started, root, runtime_id, 41).unwrap();
+    assert!(!marker.exists());
+    assert_eq!(
+        handle_hook_for_runtime_at(&write, root, runtime_id, 42).unwrap()["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
+    assert_eq!(
+        handle_hook_for_runtime_at(&root_write, root, runtime_id, 43).unwrap(),
+        json!({})
+    );
+    assert_eq!(
+        handle_hook_for_runtime_at(&replacement, root, runtime_id, 44).unwrap(),
+        json!({})
+    );
+    replacement.hook_event_name = "PostToolUse".into();
+    replacement.tool_response = Some(json!({"agent_id": "replacement-thread"}));
+    handle_hook_for_runtime_at(&replacement, root, runtime_id, 45).unwrap();
+    // A replacement attempt cannot restore the old attempt's write permission.
+    assert_eq!(
+        handle_hook_for_runtime_at(&write, root, runtime_id, 46).unwrap()["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
+    write.agent_id = Some("replacement-thread".into());
+    attest_test_child(&write, root, runtime_id);
+    assert_eq!(
+        handle_hook_for_runtime_at(&write, root, runtime_id, 47).unwrap(),
+        json!({})
+    );
+}
+
+#[test]
 fn successful_root_interrupt_fences_the_attempt_and_releases_the_gate() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
@@ -1587,7 +1744,8 @@ fn user_prompt_submit_rebinds_the_trusted_root_turn_without_blanket_cancellation
         .unwrap();
     assert!(context.contains("当前用户输入优先"));
     assert!(context.contains("只中断仍非终态且被明确取消的 target"));
-    assert!(context.contains("agents.spawn_agent 补位"));
+    assert!(context.contains("同步批次等待整批结束再派发"));
+    assert!(context.contains("异步批次可在身份已确认"));
     assert!(context.contains("不得被解释为取消全部代理"));
     interrupt.turn_id = Some("root-turn-b".to_string());
     assert_eq!(
@@ -2017,7 +2175,7 @@ fn subagent_stop_releases_root_and_stop_hook_cannot_finish_early() {
 }
 
 #[test]
-fn verified_read_only_batch_allows_only_proven_safe_root_reads() {
+fn synchronous_batches_block_local_work_while_verified_async_batches_allow_it() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     write_test_runtime_policy(root);
@@ -2115,14 +2273,16 @@ fn verified_read_only_batch_allows_only_proven_safe_root_reads() {
         "mcp__cms_database__describe_table",
     ] {
         assert_eq!(
-            handle_hook_for_runtime_at(
-                &root_tool(read_session, root_turn, tool_name),
-                root,
-                runtime_id,
-                base + 30,
-            )
-            .unwrap(),
-            json!({}),
+            permission(
+                &handle_hook_for_runtime_at(
+                    &root_tool(read_session, root_turn, tool_name),
+                    root,
+                    runtime_id,
+                    base + 30,
+                )
+                .unwrap()
+            ),
+            Some("deny".to_string()),
             "{tool_name}"
         );
     }
@@ -2131,8 +2291,8 @@ fn verified_read_only_batch_allows_only_proven_safe_root_reads() {
         "sql": "WITH columns AS (SELECT * FROM information_schema.columns) SELECT * FROM columns;"
     }));
     assert_eq!(
-        handle_hook_for_runtime_at(&sql_read, root, runtime_id, base + 30).unwrap(),
-        json!({})
+        permission(&handle_hook_for_runtime_at(&sql_read, root, runtime_id, base + 30).unwrap()),
+        Some("deny".to_string())
     );
     for tool_name in [
         "mcp__codey_fastctx__replace",
@@ -2196,8 +2356,8 @@ fn verified_read_only_batch_allows_only_proven_safe_root_reads() {
     assert_eq!(continuation["decision"].as_str(), Some("block"));
     let reason = continuation["reason"].as_str().unwrap();
     assert!(reason.contains("仍有 1 个子代理"));
-    assert!(reason.contains("数据库 schema/只读 SQL"));
-    assert!(reason.contains("写入、命令、视觉"));
+    assert!(reason.contains("同步批次须等全部代理结束，期间不得补位"));
+    assert!(reason.contains("不得恢复非协作本地工作"));
     assert!(
         !agent_marker_path(
             &session_state_dir(root, read_session),
@@ -2215,14 +2375,16 @@ fn verified_read_only_batch_allows_only_proven_safe_root_reads() {
         .exists()
     );
     assert_eq!(
-        handle_hook_for_runtime_at(
-            &root_tool(read_session, root_turn, "mcp__codey_fastctx__grep"),
-            root,
-            runtime_id,
-            base + 41,
-        )
-        .unwrap(),
-        json!({})
+        permission(
+            &handle_hook_for_runtime_at(
+                &root_tool(read_session, root_turn, "mcp__codey_fastctx__grep"),
+                root,
+                runtime_id,
+                base + 41,
+            )
+            .unwrap()
+        ),
+        Some("deny".to_string())
     );
 
     remove_active_marker(root, runtime_id, read_session, "agent-reader-b").unwrap();
@@ -2266,12 +2428,45 @@ fn verified_read_only_batch_allows_only_proven_safe_root_reads() {
         base + 53,
     )
     .unwrap();
-    assert_eq!(native_readonly, json!({}));
+    assert_eq!(permission(&native_readonly).as_deref(), Some("deny"));
 
     let mut command_reader_stop = input("SubagentStop", command_session);
     command_reader_stop.agent_id = Some("agent-command-reader".to_string());
     command_reader_stop.agent_type = Some("codey_deep_research".to_string());
     handle_hook_for_runtime_at(&command_reader_stop, root, runtime_id, base + 54).unwrap();
+
+    let async_session = "async-read-session";
+    spawn_agent(
+        async_session,
+        "async_reader",
+        "codey_deep_research",
+        "agent-async-reader",
+        read_contract("async_reader"),
+        base + 55,
+    );
+    for tool_name in ["mcp__codey_fastctx__grep", "functions.apply_patch"] {
+        assert_eq!(
+            handle_hook_for_runtime_at(
+                &root_tool(async_session, root_turn, tool_name),
+                root,
+                runtime_id,
+                base + 58,
+            )
+            .unwrap(),
+            json!({}),
+            "{tool_name}"
+        );
+    }
+    assert_eq!(
+        handle_hook_for_runtime_at(&input("Stop", async_session), root, runtime_id, base + 59)
+            .unwrap()["decision"]
+            .as_str(),
+        Some("block")
+    );
+    let mut async_reader_stop = input("SubagentStop", async_session);
+    async_reader_stop.agent_id = Some("agent-async-reader".to_string());
+    async_reader_stop.agent_type = Some("codey_deep_research".to_string());
+    handle_hook_for_runtime_at(&async_reader_stop, root, runtime_id, base + 59).unwrap();
 
     let write_session = "writer-session";
     spawn_agent(
@@ -2395,7 +2590,8 @@ fn partial_wait_updates_keep_root_blocked_until_every_subagent_stops() {
     assert!(first_reason.contains("仍有 2 个子代理"));
     assert!(first_reason.contains("first result"));
     assert!(first_reason.contains("可继续使用 agents.wait_agent"));
-    assert!(first_reason.contains("按该任务角色重新计算并发上限"));
+    assert!(first_reason.contains("同步批次须等全部代理结束，期间不得补位"));
+    assert!(first_reason.contains("按角色并发上限补位"));
     assert!(first_reason.contains("不得自动重派已结束或已放弃的旧任务"));
     assert!(first_reason.contains("不得恢复非协作本地工作"));
 
@@ -2621,7 +2817,7 @@ fn mixed_full_list_settles_only_the_terminal_ledger_marker() {
         blocked["reason"]
             .as_str()
             .unwrap()
-            .contains("按该任务角色重新计算并发上限")
+            .contains("同步批次继续等待整批全部结束，不得按空槽补位")
     );
     assert_eq!(
         active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),

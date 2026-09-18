@@ -999,10 +999,17 @@ fn pre_tool_use_output(
         BATCH_WAITING_FILE,
     );
     if active == 0 {
-        remove_session_auxiliary_file(state_root, runtime_id, &input.session_id, BATCH_WAITING_FILE)?;
-    } else if input.tool_name.as_deref().is_some_and(|name| {
-        is_wait_agent_tool(name) || is_list_agents_tool(name)
-    }) {
+        remove_session_auxiliary_file(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            BATCH_WAITING_FILE,
+        )?;
+    } else if input
+        .tool_name
+        .as_deref()
+        .is_some_and(|name| is_wait_agent_tool(name) || is_list_agents_tool(name))
+    {
         crate::fs_util::atomic_write_private(&batch_waiting_path, b"waiting")?;
     }
     let trusted_root_turn =
@@ -1019,6 +1026,20 @@ fn pre_tool_use_output(
                 "Codey 主体身份门禁：仍有 {active} 个活动子代理，但当前 PreToolUse 载荷既没有可信的 child 身份，也没有匹配本轮首个根派生调用的 turn_id，无法证明调用者是根代理。为防止匿名 child 派生、追派或中断，当前仅允许 agents.wait_agent 与不带筛选的 agents.list_agents 对账；其余编排调用已按 fail-closed 拒绝。"
             )));
         }
+    }
+    if input
+        .tool_name
+        .as_deref()
+        .is_some_and(is_interrupt_agent_tool)
+    {
+        crate::subagent_orchestrator::pre_interrupt_agent(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            input.tool_input.as_ref(),
+            now_ms,
+        )?;
+        return Ok(json!({}));
     }
     if input
         .tool_name
@@ -1319,12 +1340,8 @@ fn post_tool_use_output(
     }
     let root_independent_work_allowed =
         trusted_root_turn_matches(input, state_root, runtime_id, now_ms)?
-            && verified_async_active_count(
-                state_root,
-                runtime_id,
-                &input.session_id,
-                now_ms,
-            )? == Some(active);
+            && verified_async_active_count(state_root, runtime_id, &input.session_id, now_ms)?
+                == Some(active);
     let protocol_issue = protocol_issue_reason(state_root, runtime_id, &input.session_id)?;
     if is_wait_agent_tool(tool_name) {
         Ok(post_wait_continuation(

@@ -40,6 +40,15 @@ export const CODEY_API_COMMANDS = [
   "plugin_marketplace_status",
   "repair_plugin_marketplace",
   "repair_main_process_injection",
+  "repair_codex_config",
+  "list_codey_plugins",
+  "select_codey_plugin_package",
+  "inspect_codey_plugin",
+  "install_codey_plugin",
+  "set_codey_plugin_enabled",
+  "configure_codey_plugin",
+  "uninstall_codey_plugin",
+  "invoke_codey_plugin",
 ] as const;
 
 export type CodeyApiCommand = (typeof CODEY_API_COMMANDS)[number];

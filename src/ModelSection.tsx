@@ -13,12 +13,15 @@ import {
   IconRefresh as RefreshCw,
   IconServer as Server,
   IconShieldCheck,
+  IconSparkles,
   IconTrash as Trash,
 } from "@tabler/icons-react";
 
 import type { Confirmation, Config, ModelContextConfig, ModelState, OfficialAccount, OfficialAccountsResult, Profile, ProviderStatus } from "./App.types";
 import { OfficialAccountsPanel } from "./OfficialAccountsPanel";
 import { Card } from "@heroui/react";
+import { ModelCombobox } from "./components/ModelCombobox";
+import type { SubagentModelOption } from "./subagentModels";
 import {
   Badge,
   Button,
@@ -52,6 +55,7 @@ import {
 import { flushCardClass } from "./uiClasses";
 import { validateOutboundApiUrl, validateOutboundProxyUrl } from "./urlValidation";
 import { invoke } from "./api";
+import { readHostTheme } from "./overlayTheme";
 
 type ModelSectionProps = {
   config: Config;
@@ -64,6 +68,7 @@ type ModelSectionProps = {
   isBusy: boolean;
   busy: string | null;
   showAccountUsageInHeader: boolean;
+  subagentModelOptions?: SubagentModelOption[];
   onToggleLocalRouter: (checked: boolean) => void;
   onToggleRouteRequestLog: (checked: boolean) => void;
   onSaveRoute: (route: Profile) => Promise<boolean>;
@@ -145,10 +150,10 @@ const UPSTREAM_PROXY_TOOLTIP_CONTENT = (
   <div className="space-y-1.5 text-xs text-left leading-relaxed">
     <div className="font-semibold">上游代理格式与提示</div>
     <div>
-      支持协议：<code className="rounded bg-black/10 px-1 py-0.5 font-mono text-[11px] dark:bg-white/15">http://</code>、<code className="rounded bg-black/10 px-1 py-0.5 font-mono text-[11px] dark:bg-white/15">https://</code>、<code className="rounded bg-black/10 px-1 py-0.5 font-mono text-[11px] dark:bg-white/15">socks5://</code>、<code className="rounded bg-black/10 px-1 py-0.5 font-mono text-[11px] dark:bg-white/15">socks5h://</code>
+      支持协议：<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">http://</code>、<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">https://</code>、<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">socks5://</code>、<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">socks5h://</code>
     </div>
     <div>
-      支持代理认证：允许携带用户名与密码（如 <code className="rounded bg-black/10 px-1 py-0.5 font-mono text-[11px] dark:bg-white/15">user:pass@host:port</code>）。
+      支持代理认证：允许携带用户名与密码（如 <code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">user:pass@host:port</code>）。
     </div>
     <div className="pt-0.5">
       <div className="font-semibold text-[11px] opacity-80">常见示例：</div>
@@ -210,6 +215,7 @@ function ModelSectionComponent({
   isBusy,
   busy,
   showAccountUsageInHeader,
+  subagentModelOptions = [],
   onToggleLocalRouter,
   onToggleRouteRequestLog,
   onSaveRoute,
@@ -616,6 +622,41 @@ function ModelSectionComponent({
   const draftOfficialAccountLabel =
     displayedEmail(draftOfficialAccount) || draftOfficialAccount?.id || "";
 
+  const preferredProfile =
+    config.profiles.find((profile) => profile.id === config.activeProfileId) ??
+    config.profiles[0];
+  const preferredProviderId = preferredProfile
+    ? routeProviderId(preferredProfile)
+    : undefined;
+  const miscModelDisabled = isBusy || subagentModelOptions.length === 0;
+  const selectedMiscModelKey = config.miscModel.trim().toLowerCase();
+  const miscModelUnavailable =
+    selectedMiscModelKey !== "" &&
+    !subagentModelOptions.some(
+      (option) => option.value.toLowerCase() === selectedMiscModelKey,
+    );
+
+  const miscModelTooltip = (
+    <div className="flex flex-col gap-1 text-xs leading-relaxed max-w-[360px]">
+      <div className="font-semibold text-foreground">
+        统一指定会话命名、Git 提交消息、环境建议与自动复核回退使用的模型
+      </div>
+      <div className="text-muted">
+        留空时沿用默认选择：会话命名优先使用官方 Luna，第三方线路使用已启用的 Luna 或默认模型；Git 提交消息和环境建议沿用内置模型。选择模型后，这些功能及自动复核回退使用所选模型；只要任一线路声明支持 codex-auto-review，自动复核仍使用专用模型。自动复核回退在保存后生效，其余功能需要重启 Codex，且依赖当前版本的主进程补丁支持。
+      </div>
+      {miscModelUnavailable && (
+        <div className="text-warning font-medium">
+          当前选择不在可用模型列表中，请重新选择；保存后若仍无法解析，将沿用默认行为，自动复核回退不可用。
+        </div>
+      )}
+      {!config.localRouterEnabled && (
+        <div className="text-muted italic">
+          本地路由已关闭，自动复核回退不会生效。
+        </div>
+      )}
+    </div>
+  );
+
   return (
     <section className="route-section" aria-labelledby="route-title">
       <div className="section-title">
@@ -648,26 +689,6 @@ function ModelSectionComponent({
           </div>
         </div>
         <div className="route-heading-actions">
-          <div className="local-router-toggle route-retry-toggle">
-            <Tooltip content="流式会话中断后自动重新连接的次数，保存并重启 Codex 后生效">
-              <span className="route-retry-label cursor-help">
-                <strong>会话重试</strong>
-              </span>
-            </Tooltip>
-            <NumberInput
-              size="sm"
-              value={config.streamMaxRetries}
-              minValue={0}
-              maxValue={100}
-              disabled={isBusy}
-              onChange={(value) => {
-                if (Number.isInteger(value) && value >= 0 && value <= 100 && value !== config.streamMaxRetries) {
-                  onConfigChange?.({ ...config, streamMaxRetries: value });
-                }
-              }}
-              aria-label="会话错误重试次数"
-            />
-          </div>
           <div className="local-router-toggle local-router-toggle-group">
             <div className="local-router-toggle-item">
               <strong>本地路由</strong>
@@ -699,7 +720,7 @@ function ModelSectionComponent({
             <Button
               color="primary"
               variant="filled"
-              onClick={() => void invoke("open_route_request_logs")}
+              onClick={() => void invoke("open_route_request_logs", { theme: readHostTheme() })}
             >
               <IconListDetails size={14} aria-hidden="true" />
               <span>查看请求日志</span>
@@ -796,7 +817,7 @@ function ModelSectionComponent({
                         {!routeConfigReadOnly && (
                           <button
                             type="button"
-                            className="route-item-drag-handle cursor-grab text-gray-400 hover:text-gray-600 active:cursor-grabbing disabled:cursor-default"
+                            className="route-item-drag-handle cursor-grab text-gray-400 dark:text-gray-400 hover:text-gray-600 active:cursor-grabbing disabled:cursor-default"
                             disabled={isBusy || dirty}
                             draggable={!isBusy && !dirty}
                             aria-label={`调整线路 ${profile.name} 的顺序`}
@@ -977,6 +998,71 @@ function ModelSectionComponent({
           </div>
         </div>
 
+        <div className="route-auxiliary-bar">
+          <div className="route-auxiliary-misc">
+            <Tooltip content={miscModelTooltip} position="top">
+              <span className="route-auxiliary-label cursor-help">
+                <IconSparkles size={14} className="route-auxiliary-icon" aria-hidden="true" />
+                <strong>杂事模型</strong>
+                <IconInfoCircle size={13} className="route-auxiliary-help" aria-hidden="true" />
+              </span>
+            </Tooltip>
+            <div className="route-auxiliary-combobox">
+              <ModelCombobox
+                aria-label="杂事模型"
+                value={config.miscModel}
+                placeholder={
+                  subagentModelOptions.length === 0
+                    ? "所有线路均暂无模型"
+                    : "请选择模型"
+                }
+                disabled={miscModelDisabled}
+                options={subagentModelOptions}
+                preferredProviderId={preferredProviderId}
+                onChange={(value) => {
+                  if (!subagentModelOptions.some((option) => option.value === value)) {
+                    return;
+                  }
+                  onConfigChange?.({ ...config, miscModel: value });
+                }}
+              />
+            </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={isBusy || config.miscModel.trim() === ""}
+              onClick={() => onConfigChange?.({ ...config, miscModel: "" })}
+              className="route-misc-model-reset"
+            >
+              恢复默认
+            </Button>
+          </div>
+
+          <div className="route-auxiliary-retry">
+            <div className="local-router-toggle route-retry-toggle">
+              <Tooltip content="流式会话中断后自动重新连接的次数，保存并重启 Codex 后生效" position="top">
+                <span className="route-retry-label cursor-help">
+                  <strong>会话重试</strong>
+                  <IconInfoCircle size={13} className="route-auxiliary-help" aria-hidden="true" />
+                </span>
+              </Tooltip>
+              <NumberInput
+                size="sm"
+                value={config.streamMaxRetries}
+                minValue={0}
+                maxValue={100}
+                disabled={isBusy}
+                onChange={(value) => {
+                  if (Number.isInteger(value) && value >= 0 && value <= 100 && value !== config.streamMaxRetries) {
+                    onConfigChange?.({ ...config, streamMaxRetries: value });
+                  }
+                }}
+                aria-label="会话错误重试次数"
+              />
+            </div>
+          </div>
+        </div>
+
         <div className="readonly-note">
           <IconInfoCircle size={14} className="readonly-note-icon" aria-hidden="true" />
           <span className="readonly-note-text">
@@ -1077,7 +1163,7 @@ function ModelSectionComponent({
                           (officialRouteDraft?.routeName.length ?? 0) > 0) ? (
                           <small
                             id="official-route-name-error"
-                            className="text-[#d70015]"
+                            className="text-[var(--codey-red,#d70015)]"
                             role="alert"
                           >
                             {officialRouteDraftErrors.routeName}
@@ -1117,7 +1203,7 @@ function ModelSectionComponent({
                           (officialRouteDraft?.routeShortName.length ?? 0) > 0) ? (
                           <small
                             id="official-route-short-name-error"
-                            className="text-[#d70015]"
+                            className="text-[var(--codey-red,#d70015)]"
                             role="alert"
                           >
                             {officialRouteDraftErrors.shortName}
@@ -1158,7 +1244,7 @@ function ModelSectionComponent({
                           updateOfficialRouteDraft({ upstreamProxy: event.target.value })}
                       />
                       {officialRouteDraftErrors?.upstreamProxy ? (
-                        <small id="official-route-proxy-error" className="text-[#d70015]" role="alert">
+                        <small id="official-route-proxy-error" className="text-[var(--codey-red,#d70015)]" role="alert">
                           {officialRouteDraftErrors.upstreamProxy}
                         </small>
                       ) : null}
@@ -1238,7 +1324,7 @@ function ModelSectionComponent({
                     />
                     {routeDraftErrors?.name &&
                     (routeValidationAttempted || routeDraft.name.length > 0) ? (
-                      <small id="route-name-error" className="text-[#d70015]" role="alert">
+                      <small id="route-name-error" className="text-[var(--codey-red,#d70015)]" role="alert">
                         {routeDraftErrors.name}
                       </small>
                     ) : null}
@@ -1269,7 +1355,7 @@ function ModelSectionComponent({
                     (routeValidationAttempted || routeDraft.shortName.length > 0) ? (
                       <small
                         id="route-short-name-error"
-                        className="text-[#d70015]"
+                        className="text-[var(--codey-red,#d70015)]"
                         role="alert"
                       >
                         {routeDraftErrors.shortName}
@@ -1381,7 +1467,7 @@ function ModelSectionComponent({
                   />
                   {routeDraftErrors?.baseUrl &&
                   (routeValidationAttempted || routeDraft.baseUrl.trim()) ? (
-                    <small id="route-url-error" className="text-[#d70015]" role="alert">
+                    <small id="route-url-error" className="text-[var(--codey-red,#d70015)]" role="alert">
                       {routeDraftErrors.baseUrl}
                     </small>
                   ) : null}
@@ -1417,7 +1503,7 @@ function ModelSectionComponent({
                     }}
                   />
                   {routeValidationAttempted && routeDraftErrors?.apiKey ? (
-                    <small id="route-key-error" className="text-[#d70015]" role="alert">
+                    <small id="route-key-error" className="text-[var(--codey-red,#d70015)]" role="alert">
                       {routeDraftErrors.apiKey}
                     </small>
                   ) : null}
@@ -1460,7 +1546,7 @@ function ModelSectionComponent({
                   />
                   {routeDraftErrors?.upstreamProxy &&
                   (routeValidationAttempted || (routeDraft.upstreamProxy || "").trim()) ? (
-                    <small id="route-proxy-error" className="text-[#d70015]" role="alert">
+                    <small id="route-proxy-error" className="text-[var(--codey-red,#d70015)]" role="alert">
                       {routeDraftErrors.upstreamProxy}
                     </small>
                   ) : null}
@@ -1468,7 +1554,7 @@ function ModelSectionComponent({
               </div>
             )}
 
-            {headerError && <small className="text-[#d70015]" role="alert">{headerError}；请先在线路的请求头编辑器中修正。</small>}
+            {headerError && <small className="text-[var(--codey-red,#d70015)]" role="alert">{headerError}；请先在线路的请求头编辑器中修正。</small>}
             <DialogFooter className="route-editor-footer">
               <Button
                 variant="outline"
@@ -1517,11 +1603,11 @@ function ModelSectionComponent({
                 value={routeHeadersText}
                 disabled={isBusy}
                 rows={10}
-                className="min-h-48 rounded-lg border border-black/10 bg-white p-2 font-mono text-xs"
+                className="min-h-48 rounded-lg border border-[rgb(var(--codey-ink-rgb,0,0,0))]/10 bg-[var(--codey-surface,#fff)] p-2 font-mono text-xs"
                 onChange={(event) => { setRouteHeadersText(event.target.value); setHeaderError(""); }}
                 placeholder={'{"X-Custom-Header": "value"}'}
               />
-              {headerError && <small id="request-headers-error" className="text-[#d70015]" role="alert">{headerError}</small>}
+              {headerError && <small id="request-headers-error" className="text-[var(--codey-red,#d70015)]" role="alert">{headerError}</small>}
             </label>
             <DialogFooter className="route-editor-footer">
               <Button variant="outline" disabled={isBusy} onClick={() => setHeaderDialogProfile(null)}>取消</Button>
