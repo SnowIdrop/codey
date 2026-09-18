@@ -2,6 +2,7 @@ import type { Config, ModelState, Profile, ProviderStatus } from "./App.types";
 import { modelKey, uniqueModelIds } from "./modelIds";
 import { routeModelAlias, routeProviderId } from "./modelRoutes";
 import { routeDisplayPrefix } from "./routeShortNames";
+import { reasoningEffortValue } from "./modelReasoningEfforts";
 
 const THIRD_PARTY_REASONING_EFFORTS = ["low", "medium", "high", "xhigh"];
 const THIRD_PARTY_REASONING_EFFORT_ALLOWLIST = [
@@ -106,12 +107,18 @@ export function buildSubagentModelOptions(
 
     const officialModelMetadata = metadataForModel(officialMetadata, modelId);
     const thirdPartyModelMetadata = metadataForModel(thirdPartyMetadata, modelId);
-    const efforts = official && officialModelMetadata
+    const configuredEfforts = Object.entries(
+      config.modelReasoningEffortsByProvider?.[providerId] ?? {},
+    ).find(([model]) => modelKey(model) === modelKey(modelId))?.[1];
+    let efforts = official && officialModelMetadata
       ? officialModelMetadata.supportedReasoningEfforts
       : thirdPartyReasoningEfforts(
         thirdPartyModelMetadata?.supportedReasoningEfforts ??
           officialModelMetadata?.supportedReasoningEfforts,
       );
+    if (configuredEfforts) {
+      efforts = thirdPartyReasoningEfforts(configuredEfforts.map(reasoningEffortValue));
+    }
     const supportedReasoningEfforts = efforts.length > 0 ? efforts : ["low"];
     const requestedDefaultEffort =
       official && officialModelMetadata
