@@ -19,6 +19,143 @@ enum EncryptedContentRewrite {
     Drop,
 }
 
+/// Opt-in portable collaboration tasks: request plaintext from the producing
+/// model rather than attempting to decrypt its result. Only the three native
+/// collaboration message parameters are changed; unrelated secrets stay intact.
+pub(crate) fn prepare_plaintext_agent_arguments(body: &mut Value) -> bool {
+    let mut changed = request_plaintext_agent_arguments(body.get_mut("tools"), None);
+    // Current native Codex publishes schemas as typed input items, not only
+    // top-level tools. Do not recursively rewrite arbitrary message data.
+    let items = match body.get_mut("input") {
+        Some(Value::Array(items)) => items.as_mut_slice(),
+        Some(item @ Value::Object(_)) => std::slice::from_mut(item),
+        _ => return changed,
+    };
+    for item in items {
+        if item["type"] == "additional_tools" {
+            changed |= request_plaintext_agent_arguments(item.get_mut("tools"), None);
+        }
+    }
+    changed
+}
+
+pub(crate) fn request_plaintext_agent_arguments(
+    tools: Option<&mut Value>,
+    namespace: Option<&str>,
+) -> bool {
+    let Some(tools) = tools.and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    for tool in tools {
+        if tool["type"] == "namespace" {
+            let name = tool["name"].as_str().unwrap_or_default().to_owned();
+            if namespace.is_none() && matches!(name.as_str(), "agents" | "collaboration") {
+                changed |= request_plaintext_agent_arguments(tool.get_mut("tools"), Some(&name));
+            }
+            continue;
+        }
+        if tool["type"] != "function" {
+            continue;
+        }
+        let explicit_namespace = tool["namespace"].as_str().map(str::to_owned);
+        let function = if tool.get("function").is_some() {
+            &mut tool["function"]
+        } else {
+            tool
+        };
+        let Some(name) = function["name"].as_str() else {
+            continue;
+        };
+        let (ns, name) = name.split_once('.').unwrap_or((
+            explicit_namespace
+                .as_deref()
+                .or(namespace)
+                .unwrap_or_default(),
+            name,
+        ));
+        if !matches!(ns, "agents" | "collaboration")
+            || !matches!(name, "spawn_agent" | "send_message" | "followup_task")
+        {
+            continue;
+        }
+        if let Some(message) = function
+            .get_mut("parameters")
+            .and_then(|p| p.get_mut("properties"))
+            .and_then(|p| p.get_mut("message"))
+            .and_then(Value::as_object_mut)
+            && message.get("type").and_then(Value::as_str) == Some("string")
+            && message.get("encrypted").and_then(Value::as_bool) == Some(true)
+        {
+            message.remove("encrypted");
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Refuse agent payloads that would become an empty task at the destination.
+/// A Responses-compatible endpoint is not evidence that it holds Codex's keys.
+/// Reasoning/compaction ciphertext is deliberately outside this check.
+pub(crate) fn validate_agent_payload_delivery(
+    body: &Value,
+    accepts_codex_ciphertext: bool,
+) -> Result<()> {
+    for item in input_items(body) {
+        if item.get("type").and_then(Value::as_str) != Some("agent_message") {
+            continue;
+        }
+        let parts = match item.get("content") {
+            Some(Value::Array(parts)) => parts.as_slice(),
+            Some(part @ Value::Object(_)) => std::slice::from_ref(part),
+            _ => continue,
+        };
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) != Some("encrypted_content") {
+                continue;
+            }
+            let payload = part
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .filter(|payload| !payload.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!(
+                    "agent_task_body_unavailable: 协作任务正文为空或格式无效；已停止发送，不允许子代理根据历史猜测任务"
+                ))?;
+            if is_codex_encrypted_payload(payload) && !accepts_codex_ciphertext {
+                anyhow::bail!(
+                    "agent_task_body_unavailable: 当前线路无法保证读取 Codex 加密任务正文；Codey 不持有解密密钥，已停止发送。请使用兼容的官方 Responses 线路或通过受支持的明文任务通道重新派发；重复发送相同密文不会修复此问题"
+                );
+            }
+        }
+        // A previously adapted history may already have lost the encrypted
+        // part. Do not mistake the remaining native envelope for a task body.
+        if !parts.iter().any(|part| part["type"] == "encrypted_content") {
+            let text = parts
+                .iter()
+                .filter(|part| {
+                    matches!(
+                        part["type"].as_str(),
+                        Some("input_text" | "output_text" | "text")
+                    )
+                })
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if (text.starts_with("Message Type: NEW_TASK\n")
+                || text.starts_with("Message Type: MESSAGE\n"))
+                && text
+                    .split_once("\nPayload:")
+                    .is_some_and(|(_, body)| body.trim().is_empty())
+            {
+                anyhow::bail!(
+                    "agent_task_body_unavailable: 协作任务只剩消息头，正文缺失；已停止发送"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn input_items(body: &Value) -> &[Value] {
     match body.get("input") {
         Some(Value::Array(items)) => items,
@@ -408,6 +545,141 @@ mod tests {
             "recipient":"/root/child",
             "content":content
         })
+    }
+
+    #[test]
+    fn portable_agent_schema_changes_only_reviewed_message_arguments() {
+        let schema = || {
+            json!({"type":"object","properties":{
+                "message":{"type":"string","encrypted":true},
+                "secret":{"type":"string","encrypted":true}
+            }})
+        };
+        for namespace in ["agents", "collaboration"] {
+            let mut tools = json!([{"type":"namespace","name":namespace,"tools":[
+                {"type":"function","name":"spawn_agent","parameters":schema()},
+                {"type":"function","name":"send_message","parameters":schema()},
+                {"type":"function","name":"followup_task","parameters":schema()},
+                {"type":"function","name":"other","parameters":schema()}
+            ]}]);
+            assert!(request_plaintext_agent_arguments(Some(&mut tools), None));
+            for i in 0..3 {
+                assert_eq!(
+                    tools[0]["tools"][i]["parameters"]["properties"]["message"]["encrypted"],
+                    Value::Null
+                );
+                assert_eq!(
+                    tools[0]["tools"][i]["parameters"]["properties"]["secret"]["encrypted"],
+                    true
+                );
+            }
+            assert_eq!(
+                tools[0]["tools"][3]["parameters"]["properties"]["message"]["encrypted"],
+                true
+            );
+            assert!(!request_plaintext_agent_arguments(Some(&mut tools), None));
+        }
+    }
+
+    #[test]
+    fn portable_agent_schema_supports_flat_names_but_not_unrelated_namespaces() {
+        let schema =
+            json!({"type":"object","properties":{"message":{"type":"string","encrypted":true}}});
+        let mut tools = json!([
+            {"type":"function","name":"agents.spawn_agent","parameters":schema},
+            {"type":"function","function":{"name":"collaboration.send_message","parameters":schema}},
+            {"type":"namespace","name":"other","tools":[{"type":"function","name":"spawn_agent","parameters":schema}]},
+            {"type":"function","name":"spawn_agent","parameters":schema}
+        ]);
+        let original = tools.clone();
+        assert!(request_plaintext_agent_arguments(Some(&mut tools), None));
+        assert_eq!(
+            tools[0]["parameters"]["properties"]["message"]["encrypted"],
+            Value::Null
+        );
+        assert_eq!(
+            tools[1]["function"]["parameters"]["properties"]["message"]["encrypted"],
+            Value::Null
+        );
+        assert_eq!(tools[2], original[2]);
+        assert_eq!(tools[3], original[3]);
+    }
+
+    #[test]
+    fn portable_agent_schema_handles_native_additional_tools_only() {
+        let tools = json!([{"type":"function","name":"agents.send_message","parameters":{
+            "type":"object","properties":{"message":{"type":"string","encrypted":true}}
+        }}]);
+        let item =
+            json!({"type":"additional_tools","id":"tools_native","role":"system","tools":tools});
+        for input in [item.clone(), json!([item.clone(), item.clone()])] {
+            let mut body = json!({"input":input});
+            assert!(prepare_plaintext_agent_arguments(&mut body));
+            assert!(!prepare_plaintext_agent_arguments(&mut body));
+            assert!(!body.to_string().contains("\"encrypted\":true"));
+        }
+        let mut body = json!({"input":[{"type":"message","role":"user","tools":tools}]});
+        let original = body.clone();
+        assert!(!prepare_plaintext_agent_arguments(&mut body));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn agent_delivery_rejects_ciphertext_without_destination_support() {
+        for kind in ["NEW_TASK", "MESSAGE"] {
+            let body = json!({"input":[agent_message(json!([
+                {"type":"input_text","text":format!("Message Type: {kind}\nPayload:\n")},
+                {"type":"encrypted_content","encrypted_content":fernet_token(&[0x33; 16])}
+            ]))]});
+            let original = body.clone();
+            let error = validate_agent_payload_delivery(&body, false).unwrap_err();
+            assert!(error.to_string().contains("agent_task_body_unavailable"));
+            assert!(validate_agent_payload_delivery(&body, true).is_ok());
+            assert_eq!(body, original);
+        }
+    }
+
+    #[test]
+    fn agent_delivery_accepts_plaintext_and_rejects_missing_payloads() {
+        for payload in [json!(""), json!("  "), json!(null), json!(17)] {
+            let body = json!({"input":agent_message(json!({
+                "type":"encrypted_content", "encrypted_content":payload
+            }))});
+            for supported in [true, false] {
+                assert!(validate_agent_payload_delivery(&body, supported).is_err());
+            }
+        }
+        let mut body = json!({"input":agent_message(json!({
+            "type":"encrypted_content", "encrypted_content":"nonce: delivery-test"
+        }))});
+        assert!(validate_agent_payload_delivery(&body, false).is_ok());
+        assert!(normalize_encrypted_agent_payloads(&mut body));
+        assert_eq!(body["input"]["content"]["text"], "nonce: delivery-test");
+        assert!(validate_agent_payload_delivery(&body, false).is_ok());
+    }
+
+    #[test]
+    fn agent_delivery_does_not_reinterpret_unrelated_ciphertext() {
+        let body = json!({"input":[
+            {"type":"reasoning","encrypted_content":fernet_token(&[0x33; 16])},
+            {"type":"message","role":"user","content":[
+                {"type":"input_text","text":"Payload:"}
+            ]}
+        ]});
+        assert!(validate_agent_payload_delivery(&body, false).is_ok());
+    }
+
+    #[test]
+    fn agent_delivery_rejects_header_only_after_previous_conversion() {
+        let mut body = json!({"input":[agent_message(json!([
+            {"type":"input_text","text":"Message Type: NEW_TASK\nTask name: /root/child\nPayload:\n"}
+        ]))]});
+        assert!(validate_agent_payload_delivery(&body, false).is_err());
+        body["input"][0]["content"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"input_text","text":"nonce: visible"}));
+        assert!(validate_agent_payload_delivery(&body, false).is_ok());
     }
 
     #[test]

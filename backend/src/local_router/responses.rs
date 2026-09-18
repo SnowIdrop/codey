@@ -1565,6 +1565,25 @@ impl RouterServer {
                 )
                 .await;
         }
+        if snapshot.subagent_plaintext_messages && prepare_plaintext_agent_arguments(&mut body) {
+            body_mutated = true;
+            encoded_body = None;
+        }
+        // Run after restoring history, but before either native forwarding or
+        // protocol conversion can silently omit an opaque task body.
+        if let Err(error) = validate_agent_payload_delivery(
+            &body,
+            bridge == ProtocolBridge::NativeResponses && resolved.route.official_auth.is_some(),
+        ) {
+            return downstream
+                .write_error(
+                    400,
+                    "agent_task_body_unavailable",
+                    error.to_string(),
+                    Some(&resolved.route),
+                )
+                .await;
+        }
         let discard_opaque_reasoning = route_changed || restoring_adapted_history;
         if bridge == ProtocolBridge::NativeResponses {
             if normalize_native_responses_context(&mut body, discard_opaque_reasoning) {

@@ -2953,7 +2953,11 @@ wire_api = "responses"
         .unwrap();
     assert_eq!(
         model_catalog_override["model_catalog_json"].as_str(),
-        Some("/user/catalog.json")
+        Some(
+            home.join(crate::model_catalog::relative_path())
+                .to_string_lossy()
+                .as_ref()
+        )
     );
     assert!(
         applied

@@ -146,6 +146,32 @@ pub fn relative_path() -> &'static str {
     MODEL_CATALOG_RELATIVE_PATH
 }
 
+/// Model ids available to native dispatch, not merely configured upstream ids.
+pub(crate) fn dispatch_model_ids(home: &Path, generated_catalog: bool) -> Result<HashSet<String>> {
+    let models = if generated_catalog {
+        read_runtime_catalog_models(home)?
+    } else {
+        // Do not use read_official_entries: it merges templates and generated
+        // aliases that are not necessarily registered in native dispatch.
+        let path = ordered_catalog_sources(home)
+            .into_iter()
+            .take(2)
+            .find(|path| path.is_file())
+            .ok_or_else(|| anyhow::anyhow!("缺少原生模型目录快照，请刷新模型目录后重启"))?;
+        let value = read_catalog_value(&path)
+            .ok_or_else(|| anyhow::anyhow!("原生模型目录快照无法解析：{}", path.display()))?;
+        catalog_models_from_value(&value)
+    };
+    let ids: HashSet<String> = models
+        .iter()
+        .filter_map(|model| model.get("slug").and_then(Value::as_str))
+        .filter(|slug| !slug.trim().is_empty())
+        .map(str::to_owned)
+        .collect();
+    anyhow::ensure!(!ids.is_empty(), "原生子代理模型目录为空，无法验证派发模型");
+    Ok(ids)
+}
+
 #[derive(Debug)]
 pub(crate) struct CatalogSnapshot {
     path: PathBuf,
@@ -2239,6 +2265,31 @@ mod tests {
             serde_json::to_vec(&official_cache()).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn dispatch_ids_use_selected_catalog_not_merged_templates() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+        let selected = vec!["route-test/vendor-model".to_string()];
+        refresh_for_provider_with_capabilities(
+            home.path(),
+            false,
+            Some(&selected),
+            &selected,
+            CapabilityLists::default(),
+            "",
+        )
+        .unwrap();
+        let generated = dispatch_model_ids(home.path(), true).unwrap();
+        assert!(generated.contains("route-test/vendor-model"));
+        let native = dispatch_model_ids(home.path(), false).unwrap();
+        assert!(!native.contains("route-test/vendor-model"));
+        fs::write(home.path().join(relative_path()), r#"{"models":[]}"#).unwrap();
+        assert!(dispatch_model_ids(home.path(), true).is_err());
+        // A malformed native snapshot must not fall back to generated aliases.
+        fs::write(home.path().join("models_cache.json"), "not-json").unwrap();
+        assert!(dispatch_model_ids(home.path(), false).is_err());
     }
 
     fn staged_catalog_refresh(home: &Path, selected: &[String], overrides: CatalogOverrides<'_>) {

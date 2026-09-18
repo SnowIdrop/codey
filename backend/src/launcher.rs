@@ -540,6 +540,33 @@ fn router_subagent_runtime_config(
     Ok(runtime)
 }
 
+fn validate_subagent_dispatch_catalog(
+    home: &std::path::Path,
+    runtime: &CodeyConfig,
+    route_catalog_installed: bool,
+) -> Result<()> {
+    if !runtime.subagent_optimization {
+        return Ok(());
+    }
+    let ids = model_catalog::dispatch_model_ids(home, route_catalog_installed)?;
+    // Codex may validate the default before applying a role override.
+    for (role, model) in
+        std::iter::once(("default_subagent_model", runtime.subagent_model.as_str())).chain(
+            runtime
+                .subagent_roles
+                .iter()
+                .filter(|(_, selection)| selection.enabled)
+                .map(|(role, selection)| (role.as_str(), selection.model.as_str())),
+        )
+    {
+        anyhow::ensure!(
+            ids.contains(model),
+            "子代理角色 {role} 的模型 {model} 不在本次原生派发模型目录中；不能仅凭上游线路存在就启用角色，请刷新模型目录并重启"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn model_context_explicit_official_budget_requires_generated_catalog() {
     assert!(!should_install_codey_model_catalog(true, true, false));
@@ -804,8 +831,22 @@ async fn prepare_codex_startup_state(
     let mut runtime_subagent_config = config.clone();
     runtime_subagent_config.active_profile_id = current_profile.id.clone();
     subagent_policy::reconcile_with_model_state(&mut runtime_subagent_config, Some(&model_state));
-    let runtime_roles_config =
+    let mut runtime_roles_config =
         startup_router_subagent_runtime_config(&mut runtime_subagent_config, use_official_catalog);
+    if let Err(error) =
+        validate_subagent_dispatch_catalog(home, &runtime_roles_config, use_official_catalog)
+    {
+        // Keep saved preferences intact, and do not advertise unusable roles.
+        runtime_subagent_config.subagent_optimization = false;
+        runtime_roles_config.subagent_optimization = false;
+        error_log::record_failure(
+            "subagent_optimization_unavailable",
+            "validate_subagent_dispatch_catalog",
+            format!("本次启动已停用子代理增强：{error:#}"),
+            serde_json::json!({"routeCatalogInstalled": use_official_catalog}),
+        );
+        eprintln!("本次启动已停用子代理增强，原设置保持不变：{error:#}");
+    }
     let subagent_optimization = runtime_subagent_config.subagent_optimization;
     let subagent_model = runtime_roles_config.subagent_model.clone();
     let subagent_reasoning_effort = runtime_subagent_config.subagent_reasoning_effort.clone();
@@ -1863,15 +1904,27 @@ impl CodeyRuntime {
     pub fn supports_subagent_config_hot_reload(&self, config: &CodeyConfig) -> bool {
         self.applied_config.subagent_optimization
             && config.subagent_optimization
+            && self.applied_config.subagent_plaintext_messages == config.subagent_plaintext_messages
             && self.applied_config.local_router_enabled == config.local_router_enabled
             && self.applied_config.fast_context_tools == config.fast_context_tools
             && self.applied_config.active_profile() == config.active_profile()
     }
 
-    pub(crate) fn subagent_reconcile_config(&self, config: &CodeyConfig) -> Result<CodeyConfig> {
+    pub(crate) fn subagent_reconcile_config(
+        &self,
+        config: &CodeyConfig,
+        home: &std::path::Path,
+    ) -> Result<CodeyConfig> {
         self.validate_subagent_route_hot_reload(config)?;
         if self.applied_config.local_router_enabled {
-            router_subagent_runtime_config(config, self.subagent_route_catalog_installed)
+            let runtime =
+                router_subagent_runtime_config(config, self.subagent_route_catalog_installed)?;
+            validate_subagent_dispatch_catalog(
+                home,
+                &runtime,
+                self.subagent_route_catalog_installed,
+            )?;
+            Ok(runtime)
         } else {
             Ok(native_subagent_runtime_config(config))
         }

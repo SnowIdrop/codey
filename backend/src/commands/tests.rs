@@ -1240,6 +1240,31 @@ async fn request_log_save_without_a_running_router_reports_not_applicable_withou
 }
 
 #[tokio::test]
+async fn plaintext_subagent_setting_survives_save_and_reload() {
+    let directory = tempfile::tempdir().unwrap();
+    let initial = CodeyConfig::default();
+    let state = Arc::new(AppState {
+        store: ConfigStore::new(directory.path().join("config.json")),
+        config: RwLock::new(initial),
+        ..AppState::default()
+    });
+    for enabled in [true, false] {
+        let mut input = state.config.read().await.clone();
+        input.subagent_plaintext_messages = enabled;
+        let response = save_codey_config(&state, input).await.unwrap();
+        assert_eq!(response["status"], "ok");
+        assert_eq!(
+            state.config.read().await.subagent_plaintext_messages,
+            enabled
+        );
+        assert_eq!(
+            state.store.load().unwrap().subagent_plaintext_messages,
+            enabled
+        );
+    }
+}
+
+#[tokio::test]
 async fn disabled_local_router_keeps_route_config_read_only_without_blocking_other_settings() {
     let directory = tempfile::tempdir().unwrap();
     let store = ConfigStore::new(directory.path().join("config.json"));

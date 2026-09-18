@@ -91,6 +91,48 @@ fn subagent_catalog_fallback_config() -> CodeyConfig {
 }
 
 #[test]
+fn dispatch_catalog_rejects_default_alias_and_unregistered_role() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("models_cache.json"),
+        r#"{"models":[{"slug":"gpt-6-astra"}]}"#,
+    )
+    .unwrap();
+    let config = subagent_catalog_fallback_config();
+    let saved = config.clone();
+    let error = validate_subagent_dispatch_catalog(home.path(), &config, false).unwrap_err();
+    assert!(error.to_string().contains("default_subagent_model"));
+    let mut runtime = router_subagent_runtime_config(&config, false).unwrap();
+    assert!(validate_subagent_dispatch_catalog(home.path(), &runtime, false).is_ok());
+    runtime
+        .subagent_roles
+        .get_mut("codey_worker")
+        .unwrap()
+        .model = "vendor/model".into();
+    let error = validate_subagent_dispatch_catalog(home.path(), &runtime, false).unwrap_err();
+    assert!(error.to_string().contains("codey_worker"));
+    runtime
+        .subagent_roles
+        .get_mut("codey_worker")
+        .unwrap()
+        .enabled = false;
+    assert!(validate_subagent_dispatch_catalog(home.path(), &runtime, false).is_ok());
+    assert_eq!(config, saved);
+}
+
+#[test]
+fn dispatch_catalog_missing_or_invalid_fails_closed_unless_disabled() {
+    let home = tempfile::tempdir().unwrap();
+    let mut runtime = subagent_catalog_fallback_config();
+    assert!(validate_subagent_dispatch_catalog(home.path(), &runtime, false).is_err());
+    assert!(validate_subagent_dispatch_catalog(home.path(), &runtime, true).is_err());
+    std::fs::write(home.path().join("models_cache.json"), "not-json").unwrap();
+    assert!(validate_subagent_dispatch_catalog(home.path(), &runtime, false).is_err());
+    runtime.subagent_optimization = false;
+    assert!(validate_subagent_dispatch_catalog(home.path(), &runtime, false).is_ok());
+}
+
+#[test]
 fn subagent_catalog_fallback_uses_native_ids_without_mutating_saved_routes() {
     let mut config = subagent_catalog_fallback_config();
     config.subagent_roles.get_mut("codey_worker").unwrap().model = "route-a/vendor/model".into();
@@ -201,6 +243,12 @@ fn subagent_catalog_fallback_disables_only_this_launch_on_invalid_routes() {
 
 #[tokio::test]
 async fn subagent_catalog_fallback_keeps_live_routes_and_roles_until_restart() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("models_cache.json"),
+        r#"{"models":[{"slug":"gpt-6-astra"},{"slug":"vendor/model"}]}"#,
+    )
+    .unwrap();
     let mut config = subagent_catalog_fallback_config();
     let mut other = config.profiles[0].clone();
     other.id = "route-b".into();
@@ -243,7 +291,9 @@ async fn subagent_catalog_fallback_keeps_live_routes_and_roles_until_restart() {
         crashpad_guard_task: Mutex::new(None),
         local_router: Some(router),
     };
-    let original = runtime.subagent_reconcile_config(&config).unwrap();
+    let original = runtime
+        .subagent_reconcile_config(&config, home.path())
+        .unwrap();
     let model = &original.subagent_roles["codey_worker"].model;
     let target = || {
         snapshot
@@ -274,7 +324,9 @@ async fn subagent_catalog_fallback_keeps_live_routes_and_roles_until_restart() {
     runtime.mark_model_config_applied(&roles).await;
     assert_eq!(runtime.applied_model_catalog_config().await, roles);
     assert!(runtime.applied_model_config().await.matches(&roles));
-    let reloaded = runtime.subagent_reconcile_config(&roles).unwrap();
+    let reloaded = runtime
+        .subagent_reconcile_config(&roles, home.path())
+        .unwrap();
     assert_eq!(
         reloaded.subagent_roles["codey_worker"].model,
         "vendor/model"
@@ -297,7 +349,11 @@ async fn subagent_catalog_fallback_keeps_live_routes_and_roles_until_restart() {
             .to_string()
             .contains("需重启")
     );
-    assert!(runtime.subagent_reconcile_config(&changed).is_err());
+    assert!(
+        runtime
+            .subagent_reconcile_config(&changed, home.path())
+            .is_err()
+    );
     assert_eq!(runtime.applied_model_catalog_config().await, roles);
     assert_eq!(target(), "route-a");
 
@@ -306,7 +362,11 @@ async fn subagent_catalog_fallback_keeps_live_routes_and_roles_until_restart() {
     changed.profiles[0].enabled = false;
     changed.subagent_optimization = false;
     assert!(runtime.sync_local_router_routes(&changed).is_err());
-    assert!(runtime.subagent_reconcile_config(&changed).is_err());
+    assert!(
+        runtime
+            .subagent_reconcile_config(&changed, home.path())
+            .is_err()
+    );
     assert_eq!(target(), "route-a");
 
     // Route-qualified role IDs remain safe when a custom catalog was installed.

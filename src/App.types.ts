@@ -110,6 +110,7 @@ export type Config = {
   gpuLaunchMode: "off" | "disableGpu" | "disableGpuRasterization";
   fastContextTools: boolean;
   subagentOptimization: boolean;
+  subagentPlaintextMessages?: boolean;
   subagentModel: string;
   subagentReasoningEffort: string;
   subagentRoles: Record<SubagentRoleId, SubagentRoleConfig>;

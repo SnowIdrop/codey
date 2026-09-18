@@ -1859,6 +1859,7 @@ async fn save_codey_config_locked(
         &fast_context_tools_status,
     );
     config.subagent_optimization = config_input.subagent_optimization;
+    config.subagent_plaintext_messages = config_input.subagent_plaintext_messages;
     let mut explicitly_configured_subagent_models = Vec::new();
     let default_role_supplied = subagent_roles_present
         && !config_input.subagent_roles.is_empty()
@@ -2511,7 +2512,7 @@ pub(super) async fn hot_reload_runtime_subagent_config(
         );
     }
 
-    let runtime_config = match runtime.subagent_reconcile_config(&current_config) {
+    let runtime_config = match runtime.subagent_reconcile_config(&current_config, &codex_home()) {
         Ok(config) => config,
         Err(error) => return SubagentHotReloadOutcome::failed(format!("{error:#}")),
     };

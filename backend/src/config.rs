@@ -804,6 +804,10 @@ pub struct CodeyConfig {
     /// the next runtime. Disabled by default and restored on shutdown.
     #[serde(default)]
     pub subagent_optimization: bool,
+    /// Opt-in portable task arguments. Plaintext may appear in request/history
+    /// records; never silently downgrade encrypted collaboration parameters.
+    #[serde(default)]
+    pub subagent_plaintext_messages: bool,
     /// Default model used by newly spawned subagents while Codey's
     /// multi-agent optimization is enabled.
     #[serde(default = "default_subagent_model")]
@@ -949,6 +953,7 @@ impl Default for CodeyConfig {
             gpu_launch_mode: GpuLaunchMode::Off,
             fast_context_tools: false,
             subagent_optimization: false,
+            subagent_plaintext_messages: false,
             subagent_model: default_subagent_model(),
             subagent_reasoning_effort: default_subagent_reasoning_effort(),
             subagent_roles: default_subagent_roles(),

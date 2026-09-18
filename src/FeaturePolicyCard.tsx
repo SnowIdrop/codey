@@ -150,6 +150,18 @@ export function SubagentPolicyCardComponent({
         <div className="module-card-body subagent-policy-body">
           {config.subagentOptimization ? (
             <>
+              <div className="module-card-header">
+                <div className="module-card-titles">
+                  <h3>跨线路明文任务</h3>
+                  <p>保存并重启后生效。仅协作任务正文改用明文参数，可能出现在请求及会话记录中；旧密文无法恢复，请重新派发。</p>
+                </div>
+                <Switch
+                  checked={config.subagentPlaintextMessages ?? false}
+                  disabled={isBusy}
+                  onCheckedChange={(checked) => onConfigChange({ ...config, subagentPlaintextMessages: checked })}
+                  aria-label="跨线路明文任务"
+                />
+              </div>
               <div className="subagent-table-container">
                 <Table className="subagent-table" variant="secondary">
                   <Table.ScrollContainer>

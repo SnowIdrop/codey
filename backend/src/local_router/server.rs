@@ -597,6 +597,7 @@ impl RouteBindings {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RouterSnapshot {
+    pub(crate) subagent_plaintext_messages: bool,
     pub(crate) routes: HashMap<String, Arc<RouteTarget>>,
     pub(crate) aliases: HashMap<String, AliasTarget>,
     pub(crate) raw_models: HashMap<String, Vec<AliasTarget>>,
@@ -705,6 +706,8 @@ impl RouterSnapshot {
         model_ids.sort_unstable();
         Self {
             routes,
+            subagent_plaintext_messages: config.subagent_optimization
+                && config.subagent_plaintext_messages,
             aliases,
             raw_models,
             model_alias_history: config.model_alias_history.clone(),

@@ -8620,6 +8620,140 @@ async fn native_passthrough_rewrites_plaintext_agent_payload_before_send() {
     router.stop().await.unwrap();
 }
 
+#[test]
+fn portable_agent_messages_require_explicit_opt_in_and_enhancement() {
+    let mut config = CodeyConfig::default();
+    assert!(!RouterSnapshot::from_config(&config).subagent_plaintext_messages);
+    config.subagent_plaintext_messages = true;
+    assert!(!RouterSnapshot::from_config(&config).subagent_plaintext_messages);
+    config.subagent_optimization = true;
+    assert!(RouterSnapshot::from_config(&config).subagent_plaintext_messages);
+    let mut saved = serde_json::to_value(&config).unwrap();
+    saved
+        .as_object_mut()
+        .unwrap()
+        .remove("subagentPlaintextMessages");
+    let old_config: CodeyConfig = serde_json::from_value(saved).unwrap();
+    assert!(!old_config.subagent_plaintext_messages);
+}
+
+#[tokio::test]
+async fn portable_agent_schema_opt_in_reaches_native_upstream() {
+    for (enabled, additional) in [(false, false), (true, false), (false, true), (true, true)] {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let captured = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            write_json_response(
+                &mut stream,
+                200,
+                &json!({"object":"response","model":body["model"]}),
+            )
+            .await
+            .unwrap();
+            body
+        });
+        let (mut config, provider_id, model) = router_config(format!("http://{address}/v1"));
+        config.subagent_optimization = true;
+        config.subagent_plaintext_messages = enabled;
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+        let tools = json!([{
+            "type":"namespace","name":"agents","tools":[{
+                "type":"function","name":"spawn_agent","parameters":{
+                    "type":"object","properties":{"message":{"type":"string","encrypted":true}}
+                }
+            }]
+        }]);
+        let request_body = if additional {
+            json!({"model":model,"input":[
+                {"type":"additional_tools","id":"tools_probe","role":"system","tools":tools},
+                {"role":"user","content":"probe"}
+            ]})
+        } else {
+            json!({"model":model,"input":"probe","tools":tools})
+        };
+        let response = reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .header(
+                TURN_METADATA_HEADER,
+                json!({ROUTE_METADATA_KEY:provider_id}).to_string(),
+            )
+            .json(&request_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body = captured.await.unwrap();
+        let tools = if additional {
+            &body["input"][0]["tools"]
+        } else {
+            &body["tools"]
+        };
+        assert_eq!(
+            tools[0]["tools"][0]["parameters"]["properties"]["message"]["encrypted"],
+            if enabled { Value::Null } else { json!(true) }
+        );
+        router.stop().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unsupported_agent_ciphertext_is_rejected_before_upstream_connection() {
+    use base64::Engine as _;
+    // Structurally valid token, no actual secret or provider key involved.
+    let mut bytes = vec![0u8; 73];
+    bytes[0] = 0x80;
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    for protocol in [
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+        crate::config::UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES,
+    ] {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let (mut config, provider_id, model) = router_config(format!("http://{address}/v1"));
+        config.profiles[0].upstream_protocol = protocol.into();
+        config.profiles[0].normalize();
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+        let response = client
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .json(&json!({
+                "model":model_alias(&provider_id, &model),
+                "input":[{
+                    "type":"agent_message",
+                    "author":"/root", "recipient":"/root/child",
+                    "content":[
+                        {"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\n"},
+                        {"type":"encrypted_content","encrypted_content":token}
+                    ]
+                }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("agent_task_body_unavailable"), "{body}");
+        assert!(!body.contains(&token));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), upstream.accept())
+                .await
+                .is_err()
+        );
+        router.stop().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn chat_completions_route_rewrites_plaintext_agent_payload_before_conversion() {
     let task = "只读核对任务（第 3 轮）。禁止写入任何文件，完成后给出结论。";

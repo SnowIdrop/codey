@@ -422,12 +422,12 @@ fn apply_isolated_runtime_router_config(
         },
     )?;
     let mut effective_document = parse_document(&effective).context("解析 Codey 运行时约束失败")?;
-    if use_official_catalog {
-        update_model_catalog_reference(
-            &mut effective_document,
-            &config_path,
-            model_catalog_path.as_deref(),
-        );
+    if let Some(path) = model_catalog_path.as_deref() {
+        // The persistent document retains the user's catalog. This process,
+        // however, must use the same generated catalog used to resolve routed
+        // role ids. Preserving a raw-id user catalog here makes native spawn
+        // reject the default model before the role/router can be applied.
+        effective_document["model_catalog_json"] = value(path.to_string_lossy().into_owned());
     }
     let fastctx_namespace = effective_document
         .get("mcp_servers")
