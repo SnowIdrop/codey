@@ -64,6 +64,7 @@ const PROTOCOL_HEALTH_SCHEMA_VERSION: u32 = 1;
 const ROOT_TURN_BINDING_FILE: &str = "root-turn-binding.json";
 const ROOT_TURN_BINDING_SCHEMA_VERSION: u32 = 1;
 const BATCH_WAITING_FILE: &str = "batch-waiting.state";
+const OPTIONAL_SUBAGENT_WRAPUP_HINT: &str = " 对不再影响主线结论的异步旁路，先发送“停止调查，不再调用检索工具，直接返回已有结论、证据和未覆盖项”；若尚未结束，最多等待一次 10 秒，再用无筛选 agents.list_agents 核对，仍活动则中断该目标一次。成功中断后按 fence 结算，已有证据标为部分结果，不再等待或自动重派。必要调查仍按原流程等待；这不是统一运行时限，也不绕过身份与权限门禁。";
 const MISSING_AGENT_ID_MARKER: &str = "__codey_missing_agent_id__";
 const HOOK_STATE_LOCK_FILE: &str = "hook-state.lock";
 
@@ -622,7 +623,7 @@ fn user_prompt_submit_output(
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": format!(
-                "Codey 检测到本轮用户输入到达时仍有 {active} 个子代理未确认终态。当前用户输入优先于旧任务描述：先调用一次不带筛选的 agents.list_agents 对账；若用户明确取消或缩小了某个子任务，只中断仍非终态且被明确取消的 target。应用新输入后，同步批次等待整批结束再派发；异步批次可在身份已确认、文件范围不重叠且并发上限允许时继续独立工作或补位。普通状态询问或补充信息不得被解释为取消全部代理；同步批次或身份未确认时不得恢复非协作本地工作，所有模式在最终交付前均须结算全部活动 attempt。{compatibility}"
+                "Codey 检测到本轮用户输入到达时仍有 {active} 个子代理未确认终态。当前用户输入优先于旧任务描述：先调用一次不带筛选的 agents.list_agents 对账；若用户明确取消或缩小了某个子任务，只中断仍非终态且被明确取消的 target。应用新输入后，已不再需要的异步旁路按短收尾流程处理。同步批次等待整批结束再派发；异步批次可在身份已确认、文件范围不重叠且并发上限允许时继续独立工作或补位。普通状态询问或补充信息不得被解释为取消全部代理；同步批次或身份未确认时不得恢复非协作本地工作，所有模式在最终交付前均须结算全部活动 attempt。{compatibility}"
             )
         }
     }))
@@ -1636,7 +1637,7 @@ fn post_wait_continuation(
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动标记尚未核销。保留下方内容；可继续使用 agents.wait_agent 或不带筛选的 agents.list_agents 对账。只有当前调用仍携带并匹配本批首个根派生调用的 turn_id 时，才可使用 agents.spawn_agent、agents.send_message、agents.followup_task 或 agents.interrupt_agent 协调；缺少该绑定时按匿名主体 fail-closed。completed、errored、shutdown、not_found、FINAL_ANSWER 和 task_complete 都视为终态；同步批次须等全部代理结束，期间不得补位；只有全部活动代理均已确认为 async_ 时，才可按角色并发上限补位并继续互不重叠的独立工作。后来仍显示已 fence target 为活动的上游快照不得触发再次等待。不得自动重派已结束或已放弃的旧任务；若持续没有可信终态，Stop 恢复路径会在受控宽限期后 fence 遗留 attempt。{local_read_guidance}{task_body_recovery}{compatibility}\n\n本次 wait_agent 已返回内容：\n{returned_update}"
+            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动标记尚未核销。保留下方内容；可继续使用 agents.wait_agent 或不带筛选的 agents.list_agents 对账。只有当前调用仍携带并匹配本批首个根派生调用的 turn_id 时，才可使用 agents.spawn_agent、agents.send_message、agents.followup_task 或 agents.interrupt_agent 协调；缺少该绑定时按匿名主体 fail-closed。completed、errored、shutdown、not_found、FINAL_ANSWER 和 task_complete 都视为终态；同步批次须等全部代理结束，期间不得补位；只有全部活动代理均已确认为 async_ 时，才可按角色并发上限补位并继续互不重叠的独立工作。后来仍显示已 fence target 为活动的上游快照不得触发再次等待。不得自动重派已结束或已放弃的旧任务；若持续没有可信终态，Stop 恢复路径会在受控宽限期后 fence 遗留 attempt。{local_read_guidance}{task_body_recovery}{OPTIONAL_SUBAGENT_WRAPUP_HINT}{compatibility}\n\n本次 wait_agent 已返回内容：\n{returned_update}"
         ),
     })
 }
@@ -1659,7 +1660,7 @@ fn post_list_continuation(
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：agents.list_agents 核对后仍有 {active} 个子代理尚未确认进入终态。同步批次继续等待整批全部结束，不得按空槽补位；异步批次在身份已确认且文件范围不重叠时，允许独立工作及并发上限内的补位。completed、errored、shutdown 和 not_found 不再阻塞。累计 10 分钟仍无终态时只中断一次对应代理；中断获得结构化成功回执后立即接管，不再等待该 target 的上游状态变化，只有中断失败或目标无法匹配时才继续对账。不得无限 wait，也不得自动重派已结束或已放弃的旧任务。若 pending_init 实际已僵死，门禁会在持续 10 分钟无法进展后释放遗留状态。{local_read_guidance}{compatibility}\n\n本次 list_agents 已返回内容：\n{returned_update}"
+            "Codey 子代理汇合门禁：agents.list_agents 核对后仍有 {active} 个子代理尚未确认进入终态。同步批次继续等待整批全部结束，不得按空槽补位；异步批次在身份已确认且文件范围不重叠时，允许独立工作及并发上限内的补位。completed、errored、shutdown 和 not_found 不再阻塞。对仍必要的调查，累计 10 分钟仍无终态时只中断一次对应代理；中断获得结构化成功回执后立即接管，不再等待该 target 的上游状态变化，只有中断失败或目标无法匹配时才继续对账。不得无限 wait，也不得自动重派已结束或已放弃的旧任务。若 pending_init 实际已僵死，门禁会在持续 10 分钟无法进展后释放遗留状态。{local_read_guidance}{OPTIONAL_SUBAGENT_WRAPUP_HINT}{compatibility}\n\n本次 list_agents 已返回内容：\n{returned_update}"
         ),
     })
 }
@@ -1675,7 +1676,7 @@ fn stop_continuation(active: usize, protocol_issue: Option<&str>) -> Value {
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理门禁：仍有 {active} 个子代理尚未确认进入终态，当前任务不能结束。请先调用不带筛选的 agents.list_agents 对账，再对仍活动且未被根成功中断的 running、pending_init 或 interrupted 代理调用 agents.wait_agent；累计 10 分钟仍无终态时只中断一次对应代理。中断获得结构化成功回执后立即接管，不再等待该 target；只有中断失败或目标无法匹配时才继续对账。不得无限重试或自动重派。若协作工具已经不可用，门禁会在持续 10 分钟无法进展后释放遗留状态。{compatibility}"
+            "Codey 子代理门禁：仍有 {active} 个子代理尚未确认进入终态，当前任务不能结束。请先调用不带筛选的 agents.list_agents 对账，再对仍活动且未被根成功中断的 running、pending_init 或 interrupted 代理调用 agents.wait_agent；对仍必要的调查，累计 10 分钟仍无终态时只中断一次对应代理。中断获得结构化成功回执后立即接管，不再等待该 target；只有中断失败或目标无法匹配时才继续对账。不得无限重试或自动重派。若协作工具已经不可用，门禁会在持续 10 分钟无法进展后释放遗留状态。{OPTIONAL_SUBAGENT_WRAPUP_HINT}{compatibility}"
         ),
     })
 }

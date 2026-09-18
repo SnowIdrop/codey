@@ -8,7 +8,8 @@
 
 - 按内容结构和修改风险分工，不按文件扩展名或所属引擎一刀切。子代理通常只实施代码脚本和结构简单、关系清晰的文本修改。层级、对象引用、序列化关系或工具生成结构复杂的内容由主代理（当前通常为 ChatGPT）亲自修改，例如 Unity Prefab/Scene 的复杂 YAML、复杂序列化资产和 Unreal 蓝图/关卡资产；文本格式不代表结构简单。子代理可只读调查、定位并提出修改建议，不得直接或通过脚本、CLI、编辑器 API 间接写入这些复杂内容。可委派纯代码工具的编写，但实际作用于复杂资产的执行和保存由主代理负责。混合任务拆开代码与复杂资产的责任范围；无法明确判断时交回主代理。同步或异步模式不改变此边界。
 - 直接调用 `agents.spawn_agent`，按任务选择 `codey_quick_scan`、`codey_deep_research`、`codey_visual_analysis`、`codey_worker` 或 `codey_visual_worker`；`default` 仅兼容旧配置。`task_name` 只含小写字母、数字和下划线。
-- `message` 是唯一任务胶囊：写清目标、范围、允许操作、交付格式和必要背景，不复制整段对话，不附加 V1/V2 契约、sidecar、checks 或其他尾行协议。
+- 每次派发显式填写 `fork_turns="none"`，不继承完整主会话。`message` 是唯一任务胶囊：写清待回答的问题、已知事实、允许调查范围、排除范围、允许操作、交付格式和结束所需的证据，不复制整段对话，不附加 V1/V2 契约、sidecar、checks 或其他尾行协议。
+- 快扫任务提供已知文件或符号，不让子代理重新发现已定位内容；少量定点读取由主代理直接完成。未获主代理扩展授权，子代理不得跨范围追查，只报告范围外线索的位置和相关性。
 - 主代理根据依赖选择执行模式：下一步依赖子代理结果或文件范围重叠时，用 `sync_` 开头的 task_name；有独立工作可推进且文件范围互不重叠时，用 `async_` 开头的 task_name。未标注按同步处理。同一活动批次不得混合模式。异步任务的 message 必须明确子代理独占的文件或目录范围；主代理在任务结束前不得读写这些范围，子代理也不得越界。范围无法确定时使用同步模式。
 - 只读角色获得 `files.read`；写入角色获得 `command.execute`、`files.read` 和 `workspace.write`。写入角色暂按当前工作区建立互斥锁；实际文件与网络权限仍由 Codex 原生 sandbox、approval policy、permission profile 和 writable roots 决定。
 
@@ -22,4 +23,5 @@
 - 同步模式先派发不超过并发上限的一批独立任务，再进入 wait/list；整批全部终态或被成功中断并 fence 前，不补位、不恢复主代理本地工作。异步模式在全部活动代理身份已确认后，允许主代理继续文件范围互不重叠的独立读写，并可按角色并发上限补位。异步也必须在需要结果时汇合，最终交付前收齐全部结果；Stop 始终受生命周期门禁限制。
 - `MESSAGE` 只保存证据并继续等待。`completed`、`errored`、`error`、`failed`、`shutdown`、`not_found`、`FINAL_ANSWER` 和 `task_complete` 为终态；`pending_init`、`running`、`interrupted` 仍是非终态，除非根代理成功中断并永久放弃该 attempt。
 - 成功的 `agents.interrupt_agent` 会永久 fence 该 attempt；不要再等待或追派。重复 task ID 时只做一次无筛选 `agents.list_agents` 对账：原代理存在则等待或消费结果，不存在则由根代理接管。只有任务范围实质改变时才用全新 task ID 最多重派一次。
+- 异步旁路不再影响主线结论时，先发送“停止调查，不再调用检索工具，直接返回已有结论、证据和未覆盖项”。仅在尚未结束时最多调用一次 `agents.wait_agent`（`timeout_ms: 10000`），随后用无筛选 `agents.list_agents` 核对；仍活动则中断该目标一次。成功后按 fence 结算，不继续等待、不自动重派，已有证据标为部分结果。必要调查仍按原流程等待，这不是统一运行时限。
 - 协作工具不可用时不要循环调用；依赖有界的 pending-init、超时和 Stop 恢复路径收敛。

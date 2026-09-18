@@ -8,6 +8,7 @@
 - 子代理思考深度优先读取按线路保存的自定义配置，包括 max。
 - 第三方 Responses 的 reasoning_text 400 优先使用已存在的真实明文重放一次，避免失效 opaque 状态遮蔽有效正文；官方线路及压缩请求不采用该回退。
 - 由主代理选择同步／异步：`sync_` 或未标注的任务等待整批结束；`async_` 任务身份确认后允许主代理继续独立读写，最终交付前仍须汇合。同一活动批次不得混合模式。
+- 显式 `fork_turns="none"` 隔离主会话，任务正文包含问题、已知事实、允许／排除范围和结束证据。快扫首轮三次有界调查调用内返回结果或阶段证据，不自行扩查。不再需要的异步旁路先收已有结果，最多等待一次十秒、核对后必要时中断；这是提示规则，不新增运行时预算或路径沙箱。
 - 子代理通常实施代码脚本和结构简单的文本；Prefab 复杂 YAML 等层级、引用、序列化关系复杂的内容由主代理修改。子代理可调查并建议，不得通过脚本或编辑器工具间接写入复杂内容。
 
 最后一项及本机调度规则保存在 `customizations/codex-constraints/`，是可编辑的 Codey 约束源文件。代码不会自动把仓库里的这些文件安装到用户配置目录；部署时需同时更新。这里不包含 API Key、个人线路配置、会话数据库、用户级 AGENTS、已移除的 skill 或程序备份。
@@ -56,7 +57,7 @@ npm run check
 cargo build --release -p codey --bin codey --locked
 ```
 
-每一步成功后再继续。正常退出 Codey 及其管理的 Codex 后，备份原程序和约束文件，再将 `target/release/codey.exe` 安装到实际 Codey 安装目录，保留原目录配套文件。将 `customizations/codex-constraints/` 中四个文件按相对路径复制到 `%APPDATA%/Codey/Codey/config/codex-constraints/`；覆盖前核对本机后续编辑。不要手动编辑其 `runtime/` 生成目录。重新启动 Codey 并新建会话加载规则。
+每一步成功后再继续。正常退出 Codey 及其管理的 Codex 后，备份原程序和约束文件，再将 `target/release/codey.exe` 安装到实际 Codey 安装目录，保留原目录配套文件。将 `customizations/codex-constraints/` 中全部八个文件按相对路径复制到 `%APPDATA%/Codey/Codey/config/codex-constraints/`；覆盖前核对本机后续编辑。不要手动编辑其 `runtime/` 生成目录。重新启动 Codey 并新建会话加载规则。
 
 模型、线路和思考深度仍由 Codey 设置页管理，不从其他机器复制路由 ID 或凭据。
 
