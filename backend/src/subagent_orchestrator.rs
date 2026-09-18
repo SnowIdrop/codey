@@ -784,6 +784,15 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
             &prepared.capsule.id,
         )));
     }
+    let asynchronous = prepared.capsule.id.starts_with("async_");
+    if ledger.reservations.values().any(|reservation| {
+        reservation.state.is_active()
+            && reservation.task_id.starts_with("async_") != asynchronous
+    }) {
+        return Ok(Some(
+            "CODEY_SUBAGENT_MODE_MISMATCH: 当前批次仍在运行，不可混合同步和异步任务；请先等待当前批次全部结束。".into(),
+        ));
+    }
     if let Some(reason) = ledger_capacity_denial(&ledger) {
         return Ok(Some(reason));
     }
@@ -1690,6 +1699,7 @@ pub(crate) fn active_reservation_projection(
 /// the lifecycle marker identities exactly match the ledger projection. This
 /// deliberately accepts only `files.read`: read-only roles that can execute
 /// commands or use other capabilities keep the normal global root barrier.
+#[cfg(test)]
 pub(crate) fn verified_local_read_only_active_count(
     state_root: &Path,
     runtime_id: &str,
@@ -1743,6 +1753,38 @@ pub(crate) fn verified_local_read_only_active_count(
         return Ok(None);
     }
     Ok(Some(active.len()))
+}
+
+/// Only explicit asynchronous tasks with matching live identities release root work.
+pub(crate) fn verified_async_active_count(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    active_marker_hashes: &BTreeSet<String>,
+    now_ms: u64,
+) -> Result<Option<usize>> {
+    let store = LedgerStore::open(state_root, session_id)?;
+    let Some(ledger) = store.load(runtime_id, session_id, now_ms)? else {
+        return Ok(None);
+    };
+    let mut identities = BTreeSet::new();
+    for reservation in ledger.reservations.values().filter(|entry| entry.state.is_active()) {
+        if !reservation.task_id.starts_with("async_")
+            || reservation.spawn_failed
+            || reservation.fenced_at_ms.is_some()
+            || reservation.started_at_ms.is_none()
+            || reservation.outcome != ExecutionOutcome::Unknown
+        {
+            return Ok(None);
+        }
+        let Some(identity) = &reservation.agent_id_hash else {
+            return Ok(None);
+        };
+        if !identities.insert(identity.clone()) {
+            return Ok(None);
+        }
+    }
+    Ok((!identities.is_empty() && &identities == active_marker_hashes).then_some(identities.len()))
 }
 
 /// Atomically fences every still-active reservation before the gate discards

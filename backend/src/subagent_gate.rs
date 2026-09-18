@@ -10,18 +10,21 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::subagent::protocol::{self, AgentState as ObservedAgentState};
+#[cfg(test)]
 use crate::subagent::rules::{RuleActor, RuleContext, RuleEffect, ToolClass};
 use crate::subagent::{
     api::TraceContext,
     telemetry::{ExecutionStatus, SubagentTraceEvent, TraceEventKind, TraceRecorder},
 };
 
+#[cfg(test)]
 mod read_only_sql;
 mod runtime_policy;
 mod state;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
 use read_only_sql::database_mcp_is_read_only;
 use runtime_policy::{RuntimeSubagentPolicy, read_optional_runtime_policy_file};
 pub(crate) use runtime_policy::{
@@ -60,6 +63,7 @@ const PROTOCOL_HEALTH_FILE: &str = "protocol-health.json";
 const PROTOCOL_HEALTH_SCHEMA_VERSION: u32 = 1;
 const ROOT_TURN_BINDING_FILE: &str = "root-turn-binding.json";
 const ROOT_TURN_BINDING_SCHEMA_VERSION: u32 = 1;
+const BATCH_WAITING_FILE: &str = "batch-waiting.state";
 const MISSING_AGENT_ID_MARKER: &str = "__codey_missing_agent_id__";
 const HOOK_STATE_LOCK_FILE: &str = "hook-state.lock";
 
@@ -618,7 +622,7 @@ fn user_prompt_submit_output(
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": format!(
-                "Codey 检测到本轮用户输入到达时仍有 {active} 个子代理未确认终态。当前用户输入优先于旧任务描述：先调用一次不带筛选的 agents.list_agents 对账；若用户明确取消或缩小了某个子任务，只中断仍非终态且被明确取消的 target。应用新输入后，如仍有计划内未派发的独立任务，按该任务角色重新计算并发上限；存在空余槽位时调用 agents.spawn_agent 补位，否则继续 wait/list。普通状态询问或补充信息不得被解释为取消全部代理；所有活动 attempt 结算前不得恢复非协作本地工作。{compatibility}"
+                "Codey 检测到本轮用户输入到达时仍有 {active} 个子代理未确认终态。当前用户输入优先于旧任务描述：先调用一次不带筛选的 agents.list_agents 对账；若用户明确取消或缩小了某个子任务，只中断仍非终态且被明确取消的 target。应用新输入后，同步批次等待整批结束再派发；异步批次可在身份已确认、文件范围不重叠且并发上限允许时继续独立工作或补位。普通状态询问或补充信息不得被解释为取消全部代理；同步批次或身份未确认时不得恢复非协作本地工作，所有模式在最终交付前均须结算全部活动 attempt。{compatibility}"
             )
         }
     }))
@@ -988,6 +992,18 @@ fn pre_tool_use_output(
         return Ok(subagent_identity_missing_denial());
     }
     let active = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
+    let batch_waiting_path = session_auxiliary_path(
+        &session_state_dir(state_root, &input.session_id),
+        runtime_id,
+        BATCH_WAITING_FILE,
+    );
+    if active == 0 {
+        remove_session_auxiliary_file(state_root, runtime_id, &input.session_id, BATCH_WAITING_FILE)?;
+    } else if input.tool_name.as_deref().is_some_and(|name| {
+        is_wait_agent_tool(name) || is_list_agents_tool(name)
+    }) {
+        crate::fs_util::atomic_write_private(&batch_waiting_path, b"waiting")?;
+    }
     let trusted_root_turn =
         active > 0 && trusted_root_turn_matches(input, state_root, runtime_id, now_ms)?;
     if active > 0 && !trusted_root_turn {
@@ -1029,6 +1045,15 @@ fn pre_tool_use_output(
         .as_deref()
         .is_some_and(is_contract_spawn_tool)
     {
+        if active > 0
+            && batch_waiting_path.try_exists()?
+            && verified_async_active_count(state_root, runtime_id, &input.session_id, now_ms)?
+                != Some(active)
+        {
+            return Ok(pre_tool_reason_denial(
+                "CODEY_SUBAGENT_BATCH_WAIT: 同步批次已进入等待阶段，必须等全部代理进入终态或被成功中断后再派发。异步批次也须先确认全部活动代理的身份与 async_ 模式。",
+            ));
+        }
         if let Some(reason) = protocol_issue_reason(state_root, runtime_id, &input.session_id)? {
             return Ok(pre_tool_reason_denial(&format!(
                 "CODEY_SUBAGENT_PROTOCOL_CIRCUIT_OPEN: {reason}。协议状态尚未恢复，已停止继续派生；请先调用不带筛选的 agents.list_agents 对账。"
@@ -1068,11 +1093,8 @@ fn pre_tool_use_output(
     }
     if active > 0
         && trusted_root_turn
-        && verified_local_read_only_active_count(state_root, runtime_id, &input.session_id, now_ms)?
+        && verified_async_active_count(state_root, runtime_id, &input.session_id, now_ms)?
             == Some(active)
-        && input.tool_name.as_deref().is_some_and(|tool_name| {
-            root_read_tool_allowed(state_root, tool_name, input.tool_input.as_ref())
-        })
     {
         return Ok(json!({}));
     }
@@ -1294,9 +1316,9 @@ fn post_tool_use_output(
         remove_session_state(state_root, runtime_id, &input.session_id)?;
         return Ok(json!({}));
     }
-    let root_local_reads_allowed =
+    let root_independent_work_allowed =
         trusted_root_turn_matches(input, state_root, runtime_id, now_ms)?
-            && verified_local_read_only_active_count(
+            && verified_async_active_count(
                 state_root,
                 runtime_id,
                 &input.session_id,
@@ -1308,14 +1330,14 @@ fn post_tool_use_output(
             active,
             input.tool_response.as_ref(),
             protocol_issue.as_deref(),
-            root_local_reads_allowed,
+            root_independent_work_allowed,
         ))
     } else {
         Ok(post_list_continuation(
             active,
             input.tool_response.as_ref(),
             protocol_issue.as_deref(),
-            root_local_reads_allowed,
+            root_independent_work_allowed,
         ))
     }
 }
@@ -1592,7 +1614,7 @@ fn post_wait_continuation(
     active: usize,
     tool_response: Option<&Value>,
     protocol_issue: Option<&str>,
-    root_local_reads_allowed: bool,
+    root_independent_work_allowed: bool,
 ) -> Value {
     let returned_update = render_untrusted_tool_result(tool_response, "wait_agent");
     let task_body_recovery = tool_response
@@ -1606,15 +1628,15 @@ fn post_wait_continuation(
     let compatibility = protocol_issue
         .map(|issue| format!("\n\nHook 协议兼容性诊断：{issue}。"))
         .unwrap_or_default();
-    let local_read_guidance = if root_local_reads_allowed {
-        " 当前账本与活动 marker 已共同证明剩余子代理均已绑定且只具备 `files.read`；可信根代理可继续使用规则确认的本地读取、网页检索、MCP Resource 与数据库 schema/只读 SQL 工具消化本次部分结果。写入、命令、视觉、无法证明只读的工具和结束任务仍被拒绝；完成有界读取后继续 wait/list 汇合。"
+    let local_read_guidance = if root_independent_work_allowed {
+        " 当前账本与活动 marker 已证明全部活动代理为显式 async_ 任务且身份已绑定；可信根代理可继续独立读写，但不得访问任务约定中子代理独占的文件范围。需要其结果时再 wait/list，最终交付前必须收齐全部结果。"
     } else {
         " 在所有子代理进入终态或被根成功中断并 fence 前，不得恢复非协作本地工作、形成最终结论或结束当前任务。"
     };
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动标记尚未核销。保留下方内容；可继续使用 agents.wait_agent 或不带筛选的 agents.list_agents 对账。只有当前调用仍携带并匹配本批首个根派生调用的 turn_id 时，才可使用 agents.spawn_agent、agents.send_message、agents.followup_task 或 agents.interrupt_agent 协调；缺少该绑定时按匿名主体 fail-closed。completed、errored、shutdown、not_found、FINAL_ANSWER 和 task_complete 都视为终态；任一 attempt 终态或被根成功中断并 fence 后，如仍有计划内未派发的独立任务，按该任务角色重新计算并发上限，存在空余槽位时立即用新 task_name 调用 agents.spawn_agent 补位；否则只对仍活动的 running、pending_init 或 interrupted 代理继续等待。后来仍显示已 fence target 为活动的上游快照不得触发再次等待。不得自动重派已结束或已放弃的旧任务；若持续没有可信终态，Stop 恢复路径会在受控宽限期后 fence 遗留 attempt。{local_read_guidance}{task_body_recovery}{compatibility}\n\n本次 wait_agent 已返回内容：\n{returned_update}"
+            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动标记尚未核销。保留下方内容；可继续使用 agents.wait_agent 或不带筛选的 agents.list_agents 对账。只有当前调用仍携带并匹配本批首个根派生调用的 turn_id 时，才可使用 agents.spawn_agent、agents.send_message、agents.followup_task 或 agents.interrupt_agent 协调；缺少该绑定时按匿名主体 fail-closed。completed、errored、shutdown、not_found、FINAL_ANSWER 和 task_complete 都视为终态；同步批次须等全部代理结束，期间不得补位；只有全部活动代理均已确认为 async_ 时，才可按角色并发上限补位并继续互不重叠的独立工作。后来仍显示已 fence target 为活动的上游快照不得触发再次等待。不得自动重派已结束或已放弃的旧任务；若持续没有可信终态，Stop 恢复路径会在受控宽限期后 fence 遗留 attempt。{local_read_guidance}{task_body_recovery}{compatibility}\n\n本次 wait_agent 已返回内容：\n{returned_update}"
         ),
     })
 }
@@ -1623,21 +1645,21 @@ fn post_list_continuation(
     active: usize,
     tool_response: Option<&Value>,
     protocol_issue: Option<&str>,
-    root_local_reads_allowed: bool,
+    root_independent_work_allowed: bool,
 ) -> Value {
     let returned_update = render_untrusted_tool_result(tool_response, "list_agents");
     let compatibility = protocol_issue
         .map(|issue| format!("\n\nHook 协议兼容性诊断：{issue}。"))
         .unwrap_or_default();
-    let local_read_guidance = if root_local_reads_allowed {
-        " 当前账本与活动 marker 已共同证明剩余子代理均已绑定且只具备 `files.read`；可信根代理可继续使用规则确认的本地读取、网页检索、MCP Resource 与数据库 schema/只读 SQL 工具消化已返回证据，但写入、命令、视觉、无法证明只读的工具和结束任务仍被拒绝，随后必须继续汇合。"
+    let local_read_guidance = if root_independent_work_allowed {
+        " 当前活动代理均已确认为 async_ 任务；主代理可继续文件范围互不重叠的独立读写，不得访问子代理独占范围，最终交付前仍须汇合所有结果。"
     } else {
         " 所有活动代理结算前继续保持全局本地工具屏障。"
     };
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：agents.list_agents 核对后仍有 {active} 个子代理尚未确认进入终态。任一 attempt 已终态或被成功中断并 fence 后，如仍有计划内未派发的独立任务，可信根代理应按该任务角色重新计算并发上限，存在空余槽位时立即用新 task_name 调用 agents.spawn_agent 补位；否则只对仍活动的 running、pending_init 或 interrupted 代理继续等待、转向或停止。completed、errored、shutdown 和 not_found 不再阻塞。累计 10 分钟仍无终态时只中断一次对应代理；中断获得结构化成功回执后立即接管，不再等待该 target 的上游状态变化，只有中断失败或目标无法匹配时才继续对账。不得无限 wait，也不得自动重派已结束或已放弃的旧任务。若 pending_init 实际已僵死，门禁会在持续 10 分钟无法进展后释放遗留状态。{local_read_guidance}{compatibility}\n\n本次 list_agents 已返回内容：\n{returned_update}"
+            "Codey 子代理汇合门禁：agents.list_agents 核对后仍有 {active} 个子代理尚未确认进入终态。同步批次继续等待整批全部结束，不得按空槽补位；异步批次在身份已确认且文件范围不重叠时，允许独立工作及并发上限内的补位。completed、errored、shutdown 和 not_found 不再阻塞。累计 10 分钟仍无终态时只中断一次对应代理；中断获得结构化成功回执后立即接管，不再等待该 target 的上游状态变化，只有中断失败或目标无法匹配时才继续对账。不得无限 wait，也不得自动重派已结束或已放弃的旧任务。若 pending_init 实际已僵死，门禁会在持续 10 分钟无法进展后释放遗留状态。{local_read_guidance}{compatibility}\n\n本次 list_agents 已返回内容：\n{returned_update}"
         ),
     })
 }
@@ -2069,14 +2091,14 @@ fn normalized_ascii_identifier(value: &str) -> String {
     protocol::normalize_identifier(value)
 }
 
-fn verified_local_read_only_active_count(
+fn verified_async_active_count(
     state_root: &Path,
     runtime_id: &str,
     session_id: &str,
     now_ms: u64,
 ) -> Result<Option<usize>> {
     let marker_hashes = active_marker_hashes_for_runtime(state_root, runtime_id, session_id)?;
-    crate::subagent_orchestrator::verified_local_read_only_active_count(
+    crate::subagent_orchestrator::verified_async_active_count(
         state_root,
         runtime_id,
         session_id,
@@ -2085,6 +2107,7 @@ fn verified_local_read_only_active_count(
     )
 }
 
+#[cfg(test)]
 fn root_read_tool_allowed(state_root: &Path, tool_name: &str, tool_input: Option<&Value>) -> bool {
     let Some(tool_class) = root_read_tool_class(tool_name, tool_input) else {
         return false;
@@ -2101,6 +2124,7 @@ fn root_read_tool_allowed(state_root: &Path, tool_name: &str, tool_input: Option
         == RuleEffect::Allow
 }
 
+#[cfg(test)]
 fn root_read_tool_class(tool_name: &str, tool_input: Option<&Value>) -> Option<ToolClass> {
     let tool_class = crate::subagent::rules::classify_tool(tool_name);
     if matches!(tool_class, ToolClass::Read | ToolClass::Network) {

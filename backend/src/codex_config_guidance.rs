@@ -8,6 +8,7 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 
 - 直接调用 `agents.spawn_agent`，按任务选择 `codey_quick_scan`、`codey_deep_research`、`codey_visual_analysis`、`codey_worker` 或 `codey_visual_worker`；`default` 仅兼容旧配置。`task_name` 只含小写字母、数字和下划线。
 - `message` 是唯一任务胶囊：写清目标、范围、允许操作、交付格式和必要背景，不复制整段对话，不附加 V1/V2 契约、sidecar、checks 或其他尾行协议。
+- 主代理根据依赖选择执行模式：下一步依赖子代理结果或文件范围重叠时，用 `sync_` 开头的 task_name；有独立工作可推进且文件范围互不重叠时，用 `async_` 开头的 task_name。未标注按同步处理。同一活动批次不得混合模式。异步任务的 message 必须明确子代理独占的文件或目录范围；主代理在任务结束前不得读写这些范围，子代理也不得越界。范围无法确定时使用同步模式。
 - 只读角色获得 `files.read`；写入角色获得 `command.execute`、`files.read` 和 `workspace.write`。写入角色暂按当前工作区建立互斥锁；实际文件与网络权限仍由 Codex 原生 sandbox、approval policy、permission profile 和 writable roots 决定。
 
 ### 返回与验收
@@ -17,7 +18,7 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 
 ### 生命周期
 
-- 先派发不超过当前并发上限的独立任务，再进入 wait/list。任一 attempt 终态或被成功中断并 fence 后，按下一个计划任务的角色重新计算并发上限；存在空余槽位时立即使用新 `task_name` 补位，否则继续等待。所有计划任务均已派发后，继续等待剩余活动 attempt 结算。活动 attempt 期间只使用必要的 `agents.*` 协作工具，普通本地工作和 Stop 仍受生命周期门禁限制。
+- 同步模式先派发不超过并发上限的一批独立任务，再进入 wait/list；整批全部终态或被成功中断并 fence 前，不补位、不恢复主代理本地工作。异步模式在全部活动代理身份已确认后，允许主代理继续文件范围互不重叠的独立读写，并可按角色并发上限补位。异步也必须在需要结果时汇合，最终交付前收齐全部结果；Stop 始终受生命周期门禁限制。
 - `MESSAGE` 只保存证据并继续等待。`completed`、`errored`、`error`、`failed`、`shutdown`、`not_found`、`FINAL_ANSWER` 和 `task_complete` 为终态；`pending_init`、`running`、`interrupted` 仍是非终态，除非根代理成功中断并永久放弃该 attempt。
 - 成功的 `agents.interrupt_agent` 会永久 fence 该 attempt；不要再等待或追派。重复 task ID 时只做一次无筛选 `agents.list_agents` 对账：原代理存在则等待或消费结果，不存在则由根代理接管。只有任务范围实质改变时才用全新 task ID 最多重派一次。
 - 协作工具不可用时不要循环调用；依赖有界的 pending-init、超时和 Stop 恢复路径收敛。
@@ -31,12 +32,14 @@ pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] = &[SUBAGENT_GUIDANCE];
 pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str = "\
 `agents.spawn_agent`, `agents.wait_agent`, and other `agents.*` collaboration tools are direct commentary \
 tools; never call them through `functions.exec`. Dispatch up to the current concurrency limit from the \
-planned independent work before the first wait. While any attempt is active, use only the relevant \
-`agents.spawn_agent`, `agents.send_message`, `agents.followup_task`, `agents.interrupt_agent`, \
-`agents.list_agents`, or `agents.wait_agent`. After a terminal or successfully fenced update, recompute the \
-role-aware concurrency limit; if it exposes a slot, immediately use `agents.spawn_agent` with a new \
-`task_name` for the next planned, unspawned task; \
-otherwise return to `agents.wait_agent` with `timeout_ms: 30000`. `MESSAGE` and mailbox updates are not \
+planned independent work before the first wait. Choose `sync_` task names when subsequent work depends \
+on the results or file scopes overlap; choose `async_` only for independent work with disjoint file \
+ownership explicitly stated in the task message. Unmarked task names are synchronous. Do not mix modes \
+within an active batch. Synchronous batches must fully settle before refilling slots or resuming local \
+work; use only collaboration tools while waiting. With verified asynchronous children, the root may \
+continue independent reads and writes outside child-owned paths and refill within the role-aware \
+concurrency limit. Join before consuming dependent results and before final delivery. Use \
+`agents.wait_agent` with `timeout_ms: 30000`. `MESSAGE` and mailbox updates are not \
 completion. Use `followup_task` only for a bound nonterminal attempt. If \
 `CODEY_SUBAGENT_FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT` is denied, do not retry or wait for that target; take \
 over or use a fresh `task_name` for a materially changed task. Treat `FINAL_ANSWER`, `task_complete`, \
@@ -45,8 +48,9 @@ interrupt permanently abandons and fences that attempt, settles it for the lifec
 later active-looking provider state stale; do not wait for or follow up that target. If a wait times out or \
 lacks per-agent terminal details, call unfiltered `agents.list_agents` before waiting again. Continue until \
 all planned work has been spawned and every attempt is terminal or fenced. Then the root agent validates \
-the combined result and either continues the work or finishes. While an attempt is active, Codey's gate \
-blocks non-collaboration tools and Stop. If collaboration tools are unavailable, do not loop on an \
+the combined result and either continues the work or finishes. Codey's gate blocks non-collaboration \
+tools for synchronous or unverified active children, and blocks Stop for all active children. File scope \
+ownership is enforced by the agents' task contract, not a per-path sandbox. If collaboration tools are unavailable, do not loop on an \
 unregistered tool.";
 
 pub(crate) const ROOT_AGENT_MULTI_AGENT_MODE_HINT: &str = "Proactive multi-agent delegation is \
@@ -62,8 +66,13 @@ This is a preference, not a restriction: an explicit user choice, unavailable or
 or a clear task-specific advantage can justify another available role. Respect existing role permissions \
 and runtime availability. There is no fixed spawn \
 budget: up to three concurrent agents are allowed only when all are verified read-only, otherwise the \
-limit is two. `CODEY_SUBAGENT_CONCURRENCY_LIMIT` means wait for a slot, not failure; when any child settles, \
-recompute the role-aware limit and fill a slot from the remaining planned independent work when allowed. If an active child \
+limit is two. Select synchronous (`sync_`) or asynchronous (`async_`) task names based on dependencies \
+and disjoint file ownership. Unmarked names are synchronous; do not mix modes in an active batch. \
+Synchronous batches wait for every child before any refill or local work. Asynchronous batches permit \
+independent root reads and writes outside child-owned paths once all active identities are verified; \
+recompute the role-aware limit for optional refills. State exclusive child file scopes in each task \
+message; never access another active participant's files. `CODEY_SUBAGENT_CONCURRENCY_LIMIT` means wait, \
+not failure. Both modes must join all children before final delivery. If an active child \
 cannot decrypt its task body, use `agents.send_message` exactly once to restate the complete task; do not \
 interrupt or respawn it. If that fails, take over. After all attempts settle, validate their combined result \
 before continuing or finishing. If every spawn fails, take over. On `CODEY_SUBAGENT_DUPLICATE_TASK_ID`, call \
