@@ -227,6 +227,45 @@ pub(crate) fn normalize_native_responses_context(
     changed
 }
 
+/// 第三方 Responses 接口未必识别 Codex 的 agent_message 项；仅把正文改成
+/// input_text 仍可能丢失整条任务。载荷校验、明文归一化后，将其作为收到的
+/// user 消息发送，保留发送者、接收者和全部内容，不冒充当前代理的历史回答。
+pub(crate) fn normalize_portable_agent_messages(body: &mut Value) -> bool {
+    let items = match body.get_mut("input") {
+        Some(Value::Array(items)) => items.as_mut_slice(),
+        Some(item @ Value::Object(_)) => std::slice::from_mut(item),
+        _ => return false,
+    };
+    let mut changed = false;
+    for item in items {
+        if item["type"] != "agent_message" {
+            continue;
+        }
+        let Some(content) = item.get("content").or_else(|| item.get("message")).cloned() else {
+            continue;
+        };
+        let mut parts = match content {
+            Value::Array(parts) => parts,
+            Value::String(text) => vec![json!({"type":"input_text","text":text})],
+            part @ Value::Object(_) => vec![part],
+            _ => continue,
+        };
+        let mut metadata = String::new();
+        for field in ["author", "recipient"] {
+            if let Some(value) = item.get(field).and_then(Value::as_str) {
+                metadata.push_str(&format!("{field}: {value}\n"));
+            }
+        }
+        if !metadata.is_empty() {
+            parts.push(json!({"type":"input_text","text":metadata}));
+        }
+        // amsg ID 和内部路由字段不属于标准 message；归属信息已保留在正文中。
+        *item = json!({"type":"message","role":"user","content":parts});
+        changed = true;
+    }
+    changed
+}
+
 // 旧兼容路径使用的缺失明文标记；不能代替真实推理内容或恢复上游状态。
 pub(crate) const MISSING_REASONING_TEXT_PLACEHOLDER: &str = "(thinking unavailable)";
 

@@ -1590,6 +1590,12 @@ impl RouterServer {
                 body_mutated = true;
                 encoded_body = None;
             }
+            if resolved.route.official_auth.is_none()
+                && normalize_portable_agent_messages(&mut body)
+            {
+                body_mutated = true;
+                encoded_body = None;
+            }
         } else {
             // Chat Completions 与 Anthropic Messages 都表达不了 encrypted_content，
             // 协议转换只能丢弃该字段。第三方线路常把协作任务正文写在这个字段里，
