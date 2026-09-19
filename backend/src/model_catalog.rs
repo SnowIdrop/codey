@@ -12,6 +12,8 @@ use crate::fs_util::atomic_write_private_with_parent as atomic_write;
 use crate::model_id;
 
 const MODEL_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-official.json";
+const GEMINI_BASE_INSTRUCTIONS: &str =
+    include_str!("../resources/gemini-antigravity-base-instructions.md");
 /// Raw `codex debug models` output Codey captured itself. Recent Codex builds
 /// no longer maintain `models_cache.json` on disk, so this snapshot is the
 /// durable source for models that need instruction-bearing entries.
@@ -1914,6 +1916,34 @@ fn synthetic_model(
     }
     model["service_tiers"] = json!([]);
     model["additional_speed_tiers"] = json!([]);
+    let upstream_model =
+        model_id::parse_alias(model_id).map_or(model_id, |alias| alias.upstream_model);
+    let model_name = upstream_model
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !is_official_route_alias(model_id)
+        && (model_name == "gemini" || model_name.starts_with("gemini-"))
+    {
+        // Replace both sources: a cached base takes precedence over the template.
+        // Only owned instructions change; tool metadata and request content do not.
+        model["base_instructions"] = json!(GEMINI_BASE_INSTRUCTIONS);
+        let mut messages = model
+            .get("model_messages")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        messages.insert(
+            "instructions_template".into(),
+            json!(GEMINI_BASE_INSTRUCTIONS),
+        );
+        messages.insert("instructions_variables".into(), Value::Null);
+        model["model_messages"] = Value::Object(messages);
+        // The dedicated template already includes the skills usage guidance.
+        model["include_skills_usage_instructions"] = json!(false);
+    }
     ensure_catalog_compatibility(&mut model);
     clamp_reasoning_efforts(&mut model);
     add_fast_speed_controls(&mut model);
@@ -2289,6 +2319,153 @@ mod tests {
             serde_json::to_vec(&official_cache()).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn gemini_prompt_matches_upstream_model_names_only() {
+        let template = json!({
+            "base_instructions": "You are Codex, based on GPT-5.",
+            "model_messages": {
+                "instructions_template": "Old Codex template {personality}",
+                "instructions_variables": {"personality_default": "GPT-5"},
+                "other_metadata": "keep this"
+            },
+            "include_skills_usage_instructions": true,
+            "include_plugin_usage_instructions": true,
+            "include_apps_usage_instructions": true,
+            "apply_patch_tool_type": "freeform"
+        });
+        for (name, expected) in [
+            ("gemini", true),
+            ("gemini-3.8-flash-high", true),
+            (" route/GEMINI-3.8-FLASH-HIGH ", true),
+            ("google/gemini-3.8-pro", true),
+            ("route/google/gemini-3.8-pro", true),
+            ("route/models/gemini-3.8-flash-medium", true),
+            ("gemini-route/gpt-5.6-sol", false),
+            ("gemini-route/deepseek/model", false),
+            ("route/gpt-5.6-luna", false),
+            ("route/not-gemini-3.8", false),
+            ("route/geminiish", false),
+            ("route/gemini-3.8/other-model", false),
+            ("codey-official-account-1/gemini-3.8-flash", false),
+        ] {
+            for preserve_metadata in [false, true] {
+                let model = synthetic_model(&template, name, 0, preserve_metadata);
+                assert_eq!(
+                    model["base_instructions"] == GEMINI_BASE_INSTRUCTIONS,
+                    expected,
+                    "{name}, preserve_metadata={preserve_metadata}"
+                );
+                if expected {
+                    assert_eq!(
+                        model["model_messages"]["instructions_template"],
+                        GEMINI_BASE_INSTRUCTIONS
+                    );
+                    assert!(model["model_messages"]["instructions_variables"].is_null());
+                    assert_eq!(model["include_skills_usage_instructions"], false);
+                } else {
+                    assert_eq!(model["base_instructions"], template["base_instructions"]);
+                    assert_eq!(model["model_messages"], template["model_messages"]);
+                    assert_eq!(model["include_skills_usage_instructions"], true);
+                }
+                assert_eq!(model["model_messages"]["other_metadata"], "keep this");
+                assert_eq!(model["include_plugin_usage_instructions"], true);
+                assert_eq!(model["include_apps_usage_instructions"], true);
+                assert_eq!(model["apply_patch_tool_type"], "freeform");
+            }
+        }
+    }
+
+    #[test]
+    fn gemini_prompt_changes_only_instruction_fields() {
+        let cache = official_cache();
+        let template = &cache["models"][0];
+        let original = template.clone();
+        let baseline = synthetic_model(template, "route/custom-model", 0, false);
+        let mut gemini = synthetic_model(template, "route/gemini-3.8-flash-high", 0, false);
+        for field in [
+            "slug",
+            "display_name",
+            "base_instructions",
+            "model_messages",
+            "include_skills_usage_instructions",
+        ] {
+            gemini[field] = baseline[field].clone();
+        }
+        assert_eq!(gemini, baseline);
+        assert_eq!(*template, original);
+
+        for messages in [Value::Null, json!("legacy"), json!({})] {
+            let mut template = original.clone();
+            template["model_messages"] = messages;
+            let model = synthetic_model(&template, "gemini-3.8-flash-high", 0, false);
+            assert_eq!(model["base_instructions"], GEMINI_BASE_INSTRUCTIONS);
+            assert_eq!(
+                model["model_messages"]["instructions_template"],
+                GEMINI_BASE_INSTRUCTIONS
+            );
+            assert!(model["model_messages"]["instructions_variables"].is_null());
+        }
+    }
+
+    #[test]
+    fn gemini_prompt_keeps_safety_and_has_no_legacy_identity_markers() {
+        let lower = GEMINI_BASE_INSTRUCTIONS.to_ascii_lowercase();
+        for marker in ["codex", "gpt-5", "$codex_home"] {
+            assert!(!lower.contains(marker), "legacy identity marker: {marker}");
+        }
+        assert!(GEMINI_BASE_INSTRUCTIONS.starts_with("You are Antigravity"));
+        assert!(GEMINI_BASE_INSTRUCTIONS.contains("# Using skills"));
+        assert!(GEMINI_BASE_INSTRUCTIONS.contains("# Destructive actions"));
+        assert!(GEMINI_BASE_INSTRUCTIONS.contains("read-only"));
+        assert!(GEMINI_BASE_INSTRUCTIONS.contains("If an `update_plan` tool is available"));
+    }
+
+    #[test]
+    fn gemini_prompt_refresh_repairs_old_catalog_and_is_idempotent() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+        let selected = vec![
+            "gpt-5.6-sol".to_string(),
+            "route/gemini-3.8-flash-high".to_string(),
+            "route/deepseek-v4.1-flash".to_string(),
+        ];
+        refresh_for_provider(home.path(), false, Some(&selected), &selected).unwrap();
+        let expected = read_runtime_catalog_models(home.path()).unwrap();
+        let mut legacy = expected.clone();
+        let gemini = legacy
+            .iter_mut()
+            .find(|model| model["slug"] == selected[1])
+            .unwrap();
+        gemini["base_instructions"] = json!("Old Codex GPT-5 base");
+        gemini["model_messages"]["instructions_template"] = json!("Old Codex template");
+        gemini["model_messages"]["instructions_variables"] = json!({"personality_default": "old"});
+        gemini["include_skills_usage_instructions"] = json!(true);
+        write_verified_catalog(home.path(), &legacy).unwrap();
+
+        refresh_for_provider(home.path(), false, Some(&selected), &selected).unwrap();
+        let actual = read_runtime_catalog_models(home.path()).unwrap();
+        assert_eq!(actual, expected);
+        let gemini = actual
+            .iter()
+            .find(|model| model["slug"] == selected[1])
+            .unwrap();
+        assert_eq!(gemini["base_instructions"], GEMINI_BASE_INSTRUCTIONS);
+        assert_eq!(
+            gemini["model_messages"]["instructions_template"],
+            GEMINI_BASE_INSTRUCTIONS
+        );
+        assert_eq!(
+            actual
+                .iter()
+                .find(|model| model["slug"] == selected[0])
+                .unwrap()["base_instructions"],
+            "test-only instructions for gpt-5.6-sol"
+        );
+        let bytes = fs::read(home.path().join(relative_path())).unwrap();
+        refresh_for_provider(home.path(), false, Some(&selected), &selected).unwrap();
+        assert_eq!(fs::read(home.path().join(relative_path())).unwrap(), bytes);
     }
 
     #[test]
