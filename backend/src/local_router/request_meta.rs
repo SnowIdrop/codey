@@ -196,6 +196,7 @@ pub(crate) fn rewrite_native_responses_encoded_body(
     let mut saw_model = false;
     let mut saw_client_metadata = false;
     let mut saw_previous_response_id = false;
+    let mut saw_instructions = false;
     for (name, raw) in fields {
         let replacement = match name.as_str() {
             "model" => {
@@ -209,6 +210,16 @@ pub(crate) fn rewrite_native_responses_encoded_body(
             "previous_response_id" => {
                 saw_previous_response_id = true;
                 Some(updated.get("previous_response_id"))
+            }
+            "instructions" => {
+                saw_instructions = true;
+                if serde_json::from_str::<Value>(raw.get()).ok().as_ref()
+                    == updated.get("instructions")
+                {
+                    None
+                } else {
+                    Some(updated.get("instructions"))
+                }
             }
             _ => None,
         };
@@ -228,6 +239,7 @@ pub(crate) fn rewrite_native_responses_encoded_body(
         ("model", saw_model),
         ("client_metadata", saw_client_metadata),
         ("previous_response_id", saw_previous_response_id),
+        ("instructions", saw_instructions),
     ] {
         if saw_field {
             continue;
@@ -260,7 +272,7 @@ pub(crate) async fn rewrite_native_responses_encoded_body_offloaded(
         .filter(|(name, _)| {
             matches!(
                 name.as_str(),
-                "model" | "client_metadata" | "previous_response_id"
+                "model" | "client_metadata" | "previous_response_id" | "instructions"
             )
         })
         .map(|(name, value)| (name.clone(), value.clone()))

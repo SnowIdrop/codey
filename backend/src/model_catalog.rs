@@ -12,7 +12,7 @@ use crate::fs_util::atomic_write_private_with_parent as atomic_write;
 use crate::model_id;
 
 const MODEL_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-official.json";
-const GEMINI_BASE_INSTRUCTIONS: &str =
+pub(crate) const GEMINI_BASE_INSTRUCTIONS: &str =
     include_str!("../resources/gemini-antigravity-base-instructions.md");
 /// Raw `codex debug models` output Codey captured itself. Recent Codex builds
 /// no longer maintain `models_cache.json` on disk, so this snapshot is the
@@ -1918,15 +1918,7 @@ fn synthetic_model(
     model["additional_speed_tiers"] = json!([]);
     let upstream_model =
         model_id::parse_alias(model_id).map_or(model_id, |alias| alias.upstream_model);
-    let model_name = upstream_model
-        .trim()
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if !is_official_route_alias(model_id)
-        && (model_name == "gemini" || model_name.starts_with("gemini-"))
-    {
+    if !is_official_route_alias(model_id) && is_gemini_upstream_model(upstream_model) {
         // Replace both sources: a cached base takes precedence over the template.
         // Only owned instructions change; tool metadata and request content do not.
         model["base_instructions"] = json!(GEMINI_BASE_INSTRUCTIONS);
@@ -1948,6 +1940,14 @@ fn synthetic_model(
     clamp_reasoning_efforts(&mut model);
     add_fast_speed_controls(&mut model);
     model
+}
+
+pub(crate) fn is_gemini_upstream_model(upstream_model: &str) -> bool {
+    let name = upstream_model.trim().rsplit('/').next().unwrap_or_default();
+    name.eq_ignore_ascii_case("gemini")
+        || name
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("gemini-"))
 }
 
 fn gate_synthetic_native_web_search(model: &mut Value, allowed_model_keys: &HashSet<String>) {

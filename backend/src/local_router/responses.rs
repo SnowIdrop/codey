@@ -1645,6 +1645,26 @@ impl RouterServer {
                 return Ok(());
             }
         };
+        if request_kind == ResponsesRequestKind::Create && !compacting {
+            match adapt_gemini_base_instructions(
+                &mut body,
+                &resolved.upstream_model,
+                resolved.route.official_account,
+            ) {
+                Ok(Some(changed)) => body_mutated |= changed,
+                Ok(None) => {}
+                Err(error) => {
+                    return downstream
+                        .write_error(
+                            400,
+                            GEMINI_INSTRUCTIONS_ERROR,
+                            error.to_string(),
+                            Some(&resolved.route),
+                        )
+                        .await;
+                }
+            }
+        }
         let mut tool_bridge = ResponsesToolBridge::default();
         let offload_conversion = bridge != ProtocolBridge::NativeResponses
             && encoded_body
