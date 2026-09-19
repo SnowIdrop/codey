@@ -3,6 +3,257 @@ use crate::local_router::tests::{connect_router_websocket, router_config};
 
 const MODEL: &str = "gemini-3.8-flash-high";
 
+fn adapt_chat_tail(body: &mut Value) -> Result<Option<bool>> {
+    adapt_gemini_chat_tail(
+        body,
+        MODEL,
+        false,
+        ProtocolBridge::ResponsesToChatCompletions,
+        ResponsesRequestKind::Create,
+        false,
+    )
+}
+
+#[test]
+fn gemini_chat_tail_preserves_history_and_is_idempotent() {
+    for tail in [
+        json!({"role":"assistant","content":"Preparing the comment."}),
+        json!({"role":"assistant","content":"Preparing the comment.","reasoning_content":"THOUGHT_SENTINEL"}),
+        json!({"role":"assistant","content":"Preparing the comment.","tool_calls":[]}),
+    ] {
+        let mut body = json!({"model":MODEL,"messages":[{"role":"user","content":"TASK_SENTINEL"},tail],"tools":[{"type":"function","function":{"name":"lookup"}}],"reasoning_effort":"high","stream":true});
+        let before = body.clone();
+        assert_eq!(adapt_chat_tail(&mut body).unwrap(), Some(true));
+        let mut expected = before;
+        expected["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role":"user","content":"Continue the current task."}));
+        assert_eq!(body, expected);
+        assert_eq!(adapt_chat_tail(&mut body).unwrap(), Some(false));
+        assert_eq!(body, expected);
+    }
+}
+
+#[test]
+fn gemini_chat_tail_keeps_user_and_tool_endings() {
+    for tail in [
+        json!({"role":"user","content":"Task"}),
+        json!({"role":"tool","tool_call_id":"call-1","content":"result"}),
+    ] {
+        let mut body = json!({"messages":[tail]});
+        let before = body.clone();
+        assert_eq!(adapt_chat_tail(&mut body).unwrap(), Some(false));
+        assert_eq!(body, before);
+    }
+}
+
+#[test]
+fn gemini_chat_tail_requires_paired_calls_without_reordering_results() {
+    let calls = json!({"role":"assistant","content":null,"tool_calls":[
+        {"id":"call-1","type":"function","function":{"name":"first","arguments":"{}"}},
+        {"id":"call-2","type":"function","function":{"name":"second","arguments":"{}"}}
+    ]});
+    let mut body = json!({"messages":[calls,
+        {"role":"tool","tool_call_id":"call-2","content":"second result"},
+        {"role":"tool","tool_call_id":"call-1","content":"first result"},
+        {"role":"assistant","content":"Both completed."}
+    ]});
+    let before = body.clone();
+    assert_eq!(adapt_chat_tail(&mut body).unwrap(), Some(true));
+    assert_eq!(
+        &body["messages"].as_array().unwrap()[..4],
+        before["messages"].as_array().unwrap()
+    );
+    let mut missing = before;
+    missing["messages"].as_array_mut().unwrap().remove(1);
+    let before = missing.clone();
+    assert!(adapt_chat_tail(&mut missing).is_err());
+    assert_eq!(missing, before);
+}
+
+#[test]
+fn gemini_chat_tail_rejects_unsafe_content_without_mutation_or_secret_errors() {
+    for messages in [
+        json!([]),
+        json!([{"role":"system","content":"system"}]),
+        json!([{"role":"assistant","content":null,"reasoning_content":"SECRET_SENTINEL"}]),
+        json!([{"role":"assistant","content":" "}]),
+        json!([{"role":"assistant","content":[{"type":"image_url","image_url":{"url":"SECRET_SENTINEL"}}]}]),
+        json!([{"role":"assistant","content":"SECRET_SENTINEL","function_call":{"name":"SECRET_SENTINEL"}}]),
+        json!([{"role":"assistant","content":"text","tool_calls":"SECRET_SENTINEL"}]),
+        json!([{"role":"assistant","content":"text","tool_calls":[{"id":"SECRET_SENTINEL"}]}]),
+        json!([{"role":"assistant","content":"text","tool_calls":[{}]}]),
+        json!([{"role":"assistant","content":"text","tool_calls":[{"id":"SECRET_SENTINEL"},{"id":"SECRET_SENTINEL"}]}]),
+        json!([{"role":"tool","tool_call_id":"SECRET_SENTINEL","content":"result"},{"role":"assistant","content":"text"}]),
+    ] {
+        let mut body = json!({"messages":messages});
+        let before = body.clone();
+        let error = adapt_chat_tail(&mut body).unwrap_err().to_string();
+        assert!(!error.contains("SECRET_SENTINEL"));
+        assert_eq!(body, before);
+    }
+}
+
+#[test]
+fn gemini_chat_tail_scope_excludes_other_routes_and_compaction() {
+    for (model, official, bridge, kind, compacting) in [
+        (
+            "gpt-5.6-terra",
+            false,
+            ProtocolBridge::ResponsesToChatCompletions,
+            ResponsesRequestKind::Create,
+            false,
+        ),
+        (
+            MODEL,
+            true,
+            ProtocolBridge::ResponsesToChatCompletions,
+            ResponsesRequestKind::Create,
+            false,
+        ),
+        (
+            MODEL,
+            false,
+            ProtocolBridge::NativeResponses,
+            ResponsesRequestKind::Create,
+            false,
+        ),
+        (
+            MODEL,
+            false,
+            ProtocolBridge::ResponsesToAnthropicMessages,
+            ResponsesRequestKind::Create,
+            false,
+        ),
+        (
+            MODEL,
+            false,
+            ProtocolBridge::ResponsesToChatCompletions,
+            ResponsesRequestKind::Compact,
+            false,
+        ),
+        (
+            MODEL,
+            false,
+            ProtocolBridge::ResponsesToChatCompletions,
+            ResponsesRequestKind::Create,
+            true,
+        ),
+    ] {
+        let mut body = json!({"messages":[{"role":"assistant","content":"leave unchanged"}]});
+        let before = body.clone();
+        assert_eq!(
+            adapt_gemini_chat_tail(&mut body, model, official, bridge, kind, compacting).unwrap(),
+            None
+        );
+        assert_eq!(body, before);
+    }
+}
+
+#[tokio::test]
+async fn gemini_chat_tail_is_applied_to_actual_http_websocket_and_offloaded_bodies() {
+    for protocol in [
+        UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+        UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
+        UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES,
+    ] {
+        for (websocket, large) in [(false, false), (true, false), (false, true), (true, true)] {
+            let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let capture = tokio::spawn(async move {
+                let (mut stream, _) = upstream.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await.unwrap();
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                write_json_response(
+                    &mut stream,
+                    429,
+                    &json!({"error":{"message":"offline_tail_probe","code":"probe_429"}}),
+                )
+                .await
+                .unwrap();
+                body
+            });
+            let (config, provider) = gemini_config(format!("http://{address}/v1"), protocol);
+            let router = LocalRouter::start(&config).await.unwrap();
+            let mut body = payload(&model_id::model_alias(&provider, MODEL));
+            if large {
+                body["input"][1]["content"] = json!("x".repeat(REQUEST_JSON_OFFLOAD_BYTES + 8));
+            }
+            body["input"].as_array_mut().unwrap().push(json!({"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"TAIL_SENTINEL"}]}));
+            let response = send_test_request(&router.endpoint(), &body, websocket).await;
+            assert!(
+                response.contains("offline_tail_probe"),
+                "{protocol}: {response}"
+            );
+            let captured = tokio::time::timeout(Duration::from_secs(5), capture)
+                .await
+                .unwrap()
+                .unwrap();
+            body["model"] = json!(MODEL);
+            body["instructions"] = json!(GEMINI_BASE_INSTRUCTIONS.replace("\r\n", "\n").trim());
+            let bridge = ProtocolBridge::from_upstream_protocol(UpstreamProtocol::from_profile(
+                false, protocol,
+            ));
+            let mut expected = bridge
+                .convert_responses_body(&body)
+                .unwrap()
+                .map_or(body, |converted| converted.body);
+            if protocol == UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS {
+                expected["messages"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"role":"user","content":"Continue the current task."}));
+                assert_eq!(
+                    captured["messages"].as_array().unwrap().last().unwrap()["role"],
+                    "user"
+                );
+            }
+            for key in [
+                "messages",
+                "input",
+                "instructions",
+                "system",
+                "tools",
+                "tool_choice",
+                "reasoning",
+                "reasoning_effort",
+            ] {
+                assert_eq!(
+                    captured.get(key),
+                    expected.get(key),
+                    "{protocol}, ws={websocket}, large={large}, {key}"
+                );
+            }
+            router.stop().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn gemini_chat_tail_unsafe_tool_call_never_connects_upstream() {
+    for websocket in [false, true] {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let (config, provider) = gemini_config(
+            format!("http://{}/v1", upstream.local_addr().unwrap()),
+            UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+        );
+        let router = LocalRouter::start(&config).await.unwrap();
+        let mut body = payload(&model_id::model_alias(&provider, MODEL));
+        body["input"].as_array_mut().unwrap().push(
+            json!({"type":"function_call","call_id":"pending","name":"lookup","arguments":"{}"}),
+        );
+        let response = send_test_request(&router.endpoint(), &body, websocket).await;
+        assert!(response.contains(GEMINI_CHAT_TAIL_ERROR), "{response}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), upstream.accept())
+                .await
+                .is_err()
+        );
+        router.stop().await.unwrap();
+    }
+}
+
 #[test]
 fn gemini_legacy_baseline_matches_verified_cli_01533_fingerprint() {
     let normalized = LEGACY_BASE_INSTRUCTIONS.replace("\r\n", "\n");

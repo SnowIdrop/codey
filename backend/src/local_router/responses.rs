@@ -1726,6 +1726,30 @@ impl RouterServer {
                 return Ok(());
             }
         };
+        match adapt_gemini_chat_tail(
+            &mut upstream_body,
+            &resolved.upstream_model,
+            resolved.route.official_account,
+            bridge,
+            request_kind,
+            compacting,
+        ) {
+            Ok(Some(true)) => {
+                body_mutated = true;
+                encoded_body = None;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return downstream
+                    .write_error(
+                        400,
+                        GEMINI_CHAT_TAIL_ERROR,
+                        error.to_string(),
+                        Some(&resolved.route),
+                    )
+                    .await;
+            }
+        }
         if !resolved.route.official_account
             && normalize_responses_tool_parameter_roots(&mut upstream_body)
         {
