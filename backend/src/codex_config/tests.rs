@@ -956,6 +956,7 @@ fn disabled_subagent_roles_are_omitted_from_runtime_registration_and_policy_inpu
 #[test]
 fn runtime_guidance_keeps_writes_with_root_when_all_writable_roles_are_disabled() {
     let mut configured = crate::config::default_subagent_roles();
+    configured.get_mut(SUBAGENT_ROLE_COMMENTS).unwrap().enabled = false;
     configured
         .get_mut(crate::config::SUBAGENT_ROLE_WORKER)
         .unwrap()
@@ -981,10 +982,37 @@ fn runtime_guidance_keeps_writes_with_root_when_all_writable_roles_are_disabled(
         DEFAULT_SUBAGENT_MODEL,
         DEFAULT_SUBAGENT_REASONING_EFFORT,
     );
-    assert_eq!(
-        runtime_root_instructions_for_roles("BASE", &writable_roles),
-        "BASE"
-    );
+    let instructions = runtime_root_instructions_for_roles("BASE", &writable_roles);
+    assert!(instructions.contains(COMMENTS_ROLE_USAGE_HINT));
+    assert!(!instructions.contains(NO_WRITABLE_SUBAGENT_GUIDANCE));
+}
+
+#[test]
+fn comments_role_is_a_registered_writer_with_independent_configuration() {
+    let temp = tempfile::tempdir().unwrap();
+    let selection = SubagentRoleConfig::new("route/comments", "high");
+    let roles = BTreeMap::from([(SUBAGENT_ROLE_COMMENTS.to_string(), selection)]);
+    let instructions = runtime_root_instructions_for_roles("USER RULES", &roles);
+    assert!(instructions.contains("USER RULES"));
+    assert!(instructions.contains(COMMENTS_ROLE_USAGE_HINT));
+    assert!(!instructions.contains(NO_WRITABLE_SUBAGENT_GUIDANCE));
+    let registrations = prepare_runtime_agent_files(temp.path(), &roles, None).unwrap();
+    assert_eq!(registrations.len(), 1);
+    let text = fs::read_to_string(&registrations[0].config_file).unwrap();
+    let document = parse_document(&text).unwrap();
+    assert_eq!(document["name"].as_str(), Some(SUBAGENT_ROLE_COMMENTS));
+    assert_eq!(document["model"].as_str(), Some("route/comments"));
+    assert_eq!(document["model_reasoning_effort"].as_str(), Some("high"));
+    assert_eq!(document["sandbox_mode"].as_str(), Some("workspace-write"));
+    assert!(text.contains(SUBAGENT_TASK_BOUNDARY_GUARD));
+    assert!(!text.contains(READ_ONLY_AGENT_WRITE_GUARD));
+    assert!(text.contains("不修改可执行代码"));
+
+    let mut worker = SubagentRoleConfig::new("route/worker", "low");
+    worker.enabled = false;
+    let legacy = BTreeMap::from([(SUBAGENT_ROLE_WORKER.to_string(), worker)]);
+    let prepared = runtime_subagent_roles(Some(&legacy), DEFAULT_SUBAGENT_MODEL, "medium");
+    assert!(!prepared.contains_key(SUBAGENT_ROLE_COMMENTS));
 }
 
 #[test]

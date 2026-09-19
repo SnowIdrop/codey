@@ -124,7 +124,8 @@ three bounded investigation calls, and never expand scope without root authoriza
 prefer an enabled Codey role that fits the task and explicitly set `agent_type`: `codey_quick_scan` for \
 focused read-only lookups; `codey_deep_research` for broad read-only code, log, and document research; \
 `codey_visual_analysis` for read-only visual inspection; `codey_worker` for bounded non-visual \
-implementation; and `codey_visual_worker` for implementation requiring visual verification. Prefer these \
+implementation; `codey_comments` for scoped comment-only editing with Chinese documentation by default; \
+and `codey_visual_worker` for implementation requiring visual verification. Prefer these \
 over generic `default`, `explorer`, or `worker` when both fit; avoid omitting `agent_type` out of habit. \
 This is a preference, not a restriction: an explicit user choice, unavailable or unsuitable Codey roles, \
 or a clear task-specific advantage can justify another available role. Respect existing role permissions \
@@ -255,6 +256,13 @@ developer_instructions = """
 image_generation = false
 "#####;
 
+pub(crate) const COMMENTS_AGENT_CONFIG: &str =
+    include_str!("../../customizations/codex-constraints/agents/codey_comments.toml");
+
+pub(crate) const COMMENTS_ROLE_USAGE_HINT: &str = "\
+`codey_comments` 是代码注释身份，属于非视觉可写角色。符合委派条件的源码注释任务优先使用它，\
+限定文件或差异范围，默认中文；不得借此修改可执行代码。返回后主代理必须检查非注释内容保持不变。";
+
 pub(crate) const VISUAL_WORKER_AGENT_CONFIG: &str = r#####"name = "codey_visual_worker"
 
 description = "Writable implementation for pages, GUI, PDFs, and tasks that require visual evidence or render verification."
@@ -285,7 +293,7 @@ pub(crate) const SUBAGENT_TASK_BOUNDARY_GUARD: &str = "\
 返回时区分本次实际修改、已清理内容和未完成要求，不能用其他尝试的结果代替本次证据。";
 
 pub(crate) const NO_WRITABLE_SUBAGENT_GUIDANCE: &str = "\
-本次运行没有启用 `codey_worker` 或 `codey_visual_worker`，因此没有可写子代理。所有创建、修改、\
+本次运行没有启用 `codey_worker`、`codey_comments` 或 `codey_visual_worker`，因此没有可写子代理。所有创建、修改、\
 删除、移动文件或其他会改变状态的工作都由主代理直接完成；只读子代理只能承担检索、分析和证据\
 收集。不得把写入任务改派给 `default` 或任何只读角色，也不得要求它们尝试 `replace`、\
 `apply_patch` 或其他写入工具。";
@@ -296,6 +304,7 @@ pub(crate) fn subagent_source_config(role: &str) -> Option<&'static str> {
         "codey_deep_research" => Some(DEEP_RESEARCH_AGENT_CONFIG),
         "codey_visual_analysis" => Some(VISUAL_ANALYSIS_AGENT_CONFIG),
         "codey_worker" => Some(WORKER_AGENT_CONFIG),
+        "codey_comments" => Some(COMMENTS_AGENT_CONFIG),
         "codey_visual_worker" => Some(VISUAL_WORKER_AGENT_CONFIG),
         "default" => Some(DEFAULT_AGENT_CONFIG),
         _ => None,
@@ -615,6 +624,7 @@ mod tests {
     #[test]
     fn multi_agent_mode_hint_uses_role_aware_concurrency_without_spawn_budgets() {
         for role in [
+            "codey_comments",
             "codey_quick_scan",
             "codey_deep_research",
             "codey_visual_analysis",
@@ -676,6 +686,7 @@ mod tests {
             ("codey_deep_research", false),
             ("codey_visual_analysis", false),
             ("codey_worker", true),
+            ("codey_comments", true),
             ("codey_visual_worker", true),
             ("default", false),
         ] {

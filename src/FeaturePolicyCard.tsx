@@ -69,6 +69,12 @@ const SUBAGENT_TASK_TYPES = [
     description: "默认可写；用于边界清晰、可回滚、可测试的低到中等复杂度非视觉实现。",
   },
   {
+    id: "codey_comments",
+    name: "代码注释",
+    access: "write",
+    description: "默认可写；只处理指定范围的源码注释，默认中文，由主代理检查注释之外的代码是否保持不变。",
+  },
+  {
     id: "codey_visual_worker",
     name: "视觉实施",
     access: "write",
@@ -83,6 +89,7 @@ const SUBAGENT_TASK_TYPES = [
 
 const WRITABLE_SUBAGENT_ROLE_IDS = [
   "codey_worker",
+  "codey_comments",
   "codey_visual_worker",
 ] as const satisfies ReadonlyArray<SubagentRoleId>;
 

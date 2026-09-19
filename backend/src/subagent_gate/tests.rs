@@ -319,51 +319,56 @@ fn wait_snapshot_never_settles_unreported_ledger_siblings() {
 
 #[test]
 fn disabled_runtime_role_is_rejected_before_spawn_reservation() {
-    let temp = tempfile::tempdir().unwrap();
-    let home = temp.path();
-    let state_root = home.join(STATE_DIRECTORY);
-    let mut roles = crate::config::default_subagent_roles();
-    roles.remove(crate::config::SUBAGENT_ROLE_WORKER);
-    commit_runtime_subagent_policy(home, &roles, &BTreeMap::new()).unwrap();
+    for role in [
+        crate::config::SUBAGENT_ROLE_WORKER,
+        crate::config::SUBAGENT_ROLE_COMMENTS,
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let state_root = home.join(STATE_DIRECTORY);
+        let mut roles = crate::config::default_subagent_roles();
+        roles.remove(role);
+        commit_runtime_subagent_policy(home, &roles, &BTreeMap::new()).unwrap();
 
-    let mut spawn = input("PreToolUse", "disabled-role-session");
-    spawn.turn_id = Some("root-turn-a".to_string());
-    spawn.cwd = Some("/repo".to_string());
-    spawn.tool_name = Some("agents.spawn_agent".to_string());
-    spawn.tool_input = Some(json!({
-        "task_name": "disabled_worker",
-        "agent_type": "codey_worker",
-        "fork_turns": "none",
-        "message": delegation_message(json!({
-            "id": "disabled_worker",
-            "why": "implementation",
-            "visual": false,
-            "root": "/repo",
-            "read": [],
-            "write": ["backend/src"],
-            "checks": [{ "id": "tests", "cmd": "cargo test --lib" }]
-        }))
-    }));
-    let denied = handle_hook_for_runtime_at(&spawn, &state_root, "runtime-a", 20).unwrap();
-    assert_eq!(
-        denied["hookSpecificOutput"]["permissionDecision"].as_str(),
-        Some("deny")
-    );
-    assert!(
-        denied["hookSpecificOutput"]["permissionDecisionReason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("未创建调度账本记录"))
-    );
-    assert_eq!(
-        crate::subagent_orchestrator::active_reservation_count(
-            &state_root,
-            "runtime-a",
-            "disabled-role-session",
-            30,
-        )
-        .unwrap(),
-        None
-    );
+        let mut spawn = input("PreToolUse", "disabled-role-session");
+        spawn.turn_id = Some("root-turn-a".to_string());
+        spawn.cwd = Some("/repo".to_string());
+        spawn.tool_name = Some("agents.spawn_agent".to_string());
+        spawn.tool_input = Some(json!({
+            "task_name": "disabled_worker",
+            "agent_type": role,
+            "fork_turns": "none",
+            "message": delegation_message(json!({
+                "id": "disabled_worker",
+                "why": "implementation",
+                "visual": false,
+                "root": "/repo",
+                "read": [],
+                "write": ["backend/src"],
+                "checks": [{ "id": "tests", "cmd": "cargo test --lib" }]
+            }))
+        }));
+        let denied = handle_hook_for_runtime_at(&spawn, &state_root, "runtime-a", 20).unwrap();
+        assert_eq!(
+            denied["hookSpecificOutput"]["permissionDecision"].as_str(),
+            Some("deny")
+        );
+        assert!(
+            denied["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("未创建调度账本记录"))
+        );
+        assert_eq!(
+            crate::subagent_orchestrator::active_reservation_count(
+                &state_root,
+                "runtime-a",
+                "disabled-role-session",
+                30,
+            )
+            .unwrap(),
+            None
+        );
+    }
 }
 
 #[test]

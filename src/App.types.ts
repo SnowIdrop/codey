@@ -49,6 +49,7 @@ export type SubagentRoleId =
   | "codey_deep_research"
   | "codey_visual_analysis"
   | "codey_worker"
+  | "codey_comments"
   | "codey_visual_worker"
   | "default";
 

@@ -234,6 +234,7 @@ if (import.meta.env.DEV) {
           reasoningEffort: "high",
         },
         codey_worker: { enabled: true, model: "provider-fast-coder", reasoningEffort: "medium" },
+        codey_comments: { enabled: true, model: "provider-fast-coder", reasoningEffort: "medium" },
         codey_visual_worker: { enabled: true, model: "gpt-5.6-sol", reasoningEffort: "high" },
         default: { enabled: true, model: "gpt-5.6-sol", reasoningEffort: "medium" },
       },

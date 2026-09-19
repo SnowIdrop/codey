@@ -2637,6 +2637,49 @@ mod tests {
     }
 
     #[test]
+    fn comments_role_uses_writer_capabilities_and_conflicts_with_other_writers() {
+        for other_role in ["codey_worker", "codey_visual_worker", "codey_comments"] {
+            let temp = tempdir().unwrap();
+            let rules = rules::load(temp.path()).rules;
+            let capsule = prepare_task_capsule(
+                Some(&spawn_input("comments", "codey_comments")),
+                Some("/repo"),
+                &rules,
+            )
+            .unwrap();
+            assert_eq!(
+                capsule.capabilities,
+                ["command.execute", "files.read", "workspace.write"]
+            );
+            assert_eq!(
+                pre_spawn_with_workspace(
+                    temp.path(),
+                    "runtime-a",
+                    "session-a",
+                    Some(&spawn_input("comments", "codey_comments")),
+                    Some("/repo"),
+                    0,
+                    10
+                )
+                .unwrap(),
+                None
+            );
+            let denial = pre_spawn_with_workspace(
+                temp.path(),
+                "runtime-a",
+                "session-b",
+                Some(&spawn_input("other", other_role)),
+                Some("/repo"),
+                1,
+                11,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(denial.contains("资源冲突"), "{other_role}: {denial}");
+        }
+    }
+
+    #[test]
     fn visual_tools_require_a_bound_visual_role() {
         let temp = tempdir().unwrap();
         let root = temp.path();

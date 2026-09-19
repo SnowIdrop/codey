@@ -162,11 +162,12 @@ impl RuleSet {
     }
 
     fn validate_security_baseline(&self) -> Result<()> {
-        const EXPECTED_ROLES: [(&str, RoleAccess, bool); 6] = [
+        const EXPECTED_ROLES: [(&str, RoleAccess, bool); 7] = [
             ("codey_quick_scan", RoleAccess::ReadOnly, false),
             ("codey_deep_research", RoleAccess::ReadOnly, false),
             ("codey_visual_analysis", RoleAccess::ReadOnly, true),
             ("codey_worker", RoleAccess::Write, false),
+            ("codey_comments", RoleAccess::Write, false),
             ("codey_visual_worker", RoleAccess::Write, true),
             ("default", RoleAccess::ReadOnly, false),
         ];
@@ -481,10 +482,43 @@ fn load_file(path: &Path) -> Result<Option<(RuleSet, Vec<u8>)>> {
         }
     };
     anyhow::ensure!(bytes.len() <= 256 * 1024, "子代理规则文件超过 256 KiB");
-    let rules: RuleSet = serde_json::from_slice(&bytes)
+    let mut rules: RuleSet = serde_json::from_slice(&bytes)
         .with_context(|| format!("解析子代理规则失败：{}", path.display()))?;
+    let legacy_roles = [
+        "codey_quick_scan",
+        "codey_deep_research",
+        "codey_visual_analysis",
+        "codey_worker",
+        "codey_visual_worker",
+        "default",
+    ];
+    let legacy = rules.schema_version == RULE_SCHEMA_VERSION
+        && rules.roles.len() == legacy_roles.len()
+        && legacy_roles
+            .iter()
+            .all(|role| rules.roles.contains_key(*role))
+        && !rules
+            .rules
+            .iter()
+            .any(|rule| rule.roles.iter().any(|role| role == "codey_comments"));
+    if legacy {
+        rules
+            .roles
+            .insert("codey_comments".into(), rules.roles["codey_worker"]);
+        for rule in &mut rules.rules {
+            if rule.roles.iter().any(|role| role == "codey_worker") {
+                rule.roles.push("codey_comments".into());
+            }
+        }
+        rules.revision = rules.revision.max(8);
+    }
     rules.validate()?;
     rules.validate_not_weaker_than(embedded())?;
+    let bytes = if legacy {
+        serde_json::to_vec(&rules)?
+    } else {
+        bytes
+    };
     Ok(Some((rules, bytes)))
 }
 
@@ -667,7 +701,7 @@ mod tests {
                 .effect,
             RuleEffect::Allow
         );
-        for role in ["codey_quick_scan", "codey_worker"] {
+        for role in ["codey_quick_scan", "codey_worker", "codey_comments"] {
             assert_eq!(
                 rules
                     .evaluate(&RuleContext {
@@ -793,6 +827,133 @@ mod tests {
         assert_eq!(decision.effect, RuleEffect::Deny);
         assert_eq!(decision.rule_id, "tie-deny");
         assert_eq!(decision.conflicts, ["tie-allow"]);
+    }
+
+    #[test]
+    fn legacy_rules_add_comments_in_memory_without_losing_worker_restrictions() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut legacy = embedded().clone();
+        legacy.roles.remove("codey_comments");
+        legacy.revision = 7;
+        for rule in &mut legacy.rules {
+            rule.roles.retain(|role| role != "codey_comments");
+        }
+        legacy.rules.push(RuleDefinition {
+            id: "user-deny-worker-command".into(),
+            priority: 2000,
+            effect: RuleEffect::Deny,
+            actors: vec![RuleActor::Child],
+            roles: vec!["codey_worker".into()],
+            tools: vec!["exec_command".into()],
+            tool_classes: Vec::new(),
+            explanation: "User restriction".into(),
+        });
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        let path = live_rule_path(temp.path());
+        fs::write(&path, &bytes).unwrap();
+        let loaded = load(temp.path());
+        assert_eq!(loaded.source, RuleSource::Live);
+        assert!(loaded.warning.is_none());
+        assert_eq!(
+            loaded.rules.roles["codey_comments"],
+            loaded.rules.roles["codey_worker"]
+        );
+        for role in ["codey_worker", "codey_comments"] {
+            assert_eq!(
+                loaded
+                    .rules
+                    .evaluate(&RuleContext {
+                        actor: RuleActor::Child,
+                        role: Some(role),
+                        tool_name: "exec_command",
+                        tool_class: ToolClass::Command,
+                    })
+                    .effect,
+                RuleEffect::Deny
+            );
+            assert_eq!(
+                loaded
+                    .rules
+                    .evaluate(&RuleContext {
+                        actor: RuleActor::Child,
+                        role: Some(role),
+                        tool_name: "apply_patch",
+                        tool_class: ToolClass::Write,
+                    })
+                    .effect,
+                RuleEffect::Allow
+            );
+        }
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let last_good = fs::read(temp.path().join(LAST_GOOD_RULE_FILE)).unwrap();
+        load(temp.path());
+        assert_eq!(
+            fs::read(temp.path().join(LAST_GOOD_RULE_FILE)).unwrap(),
+            last_good
+        );
+        fs::write(&path, b"invalid").unwrap();
+        let fallback = load(temp.path());
+        assert_eq!(fallback.source, RuleSource::LastKnownGood);
+        assert_eq!(
+            fallback
+                .rules
+                .evaluate(&RuleContext {
+                    actor: RuleActor::Child,
+                    role: Some("codey_comments"),
+                    tool_name: "exec_command",
+                    tool_class: ToolClass::Command,
+                })
+                .effect,
+            RuleEffect::Deny
+        );
+
+        fs::write(temp.path().join(LAST_GOOD_RULE_FILE), &bytes).unwrap();
+        let old_fallback = load(temp.path());
+        assert_eq!(old_fallback.source, RuleSource::LastKnownGood);
+        assert!(old_fallback.rules.roles.contains_key("codey_comments"));
+    }
+
+    #[test]
+    fn explicit_comments_rules_remain_independent_and_invalid_legacy_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut rules = embedded().clone();
+        rules.rules.push(RuleDefinition {
+            id: "user-deny-comments-write".into(),
+            priority: 2000,
+            effect: RuleEffect::Deny,
+            actors: vec![RuleActor::Child],
+            roles: vec!["codey_comments".into()],
+            tools: vec!["apply_patch".into()],
+            tool_classes: Vec::new(),
+            explanation: "User restriction".into(),
+        });
+        let path = live_rule_path(temp.path());
+        fs::write(&path, serde_json::to_vec(&rules).unwrap()).unwrap();
+        let loaded = load_file(&path).unwrap().unwrap().0;
+        for (role, expected) in [
+            ("codey_comments", RuleEffect::Deny),
+            ("codey_worker", RuleEffect::Allow),
+        ] {
+            assert_eq!(
+                loaded
+                    .evaluate(&RuleContext {
+                        actor: RuleActor::Child,
+                        role: Some(role),
+                        tool_name: "apply_patch",
+                        tool_class: ToolClass::Write,
+                    })
+                    .effect,
+                expected
+            );
+        }
+        let mut legacy = embedded().clone();
+        legacy.roles.remove("codey_comments");
+        for rule in &mut legacy.rules {
+            rule.roles.retain(|role| role != "codey_comments");
+        }
+        legacy.roles.get_mut("codey_quick_scan").unwrap().access = RoleAccess::Write;
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(load_file(&path).is_err());
     }
 
     #[test]

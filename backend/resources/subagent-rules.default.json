@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "revision": 7,
+  "revision": 8,
   "conflictResolution": "highest_priority_deny_wins",
   "fallback": "deny",
   "roles": {
@@ -8,6 +8,7 @@
     "codey_deep_research": { "access": "read_only", "visual": false },
     "codey_visual_analysis": { "access": "read_only", "visual": true },
     "codey_worker": { "access": "write", "visual": false },
+    "codey_comments": { "access": "write", "visual": false },
     "codey_visual_worker": { "access": "write", "visual": true },
     "default": { "access": "read_only", "visual": false }
   },
@@ -68,7 +69,7 @@
       "priority": 800,
       "effect": "allow",
       "actors": ["child"],
-      "roles": ["codey_worker", "codey_visual_worker"],
+      "roles": ["codey_worker", "codey_comments", "codey_visual_worker"],
       "toolClasses": ["read", "write", "command", "network", "collaboration"],
       "explanation": "写入角色可使用声明范围内的读写、网络读取与受沙箱约束的命令能力。"
     },

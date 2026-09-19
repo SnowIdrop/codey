@@ -14,15 +14,17 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, Value, value};
 
 use crate::codex_config_guidance::{
-    CODEY_FASTCTX_GUIDANCE, NO_WRITABLE_SUBAGENT_GUIDANCE, READ_ONLY_AGENT_WRITE_GUARD,
-    ROOT_AGENT_COLLABORATION_USAGE_HINT, ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS,
-    ROOT_AGENT_MULTI_AGENT_MODE_HINT, SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS,
-    SUBAGENT_TASK_BOUNDARY_GUARD, append_root_agent_collaboration_usage_hint,
-    remove_codey_fastctx_guidance, remove_subagent_guidance, subagent_source_config,
+    CODEY_FASTCTX_GUIDANCE, COMMENTS_ROLE_USAGE_HINT, NO_WRITABLE_SUBAGENT_GUIDANCE,
+    READ_ONLY_AGENT_WRITE_GUARD, ROOT_AGENT_COLLABORATION_USAGE_HINT,
+    ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS, ROOT_AGENT_MULTI_AGENT_MODE_HINT,
+    SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS, SUBAGENT_TASK_BOUNDARY_GUARD,
+    append_root_agent_collaboration_usage_hint, remove_codey_fastctx_guidance,
+    remove_subagent_guidance, subagent_source_config,
 };
 use crate::config::{
-    CodeyConfig, SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS,
-    SUBAGENT_ROLE_VISUAL_WORKER, SUBAGENT_ROLE_WORKER, SubagentRoleConfig, default_config_path,
+    CodeyConfig, SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_COMMENTS, SUBAGENT_ROLE_DEFAULT,
+    SUBAGENT_ROLE_IDS, SUBAGENT_ROLE_VISUAL_WORKER, SUBAGENT_ROLE_WORKER, SubagentRoleConfig,
+    default_config_path,
 };
 #[cfg(test)]
 use crate::config::{DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT};
@@ -691,7 +693,15 @@ fn runtime_subagent_roles(
         .into_iter()
         .filter_map(|role| {
             let selection = configured
-                .and_then(|roles| roles.get(role))
+                .and_then(|roles| {
+                    roles.get(role).or_else(|| {
+                        if role == SUBAGENT_ROLE_COMMENTS {
+                            roles.get(SUBAGENT_ROLE_WORKER)
+                        } else {
+                            None
+                        }
+                    })
+                })
                 .cloned()
                 .unwrap_or_else(|| fallback.clone());
             selection.enabled.then(|| (role.to_string(), selection))
@@ -703,10 +713,15 @@ fn runtime_root_instructions_for_roles(
     root_instructions: &str,
     roles: &BTreeMap<String, SubagentRoleConfig>,
 ) -> String {
-    let has_writable_role =
-        roles.contains_key(SUBAGENT_ROLE_WORKER) || roles.contains_key(SUBAGENT_ROLE_VISUAL_WORKER);
+    let has_writable_role = roles.contains_key(SUBAGENT_ROLE_WORKER)
+        || roles.contains_key(SUBAGENT_ROLE_COMMENTS)
+        || roles.contains_key(SUBAGENT_ROLE_VISUAL_WORKER);
     if has_writable_role {
-        root_instructions.to_string()
+        if roles.contains_key(SUBAGENT_ROLE_COMMENTS) {
+            append_constraint_text(root_instructions, COMMENTS_ROLE_USAGE_HINT)
+        } else {
+            root_instructions.to_string()
+        }
     } else {
         append_constraint_text(root_instructions, NO_WRITABLE_SUBAGENT_GUIDANCE)
     }
@@ -843,7 +858,10 @@ fn render_runtime_agent(
             "developer_instructions",
         )?;
     }
-    if !matches!(role, SUBAGENT_ROLE_WORKER | SUBAGENT_ROLE_VISUAL_WORKER) {
+    if !matches!(
+        role,
+        SUBAGENT_ROLE_WORKER | SUBAGENT_ROLE_COMMENTS | SUBAGENT_ROLE_VISUAL_WORKER
+    ) {
         append_table_constraint_text(
             document.as_table_mut(),
             "developer_instructions",
