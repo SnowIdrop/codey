@@ -263,6 +263,19 @@ fn gemini_legacy_baseline_matches_verified_cli_01533_fingerprint() {
     );
 }
 
+#[test]
+fn gemini_gpt6_baseline_matches_verified_cli_0155_fingerprint() {
+    let normalized = GPT6_BASE_INSTRUCTIONS.replace("\r\n", "\n");
+    assert_eq!(
+        crate::fs_util::sha256_hex(normalized.trim().as_bytes()),
+        "be213cc3a9566255f6d43f61c54cbc33cafbc3461680ad6513afa0850050c7d6"
+    );
+    assert_ne!(
+        normalized.trim(),
+        LEGACY_BASE_INSTRUCTIONS.replace("\r\n", "\n").trim()
+    );
+}
+
 fn gemini_config(base_url: String, protocol: &str) -> (CodeyConfig, String) {
     let (mut config, provider, _) = router_config(base_url);
     config.profiles[0].upstream_protocol = protocol.into();
@@ -275,8 +288,12 @@ fn gemini_config(base_url: String, protocol: &str) -> (CodeyConfig, String) {
 }
 
 fn payload(model: &str) -> Value {
+    payload_with(model, LEGACY_BASE_INSTRUCTIONS)
+}
+
+fn payload_with(model: &str, instructions: &str) -> Value {
     json!({
-        "model":model, "instructions":LEGACY_BASE_INSTRUCTIONS,
+        "model":model, "instructions":instructions,
         "input":[
             {"role":"developer","content":"ROLE_SENTINEL: read-only; preserve Codex and GPT-5 words"},
             {"role":"user","content":"TASK_SENTINEL: keep strings and docstrings unchanged"}
@@ -288,26 +305,28 @@ fn payload(model: &str) -> Value {
 
 #[test]
 fn gemini_exact_templates_and_scope() {
-    for name in ["gemini", "GEMINI-3.8", "route/vendor/gemini-3.8-flash-high"] {
-        let mut body = payload(name);
-        let before = body.clone();
-        assert_eq!(
-            adapt_gemini_base_instructions(&mut body, name, false).unwrap(),
-            Some(true)
-        );
-        assert_eq!(
-            body["instructions"],
-            GEMINI_BASE_INSTRUCTIONS.replace("\r\n", "\n").trim()
-        );
-        for key in ["input", "tools", "reasoning", "model"] {
-            assert_eq!(body[key], before[key]);
+    for template in [LEGACY_BASE_INSTRUCTIONS, GPT6_BASE_INSTRUCTIONS] {
+        for name in ["gemini", "GEMINI-3.8", "route/vendor/gemini-3.8-flash-high"] {
+            let mut body = payload_with(name, template);
+            let before = body.clone();
+            assert_eq!(
+                adapt_gemini_base_instructions(&mut body, name, false).unwrap(),
+                Some(true)
+            );
+            assert_eq!(
+                body["instructions"],
+                GEMINI_BASE_INSTRUCTIONS.replace("\r\n", "\n").trim()
+            );
+            for key in ["input", "tools", "reasoning", "model"] {
+                assert_eq!(body[key], before[key]);
+            }
+            let adapted = body.clone();
+            assert_eq!(
+                adapt_gemini_base_instructions(&mut body, name, false).unwrap(),
+                Some(false)
+            );
+            assert_eq!(body, adapted);
         }
-        let adapted = body.clone();
-        assert_eq!(
-            adapt_gemini_base_instructions(&mut body, name, false).unwrap(),
-            Some(false)
-        );
-        assert_eq!(body, adapted);
     }
     for (name, official) in [
         ("gpt-5.6-terra", false),
@@ -327,7 +346,11 @@ fn gemini_exact_templates_and_scope() {
 
 #[test]
 fn gemini_line_endings_and_whitespace_only_are_normalized() {
-    for template in [LEGACY_BASE_INSTRUCTIONS, GEMINI_BASE_INSTRUCTIONS] {
+    for template in [
+        LEGACY_BASE_INSTRUCTIONS,
+        GPT6_BASE_INSTRUCTIONS,
+        GEMINI_BASE_INSTRUCTIONS,
+    ] {
         for text in [
             template.replace("\r\n", "\n"),
             template.replace("\r\n", "\n").replace('\n', "\r\n"),
@@ -348,8 +371,18 @@ fn gemini_unknown_or_input_only_instructions_are_rejected_without_mutation() {
         json!("You are Codex, a custom agent"),
         json!(format!("{LEGACY_BASE_INSTRUCTIONS}\nCUSTOM")),
         json!(format!("CUSTOM\n{LEGACY_BASE_INSTRUCTIONS}")),
+        json!(format!("{GPT6_BASE_INSTRUCTIONS}CUSTOM")),
+        json!(format!("{GPT6_BASE_INSTRUCTIONS}\nCUSTOM")),
+        json!(format!("CUSTOM\n{GPT6_BASE_INSTRUCTIONS}")),
     ] {
         let mut body = json!({"instructions":value,"input":[{"role":"developer","content":LEGACY_BASE_INSTRUCTIONS}]});
+        let before = body.clone();
+        assert!(adapt_gemini_base_instructions(&mut body, MODEL, false).is_err());
+        assert_eq!(body, before);
+    }
+    for embedded in [LEGACY_BASE_INSTRUCTIONS, GPT6_BASE_INSTRUCTIONS] {
+        let mut body =
+            json!({"instructions":"custom","input":[{"role":"developer","content":embedded}]});
         let before = body.clone();
         assert!(adapt_gemini_base_instructions(&mut body, MODEL, false).is_err());
         assert_eq!(body, before);
@@ -518,37 +551,43 @@ async fn gemini_routes_adapt_before_all_bridges_for_http_and_websocket() {
 
 #[tokio::test]
 async fn gemini_unknown_instructions_never_connect_to_upstream() {
-    for websocket in [false, true] {
-        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let (config, provider) = gemini_config(
-            format!("http://{}/v1", upstream.local_addr().unwrap()),
-            UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
-        );
-        let router = LocalRouter::start(&config).await.unwrap();
-        let mut body = payload(&model_id::model_alias(&provider, MODEL));
-        body["instructions"] = json!("custom instructions");
-        let response = if websocket {
-            send_test_request(&router.endpoint(), &body, true).await
-        } else {
-            let endpoint = router.endpoint();
-            let response = reqwest::Client::new()
-                .post(format!("{}/responses", endpoint.base_url))
-                .bearer_auth(&endpoint.token)
-                .json(&body)
-                .timeout(Duration::from_secs(10))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
-            response.text().await.unwrap()
-        };
-        assert!(response.contains(GEMINI_INSTRUCTIONS_ERROR), "{response}");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), upstream.accept())
-                .await
-                .is_err()
-        );
-        router.stop().await.unwrap();
+    for instructions in [
+        "custom instructions".to_string(),
+        format!("{GPT6_BASE_INSTRUCTIONS}CUSTOM"),
+        format!("CUSTOM\n{LEGACY_BASE_INSTRUCTIONS}"),
+    ] {
+        for websocket in [false, true] {
+            let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let (config, provider) = gemini_config(
+                format!("http://{}/v1", upstream.local_addr().unwrap()),
+                UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+            );
+            let router = LocalRouter::start(&config).await.unwrap();
+            let mut body = payload(&model_id::model_alias(&provider, MODEL));
+            body["instructions"] = json!(instructions);
+            let response = if websocket {
+                send_test_request(&router.endpoint(), &body, true).await
+            } else {
+                let endpoint = router.endpoint();
+                let response = reqwest::Client::new()
+                    .post(format!("{}/responses", endpoint.base_url))
+                    .bearer_auth(&endpoint.token)
+                    .json(&body)
+                    .timeout(Duration::from_secs(10))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+                response.text().await.unwrap()
+            };
+            assert!(response.contains(GEMINI_INSTRUCTIONS_ERROR), "{response}");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), upstream.accept())
+                    .await
+                    .is_err()
+            );
+            router.stop().await.unwrap();
+        }
     }
 }
 
@@ -678,8 +717,31 @@ async fn gemini_upstream_websocket_fallback_retains_adaptation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires explicit CODEY_GEMINI_PROBE_CLI and CODEY_GEMINI_PROBE_CATALOG; loopback model traffic only"]
+#[ignore = "requires native CLI, captured catalog and built Codey gate paths; loopback model traffic only"]
 async fn gemini_native_cli_child_through_actual_router() {
+    for (baseline, role, rejected) in [
+        ("legacy", json!({"agent_type":"codey_comments"}), false),
+        ("gpt6", json!({"agent_type":"codey_comments"}), false),
+        ("gpt6", json!({"agent_type":"default"}), true),
+        ("gpt6", json!({"agent_type":"explorer"}), true),
+        ("gpt6", json!({"agent_type":"worker"}), true),
+        ("gpt6", json!({"agent_type":"ds-flash"}), true),
+        ("gpt6", json!({"agent_type":"ds-pro"}), true),
+        ("gpt6", json!({"agent_type":"codey_worker"}), true),
+        ("gpt6", json!({}), true),
+        ("gpt6", json!({"agent_type":""}), true),
+        ("gpt6", json!({"agent_type":null}), true),
+        (
+            "gpt6",
+            json!({"agent_type":"codey_comments","agentRole":"explorer"}),
+            true,
+        ),
+    ] {
+        run_native_role_probe(baseline, role, rejected).await;
+    }
+}
+
+async fn run_native_role_probe(baseline: &str, role_input: Value, rejected: bool) {
     let cli = std::env::var_os("CODEY_GEMINI_PROBE_CLI").expect("set native CLI path");
     let catalog =
         std::env::var_os("CODEY_GEMINI_PROBE_CATALOG").expect("set captured catalog path");
@@ -696,6 +758,16 @@ async fn gemini_native_cli_child_through_actual_router() {
         .env("CODEY_GEMINI_PROBE_ROOT", &root)
         .env("CODEY_GEMINI_PROBE_CLI", cli)
         .env("CODEY_GEMINI_PROBE_CATALOG", catalog)
+        .env(
+            "CODEY_GEMINI_PROBE_GATE",
+            std::env::var_os("CODEY_GEMINI_PROBE_GATE").expect("set built Codey path"),
+        )
+        .env("CODEY_GEMINI_PROBE_BASELINE", baseline)
+        .env("CODEY_GEMINI_PROBE_ROLE_INPUT", role_input.to_string())
+        .env(
+            "CODEY_GEMINI_PROBE_REJECTED",
+            if rejected { "1" } else { "0" },
+        )
         .kill_on_drop(true);
     #[cfg(windows)]
     command.creation_flags(0x08000000);
@@ -717,17 +789,28 @@ async fn gemini_native_cli_child_through_actual_router() {
     let upstream: Value = serde_json::from_slice(&std::fs::read(upstream_path).unwrap()).unwrap();
     let mut profiles = Vec::new();
     let mut selected = BTreeMap::new();
+    let (child_role, child_model, child_effort, child_protocol) = if baseline == "deepseek" {
+        (
+            "codey_worker",
+            "deepseek-flash",
+            "max",
+            UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
+        )
+    } else {
+        (
+            "codey_comments",
+            MODEL,
+            "high",
+            UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+        )
+    };
     for (id, model, protocol) in [
         (
             "route-parent",
             "gpt-5.6-terra",
             UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
         ),
-        (
-            "route-child",
-            MODEL,
-            UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
-        ),
+        ("route-child", child_model, child_protocol),
     ] {
         let mut profile = ProviderProfile::new("Loopback probe");
         profile.id = id.into();
@@ -739,19 +822,36 @@ async fn gemini_native_cli_child_through_actual_router() {
         selected.insert(profile.provider_id().to_string(), vec![model.into()]);
         profiles.push(profile);
     }
+    let mut roles = crate::config::default_subagent_roles();
+    for (role, selection) in &mut roles {
+        selection.enabled = role == child_role;
+        selection.model = format!("route-child/{child_model}");
+        selection.reasoning_effort = child_effort.into();
+    }
     let config = CodeyConfig {
         active_profile_id: "route-parent".into(),
         profiles,
         selected_models_by_provider: selected,
+        subagent_optimization: true,
+        subagent_plaintext_messages: true,
+        subagent_roles: roles,
         ..CodeyConfig::default()
     }
     .normalize();
+    crate::subagent_gate::commit_runtime_subagent_policy(
+        &root.join("home"),
+        &config.subagent_roles,
+        &BTreeMap::new(),
+    )
+    .unwrap();
     let router = LocalRouter::start(&config).await.unwrap();
     let endpoint = router.endpoint();
     let handshake = root.join("router.pending.json");
     std::fs::write(
         &handshake,
-        serde_json::to_vec(&json!({"base_url":endpoint.base_url,"token":endpoint.token})).unwrap(),
+        serde_json::to_vec(&json!({"base_url":endpoint.base_url,"token":endpoint.token,
+            "role_hint":crate::codex_config_guidance::ROOT_AGENT_MULTI_AGENT_MODE_HINT}))
+        .unwrap(),
     )
     .unwrap();
     std::fs::rename(handshake, root.join("router.json")).unwrap();
@@ -764,8 +864,18 @@ async fn gemini_native_cli_child_through_actual_router() {
     let summary: Value =
         serde_json::from_slice(&std::fs::read(root.join("summary.json")).unwrap()).unwrap();
     assert!(status.success(), "{summary}");
+    for key in ["hookSawSpawn", "roleSchemaRestricted", "hintComplete"] {
+        assert_eq!(summary[key], true, "{summary}");
+    }
+    if rejected {
+        assert_eq!(summary["roleRejected"], true, "{summary}");
+        assert_eq!(summary["noChildCreated"], true, "{summary}");
+        assert_eq!(summary["childRequestCount"], 0, "{summary}");
+        return;
+    }
     for key in [
-        "childPersistedLegacyBase",
+        "childPersistedKnownBase",
+        "childRuntimeMatches",
         "chatPathCorrect",
         "baseMatches",
         "rolePreserved",
@@ -775,4 +885,10 @@ async fn gemini_native_cli_child_through_actual_router() {
     ] {
         assert_eq!(summary[key], true, "{summary}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires native CLI, captured catalog and built Codey gate paths; loopback model traffic only"]
+async fn deepseek_native_cli_preserves_max_reasoning() {
+    run_native_role_probe("deepseek", json!({"agent_type":"codey_worker"}), false).await;
 }

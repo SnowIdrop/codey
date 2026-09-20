@@ -1083,9 +1083,10 @@ fn pre_tool_use_output(
                 "CODEY_SUBAGENT_PROTOCOL_CIRCUIT_OPEN: {reason}。协议状态尚未恢复，已停止继续派生；请先调用不带筛选的 agents.list_agents 对账。"
             )));
         }
-        let role = requested_spawn_role(input.tool_input.as_ref())
-            .unwrap_or(crate::config::SUBAGENT_ROLE_DEFAULT);
-        if let Some(reason) = runtime_role_admission_denial(state_root, role)? {
+        if let Some(reason) = runtime_role_admission_denial(
+            state_root,
+            requested_spawn_role(input.tool_input.as_ref()),
+        )? {
             return Ok(pre_tool_reason_denial(&reason));
         }
         let process_cwd = std::env::current_dir()
@@ -1131,16 +1132,21 @@ fn pre_tool_use_output(
 
 fn requested_spawn_role(tool_input: Option<&Value>) -> Option<&str> {
     let input = tool_input?.as_object()?;
-    let mut roles = ["agent_type", "agentType", "agent_role", "agentRole"]
+    let role = input.get("agent_type")?.as_str()?.trim();
+    if role.is_empty() {
+        return None;
+    }
+    ["agentType", "agent_role", "agentRole"]
         .into_iter()
-        .filter_map(|key| input.get(key).and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|role| !role.is_empty());
-    let role = roles.next()?;
-    roles.all(|candidate| candidate == role).then_some(role)
+        .all(|key| {
+            input
+                .get(key)
+                .is_none_or(|value| value.as_str().map(str::trim) == Some(role))
+        })
+        .then_some(role)
 }
 
-fn runtime_role_admission_denial(state_root: &Path, role: &str) -> Result<Option<String>> {
+fn runtime_role_admission_denial(state_root: &Path, role: Option<&str>) -> Result<Option<String>> {
     let pending_path = state_root.join(RUNTIME_SUBAGENT_POLICY_PENDING_FILE);
     if read_optional_runtime_policy_file(&pending_path)?.is_some() {
         return Ok(Some(
@@ -1166,15 +1172,28 @@ fn runtime_role_admission_denial(state_root: &Path, role: &str) -> Result<Option
             )));
         }
     };
-    if policy.roles.contains_key(role) {
+    let allowed = crate::subagent_policy::enabled_specialized_roles(&policy.roles);
+    let available = if allowed.is_empty() {
+        "无；请由主代理处理".to_string()
+    } else {
+        allowed.join(", ")
+    };
+    let Some(role) = role else {
+        return Ok(Some(format!(
+            "CODEY_SUBAGENT_ROLE_REQUIRED: 必须显式提供非空字符串 agent_type，角色别名字段不得冲突。可用角色：{available}。未创建调度账本记录。"
+        )));
+    };
+    if allowed.iter().any(|allowed_role| allowed_role == role) {
         Ok(None)
-    } else if crate::config::SUBAGENT_ROLE_IDS.contains(&role) {
+    } else if role != crate::config::SUBAGENT_ROLE_DEFAULT
+        && crate::config::SUBAGENT_ROLE_IDS.contains(&role)
+    {
         Ok(Some(format!(
-            "CODEY_SUBAGENT_ROLE_DISABLED: Codey 子代理角色 `{role}` 已关闭；请在设置中开启后重试，或改用已启用角色。未创建调度账本记录。"
+            "CODEY_SUBAGENT_ROLE_DISABLED: Codey 子代理角色 `{role}` 已关闭。可用角色：{available}。未创建调度账本记录。"
         )))
     } else {
         Ok(Some(format!(
-            "CODEY_SUBAGENT_ROLE_UNKNOWN: Codey 子代理角色 `{role}` 不在当前运行时可用角色集合中；未创建调度账本记录。"
+            "CODEY_SUBAGENT_ROLE_NOT_ALLOWED: 子代理增强只允许已启用的 Codey 专用角色，禁止 `{role}`。可用角色：{available}。未创建调度账本记录。"
         )))
     }
 }

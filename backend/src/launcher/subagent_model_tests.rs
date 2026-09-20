@@ -518,3 +518,211 @@ async fn subagent_catalog_fallback_keeps_live_routes_and_roles_until_restart() {
     assert_eq!(target(), "route-a");
     runtime.local_router.as_ref().unwrap().stop().await.unwrap();
 }
+
+fn declared_efforts(values: &[&str]) -> Vec<crate::config::ModelReasoningEffort> {
+    values
+        .iter()
+        .map(|value| crate::config::ModelReasoningEffort {
+            level: (*value).to_string(),
+            value: (*value).to_string(),
+        })
+        .collect()
+}
+
+fn relay_profile(id: &str) -> ProviderProfile {
+    let mut profile = ProviderProfile::new(id);
+    profile.id = id.to_string();
+    profile.base_url = format!("https://{id}.example/v1");
+    profile
+}
+
+fn write_launch_official_cache(home: &std::path::Path) {
+    // 生成目录需要一个带指令的模板；选择状态匹配的仍是线路声明的原始模型名。
+    std::fs::write(
+        home.join("models_cache.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "models": [{
+                "slug": "gpt-6-astra",
+                "display_name": "GPT-6 Astra",
+                "description": "Test model",
+                "visibility": "list",
+                "priority": 1,
+                "base_instructions": "Test instructions"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+/// 两条线路提供同名原始模型 "vendor/model"，但声明的思考等级不同。
+fn declared_reasoning_scope_config() -> CodeyConfig {
+    let route_a = relay_profile("route-a");
+    let route_b = relay_profile("route-b");
+    CodeyConfig {
+        active_profile_id: route_a.id.clone(),
+        profiles: vec![route_a, route_b],
+        local_router_enabled: true,
+        subagent_optimization: true,
+        selected_models_by_provider: std::collections::BTreeMap::from([
+            (
+                "route-a".into(),
+                vec!["vendor/model".to_string(), "limited/model".to_string()],
+            ),
+            ("route-b".into(), vec!["vendor/model".to_string()]),
+        ]),
+        upstream_models_by_provider: std::collections::BTreeMap::from([
+            (
+                "route-a".into(),
+                vec!["vendor/model".to_string(), "limited/model".to_string()],
+            ),
+            ("route-b".into(), vec!["vendor/model".to_string()]),
+        ]),
+        model_reasoning_efforts_by_provider: std::collections::BTreeMap::from([
+            (
+                "route-a".into(),
+                std::collections::BTreeMap::from([
+                    (
+                        "vendor/model".into(),
+                        declared_efforts(&["low", "medium", "high", "xhigh", "max"]),
+                    ),
+                    ("limited/model".into(), declared_efforts(&["low", "medium"])),
+                ]),
+            ),
+            (
+                "route-b".into(),
+                std::collections::BTreeMap::from([(
+                    "vendor/model".into(),
+                    declared_efforts(&["low"]),
+                )]),
+            ),
+        ]),
+        subagent_model: "route-a/vendor/model".into(),
+        subagent_reasoning_effort: "max".into(),
+        subagent_roles: crate::config::uniform_subagent_roles("route-a/vendor/model", "max"),
+        ..CodeyConfig::default()
+    }
+}
+
+#[tokio::test]
+async fn startup_route_declarations_keep_max_and_keep_unsupported_fallbacks() {
+    let home = tempfile::tempdir().unwrap();
+    write_launch_official_cache(home.path());
+    let mut config = declared_reasoning_scope_config();
+    config
+        .subagent_roles
+        .get_mut(crate::config::SUBAGENT_ROLE_QUICK_SCAN)
+        .unwrap()
+        .model = "route-a/limited/model".into();
+    let saved = config.clone();
+
+    let profile = config.active_profile().unwrap();
+    let codex_app_path = std::path::Path::new("");
+    let startup = prepare_startup_model_catalog(&config, &profile, home.path(), codex_app_path)
+        .await
+        .unwrap();
+    let mut runtime = config.clone();
+    runtime.active_profile_id = profile.id;
+    subagent_policy::reconcile_with_model_state(&mut runtime, Some(&startup.model_state));
+
+    assert_eq!(
+        startup
+            .model_state
+            .third_party_model_metadata
+            .iter()
+            .find(|model| model.slug == "vendor/model")
+            .unwrap()
+            .supported_reasoning_efforts,
+        ["low", "medium", "high", "xhigh", "max"]
+    );
+    // 生成目录时使用的带线路前缀声明仍必须保留 max。
+    let generated: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(home.path().join(model_catalog::relative_path())).unwrap(),
+    )
+    .unwrap();
+    let generated_declaration = generated["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["slug"] == "route-a/vendor/model")
+        .unwrap();
+    assert!(
+        generated_declaration["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|level| level["effort"] == "max")
+    );
+    // 声明的 max 必须活到运行角色，而不是退回目录模板的默认深度。
+    assert_eq!(
+        runtime.subagent_roles[crate::config::SUBAGENT_ROLE_WORKER].reasoning_effort,
+        "max"
+    );
+    // 真的不支持 max 的模型仍走既有回退。
+    assert_eq!(
+        runtime.subagent_roles[crate::config::SUBAGENT_ROLE_QUICK_SCAN].reasoning_effort,
+        crate::config::DEFAULT_SUBAGENT_REASONING_EFFORT
+    );
+    assert_eq!(config, saved);
+}
+
+#[tokio::test]
+async fn startup_route_declarations_are_scoped_to_the_current_provider() {
+    let home = tempfile::tempdir().unwrap();
+    write_launch_official_cache(home.path());
+    let config = declared_reasoning_scope_config();
+    let saved = config.clone();
+
+    let profile = config.active_profile().unwrap();
+    let codex_app_path = std::path::Path::new("");
+    let startup = prepare_startup_model_catalog(&config, &profile, home.path(), codex_app_path)
+        .await
+        .unwrap();
+    let mut route_a_runtime = config.clone();
+    route_a_runtime.active_profile_id = profile.id;
+    subagent_policy::reconcile_with_model_state(&mut route_a_runtime, Some(&startup.model_state));
+    assert_eq!(
+        route_a_runtime.subagent_roles[crate::config::SUBAGENT_ROLE_WORKER].reasoning_effort,
+        "max"
+    );
+    assert!(
+        startup
+            .model_state
+            .third_party_model_metadata
+            .iter()
+            .find(|model| model.slug == "vendor/model")
+            .unwrap()
+            .supported_reasoning_efforts
+            .iter()
+            .any(|effort| effort == "max")
+    );
+
+    // 切到提供同名模型的另一条线路后，只能应用它自己的声明。
+    let mut route_b = config.clone();
+    route_b.active_profile_id = "route-b".into();
+    route_b.subagent_model = "route-b/vendor/model".into();
+    route_b.subagent_roles = crate::config::uniform_subagent_roles("route-b/vendor/model", "max");
+    let profile = route_b.active_profile().unwrap();
+    let startup = prepare_startup_model_catalog(&route_b, &profile, home.path(), codex_app_path)
+        .await
+        .unwrap();
+    let mut route_b_runtime = route_b.clone();
+    route_b_runtime.active_profile_id = profile.id;
+    subagent_policy::reconcile_with_model_state(&mut route_b_runtime, Some(&startup.model_state));
+
+    assert_eq!(
+        startup
+            .model_state
+            .third_party_model_metadata
+            .iter()
+            .find(|model| model.slug == "vendor/model")
+            .unwrap()
+            .supported_reasoning_efforts,
+        ["low"]
+    );
+    assert_eq!(
+        route_b_runtime.subagent_roles[crate::config::SUBAGENT_ROLE_WORKER].reasoning_effort,
+        "low"
+    );
+    assert_eq!(config, saved);
+}

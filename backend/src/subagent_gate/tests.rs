@@ -321,6 +321,88 @@ fn wait_snapshot_never_settles_unreported_ledger_siblings() {
 }
 
 #[test]
+fn specialized_spawn_policy_rejects_invalid_roles_without_reserving_work() {
+    let cases = [
+        (json!({}), "ROLE_REQUIRED"),
+        (json!({"agent_type":null}), "ROLE_REQUIRED"),
+        (json!({"agent_type":42}), "ROLE_REQUIRED"),
+        (json!({"agent_type":" "}), "ROLE_REQUIRED"),
+        (
+            json!({"agent_type":"codey_quick_scan","agentRole":"explorer"}),
+            "ROLE_REQUIRED",
+        ),
+        (
+            json!({"agent_type":"codey_quick_scan","agentRole":null}),
+            "ROLE_REQUIRED",
+        ),
+        (json!({"agentType":"codey_quick_scan"}), "ROLE_REQUIRED"),
+        (json!({"agent_type":"default"}), "ROLE_NOT_ALLOWED"),
+        (json!({"agent_type":"explorer"}), "ROLE_NOT_ALLOWED"),
+        (json!({"agent_type":"worker"}), "ROLE_NOT_ALLOWED"),
+        (json!({"agent_type":"ds-flash"}), "ROLE_NOT_ALLOWED"),
+        (json!({"agent_type":"ds-pro"}), "ROLE_NOT_ALLOWED"),
+    ];
+    for (role_input, expected) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(STATE_DIRECTORY);
+        write_test_runtime_policy(&root);
+        let mut spawn = input("PreToolUse", "role-policy");
+        spawn.turn_id = Some("turn-a".into());
+        spawn.tool_name = Some("agents.spawn_agent".into());
+        spawn.tool_input = Some(role_input.clone());
+        let result = handle_hook_for_runtime_at(&spawn, &root, "runtime-a", 10).unwrap();
+        assert_eq!(
+            result["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{role_input}"
+        );
+        let reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap();
+        assert!(reason.contains(expected), "{reason}");
+        assert!(reason.contains("codey_quick_scan"), "{reason}");
+        assert_eq!(
+            crate::subagent_orchestrator::active_reservation_count(
+                &root,
+                "runtime-a",
+                "role-policy",
+                20,
+            )
+            .unwrap(),
+            None
+        );
+    }
+}
+
+#[test]
+fn specialized_spawn_policy_accepts_only_enabled_specialized_roles() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join(STATE_DIRECTORY);
+    let mut roles = crate::config::default_subagent_roles();
+    roles
+        .get_mut(crate::config::SUBAGENT_ROLE_WORKER)
+        .unwrap()
+        .enabled = false;
+    commit_runtime_subagent_policy(temp.path(), &roles, &BTreeMap::new()).unwrap();
+    assert!(
+        runtime_role_admission_denial(&root, Some("codey_quick_scan"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        runtime_role_admission_denial(&root, Some("codey_worker"))
+            .unwrap()
+            .unwrap()
+            .contains("ROLE_DISABLED")
+    );
+    assert!(
+        runtime_role_admission_denial(&root, Some("default"))
+            .unwrap()
+            .unwrap()
+            .contains("ROLE_NOT_ALLOWED")
+    );
+}
+
+#[test]
 fn disabled_runtime_role_is_rejected_before_spawn_reservation() {
     for role in [
         crate::config::SUBAGENT_ROLE_WORKER,

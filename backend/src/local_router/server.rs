@@ -603,6 +603,7 @@ impl RouteBindings {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RouterSnapshot {
     pub(crate) subagent_plaintext_messages: bool,
+    pub(crate) specialized_agent_roles: Option<Vec<String>>,
     pub(crate) routes: HashMap<String, Arc<RouteTarget>>,
     pub(crate) aliases: HashMap<String, AliasTarget>,
     pub(crate) raw_models: HashMap<String, Vec<AliasTarget>>,
@@ -713,6 +714,9 @@ impl RouterSnapshot {
             routes,
             subagent_plaintext_messages: config.subagent_optimization
                 && config.subagent_plaintext_messages,
+            specialized_agent_roles: config
+                .subagent_optimization
+                .then(|| crate::subagent_policy::enabled_specialized_roles(&config.subagent_roles)),
             aliases,
             raw_models,
             model_alias_history: config.model_alias_history.clone(),

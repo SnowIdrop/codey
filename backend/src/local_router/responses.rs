@@ -1565,6 +1565,25 @@ impl RouterServer {
                 )
                 .await;
         }
+        if let Some(roles) = &snapshot.specialized_agent_roles {
+            match restrict_specialized_agent_roles(&mut body, roles) {
+                Ok(true) => {
+                    body_mutated = true;
+                    encoded_body = None;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    return downstream
+                        .write_error(
+                            400,
+                            "invalid_agent_schema",
+                            error.to_string(),
+                            Some(&resolved.route),
+                        )
+                        .await;
+                }
+            }
+        }
         if snapshot.subagent_plaintext_messages && prepare_plaintext_agent_arguments(&mut body) {
             body_mutated = true;
             encoded_body = None;

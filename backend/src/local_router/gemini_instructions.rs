@@ -4,7 +4,12 @@ use crate::model_catalog::{GEMINI_BASE_INSTRUCTIONS, is_gemini_upstream_model};
 // Captured from CLI 0.153.3 and checked against both its model catalog and child request.
 const LEGACY_BASE_INSTRUCTIONS: &str =
     include_str!("../../resources/codex-0.153.3-base-instructions.md");
-const TEMPLATE_VERSION: &str = "antigravity-v1/codex-0.153.3";
+// Captured from CLI 0.155.0-alpha.9; the rollout session metadata and the official catalog
+// route `route-mu944g8k-fjc2ct/gpt-6-astra` agree verbatim. Only line endings and outer
+// whitespace are normalized before comparison, so the exact-match contract is unchanged.
+const GPT6_BASE_INSTRUCTIONS: &str =
+    include_str!("../../resources/codex-0.155.0-alpha.9-gpt6-base-instructions.md");
+const TEMPLATE_VERSION: &str = "antigravity-v1/codex-0.153.3+codex-0.155.0-alpha.9";
 pub(crate) const GEMINI_INSTRUCTIONS_ERROR: &str = "gemini_base_instructions_unrecognized";
 pub(crate) const GEMINI_CHAT_TAIL_ERROR: &str = "gemini_chat_tail_unsupported";
 
@@ -130,10 +135,11 @@ pub(crate) fn adapt_gemini_base_instructions(
     let instructions = body.get("instructions").and_then(Value::as_str);
     let normalized = instructions.map(|text| text.replace("\r\n", "\n"));
     let legacy = LEGACY_BASE_INSTRUCTIONS.replace("\r\n", "\n");
+    let gpt6 = GPT6_BASE_INSTRUCTIONS.replace("\r\n", "\n");
     let gemini = GEMINI_BASE_INSTRUCTIONS.replace("\r\n", "\n");
     let outcome = match normalized.as_deref().map(str::trim) {
         Some(text) if text == gemini.trim() => "already_adapted",
-        Some(text) if text == legacy.trim() => {
+        Some(text) if text == legacy.trim() || text == gpt6.trim() => {
             body["instructions"] = Value::String(gemini.trim().to_string());
             "replaced"
         }

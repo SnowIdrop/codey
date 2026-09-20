@@ -668,6 +668,11 @@ async fn prepare_startup_model_catalog(
     } else {
         config.enabled_route_models(current_provider_id)
     };
+    // 选择状态使用当前线路的原始模型名；带线路前缀的声明仅用于生成跨线路目录。
+    let current_provider_model_reasoning_efforts = config
+        .model_reasoning_efforts_by_provider
+        .get(current_provider_id)
+        .cloned();
     let manual_models = current_profile
         .enabled
         .then(|| {
@@ -727,7 +732,7 @@ async fn prepare_startup_model_catalog(
                 upstream_models.as_deref(),
                 &selected_models,
                 &manual_models,
-                Some(&runtime_model_reasoning_efforts),
+                current_provider_model_reasoning_efforts.as_ref(),
                 requested_default_model.as_deref(),
             );
             (refresh, cached_catalog, selection)

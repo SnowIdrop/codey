@@ -39,6 +39,90 @@ pub(crate) fn prepare_plaintext_agent_arguments(body: &mut Value) -> bool {
     changed
 }
 
+pub(crate) fn restrict_specialized_agent_roles(body: &mut Value, roles: &[String]) -> Result<bool> {
+    let mut changed = restrict_spawn_tools(body.get_mut("tools"), None, roles)?;
+    if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
+        for item in input {
+            if item["type"] == "additional_tools" {
+                changed |= restrict_spawn_tools(item.get_mut("tools"), None, roles)?;
+            }
+        }
+    }
+    Ok(changed)
+}
+
+fn restrict_spawn_tools(
+    tools: Option<&mut Value>,
+    namespace: Option<&str>,
+    roles: &[String],
+) -> Result<bool> {
+    let Some(tools) = tools.and_then(Value::as_array_mut) else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    let mut index = 0;
+    while index < tools.len() {
+        let tool = &mut tools[index];
+        if tool["type"] == "namespace" {
+            let name = tool["name"].as_str().unwrap_or_default().to_owned();
+            if namespace.is_none() && matches!(name.as_str(), "agents" | "collaboration") {
+                changed |= restrict_spawn_tools(tool.get_mut("tools"), Some(&name), roles)?;
+            }
+            index += 1;
+            continue;
+        }
+        if tool["type"] != "function" {
+            index += 1;
+            continue;
+        }
+        let explicit_namespace = tool["namespace"].as_str().map(str::to_owned);
+        let function = if tool.get("function").is_some() {
+            &mut tool["function"]
+        } else {
+            tool
+        };
+        let Some(name) = function["name"].as_str() else {
+            index += 1;
+            continue;
+        };
+        let (ns, name) = name.split_once('.').unwrap_or((
+            explicit_namespace
+                .as_deref()
+                .or(namespace)
+                .unwrap_or_default(),
+            name,
+        ));
+        if !matches!(ns, "agents" | "collaboration") || name != "spawn_agent" {
+            index += 1;
+            continue;
+        }
+        changed = true;
+        if roles.is_empty() {
+            tools.remove(index);
+            continue;
+        }
+        let parameters = function
+            .get_mut("parameters")
+            .and_then(Value::as_object_mut)
+            .context("原生 spawn_agent 缺少参数对象，无法约束可用角色")?;
+        parameters
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+            .context("原生 spawn_agent 缺少参数属性对象，无法约束可用角色")?
+            .insert("agent_type".into(), json!({"type":"string", "enum":roles}));
+        let required = parameters
+            .entry("required")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .context("原生 spawn_agent required 必须为数组")?;
+        if !required.iter().any(|name| name == "agent_type") {
+            required.push(json!("agent_type"));
+        }
+        index += 1;
+    }
+    Ok(changed)
+}
+
 pub(crate) fn request_plaintext_agent_arguments(
     tools: Option<&mut Value>,
     namespace: Option<&str>,
@@ -624,6 +708,77 @@ pub(crate) fn validate_compaction_result(value: &Value, v2: bool) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn specialized_roles_constrain_native_spawn_schemas_only() {
+        let spawn = json!({"type":"function","name":"spawn_agent","parameters":{
+            "type":"object","properties":{"agent_type":{"type":["string","null"]},"message":{"type":"string"}},
+            "required":["message"]
+        }});
+        let mut qualified = spawn.clone();
+        qualified["name"] = json!("agents.spawn_agent");
+        let mut body = json!({
+            "tools":[{"type":"namespace","name":"agents","tools":[spawn.clone()]}],
+            "input":[{"type":"additional_tools","tools":[qualified,
+                {"type":"namespace","name":"other","tools":[spawn.clone()]}]}]
+        });
+        let roles = vec!["codey_quick_scan".to_string(), "codey_comments".to_string()];
+        assert!(restrict_specialized_agent_roles(&mut body, &roles).unwrap());
+        for function in [&body["tools"][0]["tools"][0], &body["input"][0]["tools"][0]] {
+            assert_eq!(
+                function["parameters"]["properties"]["agent_type"],
+                json!({"type":"string","enum":roles})
+            );
+            assert_eq!(
+                function["parameters"]["required"],
+                json!(["message", "agent_type"])
+            );
+        }
+        assert_eq!(body["input"][0]["tools"][1]["tools"][0], spawn);
+        assert!(restrict_specialized_agent_roles(&mut body, &[]).unwrap());
+        assert_eq!(body["tools"][0]["tools"], json!([]));
+        assert_eq!(body["input"][0]["tools"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn specialized_roles_reject_malformed_native_schema() {
+        for parameters in [
+            Value::Null,
+            json!([]),
+            json!({"properties":null}),
+            json!({"properties":{},"required":null}),
+        ] {
+            let mut body = json!({"tools":[{"type":"function","name":"agents.spawn_agent","parameters":parameters}]});
+            assert!(
+                restrict_specialized_agent_roles(&mut body, &["codey_comments".into()]).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn specialized_roles_snapshot_respects_enhancement_and_enabled_state() {
+        let mut config = CodeyConfig {
+            subagent_optimization: false,
+            ..CodeyConfig::default()
+        };
+        assert!(
+            RouterSnapshot::from_config(&config)
+                .specialized_agent_roles
+                .is_none()
+        );
+        config.subagent_optimization = true;
+        config.subagent_roles = crate::config::default_subagent_roles();
+        config
+            .subagent_roles
+            .get_mut("codey_worker")
+            .unwrap()
+            .enabled = false;
+        let snapshot = RouterSnapshot::from_config(&config);
+        let roles = snapshot.specialized_agent_roles.unwrap();
+        assert!(roles.contains(&"codey_quick_scan".to_string()));
+        assert!(!roles.contains(&"default".to_string()));
+        assert!(!roles.contains(&"codey_worker".to_string()));
+    }
 
     fn fernet_token(ciphertext: &[u8]) -> String {
         let mut token = vec![0x80];

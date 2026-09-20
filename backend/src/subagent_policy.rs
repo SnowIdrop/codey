@@ -7,6 +7,17 @@ use crate::config::{
 };
 use crate::model_catalog;
 use crate::model_id;
+
+pub(crate) fn enabled_specialized_roles(
+    roles: &std::collections::BTreeMap<String, SubagentRoleConfig>,
+) -> Vec<String> {
+    SUBAGENT_ROLE_IDS
+        .into_iter()
+        .filter(|role| *role != SUBAGENT_ROLE_DEFAULT)
+        .filter(|role| roles.get(*role).is_some_and(|selection| selection.enabled))
+        .map(str::to_string)
+        .collect()
+}
 #[cfg(test)]
 use crate::subagent::rules::{RoleAccess, RolePolicy};
 

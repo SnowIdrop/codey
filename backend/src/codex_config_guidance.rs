@@ -34,6 +34,31 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 
 ### 派发
 
+- 直接调用 `agents.spawn_agent`，显式填写 `agent_type`，只可选择已启用的 `codey_quick_scan`、`codey_deep_research`、`codey_visual_analysis`、`codey_worker`、`codey_comments` 或 `codey_visual_worker`。禁止通用与外部角色；无合适角色时由主代理处理。`default` 仅保留旧配置值，不可派发。`task_name` 只含小写字母、数字和下划线。
+- `message` 是唯一任务胶囊：写清目标、范围、允许操作、交付格式和必要背景，不复制整段对话，不附加 V1/V2 契约、sidecar、checks 或其他尾行协议。
+- 修改关键代码或文档时，可先派发独立的只读调查或核验；写入任务明确文件归属，避免重复调查或同时修改同一处。只读角色获得 `files.read`；写入角色获得 `command.execute`、`files.read` 和 `workspace.write`。写入角色暂按当前工作区建立互斥锁；实际权限仍由 Codex 原生 sandbox、approval policy、permission profile 和 writable roots 决定。
+
+### 返回与验收
+
+- 每个子代理只执行一轮且不得继续派生。返回首行使用 `status: completed | partial | blocked`，正文只保留影响决策的结论、最多 5 条带 `file:line`/符号/链接的证据和明确 gaps；多代理证据冲突时比较出处。
+- 子代理结果是候选产物，不是验收结论。所有代理结算后，由根代理结合用户要求、变更差异和必要的确定性检查统一验收；Codey 不再创建逐任务机械验收债或强制验收命令。
+
+### 生命周期
+
+- 先派发不超过当前并发上限的独立任务，再进入 wait/list。任一 attempt 终态或被成功中断并 fence 后，按下一个计划任务的角色重新计算并发上限；存在空余槽位时立即使用新 `task_name` 补位，否则继续等待。所有计划任务均已派发后，继续等待剩余活动 attempt 结算。活动 attempt 期间只使用必要的 `agents.*` 协作工具，普通本地工作和 Stop 仍受生命周期门禁限制。
+- `MESSAGE` 只保存证据并继续等待。`completed`、`errored`、`error`、`failed`、`shutdown`、`not_found`、`FINAL_ANSWER` 和 `task_complete` 为终态；`pending_init`、`running`、`interrupted` 仍是非终态，除非根代理成功中断并永久放弃该 attempt。
+- 成功的 `agents.interrupt_agent` 会永久 fence 该 attempt；不要再等待或追派。重复 task ID 时只做一次无筛选 `agents.list_agents` 对账：原代理存在则等待或消费结果，不存在则由根代理接管。只有任务范围实质改变时才用全新 task ID 最多重派一次。
+- 协作工具不可用时不要循环调用；依赖有界的 pending-init、超时和 Stop 恢复路径收敛。
+"#;
+
+const PREVIOUS_SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
+
+主动识别可独立推进的检索、实现和核验任务；存在明确分工或上下文隔离收益时，尽早使用子代理，无需用户逐次要求。先做确定边界所需的少量检查，再派发独立任务，不必等主代理完成同一调查后再分工。单步即可完成、步骤无法分离或委派没有实际收益的任务由主代理直接处理；不按文件数量或预计工具调用次数决定是否委派。
+
+纯只读工作最多同时运行 3 个子代理；存在写入型或身份未确认的代理时最多同时运行 2 个。并发限制只约束同时运行数量，不限制后续派发次数。
+
+### 派发
+
 - 直接调用 `agents.spawn_agent`，按任务选择 `codey_quick_scan`、`codey_deep_research`、`codey_visual_analysis`、`codey_worker` 或 `codey_visual_worker`；`default` 仅兼容旧配置。`task_name` 只含小写字母、数字和下划线。
 - `message` 是唯一任务胶囊：写清目标、范围、允许操作、交付格式和必要背景，不复制整段对话，不附加 V1/V2 契约、sidecar、checks 或其他尾行协议。
 - 修改关键代码或文档时，可先派发独立的只读调查或核验；写入任务明确文件归属，避免重复调查或同时修改同一处。只读角色获得 `files.read`；写入角色获得 `command.execute`、`files.read` 和 `workspace.write`。写入角色暂按当前工作区建立互斥锁；实际权限仍由 Codex 原生 sandbox、approval policy、permission profile 和 writable roots 决定。
@@ -51,8 +76,11 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 - 协作工具不可用时不要循环调用；依赖有界的 pending-init、超时和 Stop 恢复路径收敛。
 "#;
 
-pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] =
-    &[SUBAGENT_GUIDANCE, CONSERVATIVE_SUBAGENT_GUIDANCE];
+pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] = &[
+    SUBAGENT_GUIDANCE,
+    PREVIOUS_SUBAGENT_GUIDANCE,
+    CONSERVATIVE_SUBAGENT_GUIDANCE,
+];
 
 const PRE_INTERRUPT_FENCING_USAGE_HINT: &str = "\
 `agents.spawn_agent`, `agents.wait_agent`, and other `agents.*` collaboration tools are direct commentary \
@@ -112,42 +140,19 @@ the combined result and either continues the work or finishes. While an attempt 
 blocks non-collaboration tools and Stop. If collaboration tools are unavailable, do not loop on an \
 unregistered tool.";
 
-pub(crate) const ROOT_AGENT_MULTI_AGENT_MODE_HINT: &str = "Proactive multi-agent delegation is \
-active. Any earlier instruction requiring an explicit user request before spawning sub-agents no \
-longer applies. Proactively identify independent research, implementation, and verification tasks and \
-delegate them early when parallel work, context isolation, or specialized evidence materially helps. \
-Do not finish the same broad investigation in the root before delegating it. Keep one-step or inseparable \
-sequential work with the root. Always explicitly set \
-`fork_turns=\"none\"` and pass a self-contained question, known facts, allowed and excluded scope, and \
-stopping evidence in the message. Quick scans start from known files or symbols, report by the first \
-three bounded investigation calls, and never expand scope without root authorization. When delegating, strongly \
-prefer an enabled Codey role that fits the task and explicitly set `agent_type`: `codey_quick_scan` for \
-focused read-only lookups; `codey_deep_research` for broad read-only code, log, and document research; \
-`codey_visual_analysis` for read-only visual inspection; `codey_worker` for bounded non-visual \
-implementation; `codey_comments` for scoped comment-only editing with Chinese documentation by default; \
-and `codey_visual_worker` for implementation requiring visual verification. Prefer these \
-over generic `default`, `explorer`, or `worker` when both fit; avoid omitting `agent_type` out of habit. \
-This is a preference, not a restriction: an explicit user choice, unavailable or unsuitable Codey roles, \
-or a clear task-specific advantage can justify another available role. Respect existing role permissions \
-and runtime availability. There is no fixed spawn \
-budget: up to three concurrent agents are allowed only when all are verified read-only, otherwise the \
-limit is two. Select synchronous (`sync_`) or asynchronous (`async_`) task names based on dependencies \
-and disjoint file ownership. Unmarked names are synchronous; do not mix modes in an active batch. \
-Synchronous batches wait for every child before any refill or local work. Asynchronous batches permit \
-independent root reads and writes outside child-owned paths once all active identities are verified; \
-recompute the role-aware limit for optional refills. State exclusive child file scopes in each task \
-message; never access another active participant's files. `CODEY_SUBAGENT_CONCURRENCY_LIMIT` means wait, \
-not failure. Both modes must settle all children before final delivery. For optional asynchronous work \
-that no longer affects the conclusion, request existing results without further investigation; if \
-still active, wait at most once for 10000 ms, list all agents, then interrupt that target once if still \
-active. Respect successful fencing, preserve partial evidence, and do not respawn. Necessary work keeps \
-the normal wait flow; this is not a general timeout. If an active child \
-cannot decrypt its task body, use `agents.send_message` exactly once to restate the complete task; do not \
-interrupt or respawn it. If that fails, take over. After all attempts settle, validate their combined result \
-before continuing or finishing. If every spawn fails, take over. On `CODEY_SUBAGENT_DUPLICATE_TASK_ID`, call \
-unfiltered `agents.list_agents` once: wait for the original if present, otherwise take over. Only a \
-materially changed task may retry once with a fresh `task_name`. This \
-mode remains active until a later multi-agent mode developer message changes it.";
+pub(crate) const ROOT_AGENT_MULTI_AGENT_MODE_HINT: &str = "Only enabled Codey roles may spawn; \
+explicitly set `agent_type`. Never use default, explorer, worker or external roles. \
+Use codey_quick_scan for focused lookup, codey_deep_research for broad research, \
+codey_visual_analysis for visual inspection, codey_worker for implementation, \
+codey_comments for comments only, codey_visual_worker for visual implementation. \
+If no enabled role fits, the root does the work. Delegate independent work early; \
+keep inseparable work local. Set fork_turns=\"none\"; supply a self-contained task, \
+known facts, allowed paths, exclusions and stopping evidence. Quick scans return within \
+three bounded calls. No fixed spawn budget: at most three read-only agents, otherwise two. \
+Use sync_ for dependent work, async_ for disjoint ownership; unmarked means sync. \
+Do not mix modes. Sync batches fully settle before refill or local work; async work \
+stays outside child-owned paths. Follow the collaboration lifecycle instructions. \
+Never resume a fenced attempt. Join all children and review their evidence before delivery.";
 
 /// Remove the previous owned paragraph when installing the current guidance.
 pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS: &[&str] = &[
@@ -634,16 +639,17 @@ mod tests {
             assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains(role));
         }
         assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("explicitly set `agent_type`"));
-        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("a preference, not a restriction"));
-        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("another available role"));
-        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("There is no fixed spawn budget"));
-        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("up to three concurrent agents"));
-        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("limit is two"));
-        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("`CODEY_SUBAGENT_CONCURRENCY_LIMIT`"));
-        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("recompute the role-aware limit"));
-        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("cannot decrypt its task body"));
-        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("`agents.send_message` exactly once"));
-        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("do not interrupt or respawn it"));
+        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.starts_with("Only enabled Codey roles"));
+        assert!(
+            ROOT_AGENT_MULTI_AGENT_MODE_HINT
+                .contains("Never use default, explorer, worker or external roles")
+        );
+        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("No fixed spawn budget"));
+        assert!(
+            ROOT_AGENT_MULTI_AGENT_MODE_HINT
+                .contains("at most three read-only agents, otherwise two")
+        );
+        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.len() <= 1200);
         assert!(
             !ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("CODEY_SUBAGENT_BATCH_BUDGET_EXHAUSTED")
         );
@@ -656,6 +662,10 @@ mod tests {
         assert!(!SUBAGENT_GUIDANCE.contains("不超过 2 个小文件和 3 次本地工具调用"));
         assert_eq!(
             remove_subagent_guidance(&format!("USER\n\n{CONSERVATIVE_SUBAGENT_GUIDANCE}")),
+            Some("USER".into())
+        );
+        assert_eq!(
+            remove_subagent_guidance(&format!("USER\n\n{PREVIOUS_SUBAGENT_GUIDANCE}")),
             Some("USER".into())
         );
         assert!(SUBAGENT_GUIDANCE.contains("直接调用 `agents.spawn_agent`"));
