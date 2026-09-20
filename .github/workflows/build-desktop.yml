@@ -1,13 +1,29 @@
 name: Build desktop packages
+run-name: Desktop packages · ${{ github.ref_name }} · ${{ github.event_name == 'push' && github.ref_type == 'tag' && 'all' || inputs.platform || 'windows' }}
 
 on:
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Platform to build
+        type: choice
+        default: windows
+        options:
+          - windows
+          - macos
+          - all
+      run_checks:
+        description: Run full JavaScript/Rust tests, rustfmt and Clippy
+        type: boolean
+        default: false
   push:
+    branches:
+      - build/windows
     tags:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,6 +33,7 @@ env:
 jobs:
   macos:
     name: macOS ${{ matrix.arch }} unsigned
+    if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.platform == 'macos' || inputs.platform == 'all'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -59,15 +76,19 @@ jobs:
         run: pnpm run check
 
       - name: JavaScript tests
+        if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
         run: pnpm run test:js
 
       - name: Rust tests
+        if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
         run: cargo test --workspace --locked
 
       - name: Rust format
+        if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
         run: cargo fmt --all -- --check
 
       - name: Rust clippy
+        if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Build unsigned macOS app
@@ -119,6 +140,7 @@ jobs:
 
   windows:
     name: Windows x64
+    if: github.event_name == 'push' || inputs.platform == 'windows' || inputs.platform == 'all'
     runs-on: windows-latest
     env:
       CARGO_PROFILE_RELEASE_LTO: thin
@@ -196,15 +218,19 @@ jobs:
         run: pnpm run check
 
       - name: JavaScript tests
+        if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
         run: pnpm run test:js
 
       - name: Rust format
+        if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
         run: cargo fmt --all -- --check
 
       - name: Rust tests
+        if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
         run: cargo test --workspace --locked
 
       - name: Rust clippy
+        if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Build Windows executable
@@ -265,7 +291,9 @@ jobs:
 
   publish:
     name: Attach packages to GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
     needs:
       - macos
       - windows
