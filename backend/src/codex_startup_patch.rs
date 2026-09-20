@@ -71,6 +71,15 @@ pub struct PatchOptions {
     pub subagent_gate_active: bool,
     /// 杂事模型在 Codex 模型目录里的 id。`None` 表示保持 Codex 原生行为。
     pub misc_model: Option<String>,
+    pub workflow_proxy: Option<WorkflowProxyLaunchConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowProxyLaunchConfig {
+    pub executable: String,
+    pub control_address: String,
+    pub capability_token: String,
 }
 
 pub fn inspector_argument(port: u16) -> String {
@@ -111,6 +120,11 @@ fn patch_expression_with_runtime_overrides_and_validation(
         }
     };
     STARTUP_PATCH_TEMPLATE
+        .replace(
+            "\"__CODEY_WORKFLOW_PROXY_LAUNCH_CONFIG__\"",
+            &serde_json::to_string(&options.workflow_proxy)
+                .expect("workflow proxy launch config should serialize"),
+        )
         .replace(
             "\"__CODEY_RUNTIME_CONFIG_OVERRIDES__\"",
             &serde_json::to_string(runtime_config_overrides)
@@ -1670,6 +1684,7 @@ mod tests {
             disable_pet: true,
             subagent_gate_active: true,
             misc_model: None,
+            workflow_proxy: None,
         });
 
         assert!(expression.contains("const disablePet = true"));
@@ -1731,6 +1746,7 @@ mod tests {
                 disable_pet: false,
                 subagent_gate_active: true,
                 misc_model: None,
+                workflow_proxy: None,
             },
             &overrides,
         );
@@ -1747,6 +1763,7 @@ mod tests {
             disable_pet: false,
             subagent_gate_active: true,
             misc_model: None,
+            workflow_proxy: None,
         });
         assert!(!unset.contains("__CODEY_MISC_MODEL_ID__"));
         assert!(unset.contains("const rawMiscModelId = null"));
@@ -1756,6 +1773,7 @@ mod tests {
             disable_pet: false,
             subagent_gate_active: true,
             misc_model: Some("relay/housekeeping".to_string()),
+            workflow_proxy: None,
         });
         assert!(selected.contains("const rawMiscModelId = \"relay/housekeeping\""));
         assert!(selected.contains("globalThis, \"__CODEY_MISC_MODEL__\""));
@@ -1896,6 +1914,7 @@ mod tests {
             disable_pet: true,
             subagent_gate_active: true,
             misc_model: None,
+            workflow_proxy: None,
         });
         install_over_websocket(&format!("ws://{address}"), &expression, false)
             .await
@@ -2038,6 +2057,7 @@ mod tests {
             disable_pet: true,
             subagent_gate_active: true,
             misc_model: None,
+            workflow_proxy: None,
         });
         install_over_websocket(&format!("ws://{address}"), &expression, true)
             .await
@@ -2099,6 +2119,7 @@ mod tests {
             disable_pet: true,
             subagent_gate_active: true,
             misc_model: None,
+            workflow_proxy: None,
         });
         let error = tokio::time::timeout(
             std::time::Duration::from_millis(500),
@@ -2270,6 +2291,7 @@ mod tests {
                 disable_pet: false,
                 subagent_gate_active: true,
                 misc_model: None,
+                workflow_proxy: None,
             },
             &["analytics.enabled=false".to_string()],
         )

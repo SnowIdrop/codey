@@ -49,6 +49,19 @@ export const CODEY_API_COMMANDS = [
   "configure_codey_plugin",
   "uninstall_codey_plugin",
   "invoke_codey_plugin",
+  "workflow_capabilities",
+  "workflow_start",
+  "workflow_steer",
+  "workflow_list",
+  "workflow_get",
+  "workflow_events",
+  "workflow_artifact",
+  "workflow_pause",
+  "workflow_resume",
+  "workflow_cancel",
+  "workflow_retry_node",
+  "workflow_reply_interaction",
+  "workflow_bypass_audit",
 ] as const;
 
 export type CodeyApiCommand = (typeof CODEY_API_COMMANDS)[number];

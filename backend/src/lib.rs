@@ -15,6 +15,7 @@ mod fastctx_route_gate;
 mod fs_util;
 mod hook_io;
 mod http_response;
+mod instance_lock;
 mod launcher;
 mod local_router;
 mod maintenance_lock;
@@ -29,6 +30,7 @@ mod overlay_recovery;
 mod pending_approval;
 mod pet_slim_patch;
 mod plugin_marketplace;
+#[cfg(test)]
 mod process_cleanup;
 mod process_tree;
 mod prompt_optimization;
@@ -46,6 +48,7 @@ mod subagent_policy;
 mod trace_log_guard;
 mod trace_log_stats;
 mod update_helper;
+mod workflow;
 
 use std::sync::Arc;
 
@@ -162,6 +165,8 @@ impl Drop for PluginShutdownGuard {
 }
 
 async fn run(ui: NativeUpdateUi) -> Result<()> {
+    let instance_store = config::ConfigStore::default();
+    let _instance_lock = instance_lock::InstanceLock::acquire(instance_store.path())?;
     // Config load, ledger read and HTTP client construction (which loads the
     // system root store) are synchronous; keep them off the async workers.
     let state = tokio::task::spawn_blocking(|| {
@@ -288,26 +293,7 @@ async fn run(ui: NativeUpdateUi) -> Result<()> {
             serde_json::json!({}),
         );
     }
-    let shutdown_context = match shutdown_reason {
-        ShutdownReason::CodexExited => "Codex 已退出",
-        ShutdownReason::InstallUpdate => "Codey 正在安装更新",
-        ShutdownReason::Signal => "Codey 收到退出信号",
-    };
-    match process_cleanup::terminate_other_codey_processes().await {
-        Ok(0) => {}
-        Ok(count) => eprintln!("{shutdown_context}，已终止 {count} 个遗留 Codey 进程"),
-        Err(error) => {
-            error_log::record_failure(
-                "cleanup_failed",
-                "terminate_other_codey_processes",
-                format!("{error:#}"),
-                serde_json::json!({
-                    "shutdownContext": shutdown_context,
-                }),
-            );
-            eprintln!("{shutdown_context}，但清理遗留 Codey 进程失败：{error:#}");
-        }
-    }
+    let _ = shutdown_reason;
     cleanup.map_err(anyhow::Error::msg)
 }
 

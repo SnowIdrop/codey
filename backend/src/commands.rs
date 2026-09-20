@@ -22,6 +22,7 @@ mod runtime;
 mod updates;
 mod webhooks;
 mod wechat_claw;
+mod workflows;
 
 #[cfg(windows)]
 use codey_runtime_core::app_paths::{
@@ -123,6 +124,7 @@ use crate::route_request_log::RouteRequestLogReconfigure;
 use crate::session_metadata;
 use crate::session_transfer;
 use crate::trace_log_guard;
+use crate::workflow::WorkflowHost;
 
 const STARTUP_PROVIDER_MODEL_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_VISIBLE_SESSION_TIMESTAMPS: usize = 200;
@@ -130,6 +132,7 @@ const MAX_VISIBLE_SESSION_TIMESTAMPS: usize = 200;
 pub struct AppState {
     pub store: ConfigStore,
     pub config: RwLock<CodeyConfig>,
+    pub workflow: arc_swap::ArcSwap<WorkflowHost>,
     config_write_lock: Mutex<()>,
     provider_model_sync_lock: Mutex<()>,
     pub http_client: reqwest::Client,
@@ -221,12 +224,14 @@ impl Default for AppState {
                 )),
             ),
         };
+        let workflow = WorkflowHost::from_config(&config, store.path());
         let protect_crashpad_pending = config.protect_crashpad_pending;
         let persisted_waiting_notifications = initial_waiting_notifications(&store, &[]);
         let (shutdown_reason, _) = watch::channel(None);
         Self {
             store,
             config: RwLock::new(config),
+            workflow: arc_swap::ArcSwap::from(workflow),
             config_write_lock: Mutex::new(()),
             provider_model_sync_lock: Mutex::new(()),
             http_client: reqwest::Client::builder()
@@ -1344,6 +1349,19 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         "configure_codey_plugin" => native_plugins::invoke(command, &args).await,
         "uninstall_codey_plugin" => native_plugins::invoke(command, &args).await,
         "invoke_codey_plugin" => native_plugins::invoke(command, &args).await,
+        "workflow_capabilities" => workflows::capabilities(state, args).await,
+        "workflow_start" => workflows::start(state, args).await,
+        "workflow_steer" => workflows::steer(state, args).await,
+        "workflow_list" => workflows::list(state, args).await,
+        "workflow_get" => workflows::get(state, args).await,
+        "workflow_events" => workflows::events(state, args).await,
+        "workflow_artifact" => workflows::artifact(state, args).await,
+        "workflow_pause" => workflows::mutate(state, "pause", args).await,
+        "workflow_resume" => workflows::mutate(state, "resume", args).await,
+        "workflow_cancel" => workflows::mutate(state, "cancel", args).await,
+        "workflow_retry_node" => workflows::retry_node(state, args).await,
+        "workflow_reply_interaction" => workflows::reply_interaction(state, args).await,
+        "workflow_bypass_audit" => workflows::bypass_audit(state, args).await,
         _ => Err(format!("未知 Codey API 命令：{command}")),
     };
     result.unwrap_or_else(api_error_message)
@@ -1877,6 +1895,12 @@ async fn save_codey_config_locked(
     config.subagent_optimization = config_input.subagent_optimization;
     config.subagent_plaintext_messages = config_input.subagent_plaintext_messages;
     let mut explicitly_configured_subagent_models = Vec::new();
+    config.workflow = config_input.workflow;
+    if config.subagent_optimization && config.workflow.enabled {
+        return Err(
+            "Codey 工作流与原生子代理调度增强不能同时启用，请只选择一种调度模式".to_string(),
+        );
+    }
     let default_role_supplied = subagent_roles_present
         && !config_input.subagent_roles.is_empty()
         && config_input
@@ -2008,6 +2032,7 @@ async fn save_codey_config_locked(
             Ordering::Release,
         );
     }
+    state.workflow.load().apply_config(config.workflow.clone());
     Ok(SavedCodeyConfig {
         config,
         reconcile_subagent_config,
@@ -2915,6 +2940,7 @@ pub(super) fn config_requires_restart_with_route_status(
             .trim()
             .eq_ignore_ascii_case(current.misc_model.trim())
         || !applied_models.matches(current)
+        || applied.workflow.enabled != current.workflow.enabled
         || ((applied.subagent_optimization || current.subagent_optimization)
             && !applied_subagent.matches(current))
 }

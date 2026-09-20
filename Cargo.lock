@@ -388,6 +388,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "qrcode",
+ "regex",
  "reqwest",
  "rfd",
  "rusqlite",

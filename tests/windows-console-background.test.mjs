@@ -61,9 +61,8 @@ test("Windows source contract: fatal startup failures remain visible", async () 
 });
 
 test("Windows source contract: background helpers request no-window execution", async () => {
-  const [launcherPlatform, processCleanup, runtimeAppPaths] = await Promise.all([
+  const [launcherPlatform, runtimeAppPaths] = await Promise.all([
     readSource("backend/src/launcher/platform.rs"),
-    readSource("backend/src/process_cleanup.rs"),
     readSource("vendor/CodeyRuntime/crates/codey-runtime-core/src/app_paths.rs"),
   ]);
 
@@ -71,10 +70,13 @@ test("Windows source contract: background helpers request no-window execution", 
     launcherPlatform,
     /Command::new\(executable\)[\s\S]*creation_flags\(codey_runtime_core::windows_create_no_window\(\)\)[\s\S]*\.spawn\(\)/,
   );
-  assert.doesNotMatch(processCleanup, /Command::new\("taskkill"\)/);
   assert.match(
-    processCleanup,
+    launcherPlatform,
     /codey_runtime_core::windows_terminate_process_if_matches/,
+  );
+  assert.match(
+    launcherPlatform,
+    /Command::new\("taskkill"\)[\s\S]*?creation_flags\(codey_runtime_core::windows_create_no_window\(\)\)/,
   );
   assert.match(
     runtimeAppPaths,

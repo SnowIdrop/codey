@@ -54,6 +54,7 @@ import type {
   Profile,
 } from "./App.types";
 import { Badge, Button, Tooltip } from "./components/ui";
+import { WorkflowConsole } from "./workflows";
 
 const Check = IconCheck;
 const X = IconX;
@@ -111,11 +112,19 @@ export function App({
   embedded = false,
   modalContainer,
   modalVisible = true,
+  requestedView = "settings",
+  viewRequestRevision = 0,
+  workflowThreadId,
+  workflowRunId,
   onAfterClose,
   onClose,
 }: AppProps) {
   const feedbackGroupQrUrl =
     `${FEEDBACK_GROUP_QR_BASE_URL}?date=${localDateCacheKey(new Date())}`;
+  const [activeView, setActiveView] = useState<"settings" | "workflows">(
+    requestedView,
+  );
+  const workflowViewAvailable = !embedded || Boolean(workflowThreadId);
   const [config, setConfig] = useState<Config | null>(null);
   const persistedConfigRef = useRef<Config | null>(null);
   const { status, setStatus, markRestartInProgress, refreshStatus, refreshStatusForLoad,
@@ -160,6 +169,19 @@ export function App({
         : "尚未确认主进程注入修复成功，请查看运行状态或失败提示"),
     });
   }, [injectionRepairRequested, status.restartInProgress, status.startupError, status.running, status.maintenance, setNotice]);
+  useEffect(() => {
+    if (!modalVisible) return;
+    setActiveView(
+      requestedView === "workflows" && !workflowViewAvailable
+        ? "settings"
+        : requestedView,
+    );
+  }, [
+    modalVisible,
+    requestedView,
+    viewRequestRevision,
+    workflowViewAvailable,
+  ]);
   const configLoaded = config !== null;
   const pendingNativeRouterToggle = Boolean(
     config &&
@@ -176,7 +198,15 @@ export function App({
   draftConfigRef.current = config;
   const setSubagentOptimization = useCallback((enabled: boolean) => {
     setConfig((current) =>
-      current ? { ...current, subagentOptimization: enabled } : current,
+      current
+        ? {
+            ...current,
+            subagentOptimization: enabled,
+            workflow: enabled
+              ? { ...current.workflow, enabled: false }
+              : current.workflow,
+          }
+        : current,
     );
     setDirty(true);
   }, []);
@@ -1187,7 +1217,7 @@ export function App({
         afterClose={onAfterClose}
         container={modalContainer}
         onCancel={handleCloseSettings}
-        title="Codey 配置"
+        title="Codey 控制台"
         visible={modalVisible}
       >
         {loadingContent}
@@ -1279,7 +1309,7 @@ export function App({
               </Badge>
             )}
           </div>
-          <p className="m-0 mt-0.5 text-[11px] text-[var(--codey-muted,#6e6e73)] max-[760px]:hidden">管理 Codex 线路、模型服务、运行策略与诊断日志</p>
+          <p className="m-0 mt-0.5 text-[11px] text-[var(--codey-muted,#6e6e73)] max-[760px]:hidden">管理 Codex 线路、模型服务、运行策略、工作流任务与诊断日志</p>
         </div>
       </div>
 
@@ -1357,9 +1387,18 @@ export function App({
   );
 
   const appContent = (
-    <main className={`app-shell${embedded ? " embedded" : ""}`}>
-      <a className="skip-link" href="#codey-settings-content">
-        跳至设置内容
+    <main
+      className={`app-shell${embedded ? " embedded" : ""}`}
+    >
+      <a
+        className="skip-link"
+        href={
+          activeView === "settings"
+            ? "#codey-settings-content"
+            : "#codey-workflow-content"
+        }
+      >
+        跳至{activeView === "settings" ? "设置" : "工作流"}内容
       </a>
 
       {!embedded && (
@@ -1403,9 +1442,35 @@ export function App({
         </header>
       )}
 
+      {workflowViewAvailable && (
+        <nav className="codey-console-tabs" aria-label="Codey 控制台视图">
+          <button
+            type="button"
+            role="tab"
+            aria-controls="codey-settings-content"
+            aria-selected={activeView === "settings"}
+            className={activeView === "settings" ? "active" : undefined}
+            onClick={() => setActiveView("settings")}
+          >
+            设置
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-controls="codey-workflow-content"
+            aria-selected={activeView === "workflows"}
+            className={activeView === "workflows" ? "active" : undefined}
+            onClick={() => setActiveView("workflows")}
+          >
+            工作流
+          </button>
+        </nav>
+      )}
+
       <div className="page-scroll">
-        <div className="page" id="codey-settings-content">
-          {/* 最上方：运行状态 (Codex 运行与维护) */}
+        {activeView === "settings" ? (
+        <div className="page" id="codey-settings-content" role="tabpanel">
+          {/* 最上方：运行状态 (Codex 运行与维护，含 Codex 应用路径) */}
           <OperationsPanel
             codexAppPath={config.codexAppPath}
             fastContextToolsStatus={fastContextToolsStatus}
@@ -1501,6 +1566,20 @@ export function App({
           </div>
 
         </div>
+        ) : (
+          <div
+            className="page workflow-page"
+            id="codey-workflow-content"
+            role="tabpanel"
+          >
+            <WorkflowConsole
+              key={`${workflowThreadId ?? "all"}:${workflowRunId ?? "latest"}`}
+              active={!embedded || modalVisible}
+              initialRunId={workflowRunId}
+              threadId={workflowThreadId}
+            />
+          </div>
+        )}
       </div>
 
       <NoticeToast controller={noticeController} />

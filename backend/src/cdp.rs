@@ -17,6 +17,7 @@ const SETTINGS_OVERLAY_LOAD_PATH: &str = "/internal/codey/settings-overlay/load"
 const SESSION_TOOLS_LOAD_PATH: &str = "/internal/codey/session-tools/load";
 const CDP_INJECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const CODEY_BRIDGE_SCRIPT: &str = include_str!("../../dist-overlay/inject/codey-bridge.js");
+const WORKFLOW_MODE_SCRIPT: &str = include_str!("../../dist-overlay/inject/workflow-mode.js");
 const MODEL_WHITELIST_INJECT_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/model-whitelist-inject.js");
 const RENDERER_INJECT_SCRIPT: &str = concat!(
@@ -180,7 +181,15 @@ pub fn prepare_injection_scripts(
                 .to_string(),
             Internal,
         ),
-
+        (
+            "workflow-mode",
+            "Codey 工作流接管",
+            WORKFLOW_MODE_SCRIPT,
+            r#"window.__codeyWorkflowModeRuntime?.version === 1
+              ? "工作流 Composer 门禁已加载" : """#
+                .to_string(),
+            Feature,
+        ),
         (
             "model-whitelist",
             "模型白名单",
@@ -296,6 +305,7 @@ pub fn prepare_injection_scripts(
     ];
     let mut core_bundle = String::with_capacity(
         CODEY_BRIDGE_SCRIPT.len()
+            + WORKFLOW_MODE_SCRIPT.len()
             + MODEL_WHITELIST_INJECT_SCRIPT.len()
             + RENDERER_INJECT_SCRIPT.len()
             + PET_CONTROL_SHIELD_SCRIPT.len()
@@ -1044,6 +1054,22 @@ fn lazy_settings_overlay_loader_script() -> &'static str {
     open() {
       this.toggle();
     },
+    openWorkflow(request) {
+      void this.load().then((overlay) => {
+        if (typeof overlay.openWorkflow === "function") {
+          overlay.openWorkflow(request);
+        } else if (typeof overlay.open === "function") {
+          overlay.open();
+        } else {
+          overlay.toggle();
+        }
+      }).catch((error) => {
+        const message = formatError(error);
+        window.__codeyOverlayError = message;
+        loading = null;
+        window.alert(`Codey 内嵌配置面板加载失败：${message}`);
+      });
+    },
     toggle() {
       if (loading) return;
       void this.load().then((overlay) => {
@@ -1473,20 +1499,20 @@ assert.equal(nextPage.window.attempts, 1);
         assert!(prepared.scripts[1].contains("window.userScriptRan = true;"));
         assert!(prepared.scripts[1].contains(r#"status = "executed""#));
         assert!(prepared.scripts[1].contains("用户脚本 1 injection failed"));
-        assert_eq!(prepared.descriptors.len(), 9);
-        assert_eq!(prepared.descriptors[8].id, "user-script-1");
-        assert_eq!(prepared.descriptors[8].source, "user");
+        assert_eq!(prepared.descriptors.len(), 10);
+        assert_eq!(prepared.descriptors[9].id, "user-script-1");
+        assert_eq!(prepared.descriptors[9].source, "user");
         assert_eq!(
             prepared.descriptors[0].visibility,
             InjectionScriptVisibility::Internal
         );
-        assert_eq!(prepared.descriptors[5].id, "renderer-controls");
+        assert_eq!(prepared.descriptors[6].id, "renderer-controls");
         assert_eq!(
-            prepared.descriptors[5].visibility,
+            prepared.descriptors[6].visibility,
             InjectionScriptVisibility::Internal
         );
         assert_eq!(
-            prepared.descriptors[8].visibility,
+            prepared.descriptors[9].visibility,
             InjectionScriptVisibility::Feature
         );
         let snapshot_script = injection_status_snapshot_script(&prepared.descriptors);
@@ -1573,10 +1599,12 @@ assert.equal(nextPage.window.attempts, 1);
         assert_eq!(statuses[0].id, "bridge-helpers");
         assert_eq!(statuses[0].status, "effective");
         assert_eq!(statuses[0].detail.as_deref(), Some("桥接函数可调用"));
-        assert_eq!(statuses[1].id, "model-whitelist");
+        assert_eq!(statuses[1].id, "workflow-mode");
         assert_eq!(statuses[1].status, "unknown");
-        assert_eq!(statuses[3].id, "security-warning-shield");
-        assert_eq!(statuses[3].status, "inactive");
+        assert_eq!(statuses[2].id, "model-whitelist");
+        assert_eq!(statuses[2].status, "unknown");
+        assert_eq!(statuses[4].id, "security-warning-shield");
+        assert_eq!(statuses[4].status, "inactive");
         assert_eq!(
             statuses.last().map(|status| status.id.as_str()),
             Some("user-script-1")

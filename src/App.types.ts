@@ -83,6 +83,22 @@ export type ModelReasoningEffort = {
   value: string;
 };
 
+export type WorkflowConfig = {
+  enabled: boolean;
+  globalMode: boolean;
+  profile: string;
+  maxReadOnlyConcurrency: number;
+  maxProviderConcurrency: number;
+  maxRepoWriters: number;
+  maxDelegationDepth: number;
+  leaseSeconds: number;
+  infrastructureRetryLimit: number;
+  builderRepairLimit: number;
+  reviewerCount: number;
+  retentionDays: number;
+  roles: Record<string, SubagentRoleConfig>;
+};
+
 export type Config = {
   settingsRevision: number;
   localRouterEnabled: boolean;
@@ -116,6 +132,7 @@ export type Config = {
   subagentReasoningEffort: string;
   subagentRoles: Record<SubagentRoleId, SubagentRoleConfig>;
   miscModel: string;
+  workflow: WorkflowConfig;
   hideFullAccessWarning: boolean;
   showAccountUsageInHeader: boolean;
 };
@@ -325,6 +342,10 @@ export type AppProps = {
   embedded?: boolean;
   modalContainer?: HTMLElement | null;
   modalVisible?: boolean;
+  requestedView?: "settings" | "workflows";
+  viewRequestRevision?: number;
+  workflowThreadId?: string;
+  workflowRunId?: string;
   onAfterClose?: () => void;
   onClose?: () => void;
 };

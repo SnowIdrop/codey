@@ -225,6 +225,7 @@ async fn repair_main_process_injection_before_launch(
     not(windows),
     allow(clippy::ptr_arg, reason = "Windows 启动重试需要替换调用方的应用目录")
 )]
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn spawn_codex(
     app_dir: &mut PathBuf,
     debug_port: u16,
@@ -233,12 +234,14 @@ pub(super) async fn spawn_codex(
     misc_model: Option<String>,
     gpu_launch_mode: GpuLaunchMode,
     runtime_config_overrides: &[String],
+    workflow_proxy: Option<&crate::codex_startup_patch::WorkflowProxyLaunchConfig>,
 ) -> Result<SpawnedCodex> {
     #[cfg(any(windows, target_os = "macos"))]
     let patch_options = crate::codex_startup_patch::PatchOptions {
         disable_pet: disable_codex_pet,
         subagent_gate_active,
         misc_model,
+        workflow_proxy: workflow_proxy.cloned(),
     };
     #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (
@@ -246,6 +249,7 @@ pub(super) async fn spawn_codex(
         subagent_gate_active,
         misc_model,
         runtime_config_overrides,
+        workflow_proxy,
     );
     let runtime_arguments =
         codex_runtime_arguments(gpu_launch_mode, !cfg!(target_os = "macos"), cfg!(windows));
@@ -2274,6 +2278,7 @@ mod cli_wrapper_tests {
             disable_pet: false,
             subagent_gate_active: true,
             misc_model: None,
+            workflow_proxy: None,
         }
     }
 

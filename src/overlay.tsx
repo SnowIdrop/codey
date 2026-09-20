@@ -14,6 +14,7 @@ import featureStyles from "./styles.features.css?inline";
 import diagnosticStyles from "./styles.diagnostics.css?inline";
 import responsiveStyles from "./styles.responsive.css?inline";
 import { codeyApiPath, invoke } from "./api";
+import workflowStyles from "./styles.workflows.css?inline";
 import { SETTINGS_OVERLAY_Z_INDEX_CSS } from "./overlay.constants";
 import { SETTINGS_OPENED_EVENT } from "./useRuntimeStatus";
 import { installOverlayTheme } from "./overlayTheme";
@@ -25,9 +26,17 @@ import {
 
 type OverlayController = {
   open: () => void;
+  openWorkflow: (request: { threadId: string; runId?: string }) => void;
   close: () => void;
   toggle: () => void;
   isOpen: () => boolean;
+};
+
+type OverlayViewRequest = {
+  view: "settings" | "workflows";
+  revision: number;
+  threadId?: string;
+  runId?: string;
 };
 
 declare global {
@@ -157,6 +166,7 @@ if (!window.__codeySettingsOverlay) {
       featureStyles,
       diagnosticStyles,
       responsiveStyles,
+      workflowStyles,
     ),
   ];
   // HeroUI 的主题变量声明在 :root / [data-theme] 上，ShadowRoot 内没有 :root，
@@ -180,6 +190,7 @@ if (!window.__codeySettingsOverlay) {
   let hideTimer: number | undefined;
   let visible = false;
 
+  let viewRequest: OverlayViewRequest = { view: "settings", revision: 0 };
   const hide = () => {
     window.clearTimeout(hideTimer);
     hideTimer = undefined;
@@ -194,6 +205,10 @@ if (!window.__codeySettingsOverlay) {
           embedded
           modalContainer={modalContainer}
           modalVisible={visible}
+          requestedView={viewRequest.view}
+          viewRequestRevision={viewRequest.revision}
+          workflowThreadId={viewRequest.threadId}
+          workflowRunId={viewRequest.runId}
           onAfterClose={hide}
           onClose={close}
         />
@@ -207,8 +222,7 @@ if (!window.__codeySettingsOverlay) {
     window.clearTimeout(hideTimer);
     hideTimer = window.setTimeout(hide, 450);
   };
-  const open = () => {
-    if (visible) return;
+  const show = () => {
     visible = true;
     window.clearTimeout(hideTimer);
     hideTimer = undefined;
@@ -219,11 +233,31 @@ if (!window.__codeySettingsOverlay) {
     render(true);
     window.dispatchEvent(new CustomEvent(SETTINGS_OPENED_EVENT));
   };
+  const open = () => {
+    viewRequest = {
+      view: "settings",
+      revision: viewRequest.revision + 1,
+    };
+    show();
+  };
+  const openWorkflow = (request: { threadId: string; runId?: string }) => {
+    const threadId = request.threadId.trim();
+    if (!threadId) return;
+    const runId = request.runId?.trim() || undefined;
+    viewRequest = {
+      view: "workflows",
+      revision: viewRequest.revision + 1,
+      threadId,
+      runId,
+    };
+    show();
+  };
   const isOpen = () => visible;
 
   render(false);
   window.__codeySettingsOverlay = {
     open,
+    openWorkflow,
     close,
     isOpen,
     toggle: () => (visible ? close() : open()),

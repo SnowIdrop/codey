@@ -1,44 +1,54 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod app_server_proxy;
+
 fn main() {
     if let Some(code) = codey_lib::run_elevated_node_options_helper_if_requested() {
         std::process::exit(code);
     }
     codey_lib::install_crash_log_hook("codey", "runtime.codey");
-    if let Err(error) = run() {
-        let error = format!("{error:#}");
-        codey_lib::record_process_failure(
-            "process_failed",
-            "run_codey",
-            error.clone(),
-            "runtime.codey",
-        );
-        eprintln!("Codey 运行失败：{error}");
-        std::process::exit(1);
+    match run() {
+        Ok(Some(exit_code)) if exit_code != 0 => std::process::exit(exit_code),
+        Ok(_) => {}
+        Err(error) => {
+            let error = format!("{error:#}");
+            codey_lib::record_process_failure(
+                "process_failed",
+                "run_codey",
+                error.clone(),
+                "runtime.codey",
+            );
+            eprintln!("Codey 运行失败：{error}");
+            std::process::exit(1);
+        }
     }
 }
 
-fn run() -> anyhow::Result<()> {
+fn run() -> anyhow::Result<Option<i32>> {
     if codey_lib::run_node_options_repair_if_requested()? {
-        return Ok(());
+        return Ok(None);
     }
     if codey_lib::run_overlay_recovery_if_requested()? {
-        return Ok(());
+        return Ok(None);
+    }
+    if let Some(exit_code) = app_server_proxy::run_helper_if_requested()? {
+        return Ok(Some(exit_code));
     }
     if codey_lib::run_fastctx_route_hook_if_requested()? {
-        return Ok(());
+        return Ok(None);
     }
     if codey_lib::run_subagent_gate_hook_if_requested()? {
-        return Ok(());
+        return Ok(None);
     }
     if codey_lib::run_error_log_helper_if_requested()? {
-        return Ok(());
+        return Ok(None);
     }
     if codey_lib::run_update_helper_if_requested()? {
-        return Ok(());
+        return Ok(None);
     }
     if codey_lib::run_codex_cli_wrapper_if_requested()? {
-        return Ok(());
+        return Ok(None);
     }
-    codey_lib::run_desktop_application()
+    codey_lib::run_desktop_application()?;
+    Ok(None)
 }

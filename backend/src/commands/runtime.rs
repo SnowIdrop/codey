@@ -335,12 +335,21 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, Strin
         return Err(error);
     }
     let handler = make_bridge_handler(state);
+    let workflow_config = config.clone();
+    let workflow_path = state.store.path().to_path_buf();
+    let workflow = tokio::task::spawn_blocking(move || {
+        crate::workflow::WorkflowHost::from_config(&workflow_config, &workflow_path)
+    })
+    .await
+    .map_err(|error| format!("初始化工作流运行时失败：{error}"))?;
+    state.workflow.store(Arc::clone(&workflow));
     let (runtime, codex_exit) = match CodeyRuntime::start(
         &config,
         handler,
         &state.trace_log_write_protection_active,
         state.crashpad_pending_stats.clone(),
         Arc::clone(&state.account_usage_cache),
+        workflow.proxy_launch_config(),
     )
     .await
     {
@@ -359,6 +368,7 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, Strin
         ));
     }
     *state.runtime.lock().await = Some(Arc::new(runtime));
+    workflow.recover_when_ready().await;
     let runtime_generation = state.runtime_generation.fetch_add(1, Ordering::AcqRel) + 1;
     super::sync_wechat_claw_service(state).await;
     if let Some(initial_scan_task) = initial_scan_task {
@@ -549,6 +559,11 @@ async fn run_scheduled_restart(restart_state: Arc<AppState>, mut cancel: oneshot
 }
 
 async fn stop_codey_runtime_locked(state: &Arc<AppState>) -> Result<Value, String> {
+    let workflow = state.workflow.load_full();
+    tokio::time::timeout(Duration::from_secs(10), workflow.shutdown())
+        .await
+        .map_err(|_| "暂停工作流超时，未停止当前 Codex 运行时".to_string())?
+        .map_err(|error| format!("暂停工作流失败：{error}"))?;
     super::stop_wechat_claw_service(state).await;
     stop_waiting_webhook_watcher(state).await;
     let runtime = state.runtime.lock().await.take();
@@ -593,6 +608,8 @@ pub(crate) async fn cleanup_failed_runtime_start(state: &Arc<AppState>) -> Resul
 
 pub async fn begin_shutdown(state: &Arc<AppState>) {
     state.shutting_down.store(true, Ordering::Release);
+    let workflow = state.workflow.load_full();
+    let _ = crate::workflow::recovery::ShutdownHooks::pause_admission(workflow.as_ref()).await;
     let restart = state.restart_task.lock().await.take();
     if let Some(ScheduledRestart { cancel, task }) = restart {
         let _ = cancel.send(());
