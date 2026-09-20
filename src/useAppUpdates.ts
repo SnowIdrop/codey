@@ -31,6 +31,7 @@ declare global {
 type UseAppUpdatesOptions = {
   embedded: boolean;
   configLoaded: boolean;
+  autoCheckCodeyUpdates: boolean;
   isBusy: boolean;
   setBusy: Dispatch<SetStateAction<string | null>>;
   setNotice: Dispatch<SetStateAction<Notice>>;
@@ -68,6 +69,7 @@ function publishUpdateAvailability(result: UpdateCheck | null) {
 export function useAppUpdates({
   embedded,
   configLoaded,
+  autoCheckCodeyUpdates,
   isBusy,
   setBusy,
   setNotice,
@@ -82,6 +84,9 @@ export function useAppUpdates({
   const [downloadedUpdate, setDownloadedUpdate] =
     useState<UpdateDownload | null>(null);
   const updateCheckRef = useRef<UpdateCheck | null>(null);
+  const promptedVersionRef = useRef<string | null>(null);
+  const [automaticallyChecking, setAutomaticallyChecking] = useState(false);
+  const manualCheckVersion = useRef(0);
   const updateCheckInFlightRef = useRef<Promise<UpdateCheck> | null>(null);
   const requestUpdateCheck = useCallback(() => {
     const current = updateCheckInFlightRef.current;
@@ -133,7 +138,7 @@ export function useAppUpdates({
   }, []);
 
   useEffect(() => {
-    if (embedded || !configLoaded) return;
+    if (embedded || !configLoaded || !autoCheckCodeyUpdates) return;
     let cancelled = false;
     let timer = 0;
 
@@ -150,11 +155,14 @@ export function useAppUpdates({
     };
 
     const checkForUpdatesSilently = async () => {
-      if (cancelled || shouldPause()) return;
-      setUpdateResult({ tone: "pending", text: "正在检查更新…" });
+      if (cancelled) return;
+      // 暂停只影响本次检查，定时器链必须继续，否则状态被手动清空后不再恢复自动检查。
+      if (shouldPause()) return schedule();
+      const manualVersion = manualCheckVersion.current;
+      setAutomaticallyChecking(true);
       try {
         const result = await requestUpdateCheck();
-        if (cancelled) return;
+        if (cancelled || manualVersion !== manualCheckVersion.current) return;
         if (result.updateAvailable) {
           setUpdateCheck(result);
           setDownloadedUpdate(null);
@@ -163,6 +171,13 @@ export function useAppUpdates({
             text: updateCheckText(result),
           });
           publishUpdateAvailability(result);
+          if (
+            result.selectedAsset &&
+            promptedVersionRef.current !== result.latestVersion
+          ) {
+            promptedVersionRef.current = result.latestVersion;
+            askDownloadUpdate(result);
+          }
           return;
         }
         setUpdateResult({
@@ -170,10 +185,15 @@ export function useAppUpdates({
           text: updateCheckText(result),
         });
       } catch {
-        if (!cancelled) setUpdateResult({ tone: "idle", text: "" });
+        if (!cancelled && manualVersion === manualCheckVersion.current) {
+          setUpdateResult({ tone: "idle", text: "" });
+        }
         // 更新地址不可达或检查超时时直接跳过；手动检查仍会展示具体错误。
       } finally {
-        if (!cancelled && !shouldPause()) schedule();
+        if (!cancelled) {
+          setAutomaticallyChecking(false);
+          schedule();
+        }
       }
     };
 
@@ -181,11 +201,13 @@ export function useAppUpdates({
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
+      setAutomaticallyChecking(false);
     };
-  }, [configLoaded, embedded, requestUpdateCheck]);
+  }, [autoCheckCodeyUpdates, configLoaded, embedded, requestUpdateCheck]);
 
   async function checkForUpdates() {
     if (!configLoaded || isBusy) return;
+    manualCheckVersion.current += 1;
     setBusy("check-update");
     setUpdateResult({ tone: "pending", text: "正在检查更新…" });
     setUpdateCheck(null);
@@ -208,6 +230,10 @@ export function useAppUpdates({
               : "success",
         text,
       });
+      if (result.updateAvailable && result.selectedAsset) {
+        promptedVersionRef.current = result.latestVersion;
+        askDownloadUpdate(result);
+      }
     } catch (error) {
       const text = errorText(error);
       setUpdateResult({ tone: "error", text });
@@ -217,12 +243,25 @@ export function useAppUpdates({
     }
   }
 
-  async function downloadUpdate() {
+  function askDownloadUpdate(check?: UpdateCheck | null) {
+    const target = check ?? updateCheck;
+    if (!target?.updateAvailable || !target.selectedAsset || isBusy) return;
+    setConfirmation({
+      action: "download-update",
+      title: `发现 Codey 新版本 v${target.latestVersion}`,
+      description: `当前版本为 v${target.currentVersion}，检测到新版本 v${target.latestVersion}。是否立即下载更新？`,
+      confirmLabel: "立即更新",
+      run: () => void downloadUpdate(target),
+    });
+  }
+
+  async function downloadUpdate(checkOverride?: UpdateCheck | null) {
+    const target = checkOverride ?? updateCheck;
     if (
       !configLoaded ||
       isBusy ||
-      !updateCheck?.updateAvailable ||
-      !updateCheck.selectedAsset
+      !target?.updateAvailable ||
+      !target.selectedAsset
     )
       return;
     setBusy("download-update");
@@ -238,6 +277,7 @@ export function useAppUpdates({
       const text = `已下载 ${result.fileName}（${formatBytes(result.size)}），校验通过`;
       setUpdateResult({ tone: "success", text });
       setNotice({ tone: "success", text });
+      askInstallDownloadedUpdate(result);
     } catch (error) {
       const text = errorText(error);
       setUpdateResult({ tone: "error", text });
@@ -247,25 +287,27 @@ export function useAppUpdates({
     }
   }
 
-  function askInstallDownloadedUpdate() {
-    if (!downloadedUpdate || isBusy) return;
+  function askInstallDownloadedUpdate(downloadOverride?: UpdateDownload | null) {
+    const target = downloadOverride ?? downloadedUpdate;
+    if (!target || isBusy) return;
     setConfirmation({
       action: "install-update",
       title: "安装更新",
-      description: `Codey 会先保存未保存的设置，再退出当前实例，安装 ${downloadedUpdate.fileName}，然后尝试启动新版。`,
+      description: `Codey 会先保存未保存的设置，再退出当前实例，安装 ${target.fileName}，然后尝试启动新版。`,
       confirmLabel: "安装并重启",
-      run: () => void installDownloadedUpdate(),
+      run: () => void installDownloadedUpdate(target),
     });
   }
 
-  async function installDownloadedUpdate() {
-    if (!downloadedUpdate || isBusy) return;
+  async function installDownloadedUpdate(downloadOverride?: UpdateDownload | null) {
+    const target = downloadOverride ?? downloadedUpdate;
+    if (!target || isBusy) return;
     setBusy("install-update");
     setUpdateResult({ tone: "pending", text: "正在启动安装器…" });
     try {
       await beforeInstall();
       await invoke("install_downloaded_update", {
-        filePath: downloadedUpdate.filePath,
+        filePath: target.filePath,
       });
       const text = "正在退出 Codey 并启动安装器…";
       setUpdateResult({ tone: "pending", text });
@@ -279,11 +321,13 @@ export function useAppUpdates({
   }
 
   return {
+    automaticallyChecking,
     updateResult,
     updateCheck,
     downloadedUpdate,
     checkForUpdates,
     downloadUpdate,
+    askDownloadUpdate,
     askInstallDownloadedUpdate,
   };
 }

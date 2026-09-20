@@ -4,6 +4,11 @@ import test from "node:test";
 import ts from "typescript";
 import { loadTypeScriptModule } from "./helpers/load-typescript-module.mjs";
 const pluginHelpers = await loadTypeScriptModule(new URL("../src/codeyPlugins.ts", import.meta.url));
+const documentHelpers = {};
+const documentSource = await readFile(new URL("../src/pluginConfigDocument.ts", import.meta.url), "utf8");
+new Function("require", "exports", ts.transpileModule(documentSource, {
+  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+}).outputText)(name => { assert.equal(name, "./codeyPlugins"); return pluginHelpers; }, documentHelpers);
 
 const source = await readFile(new URL("../src/PluginConfigDialog.tsx", import.meta.url), "utf8");
 const compiled = ts.transpileModule(source, {
@@ -12,9 +17,7 @@ const compiled = ts.transpileModule(source, {
 const plugin = () => ({
   id: "demo", name: "Demo", version: "1", enabled: true, status: "running",
   capabilities: [],
-  config: { text: "saved", nested: { first: 1, second: 2 } },
-  configSchema: { type: "object", properties: { text: { type: "string" } } },
-  configUi: { type: "html", entry: "config.html", sha256: "first" },
+  configPath: "/demo/config.json",
 });
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
@@ -48,17 +51,13 @@ function dialogHarness(initial) {
   const modules = {
     react,
     "./codeyPlugins": pluginHelpers,
+    "./pluginConfigDocument": documentHelpers,
     "react/jsx-runtime": { jsx, jsxs: jsx, Fragment: "fragment" },
     "./api": { invoke(command, args) {
       return new Promise((resolve, reject) => calls.push({ command, args, resolve, reject }));
     } },
     "./appUtils": { errorText: error => error.message },
     "./components/ui": Object.fromEntries(["Button", "Dialog", "DialogContent", "DialogDescription", "DialogHeader", "DialogTitle"].map(name => [name, name])),
-    "./PluginHtmlConfig": { PluginHtmlConfig: "html-editor" },
-    "./SchemaConfigForm": { SchemaConfigForm(props) {
-      const [value, onEdit] = react.useState(props.value);
-      return jsx("schema-editor", { ...props, value, onEdit });
-    } },
   };
   const exports = {};
   new Function("require", "exports", compiled)(name => {
@@ -103,172 +102,140 @@ function dialogHarness(initial) {
   return { render, find, calls, changed, get closed() { return closed; }, get staleWrites() { return staleWrites; } };
 }
 
-async function loadHtml(harness, index = 0, html = "<p>config</p>", version = "1") {
-  harness.calls[index].resolve({ pluginId: "demo", version, html });
+const hash = "a".repeat(64);
+const text = '{\n  "text": "saved"\n}\n';
+async function load(harness, index = 0, content = text, version = "1", pluginId = "demo") {
+  harness.calls[index].resolve({ pluginId, version, path: "/demo/config.json", content, sha256: hash });
   await flush(); harness.render();
 }
+const button = (h, name) => h.find("Button").find(node => node.props.children === name);
+const field = (h, name) => [...h.find("input"), ...h.find("textarea"), ...h.find("select")].find(node => node.props["aria-label"] === name);
+const edit = (h, value, name = "text") => { field(h, name).props.onChange({ target: { value } }); h.render(); };
 
-test("equal plugin refresh preserves drafts and does not reload HTML", async () => {
-  const initial = plugin(), harness = dialogHarness(initial);
-  await loadHtml(harness);
-  harness.find("html-editor")[0].props.onDraftChange({ text: "draft" });
-  const refresh = { ...structuredClone(initial), status: "stopped", enabled: false, lastError: "runtime error" };
-  refresh.config.nested = { second: 2, first: 1 };
-  harness.render(refresh);
-  assert.equal(harness.calls.length, 1);
-  harness.find("html-editor")[0].props.onFailure("bridge failed");
-  harness.render(); harness.find("Button")[0].props.onClick(); harness.render();
-  assert.deepEqual(harness.find("schema-editor")[0].props.value, { text: "draft" });
-  harness.find("schema-editor")[0].props.onEdit({ text: "fallback draft" });
-  harness.render(structuredClone(refresh));
-  assert.deepEqual(harness.find("schema-editor")[0].props.value, { text: "fallback draft" });
+test("saves only changed values with digest and preserves annotations and whitespace", async () => {
+  const h = dialogHarness(plugin());
+  const original = '{ "_comments": { "text": "字段说明" }, "text" : "saved", "rules": [{ "_comments": { "x": "说明" }, "x": 1 }] }\n';
+  await load(h, 0, original);
+  assert.equal(field(h, "text").props.value, "saved");
+  assert.equal(h.find("textarea").length, 0);
+  edit(h, 'draft "quoted"\nline');
+  const save = button(h, "保存配置").props.onClick; save(); save(); h.render();
+  assert.equal(h.calls.length, 2);
+  assert.deepEqual(h.calls[1].args, { pluginId: "demo", content: original.replace('"saved"', JSON.stringify('draft "quoted"\nline')), expectedSha256: hash });
+  h.find("Dialog")[0].props.onOpenChange(false);
+  assert.equal(h.closed, 0);
+  const result = { plugins: [plugin()], platform: "linux", arch: "x86_64" };
+  h.calls[1].resolve(result); await flush();
+  assert.deepEqual(h.changed, [result]); assert.equal(h.closed, 1);
 });
 
-for (const [name, update] of [
-  ["config", value => { value.config.text = "external"; }],
-  ["version", value => { value.version = "2"; }],
-  ["schema", value => { value.configSchema.properties.text.minLength = 2; }],
-  ["UI digest", value => { value.configUi.sha256 = "second"; }],
-  ["UI entry", value => { value.configUi.entry = "new.html"; }],
-]) test(`${name} changes reset HTML, errors, fallback and draft state`, async () => {
-  const initial = plugin(), harness = dialogHarness(initial);
-  await loadHtml(harness);
-  const editor = harness.find("html-editor")[0];
-  editor.props.onDraftChange({ text: "old draft" });
-  editor.props.onSave({ text: "old draft" });
-  harness.calls[1].reject(new Error("save failed"));
-  await flush(); harness.render();
-  editor.props.onFailure("bridge failed");
-  harness.render(); harness.find("Button")[0].props.onClick(); harness.render();
-  const next = structuredClone(initial); update(next); harness.render(next);
-  assert.equal(harness.find("schema-editor").length, 0);
-  assert.equal(harness.find("html-editor").length, 0);
-  assert.equal(harness.find("p").filter(node => node.props.role === "alert").length, 0);
-  assert.equal(harness.calls.length, 3);
-  await loadHtml(harness, 2, "<p>new config</p>", next.version);
-  assert.equal(harness.find("html-editor")[0].props.html, "<p>new config</p>");
-  harness.find("html-editor")[0].props.onFailure("new bridge failure");
-  harness.render(); harness.find("Button")[0].props.onClick(); harness.render();
-  assert.deepEqual(harness.find("schema-editor")[0].props.value, next.config);
+test("annotations are non-selectable text above immutable field labels", async () => {
+  const h = dialogHarness(plugin()); await load(h, 0, '{"_comments":{"text":"说明第一行\\n说明第二行"},"text":"value","rules":[{"_comments":{"x":"嵌套说明"},"x":1}]}');
+  const comment = h.find("p").find(node => node.props.children === "说明第一行\n说明第二行");
+  assert.deepEqual(comment.props.style, { userSelect: "none", WebkitUserSelect: "none" });
+  assert.equal(comment.props.contentEditable, undefined);
+  const row = h.find("div").find(node => Array.isArray(node.props.children) && node.props.children[0]?.props?.id === comment.props.id);
+  assert.ok(row);
+  assert.equal(field(h, "text").props["aria-describedby"], comment.props.id);
+  assert.ok(h.find("label").some(node => node.props.children === "text"));
+  assert.ok(field(h, "rules.0.x"));
+  assert.equal(h.find("input").length, 2);
+  assert.equal(field(h, "_comments.text"), undefined);
 });
 
-test("schema-only drafts survive equal refresh and reset after external changes", () => {
-  const initial = { ...plugin(), configUi: null }, harness = dialogHarness(initial);
-  harness.find("schema-editor")[0].props.onEdit({ text: "draft" });
-  harness.render(structuredClone(initial));
-  assert.deepEqual(harness.find("schema-editor")[0].props.value, { text: "draft" });
-  const next = { ...initial, config: { text: "external" } }; harness.render(next);
-  assert.deepEqual(harness.find("schema-editor")[0].props.value, next.config);
+test("malformed or unsupported files keep path and require external repair", async () => {
+  for (const invalid of ["{", "[]", "null", '"text"', '{"_comments":[]}', '{"rules":[{"_comments":{"x":123}}]}']) {
+    const h = dialogHarness(plugin()); await load(h, 0, invalid);
+    assert.equal(h.find("input").length, 0); assert.equal(h.find("textarea").length, 0);
+    assert.equal(button(h, "保存配置").props.disabled, true);
+    assert.ok(h.find("p").some(node => node.props.children === "/demo/config.json"));
+    assert.ok(h.find("p").some(node => node.props.role === "alert" && node.props.children.includes("修正配置文件后重新加载")));
+    button(h, "保存配置").props.onClick(); assert.equal(h.calls.length, 1);
+  }
 });
 
-test("removing HTML UI resets the fallback draft and cancels its pending load", async () => {
-  const initial = plugin(), harness = dialogHarness(initial);
-  const next = { ...initial, configUi: null, config: { text: "schema only" } };
-  harness.render(next);
-  await loadHtml(harness);
-  assert.deepEqual(harness.find("schema-editor")[0].props.value, next.config);
-  assert.equal(harness.staleWrites, 0);
+test("scalar validation blocks invalid saves and preserves numeric tokens", async () => {
+  const h = dialogHarness(plugin()); await load(h, 0, '{"count":9007199254740993,"enabled":true,"optional":null,"multi":"first\\nsecond","empty":[],"object":{}}');
+  assert.equal(field(h, "count").props.value, "9007199254740993");
+  assert.equal(field(h, "count").props.type, "text");
+  assert.equal(field(h, "enabled").type, "select");
+  assert.equal(field(h, "multi").type, "textarea");
+  assert.equal(h.find("p").filter(n => n.props.children === "无可编辑值").length, 2);
+  edit(h, "1e", "count");
+  assert.equal(button(h, "保存配置").props.disabled, true);
+  button(h, "保存配置").props.onClick(); assert.equal(h.calls.length, 1);
+  edit(h, "9007199254740994", "count"); edit(h, "false", "enabled"); edit(h, '"value"', "optional");
+  button(h, "保存配置").props.onClick();
+  assert.ok(h.calls[1].args.content.includes('"count":9007199254740994'));
+  assert.ok(h.calls[1].args.content.includes('"optional":"value"'));
 });
 
-test("late HTML responses cannot replace a newer configuration page", async () => {
-  const initial = plugin(), harness = dialogHarness(initial);
-  harness.render({ ...initial, config: { text: "external" } });
-  assert.equal(harness.calls.length, 2);
-  await loadHtml(harness, 1, "new page");
-  await loadHtml(harness, 0, "old page");
-  assert.equal(harness.find("html-editor")[0].props.html, "new page");
-  assert.equal(harness.staleWrites, 0);
+test("dirty close and reload require confirmation and keep drafts", async () => {
+  const h = dialogHarness(plugin()); await load(h); edit(h, "draft");
+  h.find("Dialog")[0].props.onOpenChange(false); h.render();
+  assert.equal(h.closed, 0); assert.equal(h.find("section").length, 1);
+  button(h, "继续编辑").props.onClick(); h.render();
+  button(h, "重新加载").props.onClick(); h.render();
+  assert.equal(h.calls.length, 1);
+  button(h, "放弃修改").props.onClick(); h.render();
+  assert.equal(h.calls.length, 2);
+  await load(h, 1, '{ "external": true }');
+  assert.equal(field(h, "external").props.value, "true");
 });
 
-test("save blocks duplicate submissions and closing while pending", async () => {
-  const harness = dialogHarness({ ...plugin(), configUi: null });
-  const save = harness.find("schema-editor")[0].props.onSave;
-  save({ text: "draft" }); save({ text: "duplicate" });
-  harness.render();
-  assert.equal(harness.calls.length, 1);
-  assert.equal(harness.find("schema-editor")[0].props.disabled, true);
-  harness.find("Dialog")[0].props.onOpenChange(false);
+test("load errors can retry; save conflicts preserve draft", async () => {
+  const h = dialogHarness(plugin()); h.calls[0].reject(new Error("read failed")); await flush(); h.render();
+  button(h, "重试读取").props.onClick(); await load(h, 1);
+  edit(h, "draft"); button(h, "保存配置").props.onClick();
+  h.calls[2].reject(new Error("配置文件已被修改")); await flush(); h.render();
+  assert.equal(field(h, "text").props.value, "draft");
+  assert.equal(h.closed, 0); assert.equal(h.changed.length, 0);
+});
+
+test("failed reload invalidates old content and digest until a successful retry", async () => {
+  const h = dialogHarness(plugin()); await load(h);
+  button(h, "重新加载").props.onClick(); h.render();
+  assert.equal(h.find("input").length, 0);
+  assert.equal(button(h, "保存配置").props.disabled, true);
+  h.calls[1].reject(new Error("read failed")); await flush(); h.render();
+  assert.equal(h.find("input").length, 0);
+  assert.equal(button(h, "保存配置").props.disabled, true);
+  button(h, "保存配置").props.onClick(); assert.equal(h.calls.length, 2);
+  button(h, "重试读取").props.onClick();
+  h.calls[2].resolve({ pluginId: "demo", version: "1", path: "/demo/config.json", content: '{"fresh":true}', sha256: "b".repeat(64) });
+  await flush(); h.render();
+  assert.equal(field(h, "fresh").props.value, "true");
+  edit(h, "false", "fresh"); button(h, "保存配置").props.onClick();
+  assert.equal(h.calls[3].args.expectedSha256, "b".repeat(64));
+});
+
+for (const change of [{ version: "2" }, { id: "other" }]) test(`old reads ignored after identity change ${JSON.stringify(change)}`, async () => {
+  const h = dialogHarness(plugin()); const next = { ...plugin(), ...change }; h.render(next);
+  await load(h, 1, '{"new":true}', next.version, next.id);
+  await load(h, 0, '{"old":true}');
+  assert.equal(field(h, "new").props.value, "true"); assert.equal(h.staleWrites, 0);
+});
+
+for (const outcome of ["resolve", "reject"]) test(`old save ${outcome} ignored after version change`, async () => {
+  const h = dialogHarness(plugin()); await load(h); edit(h, "draft"); button(h, "保存配置").props.onClick();
+  h.render({ ...plugin(), version: "2" });
+  if (outcome === "resolve") h.calls[1].resolve({ plugins: [], platform: "linux", arch: "x86_64" });
+  else h.calls[1].reject(new Error("stale"));
+  await flush(); h.render();
+  assert.equal(h.changed.length, 0); assert.equal(h.closed, 0); assert.equal(h.staleWrites, 0);
+});
+
+test("runtime refresh preserves draft and restored value closes without warning", async () => {
+  const h = dialogHarness(plugin()); await load(h); edit(h, "draft"); h.render({ ...plugin(), enabled: false });
+  assert.equal(h.calls.length, 1); assert.equal(field(h, "text").props.value, "draft");
+  edit(h, "saved"); button(h, "返回插件管理").props.onClick(); assert.equal(h.closed, 1);
+});
+
+test("keyboard save uses the latest value before a render", async () => {
+  const h = dialogHarness(plugin()); await load(h);
+  field(h, "text").props.onChange({ target: { value: "latest" } });
   let prevented = false;
-  harness.find("DialogContent")[0].props.onEscapeKeyDown({ preventDefault() { prevented = true; } });
-  assert.equal(prevented, true); assert.equal(harness.closed, 0);
-  const result = { plugins: [], platform: "linux", arch: "x86_64" }; harness.calls[0].resolve(result);
-  await flush();
-  assert.deepEqual(harness.changed, [result]); assert.equal(harness.closed, 1);
-});
-
-for (const outcome of ["success", "failure"]) test(`configuration changes keep the save lock and ignore obsolete save ${outcome}`, async () => {
-  const initial = { ...plugin(), configUi: null }, harness = dialogHarness(initial);
-  harness.find("schema-editor")[0].props.onSave({ text: "old draft" });
-  harness.render({ ...initial, config: { text: "external" } });
-  assert.equal(harness.find("schema-editor")[0].props.disabled, true);
-  harness.find("schema-editor")[0].props.onSave({ text: "new draft" });
-  harness.find("Dialog")[0].props.onOpenChange(false);
-  assert.equal(harness.calls.length, 1); assert.equal(harness.closed, 0);
-  if (outcome === "success") harness.calls[0].resolve({ plugins: [initial] });
-  else harness.calls[0].reject(new Error("obsolete failure"));
-  await flush(); harness.render();
-  assert.deepEqual(harness.changed, []); assert.equal(harness.closed, 0);
-  assert.equal(harness.staleWrites, 0);
-  assert.equal(harness.find("p").filter(node => node.props.role === "alert").length, 0);
-  assert.equal(harness.find("schema-editor")[0].props.disabled, false);
-  harness.find("schema-editor")[0].props.onSave({ text: "new draft" });
-  assert.equal(harness.calls.length, 2);
-  const result = { plugins: [{ ...initial, config: { text: "new draft" } }], platform: "linux", arch: "x86_64" };
-  harness.calls[1].resolve(result); await flush();
-  assert.deepEqual(harness.changed, [result]); assert.equal(harness.closed, 1);
-});
-
-test("HTML initialization and restored drafts close without a discard prompt", async () => {
-  const initial = plugin(), harness = dialogHarness(initial);
-  await loadHtml(harness);
-  const editor = harness.find("html-editor")[0];
-  editor.props.onDraftChange({ nested: { second: 2, first: 1 }, text: "saved" });
-  harness.find("Dialog")[0].props.onOpenChange(false);
-  assert.equal(harness.closed, 1);
-  editor.props.onDraftChange({ text: "changed" });
-  editor.props.onDraftChange(structuredClone(initial.config));
-  harness.find("Dialog")[0].props.onOpenChange(false);
-  assert.equal(harness.closed, 2);
-});
-
-for (const mode of ["html", "schema"]) test(`${mode} drafts block closing and survive failed saves`, async () => {
-  const harness = dialogHarness({ ...plugin(), configUi: mode === "html" ? plugin().configUi : null });
-  if (mode === "html") await loadHtml(harness);
-  const editor = harness.find(`${mode}-editor`)[0];
-  editor.props.onDraftChange({ text: "draft" });
-  harness.find("Dialog")[0].props.onOpenChange(false); harness.render();
-  assert.equal(harness.closed, 0);
-  assert.ok(harness.find("section").some(node => node.props.role === "alert"));
-  harness.find("Button").find(node => node.props.children === "继续编辑").props.onClick(); harness.render();
-  editor.props.onSave({ text: "draft" });
-  harness.calls.at(-1).reject(new Error("save failed")); await flush(); harness.render();
-  harness.find("Dialog")[0].props.onOpenChange(false); harness.render();
-  assert.equal(harness.closed, 0);
-  harness.find("Button").find(node => node.props.children === "放弃修改").props.onClick();
-  assert.equal(harness.closed, 1);
-});
-
-test("an invalid unsaved JSON draft is protected even when parsed values are unchanged", () => {
-  const initial = { ...plugin(), configUi: null }, harness = dialogHarness(initial);
-  harness.find("schema-editor")[0].props.onDraftChange(initial.config, true);
-  harness.find("Dialog")[0].props.onOpenChange(false); harness.render();
-  assert.equal(harness.closed, 0);
-  assert.ok(harness.find("section").some(node => node.props.role === "alert"));
-});
-
-test("a visible discard prompt cannot close the editor during a save", async () => {
-  const harness = dialogHarness({ ...plugin(), configUi: null });
-  const editor = harness.find("schema-editor")[0];
-  editor.props.onDraftChange({ text: "draft" });
-  harness.find("Dialog")[0].props.onOpenChange(false); harness.render();
-  editor.props.onSave({ text: "draft" }); harness.render();
-  const discard = harness.find("Button").find(node => node.props.children === "放弃修改");
-  assert.equal(discard.props.disabled, true);
-  discard.props.onClick();
-  assert.equal(harness.closed, 0);
-  harness.calls[0].reject(new Error("save failed")); await flush(); harness.render();
-  const retry = harness.find("Button").find(node => node.props.children === "放弃修改");
-  assert.equal(retry.props.disabled, false);
-  retry.props.onClick();
-  assert.equal(harness.closed, 1);
+  h.find("div").find(node => node.props.onKeyDown).props.onKeyDown({ ctrlKey: true, key: "s", preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.equal(h.calls[1].args.content, text.replace("saved", "latest"));
 });

@@ -13,6 +13,7 @@ use std::time::Duration;
 
 mod config_repair;
 mod diagnostics;
+mod extensions;
 mod models;
 mod native_plugins;
 mod official_accounts;
@@ -1340,14 +1341,15 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             Err(error) => Err(error),
         },
         "plugin_marketplace_status" => plugin_marketplace_status().await,
+        "codex_extensions" => extensions::invoke(state, &args).await,
         "repair_plugin_marketplace" => repair_plugin_marketplace().await,
         "list_codey_plugins" => native_plugins::invoke(command, &args).await,
-        "get_codey_plugin_config_ui" => native_plugins::invoke(command, &args).await,
+        "get_codey_plugin_config_file" => native_plugins::invoke(command, &args).await,
         "select_codey_plugin_package" => native_plugins::invoke(command, &args).await,
         "inspect_codey_plugin" => native_plugins::invoke(command, &args).await,
         "install_codey_plugin" => native_plugins::invoke(command, &args).await,
         "set_codey_plugin_enabled" => native_plugins::invoke(command, &args).await,
-        "configure_codey_plugin" => native_plugins::invoke(command, &args).await,
+        "save_codey_plugin_config_file" => native_plugins::invoke(command, &args).await,
         "uninstall_codey_plugin" => native_plugins::invoke(command, &args).await,
         "invoke_codey_plugin" => native_plugins::invoke(command, &args).await,
         "workflow_capabilities" => workflows::capabilities(state, args).await,
@@ -1662,6 +1664,7 @@ pub async fn save_codey_config(
 
 struct CodeyConfigSaveInput {
     config: CodeyConfig,
+    auto_check_codey_updates_present: bool,
     model_reasoning_efforts_present: bool,
     model_context_present: bool,
     local_router_enabled_present: bool,
@@ -1678,6 +1681,7 @@ impl CodeyConfigSaveInput {
     fn complete(config: CodeyConfig) -> Self {
         Self {
             config,
+            auto_check_codey_updates_present: true,
             model_reasoning_efforts_present: true,
             model_context_present: true,
             local_router_enabled_present: true,
@@ -1699,6 +1703,7 @@ fn codey_config_save_input(args: &Value) -> Result<CodeyConfigSaveInput, String>
     let fields = config_value
         .as_object()
         .ok_or_else(|| "参数 config 无效：必须是 object".to_string())?;
+    let auto_check_codey_updates_present = fields.contains_key("autoCheckCodeyUpdates");
     let local_router_enabled_present = fields.contains_key("localRouterEnabled");
     let model_reasoning_efforts_present = fields.contains_key("modelReasoningEffortsByProvider");
     let model_context_present = fields.contains_key("modelContextByProvider");
@@ -1712,6 +1717,7 @@ fn codey_config_save_input(args: &Value) -> Result<CodeyConfigSaveInput, String>
         .map_err(|error| format!("参数 config 无效：{error}"))?;
     Ok(CodeyConfigSaveInput {
         config,
+        auto_check_codey_updates_present,
         model_reasoning_efforts_present,
         model_context_present,
         local_router_enabled_present,
@@ -1747,6 +1753,7 @@ async fn save_codey_config_locked(
 ) -> Result<SavedCodeyConfig, String> {
     let CodeyConfigSaveInput {
         config: mut config_input,
+        auto_check_codey_updates_present,
         model_reasoning_efforts_present,
         model_context_present,
         local_router_enabled_present,
@@ -1856,6 +1863,9 @@ async fn save_codey_config_locked(
                     .model_reasoning_efforts_by_provider
                     .contains_key(provider_id)
             });
+    }
+    if auto_check_codey_updates_present {
+        config.auto_check_codey_updates = config_input.auto_check_codey_updates;
     }
     if local_router_enabled_present {
         config.local_router_enabled = config_input.local_router_enabled;

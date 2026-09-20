@@ -69,7 +69,6 @@ pub const CODEX_APP_PATH_INVALID_ERROR: &str = "配置的 Codex App 路径无效
 const DISABLE_GPU_ARGUMENT: &str = "--disable-gpu";
 const DISABLE_GPU_RASTERIZATION_ARGUMENT: &str = "--disable-gpu-rasterization";
 const DISABLE_BACKGROUND_ECOQOS_ARGUMENT: &str = "--disable-features=UseEcoQoSForBackgroundProcess";
-const DEFAULT_CHINESE_LOCALE_ARGUMENT: &str = "--lang=zh-CN";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -320,6 +319,23 @@ fn record_reserved_provider_repair_failure(
         error,
         error_log::FailureMetadata {
             stage: Some("startup.config_repair".to_string()),
+            recoverable: Some(true),
+        },
+        serde_json::json!({
+            "codexHome": home,
+            "taskJoinFailed": task_join_failed,
+        }),
+    );
+}
+
+/// 旧版默认语言遗留值不清理只是让界面语言保持原样，因此失败只记诊断信息。
+fn record_locale_migration_failure(home: &std::path::Path, error: String, task_join_failed: bool) {
+    error_log::record_failure_with_metadata(
+        "locale_migration_failed",
+        "migrate_legacy_default_locale",
+        error,
+        error_log::FailureMetadata {
+            stage: Some("startup.locale_migration".to_string()),
             recoverable: Some(true),
         },
         serde_json::json!({
@@ -1485,6 +1501,25 @@ async fn prepare_startup_storage(
         // before any permanent maintenance is applied.
         prepare_codex_for_launch(&app_dir).await?;
 
+        // 语言迁移只清理旧版留下的默认值，属于非关键维护：失败时记录真实原因
+        // 并继续启动。阻断启动会让一处无关的配置问题（例如 base_url 非非空字符串）
+        // 表现为「迁移语言失败」，用户既看不到真实原因也无法进入 Codex。未写入
+        // 的迁移标记会在下次启动重试。
+        let locale_home = home.to_path_buf();
+        match tokio::task::spawn_blocking(move || {
+            crate::codex_config::migrate_legacy_default_locale(&locale_home)
+        })
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                record_locale_migration_failure(home, format!("{error:#}"), false);
+            }
+            Err(error) => {
+                record_locale_migration_failure(home, format!("{error}"), true);
+            }
+        }
+
         // Keep each task's saved provider. The catalog touches separate files,
         // so prepare it alongside session maintenance after Codex has stopped.
         let (session_maintenance, startup_catalog) =
@@ -1671,18 +1706,30 @@ async fn prepare_native_runtime_state(
 async fn prepare_startup_patches(
     home: &std::path::Path,
     config: &CodeyConfig,
-) -> StartupPatchState {
-    let slim_codex_pet = config.slim_codex_pet;
-    let pet_result = configure_startup_pet(home, slim_codex_pet).await;
+) -> Result<StartupPatchState> {
     // The vendored helper only probes the port on Windows. A busy 9229 on macOS
     // (another Node/Electron debugger) otherwise leaves Chromium without a
     // remote-debugging port and the injection times out after 30 s.
-    let debug_port = codey_runtime_core::ports::select_packaged_codex_debug_port_with(
-        9229,
-        true,
-        codey_runtime_core::ports::can_bind_loopback_port,
-        codey_runtime_core::ports::find_available_loopback_port,
-    );
+    prepare_startup_patches_with_port_selector(home, config, || {
+        codey_runtime_core::ports::try_select_packaged_codex_debug_port_with(
+            9229,
+            true,
+            codey_runtime_core::ports::can_bind_loopback_port,
+            codey_runtime_core::ports::try_find_available_loopback_port,
+        )
+    })
+    .await
+}
+
+async fn prepare_startup_patches_with_port_selector(
+    home: &std::path::Path,
+    config: &CodeyConfig,
+    select_debug_port: impl FnOnce() -> std::io::Result<u16>,
+) -> Result<StartupPatchState> {
+    let debug_port = select_debug_port().context("无法为 Codex 分配本地调试端口")?;
+    anyhow::ensure!(debug_port != 0, "无法为 Codex 分配有效的本地调试端口");
+    let slim_codex_pet = config.slim_codex_pet;
+    let pet_result = configure_startup_pet(home, slim_codex_pet).await;
     match pet_result {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => {
@@ -1717,7 +1764,7 @@ async fn prepare_startup_patches(
             );
         }
     };
-    StartupPatchState { debug_port }
+    Ok(StartupPatchState { debug_port })
 }
 
 // This boundary receives already-resolved launch components from the lifecycle
@@ -2058,7 +2105,17 @@ impl CodeyRuntime {
             }
         };
         stage_timings.mark("providerStateMs");
-        let patch = prepare_startup_patches(home, config).await;
+        let patch = match prepare_startup_patches(home, config).await {
+            Ok(patch) => patch,
+            Err(error) => {
+                return Err(restore_runtime_config_after_error(
+                    home,
+                    config.local_router_enabled,
+                    error,
+                )
+                .await);
+            }
+        };
         stage_timings.mark("startupPatchesMs");
         let SpawnedRenderer {
             app_dir,

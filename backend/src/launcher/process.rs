@@ -1108,8 +1108,13 @@ fn windows_local_app_data(value: Option<std::ffi::OsString>) -> Result<PathBuf> 
 
 #[cfg(any(windows, test))]
 pub(crate) fn windows_cli_wrapper_target(app_dir: &std::path::Path) -> Result<PathBuf> {
-    let target = codey_runtime_core::app_paths::codex_runtime_executable(app_dir)
-        .ok_or_else(|| anyhow::anyhow!("Codex App 内未找到内置 CLI"))?;
+    let target =
+        codey_runtime_core::app_paths::codex_runtime_executable(app_dir).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}",
+                codey_runtime_core::app_paths::codex_runtime_executable_missing(app_dir)
+            )
+        })?;
     if codey_runtime_core::app_paths::packaged_app_user_model_id(app_dir).is_none() {
         return Ok(target);
     }
@@ -1171,8 +1176,13 @@ async fn prepare_cli_wrapper(
             .context("准备 Windows Codex 用户运行文件的任务异常退出")??
     };
     #[cfg(target_os = "macos")]
-    let target = codey_runtime_core::app_paths::codex_runtime_executable(app_dir)
-        .ok_or_else(|| anyhow::anyhow!("Codex App 内未找到内置 CLI"))?;
+    let target =
+        codey_runtime_core::app_paths::codex_runtime_executable(app_dir).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}",
+                codey_runtime_core::app_paths::codex_runtime_executable_missing(app_dir)
+            )
+        })?;
     validate_code_mode_host(&target)?;
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -1240,6 +1250,12 @@ async fn prepare_cli_wrapper(
         .context("写入 macOS Codex CLI 兼容入口的任务异常退出")??;
         path
     };
+    if crate::codex_startup_patch::local_router_runtime_enabled(runtime_config_overrides) {
+        environment.push((
+            crate::codex_startup_patch::CLI_WRAPPER_STDIN_RELAY_ENV.to_string(),
+            wrapper.to_string_lossy().to_string(),
+        ));
+    }
     environment.insert(
         0,
         (
@@ -2076,7 +2092,7 @@ pub(super) fn codex_runtime_arguments(
     gpu_arguments_enabled_for_platform: bool,
     disable_background_ecoqos: bool,
 ) -> Vec<String> {
-    let mut arguments = vec![DEFAULT_CHINESE_LOCALE_ARGUMENT.to_string()];
+    let mut arguments = Vec::new();
     if disable_background_ecoqos {
         // Chromium marks backgrounded renderer processes as EcoQoS on Windows
         // 11. During Codex startup that can throttle the renderer which owns the

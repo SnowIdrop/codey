@@ -42,12 +42,12 @@ export const CODEY_API_COMMANDS = [
   "repair_main_process_injection",
   "repair_codex_config",
   "list_codey_plugins",
-  "get_codey_plugin_config_ui",
+  "get_codey_plugin_config_file",
   "select_codey_plugin_package",
   "inspect_codey_plugin",
   "install_codey_plugin",
   "set_codey_plugin_enabled",
-  "configure_codey_plugin",
+  "save_codey_plugin_config_file",
   "uninstall_codey_plugin",
   "invoke_codey_plugin",
   "workflow_capabilities",
@@ -63,6 +63,7 @@ export const CODEY_API_COMMANDS = [
   "workflow_retry_node",
   "workflow_reply_interaction",
   "workflow_bypass_audit",
+  "codex_extensions",
 ] as const;
 
 export type CodeyApiCommand = (typeof CODEY_API_COMMANDS)[number];

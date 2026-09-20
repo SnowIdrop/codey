@@ -101,6 +101,7 @@ export type WorkflowConfig = {
 
 export type Config = {
   settingsRevision: number;
+  autoCheckCodeyUpdates: boolean;
   localRouterEnabled: boolean;
   routeRequestLog: RouteRequestLogConfig;
   streamMaxRetries: number;
@@ -277,6 +278,8 @@ export type Confirmation = {
     | "restart"
     | "repair-codex-config"
     | "install-update"
+    | "download-update"
+    | "disable-auto-update-check"
     | "delete-notification-channel"
     | "delete-route"
     | "delete-official-account";

@@ -1,12 +1,13 @@
 import { memo, useMemo, useState } from "react";
 import {
   IconActivity as Activity,
+  IconChevronDown,
+  IconChevronUp,
   IconCode as Code,
   IconCloudCheck,
   IconCpu,
   IconDatabase,
   IconFileCheck,
-  IconFolderOpen,
   IconHistory,
   IconLoader2 as LoaderCircle,
   IconPlugConnected as PlugZap,
@@ -21,9 +22,8 @@ import type {
   PluginMarketplaceStatus,
   RuntimeStatus,
 } from "./App.types";
-import { Card, Disclosure } from "@heroui/react";
+import { Disclosure } from "@heroui/react";
 import { Badge, Button } from "./components/ui";
-import { flushCardClass } from "./uiClasses";
 import {
   buildEnabledOptimizationFeatures,
   canRepairMainProcessInjection,
@@ -32,7 +32,6 @@ import {
 } from "./runtimeStatusPresentation";
 
 const Cpu = IconCpu;
-const FolderOpen = IconFolderOpen;
 const History = IconHistory;
 const EMPTY_INJECTION_SCRIPTS: NonNullable<
   RuntimeStatus["injectionScripts"]
@@ -81,16 +80,15 @@ type OperationsPanelProps = {
   pluginMarketplaceStatus: PluginMarketplaceStatus | null;
   onRepairPluginMarketplace: () => void;
   onRepairMainProcessInjection: () => void;
-  onRepairCodexConfig: () => void;
+  onRepairCodexConfig?: () => void;
   configRepairNotice?: { tone: "info" | "success" | "error"; text: string } | null;
   injectionRepairing?: boolean;
-  onRestart: () => void;
+  onRestart?: () => void;
   showRestartAction?: boolean;
   restartStatusUnknown?: boolean;
 };
 
 function OperationsPanelComponent({
-  codexAppPath,
   fastContextToolsStatus,
   status,
   busy,
@@ -98,11 +96,8 @@ function OperationsPanelComponent({
   pluginMarketplaceStatus,
   onRepairPluginMarketplace,
   onRepairMainProcessInjection,
-  onRepairCodexConfig,
   configRepairNotice,
   injectionRepairing = false,
-  onRestart,
-  showRestartAction = true,
   restartStatusUnknown = false,
 }: OperationsPanelProps) {
   const [activeCardTitle, setActiveCardTitle] = useState<string | null>(null);
@@ -209,12 +204,7 @@ function OperationsPanelComponent({
   const injectionStatusPending = injectionScripts.length === 0;
   const injectionError =
     internalInjectionError || failedInjectionScriptCount > 0;
-  const resolvedCodexPath = status.codexAppPath || "/Applications/ChatGPT.app";
   const restartPending = Boolean(status.restartRequired);
-  const codexVersion = status.codexAppVersion?.trim();
-  const codexVersionLabel = codexVersion
-    ? `Codex v${codexVersion}`
-    : "Codex 版本未知";
 
 
   type MetricItem = {
@@ -420,114 +410,89 @@ function OperationsPanelComponent({
   const expandedStatusCard = expandedCardTitle
     ? statusCards.find((item) => item.title === expandedCardTitle) ?? null
     : null;
-  const ExpandedStatusIcon = expandedStatusCard?.icon;
 
   return (
     <section
       className={`operations-hub${restartPending ? " pending" : status.running ? " running" : ""}`}
-      aria-labelledby="operations-title"
+      aria-label="服务状态与诊断"
     >
-      <Card className={`operations-panel ${flushCardClass}`}>
-        <div className="operations-header">
-          <div className="operations-heading">
-            <span className="operations-heading-icon">
-              <Activity size={18} aria-hidden="true" />
-            </span>
-            <div className="operations-heading-copy">
-              <div className="operations-title-row">
-                <h2 id="operations-title">Codex 运行状态</h2>
-                <span className="codex-version-tag">{codexVersionLabel}</span>
-              </div>
-              <div
-                className="path-display header-path-display"
-                aria-label="Codex 应用路径"
-              >
-                <FolderOpen size={14} aria-hidden="true" />
-                <code>{codexAppPath || resolvedCodexPath}</code>
-              </div>
-            </div>
-          </div>
-
-          <div className="operations-actions">
-            <div
-              className="operations-status-chips"
-              role="list"
-              aria-label="核心服务状态"
-            >
-              {statusCards.map((item) => {
-                const StatusIcon = item.icon;
-                const isExpanded = activeCardTitle === item.title;
-                return (
-                  <span
-                    key={item.title}
-                    className="operations-status-chip-wrap"
-                    role="listitem"
-                  >
-                    <button
-                      type="button"
-                      className={`operations-status-chip tone-${item.tone}${isExpanded ? " active" : ""}`}
-                      onClick={() => toggleCard(item.title)}
-                      aria-expanded={isExpanded}
-                      aria-label={`${item.title}（${item.label}），点击${isExpanded ? "收起" : "展开"}`}
-                    >
-                      <span
-                        className="operations-status-chip-icon"
-                        aria-hidden="true"
-                      >
-                        <StatusIcon size={14} />
-                      </span>
-                      <span className="operations-status-chip-copy">
-                        <strong>{item.title}</strong>
-                        <small>{item.label}</small>
-                      </span>
-                    </button>
-                  </span>
-                );
-              })}
-            </div>
-
-            <Badge
-              className="operations-running-badge"
-              variant={
-                restartPending
+      <div className="operations-panel">
+        {/* 3列核心服务卡片 */}
+        <div
+          className="operations-status-cards grid grid-cols-1 gap-2.5 sm:grid-cols-3 mb-3"
+          role="list"
+          aria-label="核心服务状态"
+        >
+          {statusCards.map((item) => {
+            const StatusIcon = item.icon;
+            const isExpanded = activeCardTitle === item.title;
+            const badgeVariant =
+              item.tone === "destructive"
+                ? "destructive"
+                : item.tone === "warning"
                   ? "warning"
-                  : status.running
+                  : item.tone === "success"
                     ? "success"
-                    : "secondary"
-              }
-            >
-              <span className="operations-status-dot" aria-hidden="true" />
-              {restartPending
-                ? "等待重启"
-                : status.running
-                  ? "运行中"
-                  : "未启动"}
-            </Badge>
-            {showRestartAction && (
-              <Button
-                variant="warning"
-                size="sm"
-                disabled={isBusy || (!restartStatusUnknown && (status.restartInProgress || !status.running))}
-                onClick={onRestart}
+                    : "secondary";
+
+            return (
+              <button
+                key={item.title}
+                type="button"
+                className={`codey-card flex flex-col justify-between p-3.5 text-left transition-all cursor-pointer ${
+                  isExpanded
+                    ? "status-card-active border-blue-500 ring-2 ring-blue-500/20 shadow-xs"
+                    : "hover:border-default-foreground/20 hover:shadow-xs"
+                }`}
+                onClick={() => toggleCard(item.title)}
+                aria-expanded={isExpanded}
+                aria-label={`${item.title}（${item.label}），点击${isExpanded ? "收起" : "展开"}`}
               >
-                {busy === "restart" || (status.restartInProgress && !restartStatusUnknown) ? (
-                  <LoaderCircle className="animate-spin" aria-hidden="true" />
-                ) : (
-                  <RefreshCw aria-hidden="true" />
-                )}
-                {restartStatusUnknown ? "重新查询状态" : status.running ? "重启 Codex" : "未运行"}
-              </Button>
-            )}
-          </div>
+                <div className="flex items-center justify-between gap-2 mb-2">
+                  <div className="flex items-center gap-2">
+                    <div
+                      className={`flex size-7 shrink-0 items-center justify-center rounded-lg ${
+                        item.tone === "success"
+                          ? "bg-green-500/10 text-green-600 dark:bg-green-500/20 dark:text-green-400"
+                          : item.tone === "warning"
+                            ? "bg-amber-500/10 text-amber-600 dark:bg-amber-500/20 dark:text-amber-400"
+                            : item.tone === "destructive"
+                              ? "bg-red-500/10 text-red-600 dark:bg-red-500/20 dark:text-red-400"
+                              : "bg-blue-500/10 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400"
+                      }`}
+                      aria-hidden="true"
+                    >
+                      <StatusIcon size={15} />
+                    </div>
+                    <strong className="text-xs font-semibold text-foreground">{item.title}</strong>
+                  </div>
+                  <Badge variant={badgeVariant} className="text-[10.5px] px-1.5 py-0">
+                    {item.label}
+                  </Badge>
+                </div>
+                <p className="m-0 text-[11.5px] text-muted line-clamp-2 leading-relaxed">
+                  {item.description}
+                </p>
+                <div className="mt-2.5 flex items-center justify-between text-[11px] font-medium text-muted/70">
+                  <span>{isExpanded ? "收起诊断" : "查看诊断详情"}</span>
+                  {isExpanded ? (
+                    <IconChevronUp size={13} aria-hidden="true" />
+                  ) : (
+                    <IconChevronDown size={13} aria-hidden="true" />
+                  )}
+                </div>
+              </button>
+            );
+          })}
         </div>
 
-        {/* 详情面板只做展开收起动画，没有独立触发器：标题卡片本身就是开关。 */}
+        {/* 详情面板只做展开收起动画，没有独立触发器：状态按钮本身就是开关。 */}
         <Disclosure isExpanded={Boolean(activeCardTitle)} className="border-0 p-0">
           <Disclosure.Content>
           <Disclosure.Body className="p-0">
-          {expandedStatusCard && ExpandedStatusIcon && (
+          {expandedStatusCard && (
             <div
-              className="operations-expanded-grid"
+              className="operations-expanded-tray codey-card"
               role="region"
               aria-label="展开的系统详情"
             >
@@ -535,51 +500,6 @@ function OperationsPanelComponent({
                 key={expandedStatusCard.title}
                 className={`operations-expanded-card tone-${expandedStatusCard.tone}`}
               >
-                <div className="expanded-card-header">
-                  <div className="expanded-card-title">
-                    <span
-                      className={`expanded-card-icon tone-${expandedStatusCard.tone}`}
-                    >
-                      <ExpandedStatusIcon size={18} aria-hidden="true" />
-                    </span>
-                    <div className="expanded-card-copy">
-                      <div className="expanded-card-heading">
-                        <h3>{expandedStatusCard.title}</h3>
-                        {expandedStatusCard.enabledFeatureCount !==
-                          undefined && (
-                          <span className="expanded-card-feature-count">
-                            已启用 {expandedStatusCard.enabledFeatureCount} 项
-                          </span>
-                        )}
-                      </div>
-                      <p>{expandedStatusCard.description}</p>
-                    </div>
-                  </div>
-                  <div className="expanded-card-actions">
-                    {expandedStatusCard.showInjectionScripts && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        disabled={isBusy}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          onRepairCodexConfig();
-                        }}
-                      >
-                        {busy === "repair-codex-config" ? (
-                          <LoaderCircle className="animate-spin" aria-hidden="true" />
-                        ) : (
-                          <RefreshCw aria-hidden="true" />
-                        )}
-                        {busy === "repair-codex-config" ? "检查修复中…" : "修复 Codex 配置"}
-                      </Button>
-                    )}
-                    <Badge variant={expandedStatusCard.tone}>
-                      {expandedStatusCard.label}
-                    </Badge>
-                  </div>
-                </div>
-
                 <div className="expanded-card-body">
                   {expandedStatusCard.showInjectionScripts && configRepairNotice && (
                     <p role="status" className={`mb-3 whitespace-pre-line break-words text-sm ${configRepairNotice.tone === "error" ? "text-danger" : "text-[var(--codey-text-secondary)]"}`}>
@@ -656,7 +576,11 @@ function OperationsPanelComponent({
                       aria-labelledby="injection-status-title"
                     >
                       <div className="injection-status-header">
-                        <h4 id="injection-status-title">已生效功能</h4>
+                        <h4 id="injection-status-title">
+                          {enabledOptimizationFeatures.length > 0
+                            ? `已生效 ${enabledOptimizationFeatures.length} 项功能`
+                            : "已生效功能"}
+                        </h4>
                       </div>
 
                       {enabledOptimizationFeatures.length > 0 ? (
@@ -732,7 +656,7 @@ function OperationsPanelComponent({
           </Disclosure.Content>
         </Disclosure>
 
-      </Card>
+      </div>
     </section>
   );
 }

@@ -2,7 +2,8 @@
 // main.tsx via a dynamic import that only exists in Vite dev builds, so this
 // module never ships in the production overlay.
 import type { ProviderStatus, Config, ModelState, OfficialAccount, Profile } from "../App.types";
-import pluginConfigHtml from "../../examples/plugins/header-demo/ui/config.html?raw";
+import { pluginConfigBusinessValuesEqual, validatePluginConfigText } from "../codeyPlugins";
+import { createCodexExtensionsPreview } from "./codexExtensionsMock";
 import {
   AUTO_REVIEW_MODEL,
   includesModelId,
@@ -73,6 +74,7 @@ if (import.meta.env.DEV) {
     };
     let previewConfig: Config = {
       settingsRevision: 0,
+      autoCheckCodeyUpdates: true,
       localRouterEnabled: true,
       routeRequestLog: {
         enabled: true,
@@ -524,28 +526,70 @@ if (import.meta.env.DEV) {
     });
 
     const pluginPreviewMode = new URLSearchParams(window.location.search).get("plugins");
-    const previewPlugins = ["installed", "html", "html-error"].includes(pluginPreviewMode ?? "") ? [{
+    const previewPlugins = ["installed", "config-error", "config-invalid", "config-conflict", "config-values"].includes(pluginPreviewMode ?? "") ? [{
       id: "dev.codey.header-demo", name: "请求头示例", version: "0.1.0",
       description: "演示独立插件的请求头扩展能力。", enabled: false, status: "disabled", restartRequired: false,
-      config: { value: "demo" } as Record<string, unknown>, configSchema: { type: "object", properties: { value: { type: "string", title: "请求头值", minLength: 1 } }, required: ["value"] }, capabilities: ["request.beforeSend"],
+      configPath: "/preview/codey-plugins/installed/dev.codey.header-demo/config.json", capabilities: ["request.beforeSend"],
       pluginDir: "/preview/codey-plugins/installed/dev.codey.header-demo", dataDir: "/preview/codey-plugins/installed/dev.codey.header-demo/data", logDir: "/preview/codey-plugins/installed/dev.codey.header-demo/logs",
-      configUi: pluginPreviewMode?.startsWith("html") ? { type: "html", entry: "ui/config.html", sha256: "preview" } : null,
     }] : [];
+    let pluginConfigContent = pluginPreviewMode === "config-invalid" ? '{ "value": ' : pluginPreviewMode === "config-values" ? JSON.stringify({
+      _comments: {
+        value: "请求头使用的文本。这里只能修改值，字段名和说明保留在配置文件中。",
+        maxAttempts: "每轮最多尝试次数。达到次数或总时限时停止；修改数字后保存，再重新启用插件即可应用。",
+        enabled: "是否启用此项功能。",
+        rules: "按账号类型和模型分别设置参数。每项的说明显示在对应字段上方。",
+        "rules.accountType": "账号类型，例如 pro、plus、go、team。",
+        "rules.model": "本项对应的模型。",
+        "rules.allowedStateLengths": "允许的 state 字节长度；数组中的每个值可单独修改。",
+        notes: "多行文本会保留换行。",
+      },
+      value: "demo",
+      maxAttempts: 10,
+      enabled: true,
+      rules: [
+        { accountType: "pro", model: "gpt6", allowedStateLengths: [292] },
+        { _comments: { model: "本项使用单独的模型说明。" }, accountType: "plus", model: "5.6", allowedStateLengths: [292, 300] },
+      ],
+      notes: "第一行\n第二行",
+      optional: null,
+      empty: [],
+    }, null, 2) + "\n" : '{\n  "_comments": { "value": "请求头的值。" },\n  "value": "demo"\n}\n';
+    let activePluginConfigContent: string | null = null;
+    const configHash = async (text: string) => Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text))), byte => byte.toString(16).padStart(2, "0")).join("");
+    const extensionsPreview = createCodexExtensionsPreview(previewClientPlatform);
     window.__codeyInvokeApi = async (command, args) => {
       console.log(`[Mock API Call] ${command}`, args);
       // Wait a tiny bit to simulate network delay
       await new Promise((resolve) => setTimeout(resolve, 300));
+
+      if (command === "codex_extensions") return extensionsPreview(args?.request as Record<string, unknown>);
 
       if (command === "list_codey_plugins") {
         const pluginPreview = new URLSearchParams(window.location.search).get("plugins");
         if (pluginPreview === "error") throw new Error("预览：插件列表暂时不可用，请稍后刷新。");
         return { plugins: structuredClone(previewPlugins), platform: previewClientPlatform, arch: "aarch64" };
       }
-      if (command === "set_codey_plugin_enabled" || command === "configure_codey_plugin") {
+      if (command === "set_codey_plugin_enabled" || command === "save_codey_plugin_config_file") {
         const plugin = previewPlugins.find(item => item.id === args?.pluginId);
         if (!plugin) throw new Error("预览：插件不存在");
-        if (command === "set_codey_plugin_enabled") { plugin.enabled = Boolean(args?.enabled); plugin.status = plugin.enabled ? "enabled" : "disabled"; plugin.restartRequired = false; }
-        else { plugin.config = args?.config as Record<string, unknown>; plugin.restartRequired = plugin.enabled; }
+        if (command === "set_codey_plugin_enabled") {
+          if (args?.enabled) {
+            const invalid = validatePluginConfigText(pluginConfigContent);
+            if (invalid) throw new Error(invalid);
+          }
+          plugin.enabled = Boolean(args?.enabled); plugin.status = plugin.enabled ? "enabled" : "disabled"; plugin.restartRequired = false;
+          activePluginConfigContent = plugin.enabled ? pluginConfigContent : null;
+        }
+        else {
+          const content = args?.content;
+          if (typeof content !== "string") throw new Error("配置内容无效");
+          const invalid = validatePluginConfigText(content);
+          if (invalid) throw new Error(invalid);
+          if (pluginPreviewMode === "config-conflict") pluginConfigContent = '{"value":"external"}\n';
+          if (args?.expectedSha256 !== await configHash(pluginConfigContent)) throw new Error("配置文件已被其他程序修改，请重新加载后再保存。");
+          pluginConfigContent = content;
+          plugin.restartRequired = plugin.enabled && (activePluginConfigContent === null || !pluginConfigBusinessValuesEqual(activePluginConfigContent, content));
+        }
         return { plugins: structuredClone(previewPlugins), platform: previewClientPlatform, arch: "aarch64" };
       }
       if (command === "uninstall_codey_plugin") {
@@ -554,10 +598,11 @@ if (import.meta.env.DEV) {
         return { plugins: structuredClone(previewPlugins), platform: previewClientPlatform, arch: "aarch64" };
       }
       if (command === "select_codey_plugin_package") return null;
-      if (command === "get_codey_plugin_config_ui") {
-        if (pluginPreviewMode === "html-error") throw new Error("预览：插件配置页面校验失败");
+      if (command === "get_codey_plugin_config_file") {
+        if (pluginPreviewMode === "config-error") throw new Error("预览：配置文件暂时无法读取");
         const plugin = previewPlugins.find(item => item.id === args?.pluginId);
-        return plugin?.configUi ? { pluginId: plugin.id, version: plugin.version, html: pluginConfigHtml } : null;
+        if (!plugin) throw new Error("预览：插件不存在");
+        return { pluginId: plugin.id, version: plugin.version, path: plugin.configPath, content: pluginConfigContent, sha256: await configHash(pluginConfigContent) };
       }
 
       if (command === "load_codey_config") {
@@ -779,8 +824,9 @@ if (import.meta.env.DEV) {
         const model = String(args.model || "");
         const status = String(args.status || "");
         const protocol = String(args.protocol || "");
-        const toUnixMs = Number(args.toUnixMs) || Date.now();
-        const fromUnixMs = Number(args.fromUnixMs) || toUnixMs - 86_400_000;
+        const allTime = command === "query_route_request_log_stats" && args.allTime === true;
+        const toUnixMs = allTime ? Date.now() : Number(args.toUnixMs) || Date.now();
+        const fromUnixMs = allTime ? Math.min(toUnixMs, ...previewRouteRequestLogs.map((item) => item.timestampUnixMs)) : Number(args.fromUnixMs) || toUnixMs - 86_400_000;
         const filtered = previewRouteRequestLogs.filter((item) => {
           if (item.timestampUnixMs < fromUnixMs || item.timestampUnixMs >= toUnixMs) return false;
           if (args.requestId && item.requestId !== args.requestId) return false;
@@ -826,6 +872,8 @@ if (import.meta.env.DEV) {
               successRate: total ? succeededCount / total * 100 : null,
               avgDuration: total ? sum(durations)! / total : null,
               avgTtft: ttfts.length ? sum(ttfts)! / ttfts.length : null,
+              avgRouterPreUpstream: null, avgUpstreamHeader: null, avgUpstreamFirstByte: null,
+              avgDownstreamFirstContent: ttfts.length ? sum(ttfts)! / ttfts.length : null, avgQueueDelay: null,
               inputTokensSum: sum(rows.map((item) => item.inputTokens)),
               outputTokensSum: sum(rows.map((item) => item.outputTokens)),
               totalTokensSum: sum(rows.map((item) => item.totalTokens)),
@@ -834,9 +882,10 @@ if (import.meta.env.DEV) {
               totalTokensKnownCount: rows.filter((item) => item.totalTokens != null).length,
             };
           };
-          const bucketMs = toUnixMs - fromUnixMs <= 7 * 86_400_000 ? 3_600_000 : 86_400_000;
+          const bucketMs = toUnixMs - fromUnixMs <= 7 * 86_400_000 ? 3_600_000 : Math.max(1, Math.ceil((toUnixMs - fromUnixMs) / (366 * 86_400_000))) * 86_400_000;
           const grouped = new Map<string, typeof filtered>();
           const buckets = new Map<number, typeof filtered>();
+          const dailyBuckets = new Map<number, typeof filtered>();
           for (const item of filtered) {
             const key = args.groupBy === "provider" ? item.provider : args.groupBy === "status" ? item.status
               : args.groupBy === "protocol" ? item.upstreamTransport : args.groupBy === "request_kind" ? item.requestKind
@@ -846,12 +895,15 @@ if (import.meta.env.DEV) {
             const bucket = Math.floor(item.timestampUnixMs / bucketMs) * bucketMs;
             grouped.set(key, [...(grouped.get(key) ?? []), item]);
             buckets.set(bucket, [...(buckets.get(bucket) ?? []), item]);
+            const day = Math.floor(item.timestampUnixMs / 86_400_000) * 86_400_000;
+            if (args.includeDailyTrend === true) dailyBuckets.set(day, [...(dailyBuckets.get(day) ?? []), item]);
           }
-          const groups = [...grouped].map(([key, rows]) => ({ key, ...aggregate(rows) })).sort((a, b) => b.total - a.total || a.key.localeCompare(b.key));
+          const groups = [...grouped].map(([key, rows]) => ({ key, ...aggregate(rows) })).sort((a, b) => (args.groupSort === "tokens" ? (b.totalTokensSum ?? -1) - (a.totalTokensSum ?? -1) : b.total - a.total) || a.key.localeCompare(b.key));
           return {
             status: "ok", backend: "sqlite", queryable: true, fromUnixMs, toUnixMs,
             ...aggregate(filtered), groups: groups.slice(0, 50), groupsTruncated: groups.length > 50, bucketMs,
             trend: [...buckets].sort(([a], [b]) => a - b).map(([timestampUnixMs, rows]) => ({ timestampUnixMs, ...aggregate(rows) })),
+            ...(args.includeDailyTrend === true ? { dailyTrend: [...dailyBuckets].sort(([a], [b]) => a - b).map(([timestampUnixMs, rows]) => ({ timestampUnixMs, total: rows.length, totalTokensSum: aggregate(rows).totalTokensSum, totalTokensKnownCount: aggregate(rows).totalTokensKnownCount })) } : {}),
             recordingHealth: { enabled: true, active: true, sampleRatePerMillion: 1_000_000, pendingEntries: 0,
               accepted: previewRouteRequestLogs.length, entriesWritten: previewRouteRequestLogs.length,
               sampledOut: 0, droppedFull: 0, droppedClosed: 0, writeDropped: 0, writeFailures: 0, observerPanics: 0, writerPanics: 0, shutdownTimeouts: 0 },
