@@ -473,12 +473,13 @@
       // Current Codex can create threads through AppServerRequestClient without
       // touching the renderer bridge helper above. Rewrite at enqueue time so
       // thread/start and prewarm requests bind the selected Codey route before
-      // they reach the app server.
+      // they reach the app server. Keep the live client so MCP reload can send
+      // config/mcpServer/reload without walking the React tree.
       patched = replaceUniqueRendererGate(
         patched,
         /(enqueueRequest\(([$A-Z_a-z][$\w]*),([$A-Z_a-z][$\w]*),([$A-Z_a-z][$\w]*),([$A-Z_a-z][$\w]*)=[$A-Z_a-z][$\w]*=>\{this\.dispatchMessage\?\.\(`mcp-request`,\{request:[$A-Z_a-z][$\w]*,hostId:this\.hostId,[\s\S]{0,700}?widget:\4\?\.widget\}\)\},[$A-Z_a-z][$\w]*=null\)\{)let /g,
         (_match, prefix, methodName, paramsName) =>
-          `${prefix}let __codeyRoute=globalThis.__codeyModelWhitelistPatch?.rewriteOutgoingMessage?.({type:\`mcp-request\`,request:{method:${methodName},params:${paramsName}}});if(__codeyRoute?.request){if(globalThis.__codeyModelWhitelistPatch?.isBlockedOutgoingMessage?.(__codeyRoute)){globalThis.__codeyModelWhitelistPatch?.notifyBlockedOutgoingMessage?.(__codeyRoute);return Promise.reject(Error(\`Codey blocked cross-provider model request\`))}${methodName}=__codeyRoute.request.method??${methodName},${paramsName}=__codeyRoute.request.params??${paramsName}}let `,
+          `${prefix}(globalThis.__codeyAppServerRequestClients??(globalThis.__codeyAppServerRequestClients=new Map)).set(this.hostId,this);let __codeyRoute=globalThis.__codeyModelWhitelistPatch?.rewriteOutgoingMessage?.({type:\`mcp-request\`,request:{method:${methodName},params:${paramsName}}});if(__codeyRoute?.request){if(globalThis.__codeyModelWhitelistPatch?.isBlockedOutgoingMessage?.(__codeyRoute)){globalThis.__codeyModelWhitelistPatch?.notifyBlockedOutgoingMessage?.(__codeyRoute);return Promise.reject(Error(\`Codey blocked cross-provider model request\`))}${methodName}=__codeyRoute.request.method??${methodName},${paramsName}=__codeyRoute.request.params??${paramsName}}let `,
         "app server request route preflight",
       );
       // AppServerRequestClient runs the preflight before createRequest assigns
@@ -1727,6 +1728,66 @@
       return false;
     }
   };
+  const prepareCodeyStdinRelay = (command, rest) => {
+    const options = rest[0];
+    if (options != null && (typeof options !== "object" || Array.isArray(options))) return null;
+    if (options?.shell || options?.windowsVerbatimArguments) return null;
+    const parent = process.env;
+    const wrapper = parent.CODEY_CODEX_CLI_STDIN_RELAY;
+    const target = parent.CODEY_CODEX_CLI_WRAPPER_TARGET;
+    if (!hasCodeyStdinRelay(wrapper, { env: parent })) return null;
+    const path = process.getBuiltinModule("path");
+    const fs = process.getBuiltinModule("fs");
+    const realFile = (filename) => {
+      if (typeof filename !== "string" || !path.isAbsolute(filename)) return null;
+      try {
+        return fs.statSync(filename).isFile() ? fs.realpathSync(filename) : null;
+      } catch { return null; }
+    };
+    const wrapperFile = realFile(wrapper);
+    const targetFile = realFile(target);
+    if (!wrapperFile || !targetFile || wrapperFile === targetFile ||
+        targetFile === realFile(codeyErrorLoggerExecutable)) return null;
+    const source = parent.CODEY_CODEX_CLI_WRAPPER_SOURCE;
+    const sourceFile = source == null ? null : realFile(source);
+    if (source != null && (!sourceFile || sourceFile === wrapperFile)) return null;
+    const environment = options?.env ?? parent;
+    let commandFile = null;
+    if (typeof command !== "string") return null;
+    if (path.isAbsolute(command) || /[/\\]/.test(command)) {
+      commandFile = realFile(path.resolve(options?.cwd ?? process.cwd(), command));
+    } else if (/^codex(?:\.exe)?$/i.test(command)) {
+      // 裸命令按子进程的搜索路径定位，不能仅凭文件名认定是受控 CLI。
+      const pathKey = process.platform === "win32"
+        ? Object.keys(environment).sort().find((key) => key.toLowerCase() === "path")
+        : "PATH";
+      if (typeof environment[pathKey] !== "string") return null;
+      for (const directory of environment[pathKey].split(path.delimiter)) {
+        const candidate = path.resolve(options?.cwd ?? process.cwd(), directory, command);
+        commandFile = realFile(candidate) ?? (process.platform === "win32" && !/\.exe$/i.test(command)
+          ? realFile(`${candidate}.exe`) : null);
+        if (commandFile) break;
+      }
+    }
+    if (commandFile !== targetFile && commandFile !== wrapperFile &&
+        (!sourceFile || commandFile !== sourceFile)) return null;
+    const env = { ...environment };
+    // 仅恢复包装器协议、握手与执行上下文，不复制被 Desktop 过滤的其他变量。
+    for (const key of [
+      "CODEX_CLI_PATH", "CODEY_CODEX_CLI_STDIN_RELAY", "CODEY_CODEX_CLI_WRAPPER_TARGET",
+      "CODEY_CODEX_CLI_WRAPPER_SOURCE",
+      "CODEY_CODEX_CLI_WRAPPER_OVERRIDES", "CODEY_CODEX_CLI_WRAPPER_SUBAGENT",
+      "CODEY_CODEX_CLI_WRAPPER_PORT", "CODEY_CODEX_CLI_WRAPPER_TOKEN",
+      "CODEY_CODEX_CLI_WRAPPER_MARKER", "CODEY_CODEX_CLI_WRAPPER_HANDSHAKE_OPTIONAL",
+    ]) {
+      if (typeof parent[key] === "string") env[key] = parent[key];
+      else delete env[key];
+    }
+    for (const key of ["CODEX_HOME", "CODEX_APP_SERVER_FORCE_CLI", "NO_PROXY", "no_proxy"]) {
+      if (env[key] == null && typeof parent[key] === "string") env[key] = parent[key];
+    }
+    return { command: wrapper, rest: [{ ...options, env }, ...rest.slice(1)] };
+  };
   const childProcess = process.getBuiltinModule("child_process");
   const NativeSpawn = childProcess.spawn;
   if (!NativeSpawn.__codeyAppServerAnalyticsDisabled) {
@@ -1763,7 +1824,7 @@
     };
     const codeyAnalyticsDisabledSpawn = function (command, args, ...rest) {
       const rewritten = rewriteCodexAppServerSpawnArgs(command, args);
-      const rewrittenRest = isManagedCodexAppServerSpawn(command, rewritten)
+      let rewrittenRest = isManagedCodexAppServerSpawn(command, rewritten)
         ? withSubagentGateEnvironment(rest)
         : rest;
       const runtimeOverrideStatus = inspectCodexAppServerRuntimeOverrides(
@@ -1779,7 +1840,17 @@
             argumentCount: rewritten.length,
           }));
         }
-        runtimeOverrideStatus.stdinRelayAvailable = hasCodeyStdinRelay(command, rewrittenRest[0]);
+        if (localRouterRuntimeEnabled && !localRouterMessageSourcePatched) {
+          const relay = prepareCodeyStdinRelay(command, rewrittenRest);
+          if (relay) {
+            command = relay.command;
+            rewrittenRest = relay.rest;
+            runtimeOverrideStatus.command = command;
+          }
+          runtimeOverrideStatus.stdinRelayAvailable = relay != null;
+        } else {
+          runtimeOverrideStatus.stdinRelayAvailable = hasCodeyStdinRelay(command, rewrittenRest[0]);
+        }
         if (localRouterRuntimeEnabled && !localRouterMessageSourcePatched &&
             !runtimeOverrideStatus.stdinRelayAvailable) {
           runtimeOverrideStatus.failure = "app-server 消息补丁未匹配，且未确认使用 Codey 标准输入转发入口，已停止启动 app-server";

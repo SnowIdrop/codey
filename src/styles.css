@@ -397,7 +397,7 @@ button,
 }
 
 .config-header-feedback:hover .feedback-qr-popover,
-.config-header-feedback:focus-within .feedback-qr-popover {
+.config-header-feedback > button:focus-visible + .feedback-qr-popover {
   opacity: 1;
   transform: translate(-50%, 0);
   visibility: visible;
@@ -625,6 +625,7 @@ button,
 }
 
 .settings-content {
+  position: relative;
   display: flex;
   min-width: 0;
   min-height: 0;

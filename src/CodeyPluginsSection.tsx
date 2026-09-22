@@ -1,16 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   IconAlertTriangle,
-  IconCheck,
+  IconEraser,
   IconFilePlus,
+  IconFolderOpen,
+  IconHelpCircle,
   IconPuzzle,
   IconRefresh,
   IconSearch,
   IconSettings,
+  IconTerminal2,
   IconTrash,
 } from "@tabler/icons-react";
 import { invoke } from "./api";
 import { errorText } from "./appUtils";
+import { cn, toast } from "@heroui/react";
 import {
   Badge,
   Button,
@@ -18,39 +22,55 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
   Input,
   Switch,
+  Tooltip,
 } from "./components/ui";
 import { PluginConfigDialog } from "./PluginConfigDialog";
+import { PluginImportDialog } from "./PluginImportDialog";
 import {
   parseCodeyPluginsResult,
-  pluginStatusLabel,
   type CodeyPlugin,
   type CodeyPluginPreview,
   type CodeyPluginsResult,
 } from "./codeyPlugins";
 import { SettingsPageHeader } from "./SettingsPageHeader";
+import { formatBytes } from "./formatters";
 
 export function CodeyPluginsSection({ container }: { container?: HTMLElement | null }) {
   const [result, setResult] = useState<CodeyPluginsResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
+  const setNotice = useCallback((text: string) => {
+    if (text) toast.success(text);
+  }, []);
+  const setWarning = useCallback((text: string) => {
+    if (text) toast.warning(text);
+  }, []);
   const [searchQuery, setSearchQuery] = useState("");
-  const [customPath, setCustomPath] = useState("");
-  const [showCustomPathInput, setShowCustomPathInput] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [importError, setImportError] = useState("");
   const [preview, setPreview] = useState<CodeyPluginPreview | null>(null);
   const [editId, setEditId] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<{ kind: "enable" | "uninstall"; plugin: CodeyPlugin } | null>(null);
   const [removeData, setRemoveData] = useState(false);
+  const [clearLogsPlugin, setClearLogsPlugin] = useState<CodeyPlugin | null>(null);
+  const [clearLogsError, setClearLogsError] = useState("");
   const [known, setKnown] = useState(false);
+  const [sectionEl, setSectionEl] = useState<HTMLElement | null>(null);
+
+  const configContainer = useMemo(() => {
+    return sectionEl?.closest<HTMLElement>("#codey-settings-content") ?? sectionEl ?? container;
+  }, [sectionEl, container]);
 
   const pending = useRef(false);
   const epoch = useRef(0);
   const configurationSaved = useRef(false);
+  const importTimer = useRef(0);
 
   const accept = useCallback((data: unknown) => {
     try {
@@ -67,7 +87,6 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
   const refresh = useCallback(async () => {
     const generation = epoch.current;
     setKnown(false);
-    setPreview(null);
     setConfirm(null);
     try {
       const data = await invoke("list_codey_plugins");
@@ -144,30 +163,57 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
     };
   }, [accept]);
 
+  useEffect(() => () => window.clearTimeout(importTimer.current), []);
+
   const togglePlugin = useCallback(async (plugin: CodeyPlugin, enabled: boolean) => {
     await mutate("set_codey_plugin_enabled", { pluginId: plugin.id, enabled });
     setConfirm(null);
     setNotice(enabled ? `插件「${plugin.name}」已启用` : `插件「${plugin.name}」已停用`);
   }, [mutate]);
 
+  const closeImport = useCallback(() => {
+    window.clearTimeout(importTimer.current);
+    setImportOpen(false);
+    setPreview(null);
+    setImportError("");
+  }, []);
+
+  const openImport = useCallback(() => {
+    setPreview(null);
+    setImportError("");
+    setConfirm(null);
+    window.clearTimeout(importTimer.current);
+    importTimer.current = window.setTimeout(() => setImportOpen(true), 0);
+  }, []);
+
   const handleSelectPackage = useCallback(() => {
     void run(async () => {
-      const selected = await invoke<CodeyPluginPreview | null>("select_codey_plugin_package");
-      if (selected) {
-        setPreview(selected);
-        setConfirm(null);
+      try {
+        const selected = await invoke<CodeyPluginPreview | null>("select_codey_plugin_package");
+        if (selected) {
+          setPreview(selected);
+          setImportError("");
+        }
+      } catch (cause) {
+        setPreview(null);
+        setImportError(errorText(cause));
       }
     }, true);
   }, [run]);
 
-  const handleInspectCustomPath = useCallback(() => {
-    if (!customPath.trim()) return;
+  const handleInspectPath = useCallback((path: string) => {
+    if (!path.trim()) return;
     void run(async () => {
-      const inspected = await invoke<CodeyPluginPreview>("inspect_codey_plugin", { path: customPath.trim() });
-      setPreview(inspected);
-      setConfirm(null);
+      try {
+        const inspected = await invoke<CodeyPluginPreview>("inspect_codey_plugin", { path: path.trim() });
+        setPreview(inspected);
+        setImportError("");
+      } catch (cause) {
+        setPreview(null);
+        setImportError(errorText(cause));
+      }
     }, true);
-  }, [customPath, run]);
+  }, [run]);
 
   const filteredPlugins = useMemo(() => {
     if (!result?.plugins) return [];
@@ -181,12 +227,14 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
     );
   }, [result?.plugins, searchQuery]);
 
-  const upgrading = preview && result?.plugins.find((p) => p.id === preview.manifest.id);
+  const upgrading = preview
+    ? result?.plugins.find((plugin) => plugin.id === preview.manifest.id)
+    : undefined;
   const blocked = busy || !known || loading;
   const editing = result?.plugins.find((p) => p.id === editId);
 
   return (
-    <section className="secondary-section codey-plugins-section" aria-labelledby="codey-plugins-title">
+    <section ref={setSectionEl} className="secondary-section codey-plugins-section" aria-labelledby="codey-plugins-title">
       <SettingsPageHeader
         id="codey-plugins-title"
         title="Codey 插件"
@@ -204,17 +252,15 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
               <IconRefresh size={14} className={loading ? "animate-spin" : ""} />
               <span>刷新</span>
             </Button>
-            {result?.platform !== "linux" && (
-              <Button
-                size="sm"
-                variant="default"
-                disabled={blocked}
-                onClick={handleSelectPackage}
-              >
-                <IconFilePlus size={14} aria-hidden="true" />
-                <span>导入插件包</span>
-              </Button>
-            )}
+            <Button
+              size="sm"
+              variant="default"
+              disabled={blocked}
+              onPress={openImport}
+            >
+              <IconFilePlus size={14} aria-hidden="true" />
+              <span>导入插件包</span>
+            </Button>
           </div>
         }
       />
@@ -242,129 +288,23 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
           )}
         </div>
 
-        <div className="flex items-center gap-2">
-          <div className="relative min-w-[200px] flex-1 sm:w-60">
-            <Input
-              aria-label="搜索插件"
-              placeholder="搜索插件名称、ID 或能力…"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              leftSection={<IconSearch size={14} className="text-muted" />}
-              className="h-8 text-xs"
-            />
-          </div>
-          <Button
-            size="sm"
-            variant="ghost"
-            className="text-xs text-muted hover:text-foreground"
-            onClick={() => setShowCustomPathInput((prev) => !prev)}
-          >
-            {showCustomPathInput ? "收起路径导入" : "本地路径导入"}
-          </Button>
+        <div className="relative min-w-[200px] flex-1 sm:w-60">
+          <Input
+            aria-label="搜索插件"
+            placeholder="搜索插件名称、ID 或能力…"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            leftSection={<IconSearch size={14} className="text-muted" />}
+            className="h-8 text-xs"
+          />
         </div>
       </div>
-
-      {/* 本地文件路径展开导入框 */}
-      {showCustomPathInput && (
-        <div className="mb-4 rounded-xl border border-default/70 bg-default/20 p-3 text-xs">
-          <div className="mb-1.5 font-medium text-foreground">通过本地文件路径导入插件</div>
-          <div className="flex gap-2">
-            <Input
-              aria-label="插件包路径"
-              placeholder=".codey-plugin 文件的完整路径"
-              value={customPath}
-              disabled={blocked}
-              onChange={(e) => {
-                setCustomPath(e.target.value);
-                setPreview(null);
-              }}
-              className="flex-1 text-xs"
-            />
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={blocked || !customPath.trim()}
-              onClick={handleInspectCustomPath}
-            >
-              检查安装包
-            </Button>
-          </div>
-        </div>
-      )}
 
       {/* 提示与错误信息 */}
       {error && (
         <div role="alert" className="mb-4 flex items-start gap-2 rounded-xl border border-red-200/60 bg-red-50/70 p-3 text-xs text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300">
           <IconAlertTriangle size={15} className="mt-0.5 shrink-0" />
           <div className="flex-1 break-words">{error}</div>
-        </div>
-      )}
-      {notice && (
-        <div role="status" className="mb-4 flex items-center gap-2 rounded-xl border border-green-200/60 bg-green-50/70 p-3 text-xs text-green-700 dark:border-green-900/60 dark:bg-green-950/40 dark:text-green-300">
-          <IconCheck size={15} className="shrink-0" />
-          <div className="flex-1">{notice}</div>
-        </div>
-      )}
-
-      {/* 安装 / 升级预览 Card */}
-      {preview && (
-        <div className="mb-5 overflow-hidden rounded-2xl border-2 border-blue-500/30 bg-blue-50/20 p-5 dark:border-blue-500/40 dark:bg-blue-950/20">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="rounded-md bg-blue-500/10 px-2 py-0.5 text-xs font-semibold text-blue-600 dark:text-blue-400">
-                  {upgrading ? "升级确认" : "安装确认"}
-                </span>
-                <h3 className="m-0 text-base font-semibold text-foreground">
-                  {preview.manifest.name}
-                </h3>
-              </div>
-              <p className="mb-0 mt-1 font-mono text-xs text-muted">
-                {preview.manifest.id} · {upgrading ? `${upgrading.version} → ` : "v"}{preview.manifest.version}
-              </p>
-            </div>
-            <div className="flex items-center gap-2">
-              <Button
-                size="sm"
-                variant="default"
-                disabled={blocked}
-                onClick={() =>
-                  void run(async () => {
-                    await mutate("install_codey_plugin", { path: preview.path, sha256: preview.sha256 });
-                    setPreview(null);
-                    setNotice(`插件「${preview.manifest.name}」安装成功，默认处于停用状态。`);
-                  })
-                }
-              >
-                {upgrading ? "确认升级" : "确认安装"}
-              </Button>
-              <Button size="sm" variant="outline" disabled={blocked} onClick={() => setPreview(null)}>
-                取消
-              </Button>
-            </div>
-          </div>
-
-          {preview.manifest.description && (
-            <p className="mb-0 mt-3 text-xs text-foreground/80 leading-relaxed">
-              {preview.manifest.description}
-            </p>
-          )}
-
-          <div className="mt-3 rounded-lg bg-black/[0.03] p-3 dark:bg-white/[0.04]">
-            <div className="text-xs text-muted">
-              <strong>声明能力：</strong>
-              {[...(preview.manifest.capabilities ?? []), ...(preview.manifest.permissions ?? [])].join("、") || "无"}
-            </div>
-            {(preview.manifest.headerNames?.length ?? 0) > 0 && (
-              <div className="mt-1 text-xs text-muted">
-                <strong>可修改请求头：</strong>
-                {preview.manifest.headerNames!.join("、")}
-              </div>
-            )}
-            <p className="mb-0 mt-2 text-[11px] text-amber-600 dark:text-amber-400">
-              提示：原生插件与 Codey 在同一进程运行，具有相同系统权限。安装后默认停用，可在下方卡片中配置并信任启用。
-            </p>
-          </div>
         </div>
       )}
 
@@ -388,32 +328,17 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
               <p className="mb-4 mt-1 max-w-sm text-xs text-muted leading-relaxed">
                 通过导入 .codey-plugin 插件包，一键扩展环境适配、模型代理拦截与自定增强功能。
               </p>
-              {result?.platform !== "linux" ? (
-                <Button size="sm" variant="default" disabled={blocked} onClick={handleSelectPackage}>
-                  <IconFilePlus size={14} aria-hidden="true" />
-                  <span>导入第一个插件包</span>
-                </Button>
-              ) : (
-                <Button size="sm" variant="outline" onClick={() => setShowCustomPathInput(true)}>
-                  填写本地路径导入
-                </Button>
-              )}
+              <Button size="sm" variant="default" disabled={blocked} onPress={openImport}>
+                <IconFilePlus size={14} aria-hidden="true" />
+                <span>导入第一个插件包</span>
+              </Button>
             </>
           )}
         </div>
       ) : (
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
           {filteredPlugins.map((plugin) => {
-            const hasError = Boolean(plugin.lastError || plugin.status === "failed" || plugin.status === "error");
-            const badgeVariant = !known
-              ? "secondary"
-              : hasError
-                ? "destructive"
-                : plugin.restartRequired
-                  ? "warning"
-                  : plugin.enabled
-                    ? "success"
-                    : "secondary";
+            const hasDirs = Boolean(plugin.pluginDir || plugin.dataDir || plugin.logDir);
 
             return (
               <article
@@ -441,16 +366,55 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
                             v{plugin.version}
                           </span>
                         </div>
-                        <p className="mb-0 mt-0.5 truncate font-mono text-xs text-muted/75">
-                          {plugin.id}
-                        </p>
+                        <div className="mb-0 mt-0.5 flex items-center gap-1.5 font-mono text-xs text-muted/75">
+                          <span className="truncate">{plugin.id}</span>
+                          {hasDirs ? (
+                            <Tooltip
+                              delay={150}
+                              position="top"
+                              className="shrink-0"
+                              content={
+                                <div className="min-w-[200px] space-y-1.5 text-left leading-relaxed">
+                                  <div className="font-semibold text-xs">文件与存储目录</div>
+                                  {plugin.pluginDir ? (
+                                    <div>
+                                      <div className="text-[11px] font-medium opacity-75">插件目录</div>
+                                      <div className="mt-0.5 break-all font-mono text-[11px] select-text opacity-90">
+                                        {plugin.pluginDir}
+                                      </div>
+                                    </div>
+                                  ) : null}
+                                  {plugin.dataDir ? (
+                                    <div>
+                                      <div className="text-[11px] font-medium opacity-75">数据目录</div>
+                                      <div className="mt-0.5 break-all font-mono text-[11px] select-text opacity-90">
+                                        {plugin.dataDir}
+                                      </div>
+                                    </div>
+                                  ) : null}
+                                  {plugin.logDir ? (
+                                    <div>
+                                      <div className="text-[11px] font-medium opacity-75">日志目录</div>
+                                      <div className="mt-0.5 break-all font-mono text-[11px] select-text opacity-90">
+                                        {plugin.logDir}
+                                      </div>
+                                    </div>
+                                  ) : null}
+                                </div>
+                              }
+                            >
+                              <span
+                                className="inline-flex shrink-0 cursor-help items-center text-muted/60 transition-colors hover:text-foreground"
+                                aria-label="查看文件与存储目录"
+                              >
+                                <IconHelpCircle size={13} aria-hidden="true" />
+                              </span>
+                            </Tooltip>
+                          ) : null}
+                        </div>
                       </div>
                     </div>
                     <div className="flex items-center gap-2.5 shrink-0">
-                      <Badge variant={badgeVariant}>
-                        {!known && "上次状态："}
-                        {pluginStatusLabel(plugin)}
-                      </Badge>
                       <Switch
                         size="sm"
                         checked={plugin.enabled}
@@ -459,7 +423,6 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
                         onCheckedChange={(checked) => {
                           if (checked) {
                             setConfirm({ kind: "enable", plugin });
-                            setPreview(null);
                           } else {
                             void run(() => togglePlugin(plugin, false));
                           }
@@ -498,36 +461,26 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
                       {plugin.lastError}
                     </div>
                   )}
-
-                  {plugin.pluginDir && (
-                    <details className="mt-3 text-[11.5px] text-muted">
-                      <summary className="cursor-pointer select-none font-medium hover:text-foreground">
-                        文件与存储目录
-                      </summary>
-                      <dl className="mt-2 grid gap-1 rounded-lg bg-black/[0.02] p-2.5 font-mono text-[11px] dark:bg-white/[0.03]">
-                        <div className="flex flex-col">
-                          <dt className="text-muted/60">插件目录</dt>
-                          <dd className="m-0 break-all select-text text-foreground/90">{plugin.pluginDir}</dd>
-                        </div>
-                        {plugin.dataDir && (
-                          <div className="flex flex-col">
-                            <dt className="text-muted/60">数据目录</dt>
-                            <dd className="m-0 break-all select-text text-foreground/90">{plugin.dataDir}</dd>
-                          </div>
-                        )}
-                        {plugin.logDir && (
-                          <div className="flex flex-col">
-                            <dt className="text-muted/60">日志目录</dt>
-                            <dd className="m-0 break-all select-text text-foreground/90">{plugin.logDir}</dd>
-                          </div>
-                        )}
-                      </dl>
-                    </details>
-                  )}
                 </div>
 
-                <div className="flex items-center justify-between gap-2 border-t border-black/[0.06] bg-black/[0.015] px-5 py-2.5 dark:border-white/[0.06] dark:bg-white/[0.02]">
-                  <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center justify-between gap-2 border-t border-black/[0.06] bg-black/[0.015] px-5 py-2.5 dark:border-white/[0.06] dark:bg-white/[0.02]">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="whitespace-nowrap text-[11px] text-muted" title="当前日志及轮转备份的大小，刷新列表时更新">
+                      日志 {plugin.logSizeBytes == null ? "大小未知" : formatBytes(plugin.logSizeBytes)}
+                    </span>
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      disabled={blocked}
+                      aria-label={`清除 ${plugin.name} 的运行日志`}
+                      onClick={() => {
+                        setClearLogsError("");
+                        setClearLogsPlugin(plugin);
+                      }}
+                    >
+                      <IconEraser size={14} aria-hidden="true" />
+                      <span>清除日志</span>
+                    </Button>
                     {plugin.restartRequired && plugin.enabled ? (
                       <Button
                         size="xs"
@@ -557,6 +510,41 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
                       size="icon-sm"
                       variant="outline"
                       disabled={blocked}
+                      title="在本机终端查看日志"
+                      aria-label={`在本机终端查看 ${plugin.name} 的日志`}
+                      onClick={() => void run(async () => {
+                        const opened = await invoke<{ status: "ok" | "already_open" }>(
+                          "open_codey_plugin_logs", { pluginId: plugin.id },
+                        );
+                        if (opened.status === "already_open") {
+                          setWarning(`${plugin.name} 当前已有日志窗口`);
+                        } else {
+                          setNotice(`已在本机终端打开 ${plugin.name} 的实时日志`);
+                        }
+                      })}
+                    >
+                      <IconTerminal2 size={14} aria-hidden="true" />
+                    </Button>
+
+                    <Button
+                      size="icon-sm"
+                      variant="outline"
+                      disabled={blocked}
+                      title="在文件管理器中打开插件目录"
+                      aria-label={`打开 ${plugin.name} 的插件目录`}
+                      onClick={() => {
+                        void invoke("open_codey_plugin_directory", { pluginId: plugin.id }).catch((cause) => {
+                          setError(errorText(cause));
+                        });
+                      }}
+                    >
+                      <IconFolderOpen size={14} aria-hidden="true" />
+                    </Button>
+
+                    <Button
+                      size="icon-sm"
+                      variant="outline"
+                      disabled={blocked}
                       title="插件配置"
                       aria-label={`配置 ${plugin.name}`}
                       onClick={() => setEditId(plugin.id)}
@@ -573,7 +561,6 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
                       onClick={() => {
                         setRemoveData(false);
                         setConfirm({ kind: "uninstall", plugin });
-                        setPreview(null);
                       }}
                     >
                       <IconTrash size={14} aria-hidden="true" />
@@ -586,53 +573,204 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
         </div>
       )}
 
+      {importOpen ? (
+      <PluginImportDialog
+        open
+        container={container}
+        platform={result?.platform}
+        busy={busy}
+        preview={preview}
+        upgrading={upgrading}
+        error={importError}
+        onClose={closeImport}
+        onSelectFile={handleSelectPackage}
+        onInspectPath={handleInspectPath}
+        onClearPreview={() => {
+          setPreview(null);
+          setImportError("");
+        }}
+        onConfirm={() => {
+          if (!preview) return;
+          const selected = preview;
+          void run(async () => {
+            try {
+              await mutate("install_codey_plugin", { path: selected.path, sha256: selected.sha256 });
+              setImportOpen(false);
+              setPreview(null);
+              setImportError("");
+              setNotice(`插件「${selected.manifest.name}」安装成功，默认处于停用状态。`);
+            } catch (cause) {
+              setImportError(errorText(cause));
+            }
+          });
+        }}
+      />
+      ) : null}
+
+      {clearLogsPlugin && (
+        <Dialog open onOpenChange={(open) => { if (!open && !busy) setClearLogsPlugin(null); }}>
+          <DialogContent container={container} className="max-w-[460px]" onEscapeKeyDown={(event) => { if (busy) event.preventDefault(); }}>
+            <DialogHeader>
+              <DialogTitle>确认清除运行日志</DialogTitle>
+              <DialogDescription>
+                将清除 {clearLogsPlugin.name} 的现有运行日志及轮转备份，此操作无法恢复。插件配置和数据会保留，运行中的插件仍会继续记录新日志。
+              </DialogDescription>
+            </DialogHeader>
+            {clearLogsError && <p role="alert" className="text-sm text-danger">{clearLogsError}</p>}
+            <DialogFooter>
+              <Button variant="outline" disabled={busy} onClick={() => setClearLogsPlugin(null)}>取消</Button>
+              <Button variant="destructive" disabled={blocked} loading={busy} onClick={() => void run(async () => {
+                setClearLogsError("");
+                try {
+                  const data = await invoke("clear_codey_plugin_logs", { pluginId: clearLogsPlugin.id, confirmed: true });
+                  accept(data);
+                  setNotice(`${clearLogsPlugin.name} 的现有运行日志已清除`);
+                  setClearLogsPlugin(null);
+                } catch (cause) {
+                  setClearLogsError(errorText(cause));
+                }
+              })}>确认清除</Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+
       {/* 启用信任 / 卸载确认对话框 */}
       {confirm && (
         <Dialog open={Boolean(confirm)} onOpenChange={(open) => { if (!open) setConfirm(null); }}>
-          <DialogContent container={container} className="max-w-md">
+          <DialogContent container={container} className="max-w-[460px]">
             <DialogHeader>
-              <DialogTitle>
-                {confirm.kind === "enable" ? "信任并启用插件" : "确认卸载插件"}
-              </DialogTitle>
-              <DialogDescription>
-                {confirm.kind === "enable" ? (
-                  <>
-                    您正在启用「<strong>{confirm.plugin.name}</strong>」。
-                  </>
-                ) : (
-                  <>
-                    确定要从系统卸载「<strong>{confirm.plugin.name}</strong>」吗？
-                  </>
-                )}
-              </DialogDescription>
+              <div className="flex items-start gap-3.5">
+                <div
+                  className={cn(
+                    "flex size-10 shrink-0 items-center justify-center rounded-xl",
+                    confirm.kind === "uninstall"
+                      ? "bg-red-500/10 text-red-600 dark:bg-red-500/15 dark:text-red-400"
+                      : "bg-amber-500/10 text-amber-600 dark:bg-amber-500/15 dark:text-amber-400"
+                  )}
+                >
+                  {confirm.kind === "uninstall" ? (
+                    <IconTrash size={20} stroke={1.75} aria-hidden="true" />
+                  ) : (
+                    <IconAlertTriangle size={20} stroke={1.75} aria-hidden="true" />
+                  )}
+                </div>
+                <div className="min-w-0 flex-1 space-y-1">
+                  <DialogTitle>
+                    {confirm.kind === "enable" ? "信任并启用插件" : "确认卸载插件"}
+                  </DialogTitle>
+                  <DialogDescription>
+                    {confirm.kind === "enable"
+                      ? "启用前请确认插件来源安全与所声明的运行权限"
+                      : "确定要从系统中卸载此插件吗？"}
+                  </DialogDescription>
+                </div>
+              </div>
             </DialogHeader>
 
-            <div className="py-2 text-xs">
+            <div className="space-y-3.5 pt-2 text-xs">
+              {/* 插件信息摘要卡片 */}
+              <div className="flex items-center gap-3 rounded-xl border border-black/[0.08] bg-black/[0.02] p-3 dark:border-white/[0.08] dark:bg-white/[0.03]">
+                <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-black/[0.05] text-foreground/70 dark:bg-white/[0.08] dark:text-foreground/80">
+                  <IconPuzzle size={18} stroke={1.75} aria-hidden="true" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="truncate text-xs font-semibold text-foreground">
+                      {confirm.plugin.name}
+                    </span>
+                    {confirm.plugin.version && (
+                      <span className="rounded bg-black/[0.05] px-1.5 py-0.5 text-[10px] font-mono text-muted dark:bg-white/[0.08]">
+                        v{confirm.plugin.version}
+                      </span>
+                    )}
+                  </div>
+                  <p className="mt-0.5 line-clamp-1 text-[11.5px] text-muted">
+                    {confirm.plugin.description || confirm.plugin.id}
+                  </p>
+                </div>
+              </div>
+
               {confirm.kind === "enable" ? (
-                <div className="space-y-2">
-                  <p className="m-0 break-words text-muted">
-                    声明能力：{confirm.plugin.capabilities.join("、") || "无特定权限声明"}
-                  </p>
-                  <p className="m-0 rounded-lg bg-amber-500/10 p-2.5 text-amber-700 dark:text-amber-300">
-                    启用后将执行插件本地代码，插件具有与 Codey 相同的系统运行权限。请确认来源安全。
-                  </p>
+                <div className="space-y-3">
+                  <div className="space-y-1.5 rounded-xl border border-black/[0.08] bg-black/[0.015] p-3 dark:border-white/[0.08] dark:bg-white/[0.02]">
+                    <div className="font-medium text-foreground">声明能力</div>
+                    {confirm.plugin.capabilities.length > 0 ? (
+                      <div className="flex flex-wrap gap-1.5 pt-0.5">
+                        {confirm.plugin.capabilities.map((cap) => (
+                          <span
+                            key={cap}
+                            className="inline-flex items-center rounded-md bg-black/[0.05] px-2 py-0.5 font-mono text-[11px] text-muted dark:bg-white/[0.08]"
+                          >
+                            {cap}
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="m-0 text-muted">无特定权限声明</p>
+                    )}
+                  </div>
+
+                  <div className="flex items-start gap-2.5 rounded-xl border border-amber-500/25 bg-amber-500/10 p-3 text-amber-800 dark:text-amber-300">
+                    <IconAlertTriangle className="mt-0.5 shrink-0" size={16} aria-hidden="true" />
+                    <p className="m-0 leading-relaxed">
+                      启用后将执行插件本地代码，插件具有与 Codey 相同的系统运行权限。请确认来源安全可靠。
+                    </p>
+                  </div>
                 </div>
               ) : (
                 <div className="space-y-3">
-                  <p className="m-0 text-muted">
-                    卸载后将移除插件安装包与加载入口。
+                  <p className="m-0 text-muted leading-relaxed">
+                    卸载后将移除插件安装包与加载入口，该插件提供的扩展功能将立即停止。
                   </p>
-                  <Checkbox
-                    disabled={blocked}
-                    checked={removeData}
-                    onCheckedChange={(next) => setRemoveData(next === true)}
-                    label="同时彻底删除该插件的配置、数据和历史日志（默认保留数据）"
-                  />
+
+                  <div
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => {
+                      if (!blocked) setRemoveData((prev) => !prev);
+                    }}
+                    onKeyDown={(e) => {
+                      if ((e.key === " " || e.key === "Enter") && !blocked) {
+                        e.preventDefault();
+                        setRemoveData((prev) => !prev);
+                      }
+                    }}
+                    className={cn(
+                      "group flex items-start gap-3 rounded-xl border p-3.5 transition-all cursor-pointer select-none",
+                      removeData
+                        ? "border-red-500/40 bg-red-500/[0.06] dark:border-red-500/30 dark:bg-red-500/[0.08]"
+                        : "border-black/[0.08] bg-black/[0.015] hover:border-black/15 hover:bg-black/[0.03] dark:border-white/[0.08] dark:bg-white/[0.02] dark:hover:border-white/15 dark:hover:bg-white/[0.04]",
+                      blocked && "pointer-events-none opacity-50"
+                    )}
+                  >
+                    <div className="mt-0.5 shrink-0" onClick={(e) => e.stopPropagation()}>
+                      <Checkbox
+                        disabled={blocked}
+                        checked={removeData}
+                        onCheckedChange={(next) => setRemoveData(next === true)}
+                        aria-label="同时彻底删除该插件的配置、数据和历史日志"
+                      />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div
+                        className={cn(
+                          "font-medium transition-colors",
+                          removeData ? "text-red-700 dark:text-red-300" : "text-foreground"
+                        )}
+                      >
+                        同时彻底删除该插件的配置与数据
+                      </div>
+                      <p className="mt-1 mb-0 text-[11.5px] leading-relaxed text-muted">
+                        包含所有本地配置文件、运行缓存及历史日志。默认保留数据，以便重新安装时恢复。
+                      </p>
+                    </div>
+                  </div>
                 </div>
               )}
             </div>
 
-            <div className="flex justify-end gap-2 pt-2">
+            <DialogFooter className="mt-5 pt-1">
               <Button variant="outline" size="sm" disabled={blocked} onClick={() => setConfirm(null)}>
                 取消
               </Button>
@@ -656,9 +794,16 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
                   })
                 }
               >
-                {confirm.kind === "enable" ? "信任并启用" : "确认卸载"}
+                {confirm.kind === "uninstall" ? (
+                  <>
+                    <IconTrash size={14} aria-hidden="true" />
+                    <span>确认卸载</span>
+                  </>
+                ) : (
+                  <span>信任并启用</span>
+                )}
               </Button>
-            </div>
+            </DialogFooter>
           </DialogContent>
         </Dialog>
       )}
@@ -668,7 +813,7 @@ export function CodeyPluginsSection({ container }: { container?: HTMLElement | n
         <PluginConfigDialog
           key={editing.id}
           plugin={editing}
-          container={container}
+          container={configContainer}
           onClose={() => {
             setEditId(null);
             if (!configurationSaved.current) void run(refresh, true);

@@ -38,7 +38,6 @@ use tokio_tungstenite::tungstenite::{
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, accept_hdr_async_with_config};
 use uuid::Uuid;
 
-use crate::codex_config::CHATGPT_CODEX_BASE_URL;
 use crate::config::{
     CodeyConfig, ProviderProfile, RouteRequestLogBackend, UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES,
     UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS, UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
@@ -64,9 +63,9 @@ pub(crate) const CODEX_AUTO_REVIEW_MODEL: &str = "codex-auto-review";
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_UPSTREAM_ERROR_BYTES: usize = crate::route_request_log::MAX_LOG_ERROR_BYTES;
-const MAX_UPSTREAM_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_UPSTREAM_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_UPSTREAM_SSE_BUFFER_BYTES: usize = 2 * 1024 * 1024;
-const RETAINED_RESPONSE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const RETAINED_RESPONSE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 const MAX_CACHED_RESPONSE_IDS: usize = 1024;
 const DOWNSTREAM_WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const UPSTREAM_SSE_SNIFF_BYTES: usize = 1024;
@@ -86,9 +85,11 @@ const REQUEST_BODY_BUDGET_PERMITS: usize =
 const MAX_ROUTE_BINDINGS: usize = 4096;
 const MAX_UPSTREAM_WEBSOCKET_BACKOFFS: usize = 128;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
-// 插件回调是不可信的原生代码，可能阻塞或死锁；请求路径只在有限时间内等它。
-const PLUGIN_HEADER_CALLBACK_TIMEOUT: Duration = Duration::from_secs(3);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+// 流式网关常把响应头留到首个 token。这个期限从请求体上传完成起算，不包含
+// 上传本身：同对话切换模型会重放整段历史，若从 send() 一开始计时，60 秒会在
+// 上游已经生成（网关侧首字约三十秒）之前用完。本地记成 504 后 Codex 收不到
+// 终态，界面就停在思考。正文到达后仍由空闲期限和总期限约束。
 const UPSTREAM_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 // A non-streaming upstream may not send response headers until generation is
 // complete, so its header wait is also the model's total generation budget.
@@ -158,6 +159,7 @@ mod downstream;
 mod errors;
 mod gemini_instructions;
 mod http;
+mod lifecycle;
 mod native_history;
 mod request_log_tap;
 mod request_meta;
@@ -184,6 +186,7 @@ pub(crate) use downstream::*;
 pub(crate) use errors::*;
 pub(crate) use gemini_instructions::*;
 pub(crate) use http::*;
+use lifecycle::*;
 pub(crate) use native_history::*;
 pub(crate) use request_log_tap::*;
 pub(crate) use request_meta::*;
@@ -218,3 +221,6 @@ mod safety_tests;
 
 #[cfg(test)]
 mod header_tests;
+
+#[cfg(test)]
+mod lifecycle_tests;

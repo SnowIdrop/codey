@@ -37,6 +37,7 @@ directories.workspace = true
 fastctx = { git = "https://github.com/yc-duan/fastctx", rev = "22b40ea324a186a921dfe38c205e3ffacdf6546d", default-features = false }
 fs2.workspace = true
 futures-util.workspace = true
+http-body = "1"
 hyper-util = { version = "0.1", features = ["client-proxy", "client-proxy-system"], default-features = false }
 memchr = "2"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
@@ -48,6 +49,7 @@ semver = "1"
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
+socket2 = { version = "0.6.5", features = ["all"] }
 tokio = { workspace = true, features = ["io-std", "io-util", "net", "signal", "sync"] }
 tokio-tungstenite.workspace = true
 toml_edit.workspace = true
@@ -78,6 +80,7 @@ windows = { version = "0.58", default-features = false, features = [
   "Win32_Storage_Packaging_Appx",
   "Win32_System_LibraryLoader",
   "Win32_System_Com",
+  "Win32_System_Console",
   "Win32_System_SystemServices",
   "Win32_System_Threading",
   "Win32_System_JobObjects",

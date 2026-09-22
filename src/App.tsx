@@ -13,6 +13,7 @@ import {
   IconX,
 } from "@tabler/icons-react";
 import { invoke } from "./api";
+import { rememberOfficialAccounts } from "./officialAccountsRequests";
 import { reconcileConfigDraft } from "./configDraft";
 import { ModelPickerDialog } from "./AppDialogs";
 import { SystemSettingsDialog } from "./SystemSettingsDialog";
@@ -109,6 +110,13 @@ function thirdPartyRouteModelState(
 
 function onlyLocalRouterToggleChanged(current: Config, persisted: Config) {
   if (current.localRouterEnabled === persisted.localRouterEnabled) return false;
+  const currentKeys = Object.keys(current) as Array<keyof Config>;
+  if (currentKeys.length === Object.keys(persisted).length
+    && currentKeys.every((key) => (
+      key === "localRouterEnabled" || key === "settingsRevision" || Object.is(current[key], persisted[key])
+    ))) {
+    return true;
+  }
   return JSON.stringify({
     ...current,
     localRouterEnabled: persisted.localRouterEnabled,
@@ -209,12 +217,12 @@ export function App({
     workflowViewAvailable,
   ]);
   const configLoaded = config !== null;
-  const pendingNativeRouterToggle = Boolean(
+  const pendingNativeRouterToggle = useMemo(() => Boolean(
     config &&
       persistedConfigRef.current &&
       !config.localRouterEnabled &&
       onlyLocalRouterToggleChanged(config, persistedConfigRef.current),
-  );
+  ), [config]);
   const canSyncCurrentProvider = !dirty || pendingNativeRouterToggle;
   const setPersistedConfig = useCallback((next: Config) => {
     persistedConfigRef.current = next;
@@ -811,6 +819,7 @@ export function App({
       accountId: string;
       routeName: string;
       routeShortName: string;
+      baseUrl: string;
     },
   ) {
     if (!config) return false;
@@ -828,7 +837,7 @@ export function App({
         restartRequired?: boolean;
         modelHotReloaded?: boolean;
         customContextsRestored?: boolean;
-      }>("save_official_route_models", {
+      } & import("./App.types").OfficialAccountsResult>("save_official_route_models", {
         routeId,
         models,
         modelContexts,
@@ -836,21 +845,18 @@ export function App({
         showAccountUsageInHeader,
         // undefined 表示保持现状（如只同步模型），空字符串表示清除代理。
         ...(upstreamProxy === undefined ? {} : { upstreamProxy }),
+        // 线路名、短名称、网关和代理写入同一账号记录，避免再打一次派生/热更新。
+        ...(routeSettings
+          ? {
+              accountId: routeSettings.accountId,
+              routeName: routeSettings.routeName,
+              routeShortName: routeSettings.routeShortName,
+              baseUrl: routeSettings.baseUrl,
+            }
+          : {}),
       });
       applyRouteResult(modelResult);
-      // 官方线路的线路名、短名称和代理存放在所属账号记录里，重启派生时会重新读回。
-      if (routeSettings) {
-        const settingsResult = await invoke<import("./App.types").OfficialAccountsResult>(
-          "save_official_account_route_settings",
-          {
-            accountId: routeSettings.accountId,
-            routeName: routeSettings.routeName,
-            routeShortName: routeSettings.routeShortName,
-            upstreamProxy: (upstreamProxy ?? "").trim(),
-          },
-        );
-        handleOfficialAccountsChanged(settingsResult);
-      }
+      if (routeSettings) handleOfficialAccountsChanged(modelResult);
       saved = true;
       const restartNote = modelResult.restartRequired
         ? "，重启 Codex 后完全生效"
@@ -1198,6 +1204,7 @@ export function App({
   });
   const handleOfficialAccountsChanged = useStableEvent(
     (result: import("./App.types").OfficialAccountsResult) => {
+      rememberOfficialAccounts(result);
       if (result.config) {
         applyRouteResult({
           config: result.config,
@@ -1316,7 +1323,7 @@ export function App({
         <div className="config-header-feedback justify-self-center">
           <Button
             aria-describedby="codey-feedback-qr-description"
-            aria-label="问题反馈群，悬浮或聚焦查看二维码"
+            aria-label="问题反馈群，鼠标悬停或键盘聚焦查看二维码"
             className="h-8! whitespace-nowrap px-3.5 text-xs max-[760px]:w-8! max-[760px]:px-0!"
             variant="brand-outline"
           >
@@ -1490,6 +1497,16 @@ export function App({
             <div className="sidebar-footer-left">
               <span className="sidebar-footer-version font-mono">
                 v{status.appVersion || "0.0.1"}
+                {(updateCheck?.updateAvailable === true || Boolean(downloadedUpdate)) && (
+                  <span
+                    className="ml-1.5 inline-flex shrink-0"
+                    role="img"
+                    aria-label={downloadedUpdate ? "新版本已下载，待安装" : "有新版本可用"}
+                    title={downloadedUpdate ? "新版本已下载，待安装" : "有新版本可用"}
+                  >
+                    <span className="size-1.5 rounded-full bg-[var(--codey-red)]" aria-hidden="true" />
+                  </span>
+                )}
               </span>
               <Tooltip content={updateTooltipText} position="top">
                 <Button

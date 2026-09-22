@@ -23,6 +23,13 @@
   const runtimeHealthCheckTimeoutMs = 3_000;
   const runtimeHealthFailureRetryMs = 1_000;
   const runtimeHealthFailureThreshold = 2;
+  // 系统睡眠会同时冻结页面和后端，唤醒瞬间所有进程一起恢复，
+  // 3 秒的往返预算不足以判断 Codey 是否真的退出。排程间隔远超定时器
+  // 周期即视为刚从睡眠恢复，在这段宽限期内放宽超时与失败阈值。
+  const runtimeHealthResumeGapMs = 90_000;
+  const runtimeHealthResumeGraceMs = 120_000;
+  const runtimeHealthResumeTimeoutMs = 8_000;
+  const runtimeHealthResumeFailureThreshold = 4;
   const accountUsageRefreshIntervalMs = 60_000;
   const accountUsageTimeoutMs = 8_000;
   const sessionToolsIdleLoadTimeoutMs = 5_000;
@@ -52,6 +59,8 @@
   let runtimeHealthState = "checking";
   let runtimeHealthMessage = "";
   let runtimeHealthObservedAt = 0;
+  let runtimeHealthLastCheckAt = 0;
+  let runtimeHealthResumeGraceUntil = 0;
   let accountUsageTimer = 0;
   let accountUsageCheckInFlight = false;
   let accountUsagePollingEnabled = true;
@@ -172,9 +181,9 @@
       const updateLabel = hasDetectedUpdate() ? "，另有可用更新" : "";
       button.setAttribute(
         "aria-label",
-        `Codey 进程异常或连接中断，点击查看处理提示${updateLabel}`,
+        `Codey 连接中断，点击查看处理提示${updateLabel}`,
       );
-      button.title = `Codey 进程异常或连接中断：${detail}（点击查看处理提示）${updateLabel}`;
+      button.title = `Codey 连接中断：${detail}（点击查看处理提示）${updateLabel}`;
       return;
     }
     if (hasDetectedUpdate()) {
@@ -266,14 +275,32 @@
     }
     if (runtimeHealthCheckInFlight) return runtimeHealthSnapshot();
     runtimeHealthCheckInFlight = true;
+    const observedAt = Date.now();
+    const observedGap = runtimeHealthLastCheckAt > 0
+      ? observedAt - runtimeHealthLastCheckAt
+      : 0;
+    runtimeHealthLastCheckAt = observedAt;
+    if (observedGap >= runtimeHealthResumeGapMs) {
+      // 页面和后端被系统一起冻结，唤醒后 Codey 需要时间重新建立与
+      // Codex 的连接。恢复前记录的失败不代表当前状态，直接丢弃。
+      runtimeHealthResumeGraceUntil = observedAt + runtimeHealthResumeGraceMs;
+      runtimeHealthFailures = 0;
+    }
+    const resuming = observedAt < runtimeHealthResumeGraceUntil;
+    const checkTimeoutMs = resuming
+      ? runtimeHealthResumeTimeoutMs
+      : runtimeHealthCheckTimeoutMs;
+    const failureThreshold = resuming
+      ? runtimeHealthResumeFailureThreshold
+      : runtimeHealthFailureThreshold;
     try {
       if (typeof window.__codexSessionDeleteBridge !== "function") {
-        runtimeHealthFailures = runtimeHealthFailureThreshold;
+        runtimeHealthFailures = failureThreshold;
         return setRuntimeHealthState("unavailable", "Codey bridge 不可用");
       }
       const result = await withTimeout(
-        callBridge(backendHealthPath, {}, { timeoutMs: runtimeHealthCheckTimeoutMs }),
-        runtimeHealthCheckTimeoutMs + 250,
+        callBridge(backendHealthPath, {}, { timeoutMs: checkTimeoutMs }),
+        checkTimeoutMs + 250,
         "Codey 后端健康检查超时",
       );
       if (result?.status === "ok") {
@@ -286,15 +313,15 @@
     } catch (error) {
       runtimeHealthFailures += 1;
       const immediate = error?.code === "bridge_unavailable";
-      if (immediate) runtimeHealthFailures = runtimeHealthFailureThreshold;
-      if (runtimeHealthFailures >= runtimeHealthFailureThreshold) {
+      if (immediate) runtimeHealthFailures = failureThreshold;
+      if (runtimeHealthFailures >= failureThreshold) {
         return setRuntimeHealthState("unavailable", "Codey 后端未响应");
       }
       return setRuntimeHealthState("checking", "正在确认 Codey 进程状态");
     } finally {
       runtimeHealthCheckInFlight = false;
       const nextDelay = runtimeHealthFailures > 0
-        && runtimeHealthFailures < runtimeHealthFailureThreshold
+        && runtimeHealthFailures < failureThreshold
         ? runtimeHealthFailureRetryMs
         : runtimeHealthCheckIntervalMs;
       scheduleRuntimeHealthCheck(nextDelay);
@@ -372,6 +399,7 @@
   };
 
   const normalizeAppServerUsageWindow = (window) => {
+    if (typeof window?.usedPercent !== "number" || typeof window?.windowDurationMins !== "number") return null;
     const usedPercent = Number(window?.usedPercent);
     const windowMinutes = Number(window?.windowDurationMins);
     if (!Number.isFinite(usedPercent) || !Number.isFinite(windowMinutes) || windowMinutes <= 0) {
@@ -389,11 +417,12 @@
   };
 
   const normalizeAppServerAccountUsage = (response) => {
+    const unavailable = { status: "unavailable", code: "codex_usage_incompatible", message: "当前 Codex 暂时无法提供额度信息" };
     const payload = response?.result && typeof response.result === "object"
       ? response.result
       : response;
     if (!payload || typeof payload !== "object") {
-      throw new Error("Codex 官方额度响应格式无效");
+      return unavailable;
     }
     // 账号摘要只读取通用额度，不能合并模型专属的 rateLimitsByLimitId。
     const buckets = [];
@@ -412,9 +441,15 @@
     const secondary = primary === windowsByKind.get("weekly")
       ? windowsByKind.get("five-hour") || null
       : windowsByKind.get("weekly") || null;
-    const credits = buckets.find((bucket) => bucket.credits)?.credits || payload.credits || null;
+    const rawCredits = buckets.find((bucket) => bucket.credits)?.credits || payload.credits || null;
+    const credits = rawCredits && typeof rawCredits === "object"
+      && (rawCredits.unlimited === true || (rawCredits.hasCredits === true
+        && (typeof rawCredits.balance === "number"
+          || (typeof rawCredits.balance === "string" && rawCredits.balance.trim() !== ""))
+        && Number.isFinite(Number(rawCredits.balance))))
+      ? rawCredits : null;
     if (!primary && !secondary && !credits) {
-      throw new Error("Codex 官方额度响应中没有可展示的信息");
+      return unavailable;
     }
     const planType = buckets
       .map((bucket) => bucket.planType)
@@ -769,10 +804,11 @@
   const readAccountUsageFromAppServer = async (backendResult) => {
     const loaded = await loadSessionTools();
     if (!loaded || typeof window.__codeyReadAccountRateLimits !== "function") {
-      throw new Error("Codex 官方额度读取接口不可用");
+      return { status: "unavailable", code: "codex_usage_incompatible", message: "当前 Codex 暂时无法提供额度信息" };
     }
     const response = await window.__codeyReadAccountRateLimits();
     const snapshot = normalizeAppServerAccountUsage(response);
+    if (snapshot.status !== "ok") return snapshot;
     // Publish Codex's managed-auth result so the independent log window can reuse it.
     if (Number.isSafeInteger(backendResult?.authGeneration)) {
       const stored = await callBridge("/api/store_official_account_usage", {
@@ -802,7 +838,8 @@
       );
       if (result?.status === "error" || result?.stale) {
         try {
-          result = await withTimeout(readAccountUsageFromAppServer(result), accountUsageTimeoutMs, "读取 Codex 周额度超时");
+          const fallback = await withTimeout(readAccountUsageFromAppServer(result), accountUsageTimeoutMs, "读取 Codex 周额度超时");
+          if (fallback?.status === "ok") result = fallback;
         } catch { /* Keep the backend error when the fallback is unavailable. */ }
       }
       // A dialog query never enables the account display or its polling.
@@ -825,11 +862,12 @@
       );
       if (result?.status === "error" || result?.stale) {
         try {
-          result = await withTimeout(
+          const fallback = await withTimeout(
             readAccountUsageFromAppServer(result),
             accountUsageTimeoutMs,
             "读取 Codex 官方额度超时",
           );
+          if (fallback?.status === "ok") result = fallback;
         } catch {
           // Preserve the original backend error. It is normally more actionable
           // when the current Codex asset does not expose AppServerManager yet.
@@ -858,7 +896,8 @@
   const openSettings = () => {
     if (runtimeHealthState === "unavailable") {
       window.alert(
-        "Codey 进程异常或已退出，当前配置面板无法连接。请退出 Codex 后重新启动 Codey。",
+        "Codey 与 Codex 的连接已中断，当前配置面板无法连接。"
+        + "Codey 会继续尝试自动恢复；若长时间仍未恢复，请退出 Codex 后重新启动 Codey。",
       );
       return;
     }
@@ -1155,6 +1194,37 @@
     headerMountDirty = true;
     scheduleScan(root || document);
   };
+
+  const appServerRequestClient = () => {
+    const clients = window.__codeyAppServerRequestClients;
+    if (!clients || typeof clients.get !== "function") return null;
+    const local = clients.get("local");
+    if (local && typeof local.sendRequest === "function") return local;
+    if (typeof clients.values !== "function") return null;
+    const all = [...clients.values()].filter((client) => typeof client?.sendRequest === "function");
+    return all.length === 1 ? all[0] : null;
+  };
+  const bootstrapReloadMcpServers = async () => {
+    const client = appServerRequestClient();
+    if (client) {
+      await client.sendRequest("config/mcpServer/reload", {});
+      return { ok: true };
+    }
+    const loaded = await loadSessionTools();
+    if (
+      loaded
+      && typeof window.__codeyReloadMcpServers === "function"
+      && window.__codeyReloadMcpServers !== bootstrapReloadMcpServers
+    ) {
+      return window.__codeyReloadMcpServers();
+    }
+    const error = new Error("当前 Codex 暂不支持MCP 配置刷新，请稍后重试");
+    error.code = "codey_capability_unavailable";
+    throw error;
+  };
+  if (typeof window.__codeyReloadMcpServers !== "function") {
+    window.__codeyReloadMcpServers = bootstrapReloadMcpServers;
+  }
 
   if (rendererCoreAlreadyLoaded) return;
   window.addEventListener?.(updateAvailableEvent, (event) => {

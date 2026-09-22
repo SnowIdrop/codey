@@ -1,15 +1,22 @@
 use super::*;
 
 impl RouterServer {
-    pub(crate) async fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
+    pub(crate) async fn handle_connection(
+        &self,
+        mut stream: TcpStream,
+        connection_permit: OwnedSemaphorePermit,
+    ) -> Result<()> {
         match probe_responses_websocket(&stream).await? {
             ResponsesWebSocketProbe::Upgrade => {
-                return self.handle_responses_websocket(stream).await;
+                return self
+                    .handle_responses_websocket(stream, connection_permit)
+                    .await;
             }
             ResponsesWebSocketProbe::Http => {}
             ResponsesWebSocketProbe::Silent => {
                 // 空闲或半开连接不会发出请求，和普通 HTTP 路径的读取超时一样
                 // 回一个 408 即可；对端可能已经断开，这里只做尽力回复。
+                let _connection_permit = connection_permit;
                 let _ = write_error_response(
                     &mut stream,
                     408,
@@ -21,6 +28,7 @@ impl RouterServer {
                 return Ok(());
             }
         }
+        let _connection_permit = connection_permit;
         let pending =
             match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_http_request_head(&mut stream))
                 .await
@@ -623,63 +631,64 @@ impl RouterServer {
                 return Ok(());
             }
         };
-        let request_builder =
-            upstream_client
-                .post(&upstream_url)
-                .headers(headers)
-                .body(if body_mutated {
-                    serde_json::to_vec(&body).context("序列化 Images 上游请求失败")?
-                } else {
-                    request.body
-                });
+        let request_body = if body_mutated {
+            Bytes::from(serde_json::to_vec(&body).context("序列化 Images 上游请求失败")?)
+        } else {
+            Bytes::from(request.body)
+        };
         let response_header_timeout = if stream_requested {
             UPSTREAM_RESPONSE_HEADER_TIMEOUT
         } else {
             UPSTREAM_NON_STREAM_RESPONSE_HEADER_TIMEOUT
         };
-        let response =
-            match tokio::time::timeout(response_header_timeout, request_builder.send()).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(error)) => {
-                    let timeout = error.is_timeout();
-                    let (status, code, message) = if timeout {
-                        (
-                            504,
-                            "upstream_timeout",
-                            format!(
-                                "Codey 线路「{}」请求图片生成上游超时",
-                                route_display_name(&route)
-                            ),
-                        )
-                    } else {
-                        (
-                            424,
-                            "upstream_unreachable",
-                            format!(
-                                "Codey 线路「{}」无法连接图片生成上游",
-                                route_display_name(&route)
-                            ),
-                        )
-                    };
-                    mark_error(status, code);
-                    write_text_error_response(&mut stream, status, code, message).await?;
-                    return Ok(());
-                }
-                Err(_) => {
-                    mark_error(504, "upstream_header_timeout");
-                    write_text_error_response(
-                        &mut stream,
+        let response = match send_for_response_headers(
+            upstream_client.post(&upstream_url).headers(headers),
+            request_body,
+            response_header_timeout,
+        )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                let timeout = error.is_timeout();
+                let (status, code, message) = if timeout {
+                    (
                         504,
-                        "upstream_header_timeout",
+                        "upstream_timeout",
                         format!(
-                            "Codey 线路「{}」等待图片生成上游返回响应头超时",
+                            "Codey 线路「{}」请求图片生成上游超时",
                             route_display_name(&route)
                         ),
                     )
-                    .await?;
-                    return Ok(());
-                }
-            };
+                } else {
+                    (
+                        424,
+                        "upstream_unreachable",
+                        format!(
+                            "Codey 线路「{}」无法连接图片生成上游",
+                            route_display_name(&route)
+                        ),
+                    )
+                };
+                mark_error(status, code);
+                write_text_error_response(&mut stream, status, code, message).await?;
+                return Ok(());
+            }
+            Err(_) => {
+                mark_error(504, "upstream_header_timeout");
+                write_text_error_response(
+                    &mut stream,
+                    504,
+                    "upstream_header_timeout",
+                    format!(
+                        "Codey 线路「{}」等待图片生成上游返回响应头超时",
+                        route_display_name(&route)
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
         if let Some(probe) = &probe {
             probe.mark_upstream_headers(
                 response.status().as_u16(),
@@ -833,7 +842,14 @@ impl RouterServer {
     // Tungstenite's handshake callback fixes the error type to an HTTP
     // response value; its size is imposed by the external Callback contract.
     #[allow(clippy::result_large_err)]
-    pub(crate) async fn handle_responses_websocket(&self, stream: TcpStream) -> Result<()> {
+    pub(crate) async fn handle_responses_websocket(
+        &self,
+        stream: TcpStream,
+        connection_permit: OwnedSemaphorePermit,
+    ) -> Result<()> {
+        // 握手完成前一直占着并发名额。空闲等待在循环里释放，避免预连接和
+        // 已结束的回合把名额占满；下一条需要转发的消息会重新获取。
+        let mut connection_permit = Some(connection_permit);
         let handshake_context = Arc::new(Mutex::new(None));
         let captured_context = Arc::clone(&handshake_context);
         let token = self.token.clone();
@@ -895,13 +911,26 @@ impl RouterServer {
             socket,
             Arc::clone(&self.websocket_backoffs),
             Arc::clone(&self.request_body_budget),
+            Arc::clone(&self.idle_downstreams),
         );
         downstream.native_history = NativeResponsesHistory::with_cache(
             Arc::clone(&self.native_history_cache),
             &context.headers,
         );
 
-        while let Some(message) = downstream.next_message().await? {
+        loop {
+            drop(connection_permit.take());
+            let Some(message) = downstream.next_message().await? else {
+                break;
+            };
+            if matches!(message, WebSocketMessage::Text(_)) {
+                connection_permit = Some(
+                    Arc::clone(&self.connection_limit)
+                        .acquire_owned()
+                        .await
+                        .context("等待本地路由连接名额失败")?,
+                );
+            }
             downstream.clear_stream_id();
             match message {
                 WebSocketMessage::Text(text) => {
@@ -1787,47 +1816,6 @@ impl RouterServer {
                 return Ok(());
             }
         };
-        if crate::codey_plugins::has_request_plugins() {
-            let metadata = json!({
-                "requestId": current_router_request_id(),
-                "routeId": resolved.provider_id,
-                "accountId": resolved.route.official_auth.as_ref().map(|auth| auth.account_id.as_str()),
-                "requestedModel": resolved.requested_model,
-                "model": resolved.upstream_model,
-                "protocol": bridge.upstream_protocol().label(),
-                "subagent": subagent_request,
-            });
-            let visible_headers = headers
-                .iter()
-                .filter(|(name, _)| crate::codey_plugins::allowed_header_name(name.as_str()))
-                .filter_map(|(name, value)| {
-                    value
-                        .to_str()
-                        .ok()
-                        .map(|value| (name.as_str().to_owned(), value.to_owned()))
-                })
-                .collect();
-            let route_id = resolved.provider_id.clone();
-            // 插件回调是不可信的原生代码，可能阻塞或死锁：移到阻塞池并限制等待
-            // 时间，否则仅两个 async worker 的运行时会被一次慢回调拖停。
-            let dispatched = tokio::time::timeout(
-                PLUGIN_HEADER_CALLBACK_TIMEOUT,
-                tokio::task::spawn_blocking(move || {
-                    crate::codey_plugins::dispatch_request_headers(&metadata, &visible_headers)
-                }),
-            )
-            .await;
-            match dispatched {
-                Ok(Ok(patches)) => apply_codey_plugin_header_patches(&mut headers, patches),
-                Ok(Err(error)) => {
-                    record_plugin_header_callback_failure(&route_id, &error.to_string())
-                }
-                Err(_) => record_plugin_header_callback_failure(
-                    &route_id,
-                    "插件请求回调超时，本次请求跳过头修改",
-                ),
-            }
-        }
         // 请求体的模型名已还原为上游模型名，路由提示头里的模型名必须保持一致；
         // HTTP、WebSocket 握手和压缩请求共用这份头。
         align_routing_hint_model(&mut headers, &resolved.upstream_model);
@@ -1867,6 +1855,21 @@ impl RouterServer {
                 &resolved.upstream_model,
             );
         }
+        let mut lifecycle = request_lifecycle(
+            &headers,
+            &resolved,
+            bridge,
+            request_kind,
+            stream_requested,
+            subagent_request,
+        );
+        let mut observed = LifecycleDownstream {
+            inner: downstream,
+            status: None,
+            error: None,
+        };
+        let result: Result<()> = async {
+        let downstream = &mut observed;
         // Every downstream socket owns its upstream WebSocket cache. Subagents
         // therefore keep incremental `previous_response_id` state on their own
         // upstream connection without sharing the main agent's connection.
@@ -1875,7 +1878,9 @@ impl RouterServer {
             && stream_requested
             && bridge == ProtocolBridge::NativeResponses
         {
-            if !compacting {
+            // Lifecycle plugins need response headers, so they skip this
+            // attempt. Continuation history is staged on the HTTP fallback.
+            if !compacting && !lifecycle.is_active() {
                 let had_previous_response =
                     responses_previous_response_id(&upstream_body).is_some();
                 let websocket_attempt = downstream
@@ -1975,15 +1980,10 @@ impl RouterServer {
             && !compacting
             && !resolved.route.official_account;
         // 重发需要同一份请求头和完整请求体，只有可能重发时才保留。
-        let retry_headers = reasoning_text_retry_allowed.then(|| headers.clone());
-        if let Some(probe) = downstream.request_log_probe() {
-            probe.set_upstream_request_headers(&format_upstream_headers(&headers));
-        }
-        let mut request_builder = upstream_client.post(upstream_url).headers(headers);
         // 压缩请求不设置 reqwest 总期限:该期限从建连算到响应体读完,会把耗时较长的
         // 压缩中途截断。等待响应头由 response_header_timeout 约束,响应体读取由
         // PreparedUpstreamResponse 的总期限与空闲期限约束。
-        request_builder = if bridge == ProtocolBridge::NativeResponses {
+        let encoded: Bytes = if bridge == ProtocolBridge::NativeResponses {
             // Native HTTP requests keep large input/tool fields as their raw
             // JSON slices. Only the small top-level fields that Codey can
             // legitimately change are re-encoded, avoiding a full second
@@ -2018,13 +2018,13 @@ impl RouterServer {
                     Some(passthrough_body.len() as u64),
                 ));
             }
-            request_builder.body(passthrough_body)
+            passthrough_body.into()
         } else {
             drop(encoded_body.take());
-            request_builder.json(&upstream_body)
+            serde_json::to_vec(&upstream_body).context("序列化转换后的上游请求失败")?.into()
         };
         // 重发需要完整请求体，只有可能重发时才继续持有它。
-        let mut retryable_body = retry_headers.is_some().then_some(upstream_body);
+        let mut retryable_body = reasoning_text_retry_allowed.then_some(upstream_body);
         let response_header_timeout = if compacting {
             // 流式压缩在生成期间持续返回事件，非流式压缩要到生成结束后才返回
             // 响应头，两者的等待期限不同，都只约束响应头。
@@ -2045,20 +2045,11 @@ impl RouterServer {
                 UpstreamTransport::Http
             });
         }
-        let response_result = await_upstream(
-            downstream,
-            tokio::time::timeout(response_header_timeout, request_builder.send()),
-        )
-        .await?;
-        // The send future no longer owns the serialized request. Native HTTP
-        // can release its budget before streaming the response; adapted routes
-        // retain it only when tool-name mappings still reference request data.
-        if tool_bridge.upstream_to_response.is_empty()
-            && tool_bridge.response_to_upstream.is_empty()
-        {
-            drop(std::mem::take(&mut request.body));
-            drop(request._body_budget_permit.take());
-        }
+        let mut attempt = 0;
+        let response_result = send_lifecycle_http(
+            downstream, &mut lifecycle, &upstream_client, upstream_url,
+            &mut headers, encoded, &mut attempt, response_header_timeout,
+        ).await?;
         let Some(response) = Self::finish_upstream_http_send(
             downstream,
             response_result,
@@ -2083,7 +2074,7 @@ impl RouterServer {
         let mut upstream_response = Some(response);
         let mut preloaded_error_body = None;
         if upstream_status == 400
-            && let Some(retry_headers) = retry_headers
+            && reasoning_text_retry_allowed && attempt == 0
         {
             let response = upstream_response
                 .take()
@@ -2136,18 +2127,11 @@ impl RouterServer {
                         Some(encoded.len() as u64),
                     ));
                 }
-                let retry_result = await_upstream(
-                    downstream,
-                    tokio::time::timeout(
-                        response_header_timeout,
-                        upstream_client
-                            .post(upstream_url)
-                            .headers(retry_headers)
-                            .body(encoded)
-                            .send(),
-                    ),
-                )
-                .await?;
+                attempt += 1;
+                let retry_result = send_lifecycle_http(
+                    downstream, &mut lifecycle, &upstream_client, upstream_url,
+                    &mut headers, encoded.into(), &mut attempt, response_header_timeout,
+                ).await?;
                 let Some(retried) = Self::finish_upstream_http_send(
                     downstream,
                     retry_result,
@@ -2173,6 +2157,14 @@ impl RouterServer {
             } else {
                 preloaded_error_body = Some(body);
             }
+        }
+        // 所有可能的重发结束后再释放请求内存预算，避免等待插件时失去记账。
+        drop(retryable_body);
+        if tool_bridge.upstream_to_response.is_empty()
+            && tool_bridge.response_to_upstream.is_empty()
+        {
+            drop(std::mem::take(&mut request.body));
+            drop(request._body_budget_permit.take());
         }
         if let Some(probe) = downstream.request_log_probe() {
             probe.mark_upstream_headers(upstream_status, upstream_request_id.as_deref());
@@ -2275,6 +2267,25 @@ impl RouterServer {
                 )
                 .await;
         }
+        result
+        }.await;
+        let result = match result {
+            Err(error) if error.is::<crate::codey_plugins::lifecycle::LifecycleError>() => {
+                let error = error
+                    .downcast::<crate::codey_plugins::lifecycle::LifecycleError>()
+                    .expect("checked lifecycle error type");
+                observed
+                    .write_error(
+                        error.status,
+                        &error.code,
+                        error.message,
+                        Some(&resolved.route),
+                    )
+                    .await
+            }
+            result => result,
+        };
+        observed.finish(&mut lifecycle, &result);
         result
     }
 
@@ -2421,44 +2432,6 @@ impl RouterServer {
             }
         };
         Ok(Some(response))
-    }
-}
-
-/// 插件回调失败或超时时，本次请求不带它的头修改继续，并留下脱敏诊断。
-fn record_plugin_header_callback_failure(route_id: &str, message: &str) {
-    crate::error_log::record_failure(
-        "plugin_callback_failed",
-        "codey_plugins.dispatch_request_headers",
-        message.to_owned(),
-        serde_json::json!({"routeId": route_id}),
-    );
-}
-
-pub(crate) fn apply_codey_plugin_header_patches(
-    headers: &mut HeaderMap,
-    patches: Vec<crate::codey_plugins::HeaderPatch>,
-) {
-    let parsed = patches
-        .into_iter()
-        .map(|patch| {
-            if !crate::codey_plugins::allowed_header_name(&patch.name) {
-                return None;
-            }
-            let name = HeaderName::from_bytes(patch.name.as_bytes()).ok()?;
-            let value = match patch.value {
-                Some(value) => Some(HeaderValue::from_str(&value).ok()?),
-                None => None,
-            };
-            Some((name, value))
-        })
-        .collect::<Option<Vec<_>>>();
-    let Some(parsed) = parsed else { return };
-    for (name, value) in parsed {
-        if let Some(value) = value {
-            headers.insert(name, value);
-        } else {
-            headers.remove(name);
-        }
     }
 }
 

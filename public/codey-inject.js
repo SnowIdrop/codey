@@ -58,7 +58,6 @@
   const maxScanLatencyMs = 250;
   const sidebarTitleCache = new Map();
   let watcherWakeTimer = 0;
-  let codexSessionControllerPromise = null;
   let completionReconcileInFlight = false;
   let completionNextReconcileAt = 0;
   let completionReconcileSessionId = "";
@@ -2060,10 +2059,9 @@
             const manager = resolver(scope, "local");
             if (
               manager
-              && typeof manager.discardConversationFromCache === "function"
-              && typeof manager.handleThreadDeletion === "function"
-              && typeof manager.refreshRecentConversations === "function"
-              && typeof manager.resumeConversation === "function"
+              && ["sendRequest", "discardConversationFromCache", "refreshRecentConversations",
+                "resumeConversation", "codeyReconcileCompletedConversation"]
+                .some((method) => typeof manager[method] === "function")
             ) return manager;
           } catch {
             continue;
@@ -2110,51 +2108,63 @@
   const managerSessionController = (manager) => ({
     kind: "manager",
     manager,
-    discardConversation: (sessionId) => manager.discardConversationFromCache(sessionId),
-    notifyConversationDeleted: (sessionId) => manager.handleThreadDeletion([sessionId]),
-    refreshRecentConversations: () => manager.refreshRecentConversations(),
+    discardConversation: typeof manager.discardConversationFromCache === "function"
+      ? (sessionId) => manager.discardConversationFromCache(sessionId) : null,
+    notifyConversationDeleted: typeof manager.handleThreadDeletion === "function"
+      ? (sessionId) => manager.handleThreadDeletion([sessionId]) : null,
+    refreshRecentConversations: typeof manager.refreshRecentConversations === "function"
+      ? () => manager.refreshRecentConversations() : null,
     reconcileCompletedConversation: typeof manager.codeyReconcileCompletedConversation === "function"
       ? (payload) => manager.codeyReconcileCompletedConversation(payload)
       : null,
-    resumeConversation: (payload) => manager.resumeConversation(payload),
+    resumeConversation: typeof manager.resumeConversation === "function"
+      ? (payload) => manager.resumeConversation(payload) : null,
   });
 
-  const sessionControllerLooksUsable = (controller) => (
-    controller
-    && typeof controller.discardConversation === "function"
-    && typeof controller.notifyConversationDeleted === "function"
-    && typeof controller.refreshRecentConversations === "function"
-    && typeof controller.resumeConversation === "function"
-  );
+  const sessionControllerLooksUsable = (controller, feature = "session") => {
+    if (!controller) return false;
+    if (feature === "usage" || feature === "mcpReload") return typeof controller.manager?.sendRequest === "function";
+    if (feature === "reconcile") return sessionControllerCanReconcileCompletedConversation(controller);
+    const methods = feature === "deleteMessages"
+      ? ["discardConversation", "resumeConversation", "refreshRecentConversations"]
+      : feature === "refresh" ? ["refreshRecentConversations"] : [];
+    return methods.length ? methods.every((method) => typeof controller[method] === "function")
+      : controller.kind === "manager" || controller.kind === "signals";
+  };
+
+  const capabilityProbes = new Map();
+  const capabilityLabels = { usage: "官方额度读取", mcpReload: "MCP 配置刷新", reconcile: "完成状态同步", deleteMessages: "消息删除", refresh: "会话列表刷新", session: "会话管理" };
+  const capabilityMessage = (feature) => `当前 Codex 暂不支持${capabilityLabels[feature] || "此功能"}，请稍后重试`;
+  const pageCapabilities = Object.create(null);
+  window.__codeyPageCapabilities = pageCapabilities;
+  const publishCapability = (feature, available) => {
+    if (disposed) return;
+    pageCapabilities[feature] = {
+      status: available ? "available" : "unavailable",
+      message: available ? "" : capabilityMessage(feature),
+    };
+  };
+  const unavailableCapability = (feature) => {
+    publishCapability(feature, false);
+    const error = new Error(capabilityMessage(feature));
+    error.code = "codey_capability_unavailable";
+    return error;
+  };
 
   const sessionControllerCanReconcileCompletedConversation = (controller) => (
     controller?.kind === "manager"
     && typeof controller.reconcileCompletedConversation === "function"
   );
 
-  const loadCodexSessionController = async ({ requireCompletionReconcile = false } = {}) => {
-    if (
-      sessionControllerLooksUsable(window.__codeyCodexSessionController)
-      && (
-        !requireCompletionReconcile
-        || sessionControllerCanReconcileCompletedConversation(
-          window.__codeyCodexSessionController,
-        )
-      )
-    ) {
-      return window.__codeyCodexSessionController;
+  const discoverCodexSessionController = async (feature) => {
+    if (disposed) throw unavailableCapability(feature);
+    const requireCompletionReconcile = feature === "reconcile";
+    // Rebuild wrappers so methods added by a late renderer patch become usable.
+    if (window.__codeyCodexSessionController?.manager) {
+      window.__codeyCodexSessionController = managerSessionController(window.__codeyCodexSessionController.manager);
     }
-    if (
-      requireCompletionReconcile
-      && window.__codeyCodexSessionController?.kind === "manager"
-      && !sessionControllerCanReconcileCompletedConversation(
-        window.__codeyCodexSessionController,
-      )
-    ) {
-      // A manager can be cached before the renderer patch adds the reconcile
-      // method. Drop that stale wrapper and rediscover the patched manager.
-      window.__codeyCodexSessionController = null;
-      codexSessionControllerPromise = null;
+    if (sessionControllerLooksUsable(window.__codeyCodexSessionController, feature)) {
+      return window.__codeyCodexSessionController;
     }
     let fallbackDispatcher = typeof window.__codeyCodexSignalDispatcher === "function"
       ? window.__codeyCodexSignalDispatcher
@@ -2166,40 +2176,72 @@
     );
     const urls = (await discoverCodexAppAssetUrls())
       .sort((left, right) => managerAssetPriority(right) - managerAssetPriority(left));
+    if (disposed) throw unavailableCapability(feature);
     for (const url of urls) {
       const namedSignalAsset = url.includes("app-server-manager-signals-");
       try {
         const module = typeof window.__codeyImportCodexAsset === "function"
           ? await window.__codeyImportCodexAsset(url)
           : await import(url);
+        // 旧安装的迟到探测不能替换新安装已确认的接口。
+        if (disposed) throw unavailableCapability(feature);
         const resolver = appServerManagerResolverFromModule(module);
         const manager = resolver ? appServerManagerFromReact(resolver) : null;
         if (manager) {
           const controller = managerSessionController(manager);
-          if (
-            !requireCompletionReconcile
-            || sessionControllerCanReconcileCompletedConversation(controller)
-          ) {
+          if (sessionControllerLooksUsable(controller, feature)) {
             window.__codeyCodexSessionController = controller;
             return controller;
           }
+          // A missing optional method must not discard other usable features.
+          window.__codeyCodexSessionController ||= controller;
         }
         fallbackDispatcher ||= signalDispatcherFromModule(module, namedSignalAsset);
-      } catch {
+      } catch (error) {
+        if (disposed) throw error;
         continue;
       }
     }
-    if (fallbackDispatcher && !requireCompletionReconcile) {
+    if (fallbackDispatcher && !requireCompletionReconcile && feature !== "usage" && feature !== "mcpReload") {
       window.__codeyCodexSignalDispatcher = fallbackDispatcher;
       const controller = legacySessionController(fallbackDispatcher);
       window.__codeyCodexSessionController = controller;
       return controller;
     }
-    throw new Error(
-      requireCompletionReconcile
-        ? "Codex 完成态同步接口不可用"
-        : "Codex 会话管理接口不可用",
-    );
+    throw unavailableCapability(feature);
+  };
+  const loadCodexSessionController = async ({ requireCompletionReconcile = false, feature = "session" } = {}) => {
+    if (requireCompletionReconcile) feature = "reconcile";
+    if (disposed) throw unavailableCapability(feature);
+    const cached = window.__codeyCodexSessionController;
+    const current = cached?.manager ? managerSessionController(cached.manager) : cached;
+    if (sessionControllerLooksUsable(current, feature)) {
+      window.__codeyCodexSessionController = current;
+      capabilityProbes.delete(feature);
+      publishCapability(feature, true);
+      return current;
+    }
+    const state = capabilityProbes.get(feature) || { failures: 0, retryAt: 0, pending: null };
+    capabilityProbes.set(feature, state);
+    if (state.pending) return state.pending;
+    if (Date.now() < state.retryAt) throw unavailableCapability(feature);
+    const discover = () => discoverCodexSessionController(feature);
+    // MCP 刷新由宿主 CDP 预算约束；5 秒发现上限会让慢机或尚未 hydrate 的
+    // 页面在导入/启停后误报失败，只能重启 Codex。
+    state.pending = (feature === "mcpReload"
+      ? Promise.resolve().then(discover)
+      : waitForNativeSessionOperation(discover)).then((controller) => {
+      if (disposed) throw unavailableCapability(feature);
+      state.failures = 0;
+      state.retryAt = 0;
+      publishCapability(feature, true);
+      return controller;
+    }, () => {
+      state.failures += 1;
+      state.retryAt = Date.now() + Math.min(30_000, 1_000 * 2 ** Math.min(state.failures - 1, 5));
+      throw unavailableCapability(feature);
+    }).finally(() => { state.pending = null; });
+    return state.pending;
   };
   window.__codeyLoadCodexSessionController = loadCodexSessionController;
 
@@ -2212,30 +2254,58 @@
   };
   window.__codeyLoadCodexSignalDispatcher = loadCodexSignalDispatcher;
 
-  const getCodexSessionController = async () => {
-    if (sessionControllerLooksUsable(window.__codeyCodexSessionController)) {
-      return window.__codeyCodexSessionController;
-    }
-    codexSessionControllerPromise ||= loadCodexSessionController().catch((error) => {
-      codexSessionControllerPromise = null;
-      throw error;
-    });
-    return codexSessionControllerPromise;
-  };
+  const getCodexSessionController = (feature = "deleteMessages") => loadCodexSessionController({ feature });
 
   const readAccountRateLimits = async () => {
-    const controller = await getCodexSessionController();
-    if (
-      controller?.kind !== "manager"
-      || typeof controller.manager?.sendRequest !== "function"
-    ) {
-      throw new Error("当前 Codex 不支持官方额度读取接口");
+    let controller;
+    try {
+      controller = await getCodexSessionController("usage");
+    } catch (error) {
+      if (error?.code !== "codey_capability_unavailable") throw error;
+      return { status: "unavailable", code: error.code, message: error.message };
     }
     // Managed ChatGPT authentication, token refresh, credential-store access,
     // and request serialization stay inside Codex's own AppServerManager.
     return controller.manager.sendRequest("account/rateLimits/read");
   };
   window.__codeyReadAccountRateLimits = readAccountRateLimits;
+
+  const appServerRequestClient = () => {
+    const clients = window.__codeyAppServerRequestClients;
+    if (!clients || typeof clients.get !== "function") return null;
+    const local = clients.get("local");
+    if (local && typeof local.sendRequest === "function") return local;
+    if (typeof clients.values !== "function") return null;
+    const all = [...clients.values()].filter((client) => typeof client?.sendRequest === "function");
+    return all.length === 1 ? all[0] : null;
+  };
+
+  const reloadMcpServers = async () => {
+    capabilityProbes.delete("mcpReload");
+    const sendReload = async (target) => {
+      // Codex 协议要求 params 为对象；原生实现会把配置应用到已加载会话的下一轮。
+      await target.sendRequest("config/mcpServer/reload", {});
+      publishCapability("mcpReload", true);
+      return { ok: true };
+    };
+    const client = appServerRequestClient();
+    if (client) {
+      try {
+        return await sendReload(client);
+      } catch (error) {
+        if (/unknown method/i.test(String(error?.message || error))) throw error;
+      }
+    }
+    const controller = await loadCodexSessionController({ feature: "mcpReload" });
+    if (disposed) throw unavailableCapability("mcpReload");
+    try {
+      return await sendReload(controller.manager);
+    } catch (error) {
+      window.__codeyCodexSessionController = null;
+      throw error;
+    }
+  };
+  window.__codeyReloadMcpServers = reloadMcpServers;
 
   const reconcileStaleCompletedTask = async () => {
     if (disposed || document.visibilityState === "hidden") return false;
@@ -2298,10 +2368,10 @@
     Promise.resolve().then(operation).then(resolve, reject).finally(() => window.clearTimeout(timer));
   });
 
-  const callNativeSessionOperation = async (operation) => {
+  const callNativeSessionOperation = async (operation, feature = "deleteMessages") => {
     // Bound discovery separately: a late import must not start a destructive
     // native operation after the caller has already reported a timeout.
-    const controller = await waitForNativeSessionOperation(getCodexSessionController);
+    const controller = await getCodexSessionController(feature);
     return waitForNativeSessionOperation(() => operation(controller));
   };
 
@@ -2310,9 +2380,7 @@
     // message deletion before app-initial became discoverable. Completion
     // reconciliation specifically requires the patched AppServerManager, so it
     // must retry manager discovery instead of accepting that cached fallback.
-    const controller = await waitForNativeSessionOperation(() => (
-      loadCodexSessionController({ requireCompletionReconcile: true })
-    ));
+    const controller = await loadCodexSessionController({ requireCompletionReconcile: true });
     return waitForNativeSessionOperation(() => operation(controller));
   };
 
@@ -2358,7 +2426,7 @@
 
   const refreshRecentLocalSessions = async () => {
     try {
-      await callNativeSessionOperation((controller) => controller.refreshRecentConversations());
+      await callNativeSessionOperation((controller) => controller.refreshRecentConversations(), "refresh");
       return true;
     } catch {
       return false;
@@ -2368,7 +2436,7 @@
   const reloadConversationAfterHardDelete = async (sessionId, messageIds, discarded = false) => {
     const normalizedSessionId = String(sessionId || "").replace(/^local:/, "").trim();
     if (!normalizedSessionId || !messageIds.length) throw new Error("缺少会话或轮次 ID");
-    const controller = await getCodexSessionController();
+    const controller = await getCodexSessionController("deleteMessages");
 
     if (!discarded) await controller.discardConversation(normalizedSessionId);
     const cleanup = await callBridge("/session/delete-messages", {
@@ -2781,6 +2849,10 @@
       result = await callBridge("/session/delete-messages", { sessionId, messageIds });
     } catch (error) {
       const message = typeof error?.message === "string" ? error.message : String(error);
+      if (error?.code === "codey_capability_unavailable") {
+        showRuntimeToast(message, "error");
+        return;
+      }
       window.alert(`删除失败：${message}`);
       return;
     }
@@ -3620,6 +3692,7 @@
     // Resource cleanup timers (toast, file input, object URL) also finish.
     if (window.__codeyShowRuntimeToast === showRuntimeToast) delete window.__codeyShowRuntimeToast;
     if (window.__codeyReadAccountRateLimits === readAccountRateLimits) delete window.__codeyReadAccountRateLimits;
+    if (window.__codeyReloadMcpServers === reloadMcpServers) delete window.__codeyReloadMcpServers;
     window.__codeySessionToolsInjectLoaded = false;
   };
   window.__codeySessionToolsInstall = {

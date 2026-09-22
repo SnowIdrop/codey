@@ -1,5 +1,11 @@
 use super::*;
 
+pub(crate) enum IdleDownstreamWait {
+    Evicted,
+    Message(Option<std::result::Result<WebSocketMessage, tokio_tungstenite::tungstenite::Error>>),
+    TimedOut,
+}
+
 pub(crate) enum IdleWebSocketEvent {
     Downstream(
         Option<std::result::Result<WebSocketMessage, tokio_tungstenite::tungstenite::Error>>,
@@ -7,6 +13,68 @@ pub(crate) enum IdleWebSocketEvent {
     Upstream(Option<std::result::Result<WebSocketMessage, tokio_tungstenite::tungstenite::Error>>),
     MaintainUpstream,
     ConfigurationChanged,
+    Evicted,
+}
+
+/// 空闲下游 WebSocket 的登记表。名额按注册顺序保留，超出上限时关闭最久的一条。
+#[derive(Default)]
+pub(crate) struct IdleDownstreamRegistry {
+    next_id: u64,
+    waiters: HashMap<u64, oneshot::Sender<()>>,
+}
+
+pub(crate) struct IdleGuard {
+    id: u64,
+    registry: Arc<Mutex<IdleDownstreamRegistry>>,
+}
+
+impl Drop for IdleGuard {
+    fn drop(&mut self) {
+        self.registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .waiters
+            .remove(&self.id);
+    }
+}
+
+impl IdleDownstreamRegistry {
+    pub(crate) fn register(registry: &Arc<Mutex<Self>>) -> (IdleGuard, oneshot::Receiver<()>) {
+        let (evict_tx, evict_rx) = oneshot::channel();
+        let mut slots = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = slots.next_id;
+        slots.next_id = slots.next_id.wrapping_add(1);
+        slots.waiters.insert(id, evict_tx);
+        while slots.waiters.len() > MAX_CONCURRENT_CONNECTIONS {
+            let Some(oldest) = slots
+                .waiters
+                .keys()
+                .copied()
+                .filter(|waiter| *waiter != id)
+                .min()
+            else {
+                break;
+            };
+            if let Some(evict) = slots.waiters.remove(&oldest) {
+                let _ = evict.send(());
+            }
+        }
+        drop(slots);
+        (
+            IdleGuard {
+                id,
+                registry: Arc::clone(registry),
+            },
+            evict_rx,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.waiters.len()
+    }
 }
 
 impl WebSocketResponsesDownstream {
@@ -16,6 +84,7 @@ impl WebSocketResponsesDownstream {
             socket,
             Arc::new(Mutex::new(UpstreamWebSocketBackoffs::default())),
             Arc::new(Semaphore::new(REQUEST_BODY_BUDGET_PERMITS)),
+            Arc::new(Mutex::new(IdleDownstreamRegistry::default())),
         )
     }
 
@@ -23,6 +92,7 @@ impl WebSocketResponsesDownstream {
         socket: WebSocketStream<TcpStream>,
         websocket_backoffs: Arc<Mutex<UpstreamWebSocketBackoffs>>,
         request_body_budget: Arc<Semaphore>,
+        idle_registry: Arc<Mutex<IdleDownstreamRegistry>>,
     ) -> Self {
         let config_changes = websocket_backoffs
             .lock()
@@ -41,6 +111,7 @@ impl WebSocketResponsesDownstream {
             pending_budget_blocked: false,
             request_body_budget,
             config_changes,
+            idle_registry,
         }
     }
 
@@ -55,6 +126,7 @@ impl WebSocketResponsesDownstream {
 
     pub(crate) async fn next_message(&mut self) -> Result<Option<WebSocketMessage>> {
         let idle_deadline = tokio::time::Instant::now() + DOWNSTREAM_WEBSOCKET_IDLE_TIMEOUT;
+        let mut idle_slot = None;
         loop {
             if self.upstream.as_ref().is_some_and(|cached| {
                 !self
@@ -77,26 +149,12 @@ impl WebSocketResponsesDownstream {
                 }
                 return Ok(Some(message));
             }
+            if idle_slot.is_none() {
+                idle_slot = Some(IdleDownstreamRegistry::register(&self.idle_registry));
+            }
+            let evict = &mut idle_slot.as_mut().unwrap().1;
             let Some(upstream) = self.upstream.as_ref() else {
-                // A synthetic previous_response_id only exists in this socket's
-                // history. Closing it on idle would silently lose resumability.
-                if self.adapted_history.last.is_some() || self.native_history.has_history() {
-                    return self
-                        .socket
-                        .next()
-                        .await
-                        .transpose()
-                        .context("读取 Codey Responses WebSocket 消息失败");
-                }
-                return match tokio::time::timeout_at(idle_deadline, self.socket.next()).await {
-                    Ok(message) => message
-                        .transpose()
-                        .context("读取 Codey Responses WebSocket 消息失败"),
-                    Err(_) => {
-                        let _ = self.close(None).await;
-                        Ok(None)
-                    }
-                };
+                return self.wait_for_idle_downstream(evict, idle_deadline).await;
             };
             let maintenance_deadline = upstream.liveness.maintenance_deadline();
             let event = {
@@ -114,6 +172,7 @@ impl WebSocketResponsesDownstream {
                     // new request, so a stale socket is never used merely
                     // because the request and heartbeat deadline raced.
                     biased;
+                    _ = &mut *evict => IdleWebSocketEvent::Evicted,
                     _ = self.config_changes.changed() => IdleWebSocketEvent::ConfigurationChanged,
                     message = upstream_socket.next() => IdleWebSocketEvent::Upstream(message),
                     _ = &mut maintenance => IdleWebSocketEvent::MaintainUpstream,
@@ -122,6 +181,10 @@ impl WebSocketResponsesDownstream {
             };
 
             match event {
+                IdleWebSocketEvent::Evicted => {
+                    self.upstream.take();
+                    return Ok(None);
+                }
                 IdleWebSocketEvent::ConfigurationChanged => continue,
                 IdleWebSocketEvent::Downstream(message) => {
                     let message = message
@@ -214,6 +277,36 @@ impl WebSocketResponsesDownstream {
         }
     }
 
+    async fn wait_for_idle_downstream(
+        &mut self,
+        evict: &mut oneshot::Receiver<()>,
+        idle_deadline: tokio::time::Instant,
+    ) -> Result<Option<WebSocketMessage>> {
+        // 合成 previous_response_id 只存在这条 socket 的历史里，空闲超时不能
+        // 关掉它，否则 Codex 复用连接时会丢掉续接。连接数超出上限时另有回收。
+        let stateful = self.adapted_history.last.is_some() || self.native_history.has_history();
+        let read = self.socket.next();
+        tokio::pin!(read);
+        let idle = tokio::time::sleep_until(idle_deadline);
+        tokio::pin!(idle);
+        let outcome = tokio::select! {
+            biased;
+            _ = &mut *evict => IdleDownstreamWait::Evicted,
+            message = &mut read => IdleDownstreamWait::Message(message),
+            _ = &mut idle, if !stateful => IdleDownstreamWait::TimedOut,
+        };
+        match outcome {
+            IdleDownstreamWait::Evicted => Ok(None),
+            IdleDownstreamWait::Message(message) => message
+                .transpose()
+                .context("读取 Codey Responses WebSocket 消息失败"),
+            IdleDownstreamWait::TimedOut => {
+                let _ = self.close(None).await;
+                Ok(None)
+            }
+        }
+    }
+
     pub(crate) async fn write_text(&mut self, text: impl Into<WebSocketText>) -> Result<()> {
         tokio::time::timeout(
             DOWNSTREAM_WRITE_TIMEOUT,
@@ -292,16 +385,14 @@ impl WebSocketResponsesDownstream {
             .as_ref()
             .filter(|_| cached_matches)
             .map_or(auth_identity, |cached| cached.auth_identity);
-        self.native_history
-            .prepare(native_history_key(route, effective_auth, body), body);
+        // !cached_matches 时 effective_auth 就是请求头身份，prepare 与 restore 共用同一把钥匙。
+        let history_key = native_history_key(route, effective_auth, body);
+        self.native_history.prepare(history_key, body);
         if !cached_matches {
             // A response ID belongs to its original upstream socket. Reconnect
             // with full history only before sending this new request.
             if previous_response_key.is_some()
-                && self
-                    .native_history
-                    .restore(native_history_key(route, auth_identity, body), body)
-                    .is_err()
+                && self.native_history.restore(history_key, body).is_err()
             {
                 return Ok(UpstreamWebSocketAttempt::UseHttp);
             }
@@ -641,6 +732,31 @@ impl WebSocketResponsesDownstream {
     }
 }
 
+/// 复用连接补 `stream_id` 时 flatten 原对象再追加字段，避免为 delta 事件整树 clone。
+/// 新键写在末尾，与 `Map::insert` 后再 `to_string` 的键序一致。
+fn encode_responses_websocket_event(event: &Value, stream_id: Option<&str>) -> Result<String> {
+    match stream_id {
+        Some(stream_id) => {
+            let object = event
+                .as_object()
+                .context("Responses WebSocket 事件必须是 JSON 对象")?;
+            serde_json::to_string(&EventWithInsertedStreamId {
+                event: object,
+                stream_id,
+            })
+            .context("序列化 Responses WebSocket 事件失败")
+        }
+        None => serde_json::to_string(event).context("序列化 Responses WebSocket 事件失败"),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct EventWithInsertedStreamId<'a> {
+    #[serde(flatten)]
+    event: &'a serde_json::Map<String, Value>,
+    stream_id: &'a str,
+}
+
 pub(crate) fn responses_event_is_terminal(event: &Value) -> bool {
     matches!(
         event.get("type").and_then(Value::as_str),
@@ -908,10 +1024,11 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
             UpstreamWebSocketAuthIdentity::from_headers(headers),
             body,
         );
-        // Compaction skips the upstream WS attempt that normally stages history.
-        if is_compaction_request(body, ResponsesRequestKind::Create) {
-            self.native_history.prepare(key, body);
-        }
+        // The upstream WebSocket attempt normally stages continuation history.
+        // Compaction and an active lifecycle plugin both skip that attempt, so
+        // stage before every HTTP restore. A second call after a failed
+        // handshake only restages the same turn.
+        self.native_history.prepare(key, body);
         self.native_history.restore(key, body)
     }
 
@@ -963,24 +1080,14 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
             self.terminal_started = true;
             self.native_history.observe(event);
         }
-        let encoded = if self.event_needs_stream_id(event) {
-            let mut event = event.clone();
-            event
-                .as_object_mut()
-                .context("Responses WebSocket 事件必须是 JSON 对象")?
-                .insert(
-                    "stream_id".to_string(),
-                    Value::String(
-                        self.stream_id
-                            .as_deref()
-                            .expect("stream id must exist when insertion is required")
-                            .to_string(),
-                    ),
-                );
-            serde_json::to_string(&event).context("序列化 Responses WebSocket 事件失败")?
-        } else {
-            serde_json::to_string(event).context("序列化 Responses WebSocket 事件失败")?
-        };
+        let encoded = encode_responses_websocket_event(
+            event,
+            self.event_needs_stream_id(event).then(|| {
+                self.stream_id
+                    .as_deref()
+                    .expect("stream id must exist when insertion is required")
+            }),
+        )?;
         self.write_text(encoded).await
     }
 
@@ -1299,4 +1406,111 @@ pub(crate) async fn write_static_response(
     write_all_with_timeout(stream, header.as_bytes(), "写入请求日志页面响应头失败").await?;
     write_all_with_timeout(stream, body, "写入请求日志页面失败").await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod http_fallback_history_tests {
+    use super::super::tests::{local_websocket_pair, router_config};
+    use super::*;
+
+    #[tokio::test]
+    async fn http_fallback_stages_history_when_the_websocket_attempt_is_skipped() {
+        let (config, provider_id, model) = router_config("http://127.0.0.1:9/v1".into());
+        let snapshot = RouterSnapshot::from_config(&config);
+        let route = snapshot.routes[&provider_id].as_ref();
+        let (socket, mut peer) = local_websocket_pair().await;
+        let mut downstream = WebSocketResponsesDownstream::new(socket);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("session-id"),
+            HeaderValue::from_static("lifecycle-session"),
+        );
+        downstream.native_history = NativeResponsesHistory::with_cache(
+            Arc::new(Mutex::new(NativeHistoryCache::default())),
+            &[("session-id".into(), "lifecycle-session".into())],
+        );
+
+        let mut first = json!({"model": model, "stream": true, "input": "original task"});
+        assert!(
+            !downstream
+                .prepare_native_http_fallback(route, &headers, &mut first)
+                .unwrap()
+        );
+        downstream
+            .write_event(&json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-first",
+                    "status": "completed",
+                    "output": []
+                }
+            }))
+            .await
+            .unwrap();
+        let WebSocketMessage::Text(_) = peer.next().await.unwrap().unwrap() else {
+            panic!("expected the completed event");
+        };
+
+        downstream.clear_stream_id();
+        let mut second = json!({
+            "model": model,
+            "stream": true,
+            "previous_response_id": "resp-first",
+            "input": "follow up"
+        });
+        assert!(
+            downstream
+                .prepare_native_http_fallback(route, &headers, &mut second)
+                .unwrap()
+        );
+        assert!(second.get("previous_response_id").is_none());
+        assert_eq!(
+            second["input"],
+            json!([
+                {"role":"user","content":"original task"},
+                {"role":"user","content":"follow up"}
+            ])
+        );
+
+        let mut unknown = json!({
+            "model": model,
+            "previous_response_id": "resp-missing",
+            "input": "another"
+        });
+        let error = downstream
+            .prepare_native_http_fallback(route, &headers, &mut unknown)
+            .unwrap_err();
+        assert!(error.to_string().contains("会话历史已失效"), "{error}");
+        assert_eq!(unknown["previous_response_id"], "resp-missing");
+    }
+}
+
+#[cfg(test)]
+mod encode_stream_id_tests {
+    use super::*;
+
+    #[test]
+    fn inserted_stream_id_matches_map_insert_key_order() {
+        let event = json!({
+            "delta": "x",
+            "type": "response.output_text.delta",
+        });
+        let encoded = encode_responses_websocket_event(&event, Some("main")).unwrap();
+        let mut cloned = event.clone();
+        cloned
+            .as_object_mut()
+            .unwrap()
+            .insert("stream_id".into(), Value::String("main".into()));
+        assert_eq!(encoded, serde_json::to_string(&cloned).unwrap());
+        assert!(encoded.contains("\"stream_id\":\"main\""));
+    }
+
+    #[test]
+    fn missing_stream_id_serializes_the_original_event() {
+        let event = json!({"type": "response.created"});
+        assert_eq!(
+            encode_responses_websocket_event(&event, None).unwrap(),
+            serde_json::to_string(&event).unwrap()
+        );
+    }
 }

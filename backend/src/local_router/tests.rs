@@ -1,4 +1,5 @@
 use super::*;
+use crate::codex_config::CHATGPT_CODEX_BASE_URL;
 use crate::config::ProviderProfile;
 
 #[test]
@@ -1745,6 +1746,109 @@ async fn idle_connection_receives_a_request_timeout_without_a_router_failure() {
 }
 
 #[tokio::test]
+async fn idle_downstream_websockets_do_not_consume_connection_permits() {
+    let (config, _, _) = router_config("http://127.0.0.1:9/v1".into());
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let mut sockets = Vec::new();
+    for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+        sockets.push(connect_router_websocket(&endpoint).await);
+    }
+    let url = reqwest::Url::parse(&endpoint.base_url).unwrap();
+    let mut last = String::new();
+    let mut available = false;
+    for _ in 0..50 {
+        let mut health = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+            .await
+            .unwrap();
+        health
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        last.clear();
+        tokio::time::timeout(Duration::from_secs(2), health.read_to_string(&mut last))
+            .await
+            .expect("healthz should respond")
+            .unwrap();
+        if last.contains("200") && last.contains("ok") {
+            available = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        available,
+        "idle websockets should leave a connection slot for healthz, got {last}"
+    );
+    drop(sockets);
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn connections_that_have_not_gone_idle_still_report_router_busy() {
+    let (config, _, _) = router_config("http://127.0.0.1:9/v1".into());
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let url = reqwest::Url::parse(&endpoint.base_url).unwrap();
+    let mut silent = Vec::new();
+    let head = format!(
+        "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 100\r\n\r\n",
+        endpoint.token
+    );
+    for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+        let mut stream = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+            .await
+            .unwrap();
+        stream.write_all(head.as_bytes()).await.unwrap();
+        silent.push(stream);
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut last = String::new();
+    let mut busy = false;
+    for _ in 0..20 {
+        let mut health = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+            .await
+            .unwrap();
+        if health
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .is_err()
+        {
+            busy = true;
+            break;
+        }
+        last.clear();
+        match tokio::time::timeout(Duration::from_secs(2), health.read_to_string(&mut last)).await {
+            Ok(Ok(_)) if last.contains("router_busy") => {
+                busy = true;
+                break;
+            }
+            Ok(Err(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                // 拒绝名额也用尽时，这条连接会被直接丢掉。
+                busy = true;
+                break;
+            }
+            Ok(Ok(_)) | Ok(Err(_)) => {}
+            Err(_) => break,
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        busy,
+        "in-flight connections should still saturate the router, got {last}"
+    );
+    drop(silent);
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn unsupported_websocket_handshake_falls_back_to_http_until_config_changes() {
     let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let upstream_address = upstream.local_addr().unwrap();
@@ -2685,6 +2789,43 @@ fn official_account_models_enter_the_router_only_when_login_is_available() {
 }
 
 #[test]
+fn official_account_route_uses_a_saved_gateway_instead_of_the_default() {
+    let mut official = ProviderProfile::new("官方账号1");
+    official.id = crate::config::DERIVED_OFFICIAL_PROFILE_ID.into();
+    official.source_provider_id = Some("openai".into());
+    official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    official.base_url = "https://gateway.example/backend-api/codex/".into();
+    official.normalize();
+    let mut config = CodeyConfig {
+        active_profile_id: official.id.clone(),
+        profiles: vec![official],
+        official_account_available_this_launch: true,
+        ..CodeyConfig::default()
+    }
+    .normalize();
+    config
+        .selected_models_by_provider
+        .insert("openai".into(), vec!["gpt-5.6-sol".into()]);
+
+    let resolved = RouterSnapshot::from_config(&config)
+        .target_for_model(&model_alias("openai", "gpt-5.6-sol"))
+        .unwrap();
+
+    assert_eq!(
+        resolved.route.upstream_url.as_ref().unwrap(),
+        "https://gateway.example/backend-api/codex/responses"
+    );
+    assert_eq!(
+        resolved.route.upstream_compact_url.as_ref().unwrap(),
+        "https://gateway.example/backend-api/codex/responses/compact"
+    );
+    assert_eq!(
+        resolved.route.upstream_websocket_url.as_ref().unwrap(),
+        "wss://gateway.example/backend-api/codex/responses"
+    );
+}
+
+#[test]
 fn stored_official_account_routes_serve_requests_without_the_default_login() {
     let mut first = ProviderProfile::new("主力账号");
     first.id = crate::config::official_profile_id("acct-one");
@@ -2737,11 +2878,13 @@ fn stored_official_account_routes_serve_requests_without_the_default_login() {
 fn codex_login_route_outranks_stored_accounts_for_default_quota() {
     let login = OfficialRouteAuth {
         account_id: "test-default".into(),
+        email: None,
         path: std::path::PathBuf::from("/codex/home/auth.json"),
         accepts_incoming_authorization: true,
     };
     let idle = OfficialRouteAuth {
         account_id: "test-idle".into(),
+        email: None,
         path: std::path::PathBuf::from("/codey/accounts/test-idle.json"),
         accepts_incoming_authorization: false,
     };
@@ -6748,6 +6891,160 @@ async fn compaction_timeout_releases_session_and_model_switch_keeps_request_snap
 }
 
 #[tokio::test]
+async fn model_switch_sized_upload_does_not_spend_the_header_timeout() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let (config, provider_id, model) =
+        router_config(format!("http://{}/v1", upstream.local_addr().unwrap()));
+    let (headers_read, headers_read_rx) = oneshot::channel();
+    let (release, release_rx) = oneshot::channel::<()>();
+    let upstream_task = tokio::spawn(async move {
+        let (socket, _) = upstream.accept().await.unwrap();
+        let std_socket = socket.into_std().unwrap();
+        std_socket.set_nonblocking(false).unwrap();
+        let socket = socket2::Socket::from(std_socket);
+        // 不读正文时，小接收窗口会把上传堵在半路，旧的 60 秒期限会把这次上传记成 504。
+        socket.set_recv_buffer_size(1024).unwrap();
+        let std_socket: std::net::TcpStream = socket.into();
+        std_socket.set_nonblocking(true).unwrap();
+        let mut socket = TcpStream::from_std(std_socket).unwrap();
+        let mut header = Vec::new();
+        let mut byte = [0_u8; 1];
+        loop {
+            socket.read_exact(&mut byte).await.unwrap();
+            header.push(byte[0]);
+            if header.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let header = String::from_utf8(header).unwrap();
+        let length = header
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap();
+        headers_read.send(length).unwrap();
+        release_rx.await.unwrap();
+        socket2::SockRef::from(&socket)
+            .set_recv_buffer_size(1024 * 1024)
+            .unwrap();
+        let mut body = vec![0_u8; length];
+        tokio::time::timeout(Duration::from_secs(30), socket.read_exact(&mut body))
+            .await
+            .expect("上传仍应在进行，不能被响应头期限提前掐断")
+            .unwrap();
+        let sse = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{",
+            "\"id\":\"resp-after-upload\",\"object\":\"response\",\"status\":\"completed\",\"output\":[]}}\n\n"
+        );
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                    sse.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    // 1 MiB 正文可能全部进入 Linux/Windows 的发送缓冲；仅缩小接收缓冲不足以
+    // 阻塞发送。使用更大的正文，让连接在上游恢复读取前仍有数据等待写出。
+    let padding = "x".repeat(16 * 1024 * 1024);
+    let mut pending = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(endpoint.token)
+            .json(&json!({
+                "model": model_alias(&provider_id, &model),
+                "stream": true,
+                "input": padding,
+            }))
+            .send()
+            .await
+            .unwrap()
+    });
+    let length = headers_read_rx.await.unwrap();
+    assert!(
+        length > 512 * 1024,
+        "forwarded body was only {length} bytes"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut pending)
+            .await
+            .is_err(),
+        "upload must still be in progress before the virtual header timeout"
+    );
+    tokio::time::pause();
+    tokio::time::advance(UPSTREAM_RESPONSE_HEADER_TIMEOUT + Duration::from_secs(10)).await;
+    tokio::time::resume();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    let early = tokio::time::timeout(Duration::from_millis(200), &mut pending).await;
+    assert!(
+        early.is_err(),
+        "header timeout included the blocked history upload"
+    );
+    release.send(()).unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(10), pending)
+        .await
+        .expect("upstream response should arrive after the body upload")
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    upstream_task.await.unwrap();
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn streaming_header_timeout_still_bounds_the_wait_after_upload() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let (config, provider_id, model) =
+        router_config(format!("http://{}/v1", upstream.local_addr().unwrap()));
+    let (received, received_rx) = oneshot::channel();
+    let upstream_task = tokio::spawn(async move {
+        let (mut socket, _) = upstream.accept().await.unwrap();
+        let request = read_http_request(&mut socket).await.unwrap();
+        received.send(()).unwrap();
+        assert!(request.body.len() < 64 * 1024);
+        std::future::pending::<()>().await;
+    });
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let pending = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(endpoint.token)
+            .json(&json!({
+                "model": model_alias(&provider_id, &model),
+                "stream": true,
+                "input": "short",
+            }))
+            .send()
+            .await
+            .unwrap()
+    });
+    received_rx.await.unwrap();
+    tokio::time::pause();
+    tokio::time::advance(UPSTREAM_RESPONSE_HEADER_TIMEOUT + Duration::from_secs(1)).await;
+    tokio::time::resume();
+    let response = tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .expect("uploaded requests must still hit the header timeout")
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 504);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("upstream_header_timeout"), "{body}");
+    upstream_task.abort();
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn upstream_error_body_read_stops_at_the_total_deadline() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -10491,4 +10788,330 @@ async fn anthropic_upstream_http_error_keeps_status_and_safe_text() {
     assert!(!body.contains("sk-upstream"), "{body}");
     assert_eq!(upstream_task.await.unwrap(), "/v1/messages");
     router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn chat_stream_merges_legacy_function_call_deltas_into_indexed_tool_calls() {
+    // 上游把同一次调用的两种形状拆开发送：索引式增量给调用 ID，legacy 增量补名字和参数。
+    // 两者必须落在同一次调用上，收尾时不能留下没有名字的工具状态。
+    let chunks = [
+        json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call-mixed","type":"function","function":{"arguments":""}}
+        ]}}]}),
+        json!({"choices":[{"index":0,"delta":{
+            "function_call":{"name":"lookup","arguments":"{\"q\":1}"}
+        }}]}),
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+    ];
+    let mut sse = chunks
+        .iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .collect::<String>();
+    sse.push_str("data: [DONE]\n\n");
+
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_sse = sse.clone();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        read_http_request(&mut stream).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{upstream_sse}",
+                    upstream_sse.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let (mut config, provider_id, model) = router_config(format!("http://{upstream_address}/v1"));
+    config.profiles[0].upstream_protocol =
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+    config.profiles[0].normalize();
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({
+            "model": model_alias(&provider_id, &model),
+            "input": "hello",
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.text().await.unwrap();
+
+    assert!(!body.contains("upstream_stream_error"), "{body}");
+    assert!(
+        body.contains("response.function_call_arguments.done"),
+        "{body}"
+    );
+    assert!(body.contains("\"call_id\":\"call-mixed\""), "{body}");
+    assert!(body.contains("response.completed"), "{body}");
+    assert_eq!(upstream_task.await.unwrap(), ());
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn chat_stream_merges_reversed_legacy_deltas_and_drops_empty_tool_slots() {
+    // 同一调用也可能先给名字后给参数，另外上游还会发完全没有内容的槽位。
+    let chunks = [
+        json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call-reversed","type":"function","function":{"name":"look"}}
+        ]}}]}),
+        json!({"choices":[{"index":0,"delta":{
+            "function_call":{"arguments":"{\"q\":2}"}
+        }}]}),
+        json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":7}]}}]}),
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+    ];
+    let mut sse = chunks
+        .iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .collect::<String>();
+    sse.push_str("data: [DONE]\n\n");
+
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_sse = sse.clone();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        read_http_request(&mut stream).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{upstream_sse}",
+                    upstream_sse.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let (mut config, provider_id, model) = router_config(format!("http://{upstream_address}/v1"));
+    config.profiles[0].upstream_protocol =
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+    config.profiles[0].normalize();
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({
+            "model": model_alias(&provider_id, &model),
+            "input": "hello",
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body = response.text().await.unwrap();
+
+    assert!(!body.contains("upstream_stream_error"), "{body}");
+    let parsed = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let items = parsed
+        .iter()
+        .filter(|event| event["type"] == "response.output_item.done")
+        .map(|event| event["item"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(items.len(), 1, "{body}");
+    assert_eq!(items[0]["name"], "look");
+    assert_eq!(items[0]["call_id"], "call-reversed");
+    assert_eq!(items[0]["arguments"], "{\"q\":2}");
+    assert!(body.contains("response.completed"), "{body}");
+    assert_eq!(upstream_task.await.unwrap(), ());
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn chat_stream_without_any_tool_name_still_fails_the_route() {
+    // 丢弃空槽位不能变成丢弃真实调用：只有参数、始终没有名字的工具仍然是故障。
+    let chunks = [
+        json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call-nameless","type":"function","function":{"arguments":"{\"q\":1}"}}
+        ]}}]}),
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+    ];
+    let mut sse = chunks
+        .iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .collect::<String>();
+    sse.push_str("data: [DONE]\n\n");
+
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_sse = sse.clone();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        read_http_request(&mut stream).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{upstream_sse}",
+                    upstream_sse.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let (mut config, provider_id, model) = router_config(format!("http://{upstream_address}/v1"));
+    config.profiles[0].upstream_protocol =
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+    config.profiles[0].normalize();
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({
+            "model": model_alias(&provider_id, &model),
+            "input": "hello",
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body = response.text().await.unwrap();
+
+    assert!(body.contains("upstream_stream_error"), "{body}");
+    assert!(body.contains("response.failed"), "{body}");
+    assert!(
+        body.contains("线路「Relay」返回了无法继续处理的流式响应"),
+        "{body}"
+    );
+    assert_eq!(upstream_task.await.unwrap(), ());
+    router.stop().await.unwrap();
+}
+
+/// 跑一条 chat SSE 流，返回下游收到的全部 Responses 事件。
+async fn collect_responses_events_from_chat_stream(chunks: &[Value]) -> Vec<Value> {
+    let mut sse = chunks
+        .iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .collect::<String>();
+    sse.push_str("data: [DONE]\n\n");
+
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        read_http_request(&mut stream).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                    sse.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let (mut config, provider_id, model) = router_config(format!("http://{upstream_address}/v1"));
+    config.profiles[0].upstream_protocol =
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+    config.profiles[0].normalize();
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({
+            "model": model_alias(&provider_id, &model),
+            "input": "hello",
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body = response.text().await.unwrap();
+    let events = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    upstream_task.await.unwrap();
+    router.stop().await.unwrap();
+    events
+}
+
+fn response_output(events: &[Value]) -> Vec<Value> {
+    events
+        .iter()
+        .find(|event| event["type"] == "response.completed")
+        .map(|event| {
+            event["response"]["output"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn chat_stream_keeps_output_index_contiguous_after_dropping_empty_slots() {
+    // 空槽位如果先出现，会占用 output_index；它被丢弃后剩下的工具项必须从 0 开始编号。
+    let events = collect_responses_events_from_chat_stream(&[
+        json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":9}]}}]}),
+        json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call-real","type":"function","function":{"name":"lookup","arguments":"{}"}}
+        ]}}]}),
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+    ])
+    .await;
+
+    let added = events
+        .iter()
+        .filter(|event| event["type"] == "response.output_item.added")
+        .map(|event| event["output_index"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(added, vec![0], "{events:#?}");
+    let output = response_output(&events);
+    assert_eq!(output.len(), 1, "{output:#?}");
+    assert_eq!(output[0]["name"], "lookup");
+}
+
+#[tokio::test]
+async fn chat_stream_keeps_distinct_tools_separate_across_both_shapes() {
+    // 上游同时用 legacy 与索引式形状表达两个不同工具时，两种到达顺序下都不能被拼成一个。
+    let legacy_first = json!([
+        {"choices":[{"index":0,"delta":{"function_call":{"name":"alpha","arguments":"{\"a\":1}"}}}]},
+        {"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call-beta","type":"function","function":{"name":"beta","arguments":"{\"b\":2}"}}
+        ]}}]},
+        {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]},
+    ]);
+    let indexed_first = json!([
+        {"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"id":"call-beta","type":"function","function":{"name":"beta","arguments":"{\"b\":2}"}}
+        ]}}]},
+        {"choices":[{"index":0,"delta":{"function_call":{"name":"alpha","arguments":"{\"a\":1}"}}}]},
+        {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]},
+    ]);
+
+    for chunks in [legacy_first, indexed_first] {
+        let chunks = chunks.as_array().unwrap().clone();
+        let events = collect_responses_events_from_chat_stream(&chunks).await;
+        let output = response_output(&events);
+        let mut names = output
+            .iter()
+            .map(|item| item["name"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, vec!["alpha", "beta"], "{output:#?}");
+    }
 }

@@ -172,6 +172,7 @@ impl LocalRouter {
             bindings: Arc::new(Mutex::new(RouteBindings::default())),
             websocket_backoffs: Arc::clone(&websocket_backoffs),
             native_history_cache: Arc::new(Mutex::new(NativeHistoryCache::default())),
+            idle_downstreams: Arc::new(Mutex::new(IdleDownstreamRegistry::default())),
             client: upstream_http_client_builder()
                 .build()
                 .context("创建 Codey 本地路由 HTTP 客户端失败")?,
@@ -209,6 +210,9 @@ impl LocalRouter {
                                 // hold those back waiting on delayed ACKs and add
                                 // latency to every streamed token.
                                 let _ = stream.set_nodelay(true);
+                                // 休眠或断网后对端经常不发 FIN。keepalive 失败时，正在读的
+                                // 连接会退出，不再一直占着任务。
+                                enable_downstream_keepalive(&stream);
                                 let server = Arc::clone(&server);
                                 let permit = match Arc::clone(&server.connection_limit)
                                     .try_acquire_owned()
@@ -246,8 +250,7 @@ impl LocalRouter {
                                 connections.spawn(ROUTER_REQUEST_ID.scope(
                                     request_id.clone(),
                                     ROUTER_REQUEST_STARTED_AT.scope(Instant::now(), async move {
-                                        let _permit = permit;
-                                        if let Err(error) = server.handle_connection(stream).await {
+                                        if let Err(error) = server.handle_connection(stream, permit).await {
                                             record_router_failure_nonblocking(
                                                 "local_router_request_failed",
                                                 "handle_local_router_connection",
@@ -408,10 +411,11 @@ pub(crate) fn outbound_proxy_applies_to_route(profile: &ProviderProfile) -> bool
         return true;
     }
     let base_url = if profile.official_account {
-        CHATGPT_CODEX_BASE_URL
+        crate::codex_provider::official_route_base_url(profile)
     } else {
-        profile.base_url.as_str()
+        profile.base_url.clone()
     };
+    let base_url = base_url.as_str();
     outbound_proxy_applies_to_url_with_matcher(base_url, &SystemProxyMatcher::from_system())
 }
 
@@ -445,6 +449,14 @@ impl Drop for LocalRouter {
     }
 }
 
+fn enable_downstream_keepalive(stream: &TcpStream) {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(UPSTREAM_TCP_KEEPALIVE_IDLE)
+        .with_interval(UPSTREAM_TCP_KEEPALIVE_INTERVAL)
+        .with_retries(UPSTREAM_TCP_KEEPALIVE_RETRIES);
+    let _ = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive);
+}
+
 pub(crate) struct RouterServer {
     pub(crate) token: String,
     pub(crate) bearer_token: String,
@@ -455,6 +467,7 @@ pub(crate) struct RouterServer {
     pub(crate) bindings: Arc<Mutex<RouteBindings>>,
     pub(crate) websocket_backoffs: Arc<Mutex<UpstreamWebSocketBackoffs>>,
     pub(crate) native_history_cache: Arc<Mutex<NativeHistoryCache>>,
+    pub(crate) idle_downstreams: Arc<Mutex<IdleDownstreamRegistry>>,
     pub(crate) client: reqwest::Client,
     /// 按代理地址缓存的线路专用客户端，保留连接池复用。上限内缓存，
     /// 超出后清空重建（代理地址变更是罕见操作，代价仅为重建连接）。
@@ -643,7 +656,7 @@ impl RouterSnapshot {
                 continue;
             }
             let base_url = if profile.official_account {
-                CHATGPT_CODEX_BASE_URL.to_string()
+                crate::codex_provider::official_route_base_url(profile)
             } else {
                 profile.normalized_base_url()
             };
@@ -983,6 +996,7 @@ pub(crate) struct RouteTarget {
 #[derive(Clone, Debug)]
 pub(crate) struct OfficialRouteAuth {
     pub(crate) account_id: String,
+    pub(crate) email: Option<String>,
     pub(crate) path: PathBuf,
     pub(crate) accepts_incoming_authorization: bool,
 }
@@ -997,11 +1011,18 @@ fn official_route_auth(profile: &crate::config::ProviderProfile) -> Option<Offic
         &crate::config::default_config_path(),
     );
     let path = store.credential_path(codex_home, &account_id);
+    // 账号邮箱随路由快照读取，生命周期不接受客户端提供的邮箱。
+    let email = store
+        .get(&account_id)
+        .ok()
+        .flatten()
+        .and_then(|record| record.email);
     // Codex refreshes the default account's copy in place and sends its token
     // with every request; idle accounts keep their own stored document.
     let accepts_incoming_authorization = path == codex_home.join("auth.json");
     Some(OfficialRouteAuth {
         account_id,
+        email,
         path,
         accepts_incoming_authorization,
     })

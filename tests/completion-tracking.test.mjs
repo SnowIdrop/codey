@@ -400,6 +400,196 @@ test("reconciles when the conversation appears after renderer startup", async ()
   assert.deepEqual(events.map((event) => event.payload.conversationId), ["session-1"]);
 });
 
+test("usage-only manager remains available when deletion and reconciliation are missing", async () => {
+  const requests = [];
+  const runtime = loadInjection({
+    discoveredAppServerManager: { sendRequest(method) { requests.push(method); return { rateLimits: {} }; } },
+    selectedTurnIds: ["turn-1"],
+  });
+  await flushMicrotasks();
+  assert.equal(runtime.window.__codeyPageCapabilities.reconcile.status, "unavailable");
+  assert.ok((await runtime.window.__codeyReadAccountRateLimits()).rateLimits);
+  assert.deepEqual(requests, ["account/rateLimits/read"]);
+  await runtime.window.__codeyDeleteSelectedMessages();
+  assert.equal(runtime.bridgeCalls.some((call) => call.path === "/session/delete-messages"), false);
+  assert.equal(runtime.alerts.length, 0);
+  assert.deepEqual(runtime.getVisibleTurnIds(), ["turn-1"]);
+  assert.equal(runtime.window.__codeyPageCapabilities.deleteMessages.status, "unavailable");
+});
+
+test("MCP reload prefers the patched AppServerRequestClient over fiber discovery", async () => {
+  const requests = [];
+  const runtime = loadInjection({ initialSessionId: "" });
+  runtime.window.__codeyAppServerRequestClients = new Map([
+    ["local", {
+      sendRequest(...args) {
+        requests.push(args);
+        return {};
+      },
+    }],
+  ]);
+  assert.equal((await runtime.window.__codeyReloadMcpServers()).ok, true);
+  assert.equal(JSON.stringify(requests), JSON.stringify([["config/mcpServer/reload", {}]]));
+  assert.equal(runtime.window.__codeyCodexSessionController, null);
+});
+
+test("MCP reload awaits the native request without restarting or resuming a task", async () => {
+  const requests = [];
+  let finish;
+  const runtime = loadInjection({
+    initialSessionId: "",
+    discoveredAppServerManager: {
+      sendRequest(...args) {
+        requests.push(args);
+        return new Promise((resolve) => { finish = resolve; });
+      },
+    },
+  });
+  let completed = false;
+  const reload = runtime.window.__codeyReloadMcpServers().then((value) => {
+    completed = true;
+    return value;
+  });
+  await flushMicrotasks();
+  assert.equal(JSON.stringify(requests), JSON.stringify([["config/mcpServer/reload", {}]]));
+  assert.equal(completed, false);
+  finish({});
+  assert.equal((await reload).ok, true);
+  assert.equal(runtime.window.__codeyPageCapabilities.mcpReload.status, "available");
+});
+
+test("MCP reload propagates protocol errors and can be retried", async () => {
+  let fail = true;
+  const runtime = loadInjection({
+    initialSessionId: "",
+    discoveredAppServerManager: {
+      sendRequest() {
+        return fail ? Promise.reject(new Error("Unknown method")) : Promise.resolve({});
+      },
+    },
+  });
+  await assert.rejects(runtime.window.__codeyReloadMcpServers(), /Unknown method/);
+  fail = false;
+  assert.equal((await runtime.window.__codeyReloadMcpServers()).ok, true);
+});
+
+test("MCP reload reports an unavailable manager instead of using legacy session signals", async () => {
+  const runtime = loadInjection({ initialSessionId: "" });
+  runtime.window.__codeyCodexSignalDispatcher = () => { throw new Error("unexpected signal"); };
+  await assert.rejects(runtime.window.__codeyReloadMcpServers(), { code: "codey_capability_unavailable" });
+  assert.equal(runtime.window.__codeyPageCapabilities.mcpReload.status, "unavailable");
+});
+
+test("MCP reload discovery is not capped by the native session timeout", async () => {
+  const requests = [];
+  const manager = {
+    sendRequest(...args) {
+      requests.push(args);
+      return {};
+    },
+  };
+  const runtime = loadInjection({
+    discoveredAppServerManager: manager,
+    initialSessionId: "",
+  });
+  runtime.window.__codeyCodexSessionController = null;
+  const originalImport = runtime.window.__codeyImportCodexAsset;
+  let release;
+  runtime.window.__codeyImportCodexAsset = (...args) => new Promise((resolve) => {
+    release = () => resolve(originalImport(...args));
+  });
+  const reload = runtime.window.__codeyReloadMcpServers();
+  await flushMicrotasks();
+  runtime.flushTimers();
+  await flushMicrotasks();
+  assert.equal(requests.length, 0);
+  release();
+  assert.equal((await reload).ok, true);
+  assert.equal(JSON.stringify(requests), JSON.stringify([["config/mcpServer/reload", {}]]));
+});
+
+test("message deletion preflights resume and refresh before releasing or persisting", async () => {
+  for (const missing of ["resumeConversation", "refreshRecentConversations", "discardConversationFromCache"]) {
+    let releases = 0;
+    const manager = {
+      discardConversationFromCache() { releases += 1; },
+      resumeConversation() {},
+      refreshRecentConversations() {},
+      sendRequest() {},
+    };
+    delete manager[missing];
+    const runtime = loadInjection({ discoveredAppServerManager: manager, selectedTurnIds: ["turn-1"] });
+    await flushMicrotasks();
+    await runtime.window.__codeyDeleteSelectedMessages();
+    assert.equal(releases, 0, missing);
+    assert.equal(runtime.bridgeCalls.some((call) => call.path === "/session/delete-messages"), false, missing);
+  }
+});
+
+test("failed discovery backs off independently and recovers when a manager appears", async () => {
+  let imports = 0;
+  // Exercise discovery through an already discoverable manager asset.
+  const manager = { sendRequest() { return { rateLimits: {} }; } };
+  const discovered = loadInjection({ discoveredAppServerManager: manager, initialSessionId: "" });
+  const originalImport = discovered.window.__codeyImportCodexAsset;
+  discovered.window.__codeyImportCodexAsset = async (...args) => { imports += 1; return originalImport(...args); };
+  await assert.rejects(discovered.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" }), { code: "codey_capability_unavailable" });
+  const firstImports = imports;
+  await assert.rejects(discovered.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" }));
+  assert.equal(imports, firstImports);
+  discovered.advanceTime(1_000);
+  await assert.rejects(discovered.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" }));
+  assert.ok(imports > firstImports);
+  const secondImports = imports;
+  discovered.advanceTime(1_000);
+  await assert.rejects(discovered.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" }));
+  assert.equal(imports, secondImports, "second failure waits two seconds");
+  Object.assign(manager, { discardConversationFromCache() {}, resumeConversation() {}, refreshRecentConversations() {} });
+  const controller = await discovered.window.__codeyLoadCodexSessionController({ feature: "deleteMessages" });
+  assert.equal(controller.manager, manager);
+  assert.equal(discovered.window.__codeyPageCapabilities.deleteMessages.status, "available");
+  assert.ok((await discovered.window.__codeyReadAccountRateLimits()).rateLimits);
+});
+
+test("timed out discovery cannot later issue a message deletion", async () => {
+  const manager = { discardConversationFromCache() {}, resumeConversation() {}, refreshRecentConversations() {} };
+  const runtime = loadInjection({ discoveredAppServerManager: manager, initialSessionId: "", selectedTurnIds: ["turn-1"] });
+  const originalImport = runtime.window.__codeyImportCodexAsset;
+  let release;
+  runtime.window.__codeyImportCodexAsset = (...args) => new Promise((resolve) => { release = () => resolve(originalImport(...args)); });
+  runtime.setSessionId("session-1");
+  const deletion = runtime.window.__codeyDeleteSelectedMessages();
+  await flushMicrotasks();
+  runtime.flushTimers();
+  await deletion;
+  release();
+  await flushMicrotasks();
+  assert.equal(runtime.bridgeCalls.some((call) => call.path === "/session/delete-messages"), false);
+  assert.equal(runtime.alerts.length, 0);
+});
+
+test("disposed capability discovery cannot replace a new installation's controller or status", async () => {
+  const manager = { sendRequest() { return { rateLimits: {} }; } };
+  const runtime = loadInjection({ discoveredAppServerManager: manager, initialSessionId: "" });
+  const originalImport = runtime.window.__codeyImportCodexAsset;
+  let release;
+  runtime.window.__codeyImportCodexAsset = (...args) => new Promise((resolve) => {
+    release = () => resolve(originalImport(...args));
+  });
+  const pending = runtime.window.__codeyLoadCodexSessionController({ feature: "usage" });
+  await flushMicrotasks();
+  runtime.window.__codeySessionToolsInstall.dispose();
+  const replacement = { kind: "manager", manager: { sendRequest() {} } };
+  const replacementStatus = { usage: { status: "available", message: "" } };
+  runtime.window.__codeyCodexSessionController = replacement;
+  runtime.window.__codeyPageCapabilities = replacementStatus;
+  release();
+  await assert.rejects(pending, { code: "codey_capability_unavailable" });
+  assert.equal(runtime.window.__codeyCodexSessionController, replacement);
+  assert.equal(runtime.window.__codeyPageCapabilities, replacementStatus);
+  assert.equal(replacementStatus.usage.status, "available");
+});
+
 test("rediscovers a patched manager cached before completion reconciliation was available", async () => {
   const managerEvents = [];
   const discoveredAppServerManager = {

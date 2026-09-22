@@ -35,14 +35,15 @@ jobs:
     name: macOS ${{ matrix.arch }} unsigned
     if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.platform == 'macos' || inputs.platform == 'all'
     runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_PROFILE_RELEASE_LTO: thin
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: arm64
             runner: macos-14
-          - arch: x64
-            runner: macos-15-intel
 
     steps:
       - name: Checkout Codey
@@ -79,9 +80,14 @@ jobs:
         if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
         run: pnpm run test:js
 
+      - name: Build embedded frontend assets
+        run: pnpm run vite:build
+
       - name: Rust tests
         if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
         run: cargo test --workspace --locked
+        env:
+          CODEY_SKIP_OVERLAY_BUILD: "1"
 
       - name: Rust format
         if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
@@ -90,10 +96,13 @@ jobs:
       - name: Rust clippy
         if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        env:
+          CODEY_SKIP_OVERLAY_BUILD: "1"
 
       - name: Build unsigned macOS app
         env:
           CODEY_SKIP_CODESIGN: "1"
+          CODEY_SKIP_OVERLAY_BUILD: "1"
           CODEY_UPDATE_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
         run: pnpm run build
 
@@ -221,6 +230,9 @@ jobs:
         if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
         run: pnpm run test:js
 
+      - name: Build embedded frontend assets
+        run: pnpm run vite:build
+
       - name: Rust format
         if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
         run: cargo fmt --all -- --check
@@ -228,13 +240,18 @@ jobs:
       - name: Rust tests
         if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
         run: cargo test --workspace --locked
+        env:
+          CODEY_SKIP_OVERLAY_BUILD: "1"
 
       - name: Rust clippy
         if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        env:
+          CODEY_SKIP_OVERLAY_BUILD: "1"
 
       - name: Build Windows executable
         env:
+          CODEY_SKIP_OVERLAY_BUILD: "1"
           CODEY_UPDATE_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
         run: pnpm run build
 
@@ -270,6 +287,20 @@ jobs:
           if (-not $makensis) {
             throw "makensis.exe was not found. The NSIS install step must expose it before packaging."
           }
+
+          # 安装包内嵌的版本必须与清单版本一致：更新助手按清单版本校验安装结果，
+          # 两者错位会被判成"安装没有生效"，用户就会在更新提示里原地循环。
+          $cargoMatch = Select-String -Path "Cargo.toml" -Pattern '^\s*version\s*=\s*"([^"]+)"' |
+            Select-Object -First 1
+          if (-not $cargoMatch) {
+            throw "Unable to read the workspace version from Cargo.toml."
+          }
+          $cargoVersion = $cargoMatch.Matches[0].Groups[1].Value
+          $manifestVersion = $version -replace '-\d+$', ''
+          if ($cargoVersion -ne $manifestVersion) {
+            throw "Cargo.toml version $cargoVersion does not match packaged version $manifestVersion. Bump the workspace version before releasing."
+          }
+
           $installerScript = (Resolve-Path "scripts\installer\windows\Codey.nsi").Path
           & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=$version" "/DPROJECT_ROOT=$env:GITHUB_WORKSPACE" $installerScript
           if ($LASTEXITCODE -ne 0) {

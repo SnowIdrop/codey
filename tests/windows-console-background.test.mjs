@@ -17,8 +17,9 @@ test("Windows source contract: Codey uses the GUI subsystem", async () => {
     main,
     /^#!\[cfg_attr\(target_os = "windows", windows_subsystem = "windows"\)\]/,
   );
-  assert.doesNotMatch(library, /ShowWindow|GetConsoleWindow/);
-  assert.doesNotMatch(manifest, /Win32_System_Console/);
+  // 插件日志子进程可按需创建控制台，桌面入口仍应直接使用 GUI 子系统。
+  assert.doesNotMatch(main, /AllocConsole|AttachConsole|ShowWindow|GetConsoleWindow/);
+  assert.doesNotMatch(library, /AllocConsole|AttachConsole|ShowWindow|GetConsoleWindow/);
   assert.match(manifest, /Win32_UI_WindowsAndMessaging/);
 });
 
@@ -127,11 +128,30 @@ test("Windows source contract: updates use the detached native helper", async ()
     updateHelper,
     /std::fs::copy\(&executable, &helper_path\)[\s\S]*Command::new\(&helper_path\)/,
   );
+  // 安装结果必须先复核，再决定是否重启：静默 NSIS 失败时盲目重启只会让用户
+  // 反复回到旧版本。
   assert.match(
     updateHelper,
-    /let install_result = install_windows_update[\s\S]*let restart_result = restart_codey/,
+    /match outcome \{[\s\S]*?Ok\(UpdateInstallOutcome::Updated\s*\|\s*UpdateInstallOutcome::Failed\)[\s\S]*?restart_codey\(invocation, &log_path\)/,
+  );
+  assert.match(
+    updateHelper,
+    /Ok\(UpdateInstallOutcome::Unverified\) => \{[\s\S]*?restart_codey\(invocation, &log_path\)/,
+  );
+  assert.match(
+    updateHelper,
+    /Err\(install_error\) => \{[\s\S]*?finish_update_report\(&report_path, &report_version, "failed", &install_error\)[\s\S]*?Err\(install_error\)/,
+  );
+  assert.doesNotMatch(
+    updateHelper,
+    /let install_result = install_windows_update/,
+    "安装失败后不得再无条件重启旧版本",
   );
   assert.match(updateHelper, /raw_arg\(nsis_install_directory_argument/);
+  assert.match(
+    updateHelper,
+    /let outcome = verify_installed_update\(invocation, expected_version\.as_deref\(\), before\)/,
+  );
 });
 
 test("Windows source contract: missing Codex paths recover before startup", async () => {
@@ -153,5 +173,13 @@ test("Windows source contract: missing Codex paths recover before startup", asyn
     commands,
     /FileDialog::new\(\)[\s\S]*选择 Codex 桌面应用安装目录[\s\S]*pick_folder\(\)/,
   );
-  assert.match(commands, /save_config_to_store\(state, &config\)/);
+  const recoverPath = commands.match(
+    /async fn ensure_windows_codex_app_path\([\s\S]*?\n\}/,
+  )?.[0];
+  assert.ok(recoverPath, "应存在 Windows Codex 路径恢复函数");
+  assert.match(recoverPath, /config\.codex_app_path = app_dir\.to_string_lossy\(\)\.to_string\(\)/);
+  assert.match(
+    recoverPath,
+    /let config = save_config_to_store\(state, config\)\s*\.await\s*\.map_err\([^\n]+\)\?;\s*\*state\.config\.write\(\)\.await = config;/,
+  );
 });
