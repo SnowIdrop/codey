@@ -4,7 +4,7 @@ use crate::config::ProviderProfile;
 #[tokio::test]
 async fn context_recovery_preserves_other_settings_and_backs_up_the_budget() {
     let directory = tempfile::tempdir().unwrap();
-    let mut config = CodeyConfig::default();
+    let mut config = CodeyConfig::default().normalize();
     config.model_context_by_provider.insert(
         "route".into(),
         BTreeMap::from([(
