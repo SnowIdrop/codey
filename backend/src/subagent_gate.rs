@@ -10,8 +10,6 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::subagent::protocol::{self, AgentState as ObservedAgentState};
-#[cfg(test)]
-use crate::subagent::rules::{RuleActor, RuleContext, RuleEffect, ToolClass};
 use crate::subagent::{
     api::TraceContext,
     telemetry::{ExecutionStatus, SubagentTraceEvent, TraceEventKind, TraceRecorder},
@@ -2400,46 +2398,6 @@ fn verified_async_active_count(
         &marker_hashes,
         now_ms,
     )
-}
-
-#[cfg(test)]
-fn root_read_tool_allowed(state_root: &Path, tool_name: &str, tool_input: Option<&Value>) -> bool {
-    let Some(tool_class) = root_read_tool_class(tool_name, tool_input) else {
-        return false;
-    };
-    crate::subagent::rules::load_logged(state_root)
-        .rules
-        .evaluate(&RuleContext {
-            actor: RuleActor::Root,
-            role: None,
-            tool_name,
-            tool_class,
-        })
-        .effect
-        == RuleEffect::Allow
-}
-
-#[cfg(test)]
-fn root_read_tool_class(tool_name: &str, tool_input: Option<&Value>) -> Option<ToolClass> {
-    let tool_class = crate::subagent::rules::classify_tool(tool_name);
-    if matches!(tool_class, ToolClass::Read | ToolClass::Network) {
-        return Some(tool_class);
-    }
-
-    let normalized = tool_name.trim().to_ascii_lowercase();
-    if matches!(
-        normalized.as_str(),
-        "read_mcp_resource"
-            | "functions.read_mcp_resource"
-            | "list_mcp_resources"
-            | "functions.list_mcp_resources"
-            | "list_mcp_resource_templates"
-            | "functions.list_mcp_resource_templates"
-    ) {
-        return Some(ToolClass::Read);
-    }
-
-    database_mcp_is_read_only(&normalized, tool_input).then_some(ToolClass::Read)
 }
 
 fn is_collaboration_tool(tool_name: &str) -> bool {

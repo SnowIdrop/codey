@@ -1732,66 +1732,6 @@ pub(crate) fn active_reservation_projection(
     Ok(Some((active.len(), identities)))
 }
 
-/// Proves that every active attempt is a bound, local-read-only child and that
-/// the lifecycle marker identities exactly match the ledger projection. This
-/// deliberately accepts only `files.read`: read-only roles that can execute
-/// commands or use other capabilities keep the normal global root barrier.
-#[cfg(test)]
-pub(crate) fn verified_local_read_only_active_count(
-    state_root: &Path,
-    runtime_id: &str,
-    session_id: &str,
-    active_marker_hashes: &BTreeSet<String>,
-    now_ms: u64,
-) -> Result<Option<usize>> {
-    if active_marker_hashes.is_empty() {
-        return Ok(None);
-    }
-    let loaded_rules = rules::load_logged(state_root);
-    let store = LedgerStore::open(state_root, session_id)?;
-    let Some(ledger) = store.load(runtime_id, session_id, now_ms)? else {
-        return Ok(None);
-    };
-    let active = ledger
-        .reservations
-        .values()
-        .filter(|reservation| reservation.state.is_active())
-        .collect::<Vec<_>>();
-    if active.is_empty() || active.len() != active_marker_hashes.len() {
-        return Ok(None);
-    }
-
-    let mut bound_agent_hashes = BTreeSet::new();
-    for reservation in &active {
-        let role_is_read_only = loaded_rules
-            .rules
-            .role_policy(&reservation.role)
-            .is_some_and(|policy| policy.access == RoleAccess::ReadOnly);
-        let files_read_only = matches!(
-            reservation.capabilities.as_slice(),
-            [capability] if capability == "files.read"
-        );
-        let Some(agent_id_hash) = reservation.agent_id_hash.as_ref() else {
-            return Ok(None);
-        };
-        if reservation.spawn_failed
-            || reservation.fenced_at_ms.is_some()
-            || reservation.started_at_ms.is_none()
-            || reservation.outcome != ExecutionOutcome::Unknown
-            || !role_is_read_only
-            || reservation.write_capable
-            || !files_read_only
-            || !bound_agent_hashes.insert(agent_id_hash.clone())
-        {
-            return Ok(None);
-        }
-    }
-    if &bound_agent_hashes != active_marker_hashes {
-        return Ok(None);
-    }
-    Ok(Some(active.len()))
-}
-
 /// Only explicit asynchronous tasks with matching live identities release root work.
 pub(crate) fn verified_async_active_count(
     state_root: &Path,

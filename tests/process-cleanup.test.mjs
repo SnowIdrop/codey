@@ -22,7 +22,7 @@ test("shutdown reaps only the runtime-owned Codex process tree", async () => {
   const finalShutdown = library.slice(shutdownStart, shutdownEnd);
   assert.match(finalShutdown, /stop_runtime_with_retry\(&state\)\.await/);
   assert.doesNotMatch(finalShutdown, /terminate_other_codey_processes/);
-  assert.match(library, /#\[cfg\(test\)\]\s*mod process_cleanup;/);
+  assert.match(library, /#\[cfg\(all\(test, unix\)\)\]\s*mod process_cleanup;/);
   assert.doesNotMatch(
     finalShutdown,
     /if shutdown_reason == ShutdownReason::CodexExited/,
