@@ -75,10 +75,7 @@ test("Windows source contract: background helpers request no-window execution", 
     launcherPlatform,
     /codey_runtime_core::windows_terminate_process_if_matches/,
   );
-  assert.match(
-    launcherPlatform,
-    /Command::new\("taskkill"\)[\s\S]*?creation_flags\(codey_runtime_core::windows_create_no_window\(\)\)/,
-  );
+  assert.doesNotMatch(launcherPlatform, /Command::new\("taskkill"\)/);
   assert.match(
     runtimeAppPaths,
     /Command::new\("powershell"\)\s*\.creation_flags\(crate::windows_create_no_window\(\)\)/,

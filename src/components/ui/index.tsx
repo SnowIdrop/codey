@@ -674,5 +674,3 @@ export function DrawerDescription({ id, className, ...props }: React.HTMLAttribu
   const labels = React.useContext(DrawerLabelContext);
   return <p {...props} id={id ?? labels?.descriptionId} className={cn("m-0 text-xs leading-relaxed text-muted", className)} />;
 }
-
-

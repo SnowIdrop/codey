@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import test from "node:test";
+
+import { loadStartupPatchTemplate } from "./helpers/startup-patch.mjs";
 
 const proxyEnvironmentKeys = [
   "CODEY_WORKFLOW_PROXY_ENABLED",
@@ -9,19 +10,6 @@ const proxyEnvironmentKeys = [
   "CODEY_WORKFLOW_PROXY_TOKEN",
   "CODEY_WORKFLOW_PROXY_BYPASS",
 ];
-
-async function loadStartupPatchExpression() {
-  const template = await readFile(
-    new URL("../backend/src/codex_startup_patch.js", import.meta.url),
-    "utf8",
-  );
-  return template
-    .replaceAll("__DISABLE_PET__", "false")
-    .replaceAll("__FAST_CODEX_STARTUP__", "false")
-    .replaceAll("__SUBAGENT_GATE_ACTIVE__", "false")
-    .replaceAll('"__CODEY_RUNTIME_CONFIG_OVERRIDES__"', "[]")
-    .replaceAll('"__CODEY_ERROR_LOGGER_EXECUTABLE__"', '""');
-}
 
 test("workflow proxy is opt-in and rewrites only exact codex app-server spawns", async () => {
   const Module = process.getBuiltinModule("module");
@@ -66,17 +54,20 @@ test("workflow proxy is opt-in and rewrites only exact codex app-server spawns",
 
   try {
     assert.equal(
-      (0, eval)(await loadStartupPatchExpression()),
-      "codey-startup-patch-installed-v22",
+      (0, eval)(await loadStartupPatchTemplate({
+        runtimeConfigOverrides: [],
+        errorLoggerExecutable: "",
+      })),
+      "codey-startup-patch-installed-v40",
     );
     const childProcess = Module._load("node:child_process", undefined, false);
 
     const disabled = childProcess.spawn("/opt/codex", ["app-server"]);
     assert.equal(disabled.command, "/opt/codex");
     assert.deepEqual(disabled.args, [
+      "app-server",
       "-c",
       "analytics.enabled=false",
-      "app-server",
     ]);
     assert.equal(
       globalThis.__CODEY_REWRITE_CODEX_APP_SERVER_PROXY_SPAWN__(
@@ -103,11 +94,11 @@ test("workflow proxy is opt-in and rewrites only exact codex app-server spawns",
       "--codex-executable",
       "/opt/codex",
       "--",
-      "-c",
-      "analytics.enabled=false",
       "app-server",
       "--listen",
       "stdio",
+      "-c",
+      "analytics.enabled=false",
     ]);
     assert.doesNotMatch(
       JSON.stringify({ command: proxied.command, args: proxied.args }),
