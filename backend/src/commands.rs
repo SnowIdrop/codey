@@ -2667,7 +2667,7 @@ pub(super) async fn hot_reload_runtime_subagent_config(
         );
     }
 
-    let runtime_config = match runtime.subagent_reconcile_config(&current_config, &codex_home()) {
+    let runtime_config = match runtime.subagent_reconcile_config(&current_config, codex_home()) {
         Ok(config) => config,
         Err(error) => return SubagentHotReloadOutcome::failed(format!("{error:#}")),
     };
