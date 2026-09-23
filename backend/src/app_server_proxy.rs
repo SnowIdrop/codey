@@ -947,7 +947,10 @@ fn validate_real_codex_invocation(executable: &OsStr, arguments: &[OsString]) ->
         if !Path::new(executable).is_absolute()
             || !Path::new(&wrapper).is_absolute()
             || !target.is_absolute()
-            || !target.file_name().and_then(OsStr::to_str).is_some_and(matches_codex_executable_name)
+            || !target
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(matches_codex_executable_name)
             || std::fs::canonicalize(executable)? != std::fs::canonicalize(wrapper)?
         {
             bail!("app-server proxy helper 只允许启动真实 Codex 或本次受控包装器");

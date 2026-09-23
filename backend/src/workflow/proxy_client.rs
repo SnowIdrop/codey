@@ -482,9 +482,12 @@ impl ProxyAppServerAdapter {
             .client
             .request("config/read", json!({ "cwd": cwd, "includeLayers": false }))
             .await?;
-        let config = result.get("config").and_then(Value::as_object).ok_or_else(|| {
-            WorkflowError::Adapter("config/read response omitted config".to_string())
-        })?;
+        let config = result
+            .get("config")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                WorkflowError::Adapter("config/read response omitted config".to_string())
+            })?;
         Ok(ThreadContext {
             thread_id: String::new(),
             cwd: cwd.to_string(),
@@ -492,12 +495,16 @@ impl ProxyAppServerAdapter {
                 .get("approval_policy")
                 .filter(|value| !value.is_null())
                 .cloned()
-                .ok_or_else(|| WorkflowError::Adapter("config/read omitted approval_policy".to_string()))?,
+                .ok_or_else(|| {
+                    WorkflowError::Adapter("config/read omitted approval_policy".to_string())
+                })?,
             sandbox: config
                 .get("sandbox_mode")
                 .filter(|value| !value.is_null())
                 .cloned()
-                .ok_or_else(|| WorkflowError::Adapter("config/read omitted sandbox_mode".to_string()))?,
+                .ok_or_else(|| {
+                    WorkflowError::Adapter("config/read omitted sandbox_mode".to_string())
+                })?,
             model: config
                 .get("model")
                 .and_then(Value::as_str)

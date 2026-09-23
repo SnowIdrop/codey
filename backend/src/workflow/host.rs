@@ -690,13 +690,13 @@ impl WorkflowHost {
             );
             match manager.recover().await {
                 Ok(run_ids) => {
-                for run_id in run_ids {
-                    if host.service.get(&run_id).await.is_ok_and(|details| {
-                        matches!(details.run.status, RunStatus::Queued | RunStatus::Running)
-                    }) {
-                        host.spawn_executor(run_id).await;
+                    for run_id in run_ids {
+                        if host.service.get(&run_id).await.is_ok_and(|details| {
+                            matches!(details.run.status, RunStatus::Queued | RunStatus::Running)
+                        }) {
+                            host.spawn_executor(run_id).await;
+                        }
                     }
-                }
                 }
                 Err(error) => {
                     crate::error_log::record_failure(
