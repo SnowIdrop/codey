@@ -183,23 +183,19 @@ jobs:
       - name: Install NSIS
         shell: pwsh
         run: |
-          $maxAttempts = 3
-          $installExitCode = 1
-          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-            choco install nsis --yes --no-progress
-            $installExitCode = $LASTEXITCODE
-            if ($installExitCode -eq 0) {
-              break
-            }
-
-            if ($attempt -lt $maxAttempts) {
-              $delaySeconds = 15 * $attempt
-              Write-Warning "Chocolatey failed to install NSIS (attempt $attempt/$maxAttempts, exit code $installExitCode). Retrying in $delaySeconds seconds."
-              Start-Sleep -Seconds $delaySeconds
-            }
+          # Download the pinned package directly: the Chocolatey metadata feed
+          # can return 503/504 even when package downloads remain available.
+          $packageDir = Join-Path $env:RUNNER_TEMP "codey-nsis"
+          New-Item -ItemType Directory -Force $packageDir | Out-Null
+          $package = Join-Path $packageDir "nsis.install.3.12.0.nupkg"
+          Invoke-WebRequest -Uri "https://community.chocolatey.org/api/v2/package/nsis.install/3.12.0" -OutFile $package -MaximumRetryCount 3 -RetryIntervalSec 15
+          $expectedHash = "4A1BBF9987E5B9B6BDA4C2433AF62BB79F2D9D3BD67B392F29A069ECDA8C5F64"
+          if ((Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash -ne $expectedHash) {
+            throw "NSIS package checksum mismatch."
           }
-          if ($installExitCode -ne 0) {
-            throw "Chocolatey failed to install NSIS after $maxAttempts attempts (exit code $installExitCode)."
+          choco install nsis.install --version=3.12.0 --source=$packageDir --yes --no-progress
+          if ($LASTEXITCODE -ne 0) {
+            throw "Chocolatey failed to install the verified NSIS package (exit code $LASTEXITCODE)."
           }
 
           $makensis = @(
