@@ -14,12 +14,12 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, Value, value};
 
 use crate::codex_config_guidance::{
-    CODEY_FASTCTX_GUIDANCE, COMMENTS_ROLE_USAGE_HINT, NO_WRITABLE_SUBAGENT_GUIDANCE,
-    READ_ONLY_AGENT_WRITE_GUARD, ROOT_AGENT_COLLABORATION_USAGE_HINT,
-    ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS, ROOT_AGENT_MULTI_AGENT_MODE_HINT,
-    SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS, SUBAGENT_TASK_BOUNDARY_GUARD,
-    append_root_agent_collaboration_usage_hint, remove_codey_fastctx_guidance,
-    remove_subagent_guidance, subagent_source_config,
+    CODEY_FASTCTX_GUIDANCE, CODEY_FASTCTX_GUIDANCE_VERSIONS, COMMENTS_ROLE_USAGE_HINT,
+    NO_WRITABLE_SUBAGENT_GUIDANCE, READ_ONLY_AGENT_WRITE_GUARD,
+    ROOT_AGENT_COLLABORATION_USAGE_HINT, ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS,
+    ROOT_AGENT_MULTI_AGENT_MODE_HINT, SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS,
+    SUBAGENT_TASK_BOUNDARY_GUARD, append_root_agent_collaboration_usage_hint,
+    remove_codey_fastctx_guidance, remove_subagent_guidance, subagent_source_config,
 };
 use crate::config::{
     CodeyConfig, SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_COMMENTS, SUBAGENT_ROLE_DEFAULT,
@@ -222,6 +222,7 @@ impl Drop for RuntimeConfigLock {
 pub(crate) struct RuntimeRouterConfigOptions<'a> {
     pub local_router: Option<&'a RuntimeRouterEndpoint>,
     pub use_official_catalog: bool,
+    pub model_contexts: Option<&'a BTreeMap<String, crate::config::ModelContextConfig>>,
     pub default_model: Option<&'a str>,
     pub fast_context_tools: bool,
     pub subagent_optimization: bool,
@@ -250,6 +251,7 @@ struct RouterApplyOptions<'a> {
     local_router: Option<&'a RuntimeRouterEndpoint>,
     stream_max_retries: u32,
     use_official_catalog: bool,
+    model_contexts: Option<&'a BTreeMap<String, crate::config::ModelContextConfig>>,
     default_model: Option<&'a str>,
     fastctx_command: Option<&'a Path>,
     subagent_optimization: bool,
@@ -274,6 +276,14 @@ struct RuntimeAgentPlan {
     contents: Vec<u8>,
 }
 
+pub(crate) fn runtime_router_platform_supported() -> bool {
+    cfg!(any(windows, target_os = "macos"))
+}
+
+pub(crate) fn unsupported_runtime_platform_message() -> &'static str {
+    "当前平台尚不能把 Codey Provider 配置限定到单次 Codex 进程；为避免修改用户 config.toml，已取消启动"
+}
+
 pub(crate) fn apply_runtime_router_config(
     home: &Path,
     options: RuntimeRouterConfigOptions<'_>,
@@ -289,10 +299,8 @@ pub(crate) fn apply_runtime_router_config(
     // a platform where that patch is not available.
     let subagent_optimization =
         options.subagent_optimization && cfg!(any(windows, target_os = "macos"));
-    if !cfg!(any(windows, target_os = "macos")) {
-        bail!(
-            "当前平台尚不能把 Codey Provider 配置限定到单次 Codex 进程；为避免修改用户 config.toml，已取消启动"
-        );
+    if !runtime_router_platform_supported() {
+        bail!(unsupported_runtime_platform_message());
     }
     // Most runtime values stay command-local `-c` overlays. Codex Desktop still
     // looks up a thread's saved `model_provider` from disk, so persist only the
@@ -303,6 +311,7 @@ pub(crate) fn apply_runtime_router_config(
             local_router: options.local_router,
             stream_max_retries: options.stream_max_retries,
             use_official_catalog,
+            model_contexts: options.model_contexts,
             default_model,
             fastctx_command: fastctx_command.as_deref(),
             subagent_optimization,
@@ -383,6 +392,7 @@ fn apply_isolated_runtime_router_config(
         local_router,
         stream_max_retries,
         use_official_catalog,
+        model_contexts,
         default_model,
         fastctx_command,
         subagent_optimization,
@@ -427,7 +437,10 @@ fn apply_isolated_runtime_router_config(
         },
     )?;
     let mut effective_document = parse_document(&effective).context("解析 Codey 运行时约束失败")?;
-    if let Some(path) = model_catalog_path.as_deref() {
+    if let Some(path) = model_catalog_path
+        .as_deref()
+        .filter(|_| subagent_optimization)
+    {
         // The persistent document retains the user's catalog. This process,
         // however, must use the same generated catalog used to resolve routed
         // role ids. Preserving a raw-id user catalog here makes native spawn
@@ -445,9 +458,10 @@ fn apply_isolated_runtime_router_config(
     let constraints_dir = marker.with_file_name(CODEY_CONSTRAINTS_DIR);
     create_private_dir_all(&constraints_dir)?;
     let fastctx_instructions = if fastctx_namespace.is_some() {
-        Some(read_or_create_constraint_file(
+        Some(read_or_create_versioned_constraint_file(
             &constraints_dir.join(CODEY_FASTCTX_INSTRUCTIONS_FILE),
             CODEY_FASTCTX_GUIDANCE,
+            CODEY_FASTCTX_GUIDANCE_VERSIONS,
         )?)
     } else {
         None
@@ -520,7 +534,11 @@ fn apply_isolated_runtime_router_config(
     } else {
         (None, Vec::new())
     };
-    if let Some(path) = resolved_model_catalog_path(&effective_document, home) {
+    if let Some(path) = resolved_runtime_model_catalog_path(
+        &effective_document,
+        home,
+        local_router.and(model_contexts),
+    )? {
         effective_document["model_catalog_json"] = value(path.to_string_lossy().into_owned());
     }
     let runtime_config_overrides = build_isolated_runtime_overrides(
@@ -642,6 +660,7 @@ fn apply_isolated_test_runtime_config(
             local_router: Some(test_runtime_router_endpoint()),
             stream_max_retries: 5,
             use_official_catalog,
+            model_contexts: None,
             default_model: None,
             fastctx_command,
             subagent_optimization,
@@ -715,7 +734,8 @@ fn runtime_root_instructions_for_roles(
 ) -> String {
     let has_writable_role = roles.contains_key(SUBAGENT_ROLE_WORKER)
         || roles.contains_key(SUBAGENT_ROLE_COMMENTS)
-        || roles.contains_key(SUBAGENT_ROLE_VISUAL_WORKER);
+        || roles.contains_key(SUBAGENT_ROLE_VISUAL_WORKER)
+        || roles.contains_key(SUBAGENT_ROLE_DEFAULT);
     if has_writable_role {
         if roles.contains_key(SUBAGENT_ROLE_COMMENTS) {
             append_constraint_text(root_instructions, COMMENTS_ROLE_USAGE_HINT)
@@ -860,7 +880,10 @@ fn render_runtime_agent(
     }
     if !matches!(
         role,
-        SUBAGENT_ROLE_WORKER | SUBAGENT_ROLE_COMMENTS | SUBAGENT_ROLE_VISUAL_WORKER
+        SUBAGENT_ROLE_WORKER
+            | SUBAGENT_ROLE_COMMENTS
+            | SUBAGENT_ROLE_VISUAL_WORKER
+            | SUBAGENT_ROLE_DEFAULT
     ) {
         append_table_constraint_text(
             document.as_table_mut(),
@@ -3006,17 +3029,47 @@ fn local_router_provider_table(endpoint: &RuntimeRouterEndpoint) -> Table {
 pub(crate) fn runtime_model_catalog_path(
     home: &Path,
     use_codey_catalog: bool,
+    contexts: Option<&BTreeMap<String, crate::config::ModelContextConfig>>,
 ) -> Result<Option<PathBuf>> {
-    if use_codey_catalog {
-        return Ok(Some(home.join(crate::model_catalog::relative_path())));
-    }
     let config_path = home.join("config.toml");
     let source = read_optional(&config_path)?.unwrap_or_default();
     let source = String::from_utf8(source).context("Codex 配置不是 UTF-8")?;
     let mut document = parse_document(&source)?;
     let desired = use_codey_catalog.then(|| home.join(crate::model_catalog::relative_path()));
     update_model_catalog_reference(&mut document, &config_path, desired.as_deref());
-    Ok(resolved_model_catalog_path(&document, home))
+    resolved_runtime_model_catalog_path(&document, home, contexts)
+}
+
+fn resolved_runtime_model_catalog_path(
+    document: &DocumentMut,
+    home: &Path,
+    contexts: Option<&BTreeMap<String, crate::config::ModelContextConfig>>,
+) -> Result<Option<PathBuf>> {
+    let Some(source) = resolved_model_catalog_path(document, home) else {
+        return Ok(None);
+    };
+    let Some(contexts) = contexts.filter(|contexts| !contexts.is_empty()) else {
+        return Ok(Some(source));
+    };
+    if is_codey_owned_model_catalog_path(&source.to_string_lossy(), &home.join("config.toml")) {
+        return Ok(Some(source));
+    }
+    crate::model_catalog::prepare_context_catalog_overlay(home, &source, contexts).map(Some)
+}
+
+/// 保存前只验证，不写入目录副本；失败时配置和当前运行时均保持原样。
+pub(crate) fn validate_runtime_model_contexts(
+    home: &Path,
+    contexts: &BTreeMap<String, crate::config::ModelContextConfig>,
+) -> Result<()> {
+    if contexts.is_empty() {
+        return Ok(());
+    }
+    // 关闭 Codey 目录选择后，只会剩下用户自定义的目录引用。
+    if let Some(source) = runtime_model_catalog_path(home, false, None)? {
+        crate::model_catalog::render_context_catalog_overlay(&source, contexts)?;
+    }
+    Ok(())
 }
 
 fn resolved_model_catalog_path(document: &DocumentMut, home: &Path) -> Option<PathBuf> {

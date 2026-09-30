@@ -16,16 +16,23 @@ const APP_SERVER_RUNTIME_OVERRIDES_VERIFIED_RESULT: &str =
 /// 配置已验证且使用 Codey stdin relay 时，允许消息补丁失配后降级启动。
 const APP_SERVER_RUNTIME_OVERRIDES_DEGRADED_RESULT: &str =
     "codey-app-server-runtime-overrides-degraded";
+/// JS 在等待窗口内没有观察到 app-server 启动时放进异常文本，启动器据此重试。
+const APP_SERVER_RUNTIME_OVERRIDE_TIMEOUT_MARKER: &str =
+    "codey-app-server-runtime-overrides-timeout";
 const MAX_INSPECTOR_TARGET_RESPONSE_BYTES: usize = 1024 * 1024;
 /// Inspector 发现窗口。fuse 允许时 Node 在应用脚本运行前就绑定端口，20 秒足以覆盖冷启动。
 pub(crate) const STARTUP_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const STARTUP_PATCH_INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// 覆盖确认的调试会话上限。须盖住断点恢复前的协议和补丁求值，以及 JS 侧
+/// `appServerRuntimeOverrideTimeoutMs`（150 秒）。Codex 先显示窗口再启动
+/// app-server，Windows 商店版冷启动经常要超过一分钟才走到这次 spawn。
 const STARTUP_PATCH_RUNTIME_OVERRIDE_INSTALL_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(24);
+    std::time::Duration::from_secs(165);
 /// 单次启动尝试等待 CLI 包装器确认的上限。进程退出、明确失败或确认成功都会提前结束；
-/// Windows 最多两次尝试，清理后重新计时。
+/// Windows 最多两次尝试，清理后重新计时。须盖住上面的调试会话，否则会话还在等
+/// app-server 时外层截止时间会先把它掐断。
 pub(crate) const STARTUP_CLI_READY_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(60);
+    std::time::Duration::from_secs(180);
 /// 回环端口连通性探测时限（渲染进程调试端口、Inspector 端口）。
 const LOOPBACK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 
@@ -196,6 +203,21 @@ fn prepare_startup_require_in(
     options: PatchOptions,
     runtime_config_overrides: &[String],
 ) -> Result<StartupRequire> {
+    prepare_startup_require_with_path(
+        state_dir,
+        options,
+        runtime_config_overrides,
+        space_free_path,
+    )
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn prepare_startup_require_with_path(
+    state_dir: &std::path::Path,
+    options: PatchOptions,
+    runtime_config_overrides: &[String],
+    resolve_path: impl FnOnce(&std::path::Path) -> Result<std::path::PathBuf>,
+) -> Result<StartupRequire> {
     let directory = state_dir.join(STARTUP_REQUIRE_DIR);
     std::fs::create_dir_all(&directory)
         .with_context(|| format!("创建 Codex 启动补丁目录失败：{}", directory.display()))?;
@@ -216,7 +238,18 @@ fn prepare_startup_require_in(
     );
     crate::fs_util::atomic_write_private_with_parent(&script_path, expression.as_bytes())
         .with_context(|| format!("写入 Codex 启动补丁失败：{}", script_path.display()))?;
-    let require_path = space_free_path(&script_path)?;
+    let require_argument =
+        match resolve_path(&script_path).and_then(|path| node_require_argument(&path)) {
+            Ok(argument) => argument,
+            Err(error) => {
+                if let Err(cleanup) = std::fs::remove_file(&script_path) {
+                    return Err(anyhow::anyhow!(
+                        "{error:#}；清理未使用的启动补丁失败：{cleanup}"
+                    ));
+                }
+                return Err(error);
+            }
+        };
     Ok(StartupRequire {
         environment: vec![
             ("CODEX_SPARKLE_ENABLED".to_string(), "false".to_string()),
@@ -224,10 +257,7 @@ fn prepare_startup_require_in(
                 "CODEY_DISABLE_MACOS_CHILD_PROCESS_SAMPLER".to_string(),
                 "true".to_string(),
             ),
-            (
-                "NODE_OPTIONS".to_string(),
-                node_require_argument(&require_path)?,
-            ),
+            ("NODE_OPTIONS".to_string(), require_argument),
             (
                 STARTUP_PATCH_MARKER_ENV.to_string(),
                 marker_path.to_string_lossy().into_owned(),
@@ -783,55 +813,105 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
 
 #[cfg(windows)]
 fn run_windows_package_resume_helper_if_requested() -> Result<bool> {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
-
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    let Some(thread_id) = windows_package_resume_thread_id(&arguments)? else {
+    let Some(WindowsPackageResumeTarget {
+        process_id,
+        thread_id,
+        launch_id,
+        feedback_path,
+    }) = windows_package_resume_target(&arguments)?
+    else {
         return Ok(false);
     };
-    let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, thread_id) }
-        .context("打开 Windows Store Codex 启动线程失败")?;
-    let previous_suspend_count = unsafe { ResumeThread(thread) };
-    let resume_error = (previous_suspend_count == u32::MAX).then(windows::core::Error::from_win32);
-    unsafe { CloseHandle(thread) }.context("关闭 Windows Store Codex 启动线程句柄失败")?;
-    let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
-        "launcher.windows_package_thread_resumed",
-        serde_json::json!({
-            "threadId": thread_id,
-            "previousSuspendCount": previous_suspend_count,
-            "succeeded": resume_error.is_none(),
-            "helperWrapperEnvironmentPresent": std::env::var_os(CLI_WRAPPER_TARGET_ENV).is_some(),
-            "helperWslEnvironmentPresent": std::env::var_os("WSL_DISTRO_NAME").is_some(),
-        }),
+    let result = crate::launcher::resume_windows_packaged_thread(
+        process_id,
+        thread_id,
+        launch_id,
+        &feedback_path,
     );
-    // 助手随即退出，确保这次恢复结果已写入磁盘。
-    let _ = codey_runtime_core::diagnostic_log::flush_diagnostic_log();
-    if let Some(error) = resume_error {
-        return Err(error).context("恢复 Windows Store Codex 启动线程失败");
+    if let Err(error) = &result {
+        crate::error_log::record_failure(
+            "package_thread_resume_failed",
+            "resume_windows_packaged_thread",
+            format!("{error:#}"),
+            serde_json::json!({"processId": process_id, "threadId": thread_id}),
+        );
     }
-    Ok(true)
+    let _ = codey_runtime_core::diagnostic_log::flush_diagnostic_log();
+    result.map(|_| true)
 }
 
 #[cfg(any(windows, test))]
-fn windows_package_resume_thread_id(arguments: &[OsString]) -> Result<Option<u32>> {
+#[derive(Debug, PartialEq, Eq)]
+struct WindowsPackageResumeTarget {
+    process_id: u32,
+    thread_id: u32,
+    launch_id: uuid::Uuid,
+    feedback_path: std::path::PathBuf,
+}
+
+#[cfg(any(windows, test))]
+fn windows_package_resume_target(
+    arguments: &[OsString],
+) -> Result<Option<WindowsPackageResumeTarget>> {
     if arguments.first().and_then(|value| value.to_str()) != Some(WINDOWS_PACKAGE_RESUME_ARGUMENT) {
         return Ok(None);
     }
-    let value = arguments
-        .windows(2)
-        .find(|pair| {
-            pair[0]
-                .to_str()
-                .is_some_and(|value| value.eq_ignore_ascii_case("-tid"))
-        })
-        .and_then(|pair| pair[1].to_str())
-        .context("Windows Store 未向 Codey 传递待恢复的线程 ID")?;
-    let thread_id = value
-        .parse::<u32>()
-        .context("Windows Store 传递了无效的线程 ID")?;
-    anyhow::ensure!(thread_id != 0, "Windows Store 传递了空线程 ID");
-    Ok(Some(thread_id))
+    let mut process_id = None;
+    let mut thread_id = None;
+    let mut launch_id = None;
+    let mut feedback_path = None;
+    let (pairs, remainder) = arguments[1..].as_chunks::<2>();
+    for pair in pairs {
+        let name = pair[0].to_str().context("Windows Store 启动参数名称无效")?;
+        if name.eq_ignore_ascii_case("--launch-state") {
+            anyhow::ensure!(feedback_path.is_none(), "Windows Store 启动通知路径重复");
+            feedback_path = Some(std::path::PathBuf::from(&pair[1]));
+            continue;
+        }
+        if name.eq_ignore_ascii_case("--launch-id") {
+            anyhow::ensure!(launch_id.is_none(), "Windows Store 启动标识重复");
+            let value = pair[1].to_str().context("Windows Store 启动标识无效")?;
+            let id = uuid::Uuid::parse_str(value).context("Windows Store 启动标识无效")?;
+            anyhow::ensure!(!id.is_nil(), "Windows Store 启动标识为空");
+            launch_id = Some(id);
+            continue;
+        }
+        let target = if name.eq_ignore_ascii_case("-p") {
+            &mut process_id
+        } else if name.eq_ignore_ascii_case("-tid") {
+            &mut thread_id
+        } else {
+            anyhow::bail!("Windows Store 启动参数不受支持");
+        };
+        anyhow::ensure!(target.is_none(), "Windows Store 启动参数重复");
+        let value = pair[1]
+            .to_str()
+            .context("Windows Store 进程或线程 ID 无效")?;
+        anyhow::ensure!(
+            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
+            "Windows Store 进程或线程 ID 无效"
+        );
+        let value = value
+            .parse::<u32>()
+            .context("Windows Store 进程或线程 ID 无效")?;
+        anyhow::ensure!(value != 0, "Windows Store 进程或线程 ID 为空");
+        *target = Some(value);
+    }
+    anyhow::ensure!(remainder.is_empty(), "Windows Store 启动参数缺少值");
+    let launch_id = launch_id.context("Windows Store 未传递启动标识")?;
+    let feedback_path = feedback_path.context("Windows Store 未传递启动通知路径")?;
+    anyhow::ensure!(
+        feedback_path.is_absolute()
+            && feedback_path.file_name() == Some(OsStr::new(&format!("resume-{launch_id}.json"))),
+        "Windows Store 启动通知路径与本次启动不匹配"
+    );
+    Ok(Some(WindowsPackageResumeTarget {
+        process_id: process_id.context("Windows Store 未传递待恢复的进程 ID")?,
+        thread_id: thread_id.context("Windows Store 未传递待恢复的线程 ID")?,
+        launch_id,
+        feedback_path,
+    }))
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -1160,8 +1240,30 @@ pub async fn install(
         ),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("Codex 启动补丁调试会话超时"))??;
+    .map_err(|_| startup_debug_session_timeout())??;
     Ok(())
+}
+
+/// 调试会话没在时限内返回。保留为可重试的超时，Windows 才会进行下一次启动尝试。
+pub(crate) fn startup_debug_session_timeout() -> anyhow::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, "Codex 启动补丁调试会话超时").into()
+}
+
+/// 运行时覆盖确认的异常。未观察到启动是超时，配置不兼容则保持不可重试。
+pub(crate) fn app_server_runtime_override_confirmation_error(
+    exception: &serde_json::Value,
+) -> anyhow::Error {
+    if exception
+        .to_string()
+        .contains(APP_SERVER_RUNTIME_OVERRIDE_TIMEOUT_MARKER)
+    {
+        return std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("Codex app-server 运行时覆盖确认超时：{exception}"),
+        )
+        .into();
+    }
+    anyhow::anyhow!("Codex app-server 运行时覆盖校验失败：{exception}")
 }
 
 /// 从 reqwest 错误链里找出底层 socket 错误类型，用于区分「被拒绝」与「被拖住」。
@@ -1407,7 +1509,7 @@ async fn install_over_websocket(
                     .get("result")
                     .and_then(|result| result.get("exceptionDetails"))
                 {
-                    anyhow::bail!("Codex app-server 运行时覆盖校验失败：{exception}");
+                    return Err(app_server_runtime_override_confirmation_error(exception));
                 }
                 let value = payload
                     .pointer("/result/result/value")
@@ -1619,21 +1721,129 @@ mod tests {
     }
 
     #[test]
-    fn windows_package_resume_helper_requires_its_marker_and_thread_id() {
-        assert_eq!(windows_package_resume_thread_id(&[]).unwrap(), None);
+    fn windows_package_resume_helper_requires_both_process_and_thread() {
+        let launch_id = "37f4f759-55f1-4b66-a45d-160644fe20d4";
+        let feedback_path = std::env::temp_dir()
+            .join("自定义 Codey 状态")
+            .join(format!("resume-{launch_id}.json"));
+        assert_eq!(windows_package_resume_target(&[]).unwrap(), None);
         assert_eq!(
-            windows_package_resume_thread_id(
-                &[WINDOWS_PACKAGE_RESUME_ARGUMENT, "-p", "42", "-tid", "73"].map(OsString::from)
-            )
-            .unwrap(),
-            Some(73)
+            windows_package_resume_target(&["--debug-port".into()]).unwrap(),
+            None
         );
-        assert!(
-            windows_package_resume_thread_id(
-                &[WINDOWS_PACKAGE_RESUME_ARGUMENT, "-tid", "invalid"].map(OsString::from)
-            )
-            .is_err()
-        );
+        for args in [["-p", "42", "-tid", "73"], ["-TID", "73", "-P", "42"]] {
+            let args = std::iter::once(WINDOWS_PACKAGE_RESUME_ARGUMENT)
+                .chain(["--launch-id", launch_id])
+                .chain(args)
+                .map(OsString::from)
+                .chain([
+                    OsString::from("--launch-state"),
+                    feedback_path.clone().into_os_string(),
+                ])
+                .collect::<Vec<_>>();
+            assert_eq!(
+                windows_package_resume_target(&args).unwrap(),
+                Some(WindowsPackageResumeTarget {
+                    process_id: 42,
+                    thread_id: 73,
+                    launch_id: uuid::Uuid::parse_str(launch_id).unwrap(),
+                    feedback_path: feedback_path.clone()
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn windows_package_resume_helper_rejects_malformed_targets() {
+        let feedback_path =
+            std::env::temp_dir().join("resume-37f4f759-55f1-4b66-a45d-160644fe20d4.json");
+        for args in [
+            vec![],
+            vec!["-tid", "73"],
+            vec!["-p", "42"],
+            vec!["-p", "42", "-tid"],
+            vec!["-p", "0", "-tid", "73"],
+            vec!["-p", "42", "-tid", "0"],
+            vec!["-p", "invalid", "-tid", "73"],
+            vec!["-p", "42", "-tid", "4294967296"],
+            vec!["-p", "42", "-tid", "+73"],
+            vec!["-p", "42", "-tid", "-73"],
+            vec!["-p", "42", "-tid", "73", "-P", "42"],
+            vec!["-p", "42", "-tid", "73", "-tid", "74"],
+            vec!["-p", "42", "-tid", "73", "--extra", "1"],
+        ] {
+            let args = std::iter::once(WINDOWS_PACKAGE_RESUME_ARGUMENT)
+                .chain(["--launch-id", "37f4f759-55f1-4b66-a45d-160644fe20d4"])
+                .chain(args)
+                .map(OsString::from)
+                .chain([
+                    OsString::from("--launch-state"),
+                    feedback_path.clone().into_os_string(),
+                ])
+                .collect::<Vec<_>>();
+            assert!(windows_package_resume_target(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn windows_package_resume_helper_requires_valid_unique_launch_id() {
+        let feedback_path =
+            std::env::temp_dir().join("resume-37f4f759-55f1-4b66-a45d-160644fe20d4.json");
+        for extra in [
+            vec![],
+            vec!["--launch-id", "../other-launch"],
+            vec!["--launch-id", "00000000-0000-0000-0000-000000000000"],
+            vec![
+                "--launch-id",
+                "37f4f759-55f1-4b66-a45d-160644fe20d4",
+                "--launch-id",
+                "37f4f759-55f1-4b66-a45d-160644fe20d4",
+            ],
+        ] {
+            let args = [WINDOWS_PACKAGE_RESUME_ARGUMENT, "-p", "42", "-tid", "73"]
+                .into_iter()
+                .chain(extra)
+                .map(OsString::from)
+                .chain([
+                    OsString::from("--launch-state"),
+                    feedback_path.clone().into_os_string(),
+                ])
+                .collect::<Vec<_>>();
+            assert!(windows_package_resume_target(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn windows_package_resume_helper_rejects_missing_or_unrelated_state_path() {
+        let base = [
+            WINDOWS_PACKAGE_RESUME_ARGUMENT,
+            "-p",
+            "42",
+            "-tid",
+            "73",
+            "--launch-id",
+            "37f4f759-55f1-4b66-a45d-160644fe20d4",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        assert!(windows_package_resume_target(&base).is_err());
+        for path in [
+            std::path::PathBuf::from("relative/resume-37f4f759-55f1-4b66-a45d-160644fe20d4.json"),
+            std::env::temp_dir().join("unrelated.json"),
+        ] {
+            let mut args = base.clone();
+            args.extend([OsString::from("--launch-state"), path.into_os_string()]);
+            assert!(windows_package_resume_target(&args).is_err());
+        }
+        let path = std::env::temp_dir().join("resume-37f4f759-55f1-4b66-a45d-160644fe20d4.json");
+        let mut args = base;
+        args.extend([
+            OsString::from("--launch-state"),
+            path.clone().into_os_string(),
+        ]);
+        assert!(windows_package_resume_target(&args).is_ok());
+        args.extend([OsString::from("--launch-state"), path.into_os_string()]);
+        assert!(windows_package_resume_target(&args).is_err());
     }
 
     #[test]
@@ -1711,6 +1921,43 @@ mod tests {
             APP_SERVER_RUNTIME_OVERRIDES_VERIFIED_RESULT
         );
         assert!(STARTUP_PATCH_RUNTIME_OVERRIDE_INSTALL_TIMEOUT > STARTUP_PATCH_INSTALL_TIMEOUT);
+        // 调试会话必须盖住 JS 的等待，否则慢启动会先被会话超时掐断。
+        // 外层启动预算再盖住调试会话，避免窗口还没出来就结束这次尝试。
+        assert!(
+            STARTUP_PATCH_RUNTIME_OVERRIDE_INSTALL_TIMEOUT
+                >= std::time::Duration::from_secs(150) + std::time::Duration::from_secs(10)
+        );
+        assert!(STARTUP_CLI_READY_TIMEOUT > STARTUP_PATCH_RUNTIME_OVERRIDE_INSTALL_TIMEOUT);
+        assert!(STARTUP_PATCH_TEMPLATE.contains(APP_SERVER_RUNTIME_OVERRIDE_TIMEOUT_MARKER));
+        assert!(STARTUP_PATCH_TEMPLATE.contains("appServerRuntimeOverrideTimeoutMs = 150_000"));
+    }
+
+    #[test]
+    fn runtime_override_timeouts_stay_retryable() {
+        let session = startup_debug_session_timeout();
+        let session_io = session
+            .downcast_ref::<std::io::Error>()
+            .expect("debug session timeout should stay an io timeout");
+        assert_eq!(session_io.kind(), std::io::ErrorKind::TimedOut);
+        assert!(session.to_string().contains("调试会话超时"));
+
+        let timed_out = app_server_runtime_override_confirmation_error(&serde_json::json!({
+            "exception": {
+                "description": format!("{APP_SERVER_RUNTIME_OVERRIDE_TIMEOUT_MARKER} 未观察到 app-server 启动调用")
+            }
+        }));
+        assert_eq!(
+            timed_out
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::TimedOut)
+        );
+
+        let incompatible = app_server_runtime_override_confirmation_error(&serde_json::json!({
+            "exception": { "description": "缺失：model_provider" }
+        }));
+        assert!(incompatible.downcast_ref::<std::io::Error>().is_none());
+        assert!(incompatible.to_string().contains("运行时覆盖校验失败"));
     }
 
     /// 状态字是 Rust 与 JS 两侧各自硬编码的跨语言契约：改了一边而忘了另一边，
@@ -1724,6 +1971,10 @@ mod tests {
         assert!(
             STARTUP_PATCH_TEMPLATE.contains(APP_SERVER_RUNTIME_OVERRIDES_DEGRADED_RESULT),
             "JS payload must return the degraded status the launcher accepts"
+        );
+        assert!(
+            STARTUP_PATCH_TEMPLATE.contains(APP_SERVER_RUNTIME_OVERRIDE_TIMEOUT_MARKER),
+            "JS payload must mark an unobserved app-server wait so the launcher can retry"
         );
     }
 
@@ -2404,6 +2655,37 @@ mod tests {
         assert!(!path_has_whitespace(&resolved));
         assert_eq!(std::fs::read_to_string(&resolved).unwrap(), "1");
         std::fs::remove_file(resolved).unwrap();
+    }
+
+    #[test]
+    fn failed_path_preparation_removes_the_unused_patch() {
+        let temp = tempfile::tempdir().unwrap();
+        let options = PatchOptions {
+            disable_pet: false,
+            subagent_gate_active: false,
+            misc_model: None,
+            workflow_proxy: None,
+        };
+        let failure = prepare_startup_require_with_path(temp.path(), options.clone(), &[], |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+        });
+        assert!(failure.is_err());
+        let invalid_argument =
+            prepare_startup_require_with_path(temp.path(), options.clone(), &[], |_| {
+                Ok(temp.path().join("missing patch.js"))
+            });
+        assert!(invalid_argument.is_err());
+        assert_eq!(
+            std::fs::read_dir(temp.path().join(STARTUP_REQUIRE_DIR))
+                .unwrap()
+                .count(),
+            0
+        );
+        let first = prepare_startup_require_in(temp.path(), options.clone(), &[]).unwrap();
+        let second = prepare_startup_require_in(temp.path(), options, &[]).unwrap();
+        assert_ne!(first.marker_path, second.marker_path);
+        assert!(first.marker_path.with_extension("js").is_file());
+        assert!(second.marker_path.with_extension("js").is_file());
     }
 
     #[test]

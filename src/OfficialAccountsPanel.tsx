@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { IconBrandOpenai, IconCheck, IconLogin2 as IconLogin, IconPlus, IconRefresh, IconSparkles, IconTrash } from "@tabler/icons-react";
+import { IconBrandOpenai, IconCheck, IconClipboard, IconLogin2 as IconLogin, IconPlus, IconRefresh, IconSparkles, IconTrash } from "@tabler/icons-react";
 
 import { invoke } from "./api";
 import { errorText } from "./appUtils";
 import { listOfficialAccounts, rememberOfficialAccounts } from "./officialAccountsRequests";
-import { Badge, Button, Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, Tooltip } from "./components/ui";
+import { Badge, Button, Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, TextArea, Tooltip } from "./components/ui";
 import { maskEmail } from "./sensitiveText";
 import type { Confirmation, OfficialAccount, OfficialAccountsResult } from "./App.types";
 import type { AccountUsageSnapshot } from "./quotaEstimate";
@@ -164,6 +164,8 @@ function UsageLine({ snapshot }: { snapshot: AccountUsageSnapshot | null }) {
 export type OfficialAccountsPanelProps = {
   officialAccountAvailable: boolean;
   isBusy: boolean;
+  /** 「线路与模型」菜单是否打开；关闭时不再获取官方额度与套餐数据。 */
+  active: boolean;
   maskSensitive?: boolean;
   popupContainer: HTMLElement | null;
   onAccountsLoaded?: (accounts: OfficialAccount[] | null) => void;
@@ -175,6 +177,7 @@ export type OfficialAccountsPanelProps = {
 export function OfficialAccountsPanel({
   officialAccountAvailable,
   isBusy,
+  active,
   maskSensitive = false,
   popupContainer,
   onAccountsLoaded,
@@ -190,6 +193,9 @@ export function OfficialAccountsPanel({
   const [login, setLogin] = useState<LoginStart | null>(null);
   const [loginError, setLoginError] = useState("");
   const [copied, setCopied] = useState(false);
+  const [manualOpen, setManualOpen] = useState(false);
+  const [manualInput, setManualInput] = useState("");
+  const [manualError, setManualError] = useState("");
   const loginRef = useRef<LoginStart | null>(null);
   loginRef.current = login;
 
@@ -260,11 +266,14 @@ export function OfficialAccountsPanel({
     }
   }, [refreshRoutes]);
 
-  // 额度轮询跟随账号 id 与失效状态：检测到失效后重读列表不会重启整轮查询，
-  // 避免同一批账号反复请求官方接口；账号重新添加恢复可用时轮询重新开始。
+  // 官方额度和套餐只在「线路与模型」菜单打开期间获取：每次打开都按当前账号
+  // 列表重取一遍（后端 60 秒缓存之外的请求会真的打到官方），菜单关闭后不再
+  // 后台轮询，账号卡片里的套餐也只在打开菜单时更新。查询跟随账号 id 与失效
+  // 状态，检测到失效后重读列表不会重启整轮查询。
   const accountListKey =
     accounts?.map((account) => `${account.id}:${account.invalid ? 1 : 0}`).join("\n") ?? "";
   useEffect(() => {
+    if (!active) return;
     const list = accountsRef.current;
     if (list.length === 0) return;
     let cancelled = false;
@@ -289,7 +298,7 @@ export function OfficialAccountsPanel({
     return () => {
       cancelled = true;
     };
-  }, [accountListKey, refreshUsage]);
+  }, [active, accountListKey, refreshUsage]);
 
   // Poll a pending login until the callback completes or the user closes it.
   useEffect(() => {
@@ -359,6 +368,43 @@ export function OfficialAccountsPanel({
     } catch {
       setCopied(false);
       onNotice({ tone: "info", text: "无法访问剪贴板，请手动复制登录链接" });
+    }
+  }
+
+  function openManual() {
+    setManualError("");
+    setManualInput("");
+    setManualOpen(true);
+  }
+
+  function closeManual() {
+    if (pending === "manual") return;
+    setManualOpen(false);
+    setManualInput("");
+    setManualError("");
+  }
+
+  async function submitManual() {
+    const credential = manualInput.trim();
+    if (!credential) {
+      setManualError("请粘贴 Refresh Token 或 OAuth JSON");
+      return;
+    }
+    setPending("manual");
+    setManualError("");
+    try {
+      const result = await invoke<OfficialAccountsResult>("import_official_account_credential", { credential });
+      applyResult(result);
+      setManualOpen(false);
+      setManualInput("");
+      onNotice({
+        tone: result.warning ? "info" : "success",
+        text: result.warning ? `账号已添加；${result.warning}` : "官方账号已添加",
+      });
+    } catch (error) {
+      setManualError(errorText(error));
+    } finally {
+      setPending(null);
     }
   }
 
@@ -467,6 +513,12 @@ export function OfficialAccountsPanel({
               <span>导入当前登录</span>
             </Button>
           </Tooltip>
+          <Tooltip content="粘贴 Refresh Token 或 OAuth JSON">
+            <Button variant="link" color="primary" size="xs" disabled={disabled} onClick={openManual}>
+              <IconClipboard size={13} aria-hidden="true" />
+              <span>手动输入</span>
+            </Button>
+          </Tooltip>
           <Button variant="brand-outline" size="xs" disabled={disabled} loading={pending === "login"} onClick={() => void startLogin()}>
             <IconPlus size={13} aria-hidden="true" />
             <span>添加账号</span>
@@ -483,7 +535,11 @@ export function OfficialAccountsPanel({
         <ul className="official-account-list">
           {accounts.map((account) => {
             const label = accountLabel(account);
-            const plan = formatPlan(account.planType);
+            // 账号记录里的套餐只反映添加账号时的登录信息。额度查询每次都带
+            // 官方当前的套餐，有它时以它为准，降级后才不会继续显示 Pro。
+            const snapshotPlan = usages[account.id]?.status === "ok" ? usages[account.id]?.planType : undefined;
+            const planType = snapshotPlan || account.planType;
+            const plan = formatPlan(planType);
             return (
               <li
                 key={account.id}
@@ -498,8 +554,8 @@ export function OfficialAccountsPanel({
                       <div className="official-account-line">
                         <strong title={label}>{label}</strong>
                         {plan && (
-                          <span className={planTagClass(account.planType)}>
-                            {account.planType?.toLowerCase() === "pro" ? (
+                          <span className={planTagClass(planType)}>
+                            {planType?.toLowerCase() === "pro" ? (
                               <IconSparkles size={11} stroke={2.2} className="official-account-plan-icon" aria-hidden="true" />
                             ) : null}
                             <span>{plan}</span>
@@ -589,6 +645,45 @@ export function OfficialAccountsPanel({
             ) : (
               <Button variant="secondary" size="sm" onClick={() => void closeLogin()}>取消</Button>
             )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={manualOpen} onOpenChange={(open) => { if (!open) closeManual(); }}>
+        <DialogContent
+          className="sm:w-[520px]"
+          container={popupContainer}
+          onEscapeKeyDown={(event) => { if (pending === "manual") event.preventDefault(); }}
+          onPointerDownOutside={(event) => { if (pending === "manual") event.preventDefault(); }}
+        >
+          <DialogHeader>
+            <DialogTitle>手动添加官方账号</DialogTitle>
+            <DialogDescription>
+              粘贴 Refresh Token，或包含 access_token 与 refresh_token 的 OAuth JSON。只含 Refresh Token 时会向官方换取登录；已含 access token 的 JSON 直接保存，不会轮换来源令牌。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="official-login-body">
+            <TextArea
+              aria-label="Refresh Token 或 OAuth JSON"
+              autoFocus
+              autoComplete="off"
+              className="min-h-[148px] resize-y font-mono text-xs leading-relaxed"
+              disabled={pending === "manual"}
+              placeholder="Refresh Token 或 OAuth JSON"
+              spellCheck={false}
+              value={manualInput}
+              onChange={(event) => {
+                setManualInput(event.target.value);
+                if (manualError) setManualError("");
+              }}
+            />
+            {manualError ? <small className="official-accounts-error">{manualError}</small> : null}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" size="sm" disabled={pending === "manual"} onClick={closeManual}>取消</Button>
+            <Button size="sm" disabled={disabled || manualInput.trim() === ""} loading={pending === "manual"} onClick={() => void submitManual()}>
+              添加
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

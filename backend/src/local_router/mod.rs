@@ -74,23 +74,35 @@ const MAX_CUSTOM_TOOL_BRIDGE_DESCRIPTION_BYTES: usize = 8 * 1024;
 const MAX_CUSTOM_TOOL_SOURCE_DESCRIPTION_BYTES: usize = 2 * 1024;
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 const MAX_CONCURRENT_REJECTIONS: usize = 4;
+// 句柄耗尽、对端提前中止等 accept 错误通常是暂时的；监听器一旦退出，Codex
+// 的所有请求都会被拒绝连接，所以只退避重试，关闭信号才结束监听。
+const ACCEPT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
+const ACCEPT_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 const REQUEST_BODY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const REQUEST_BODY_BUDGET_UNIT_BYTES: usize = 64 * 1024;
 // serde_json trees and protocol conversion buffers live alongside the encoded
 // request. Reserve a conservative multiple of the wire size so the semaphore
 // represents the request's working set instead of only its first Vec<u8>.
+// Once those copies are gone, the reservation shrinks to the single buffer
+// still retained, and drops after that buffer is handed to the connection.
 const REQUEST_MEMORY_BUDGET_MULTIPLIER: usize = 4;
 const REQUEST_BODY_BUDGET_PERMITS: usize =
     REQUEST_BODY_BUDGET_BYTES / REQUEST_BODY_BUDGET_UNIT_BYTES;
+// 上传结束就会交回名额。后来的请求最多等两秒，并且只在当时有空闲名额时占用，
+// 不会排在一个更大的请求后面。等不到就返回 503，连接不会被长时间占住。
+const REQUEST_BODY_BUDGET_WAIT: Duration = Duration::from_secs(2);
 const MAX_ROUTE_BINDINGS: usize = 4096;
 const MAX_UPSTREAM_WEBSOCKET_BACKOFFS: usize = 128;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-// 流式网关常把响应头留到首个 token。这个期限从请求体上传完成起算，不包含
-// 上传本身：同对话切换模型会重放整段历史，若从 send() 一开始计时，60 秒会在
-// 上游已经生成（网关侧首字约三十秒）之前用完。本地记成 504 后 Codex 收不到
-// 终态，界面就停在思考。正文到达后仍由空闲期限和总期限约束。
+// 流式网关常把响应头留到首个 token。60 秒只覆盖正文离开本机发送缓冲之后的
+// 首字等待。同对话切换模型会重放整段历史，HTTP/2 窗口和内核发送缓冲可以在
+// 网关收齐之前就把正文取走；若从取走起只等 60 秒，会在网关侧首字（高思考大约
+// 三十秒）之前用完。本地记成 504 后 Codex 收不到终态，界面就停在思考。
+// 仍在缓冲中的传输由 response_header_timeout 按正文大小加到这个期限上。
 const UPSTREAM_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
+// 正文被协议栈取走后，按这个上行速率估算它还要多久才到达网关。
+const BUFFERED_UPLOAD_BYTES_PER_SEC: u64 = 64 * 1024;
 // A non-streaming upstream may not send response headers until generation is
 // complete, so its header wait is also the model's total generation budget.
 const UPSTREAM_NON_STREAM_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -161,6 +173,7 @@ mod gemini_instructions;
 mod http;
 mod lifecycle;
 mod native_history;
+mod plugin_transport;
 mod request_log_tap;
 mod request_meta;
 mod resource_budget;
@@ -175,6 +188,7 @@ mod upstream_response;
 mod websocket;
 mod websocket_context;
 mod websocket_tls;
+mod xai;
 
 pub(crate) use adapt::*;
 pub(crate) use anthropic_request::*;
@@ -200,6 +214,7 @@ pub(crate) use upstream::*;
 pub(crate) use upstream_response::*;
 pub(crate) use websocket::*;
 pub(crate) use websocket_context::*;
+pub(crate) use xai::*;
 
 #[cfg(test)]
 #[path = "../local_router_bench.rs"]

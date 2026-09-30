@@ -7,9 +7,10 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use super::{
-    AppState, LaunchOfficialAccountStatus, current_model_state_async, error_log,
-    hot_reload_runtime_models, open_system_browser, prepare_routes_for_current_launch,
-    redacted_config, runtime_config_requires_restart, save_config_to_store,
+    AppState, LaunchOfficialAccountStatus, argument, current_model_state_async, error_log,
+    hot_reload_runtime_models, official_account_available_for_usage, open_system_browser,
+    optional_argument, prepare_routes_for_current_launch, query_official_account_usage,
+    redacted_config, runtime_config_requires_restart, save_config_to_store, string_argument,
 };
 use crate::codex_config::codex_home;
 use crate::config::{
@@ -19,6 +20,105 @@ use crate::official_accounts::{
     LoginPhase, OfficialAccountInvalid, OfficialAccountRecord, OfficialAccountStore,
     refresh_if_stale_cached, start_login,
 };
+
+pub(super) async fn invoke(
+    state: &Arc<AppState>,
+    command: &str,
+    args: &Value,
+) -> Result<Value, String> {
+    match command {
+        "query_official_account_usage" => match (
+            optional_argument::<bool>(args, "forceRefresh"),
+            optional_argument::<String>(args, "accountId"),
+        ) {
+            (Ok(force), Ok(account_id)) => {
+                Ok(query_official_account_usage(state, force.unwrap_or(false), account_id).await)
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        },
+        "store_official_account_usage" => match (
+            argument::<u64>(args, "authGeneration"),
+            argument::<crate::account_usage::AccountUsageSnapshot>(args, "snapshot"),
+        ) {
+            (Ok(generation), Ok(snapshot)) => {
+                if !official_account_available_for_usage(&*state.config.read().await) {
+                    Err("当前没有可用的官方账号".to_string())
+                } else {
+                    state
+                        .account_usage_cache
+                        .lock()
+                        .await
+                        .for_codex_home(codex_home())
+                        .store_displayed_snapshot(
+                            &crate::account_usage::codex_auth_path(codex_home()),
+                            generation,
+                            snapshot,
+                        )
+                        .map(|()| json!({"status": "ok"}))
+                        .map_err(|error| error.to_string())
+                }
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        },
+        "list_official_accounts" => list_official_accounts(state).await,
+        "refresh_official_account_routes" => {
+            refresh_official_route_after_account_change(state).await
+        }
+        "start_official_account_login" => start_official_account_login(state).await,
+        "poll_official_account_login" => match string_argument(args, "loginId") {
+            Ok(login_id) => poll_official_account_login(state, login_id).await,
+            Err(error) => Err(error),
+        },
+        "cancel_official_account_login" => match string_argument(args, "loginId") {
+            Ok(login_id) => cancel_official_account_login(state, login_id).await,
+            Err(error) => Err(error),
+        },
+        "import_current_codex_login" => import_current_codex_login(state).await,
+        "import_official_account_credential" => match string_argument(args, "credential") {
+            Ok(credential) => import_official_account_credential(state, credential).await,
+            Err(error) => Err(error),
+        },
+        "set_default_official_account" => match string_argument(args, "accountId") {
+            Ok(account_id) => set_default_official_account(state, account_id).await,
+            Err(error) => Err(error),
+        },
+        "remove_official_account" => match string_argument(args, "accountId") {
+            Ok(account_id) => remove_official_account(state, account_id).await,
+            Err(error) => Err(error),
+        },
+        "save_official_account_route_settings" => match (
+            string_argument(args, "accountId"),
+            optional_argument::<String>(args, "routeName"),
+            optional_argument::<String>(args, "routeShortName"),
+            optional_argument::<String>(args, "upstreamProxy"),
+            optional_argument::<String>(args, "baseUrl"),
+        ) {
+            (
+                Ok(account_id),
+                Ok(route_name),
+                Ok(route_short_name),
+                Ok(upstream_proxy),
+                Ok(base_url),
+            ) => {
+                save_official_account_route_settings(
+                    state,
+                    account_id,
+                    route_name.unwrap_or_default(),
+                    route_short_name.unwrap_or_default(),
+                    upstream_proxy.unwrap_or_default(),
+                    base_url.unwrap_or_default(),
+                )
+                .await
+            }
+            (Err(error), _, _, _, _)
+            | (_, Err(error), _, _, _)
+            | (_, _, Err(error), _, _)
+            | (_, _, _, Err(error), _)
+            | (_, _, _, _, Err(error)) => Err(error),
+        },
+        _ => Err(format!("未知 Codey API 命令：{command}")),
+    }
+}
 
 fn accounts_payload(store: &OfficialAccountStore) -> Result<Value, String> {
     let default_account_id = store
@@ -145,6 +245,20 @@ pub(super) async fn import_current_codex_login(state: &Arc<AppState>) -> Result<
         .map_err(|error| format!("读取 Codex 登录信息任务异常退出：{error}"))?
         .map_err(|error| format!("{error:#}"))?
         .ok_or_else(|| "当前 Codex 没有 ChatGPT 官方账号登录，无法导入".to_string())?;
+    let payload = add_account(state, record).await?;
+    Ok(merge(payload, json!({ "status": "ok" })))
+}
+
+pub(super) async fn import_official_account_credential(
+    state: &Arc<AppState>,
+    credential: String,
+) -> Result<Value, String> {
+    let record = crate::official_accounts::official_account_from_manual_input(
+        &state.http_client,
+        &credential,
+    )
+    .await
+    .map_err(|error| format!("{error:#}"))?;
     let payload = add_account(state, record).await?;
     Ok(merge(payload, json!({ "status": "ok" })))
 }

@@ -665,6 +665,7 @@ fn isolated_runtime_restores_live_disk_provider_to_resume_shim() {
     apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
             use_official_catalog: false,
@@ -775,6 +776,7 @@ fn local_router_accepts_a_codey_owned_resume_shim() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
             use_official_catalog: true,
@@ -825,6 +827,7 @@ fn isolated_runtime_config_creates_empty_codex_config_when_missing() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
             use_official_catalog: true,
@@ -965,6 +968,10 @@ fn runtime_guidance_keeps_writes_with_root_when_all_writable_roles_are_disabled(
         .get_mut(crate::config::SUBAGENT_ROLE_VISUAL_WORKER)
         .unwrap()
         .enabled = false;
+    configured
+        .get_mut(crate::config::SUBAGENT_ROLE_DEFAULT)
+        .unwrap()
+        .enabled = false;
     let runtime_roles = runtime_subagent_roles(
         Some(&configured),
         DEFAULT_SUBAGENT_MODEL,
@@ -1021,6 +1028,7 @@ fn runtime_guidance_upgrades_owned_defaults_without_overwriting_custom_sources()
     let path = temp.path().join("instructions.md");
     for (current, versions) in [
         (SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS),
+        (CODEY_FASTCTX_GUIDANCE, CODEY_FASTCTX_GUIDANCE_VERSIONS),
         (
             ROOT_AGENT_COLLABORATION_USAGE_HINT,
             ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS,
@@ -1044,6 +1052,90 @@ fn runtime_guidance_upgrades_owned_defaults_without_overwriting_custom_sources()
             assert_eq!(fs::read_to_string(&path).unwrap(), customized);
         }
     }
+}
+
+#[test]
+fn isolated_prompt_sources_migrate_historical_defaults_and_preserve_user_guidance() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut sources = Vec::new();
+    for (name, current, versions) in [
+        ("root.md", SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS),
+        (
+            "fastctx.md",
+            CODEY_FASTCTX_GUIDANCE,
+            CODEY_FASTCTX_GUIDANCE_VERSIONS,
+        ),
+        (
+            "collaboration.md",
+            ROOT_AGENT_COLLABORATION_USAGE_HINT,
+            ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS,
+        ),
+    ] {
+        let path = temp.path().join(name);
+        fs::write(&path, versions.last().unwrap()).unwrap();
+        sources.push(read_or_create_versioned_constraint_file(&path, current, versions).unwrap());
+    }
+    let mut document = parse_document(
+        r#"[features.multi_agent_v2]
+enabled = true
+"#,
+    )
+    .unwrap();
+    document["developer_instructions"] = value(format!(
+        "User root guidance.\n\n{}\n\n{}",
+        SUBAGENT_GUIDANCE_VERSIONS.last().unwrap(),
+        CODEY_FASTCTX_GUIDANCE_VERSIONS[1..].join("\n\n"),
+    ));
+    document["features"]["multi_agent_v2"]["subagent_developer_instructions"] = value(format!(
+        "User child guidance.\n\n{}",
+        CODEY_FASTCTX_GUIDANCE_VERSIONS[1..].join("\n\n"),
+    ));
+    document["features"]["multi_agent_v2"]["root_agent_usage_hint_text"] = value(format!(
+        "User collaboration policy.\n\n{}",
+        ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS[1..].join("\n\n"),
+    ));
+    apply_isolated_prompt_sources(
+        &mut document,
+        Some(&sources[0]),
+        Some(&sources[1]),
+        Some(&sources[2]),
+    )
+    .unwrap();
+    let first = document_string(&document).unwrap();
+    let root = document["developer_instructions"].as_str().unwrap();
+    assert!(root.contains("User root guidance."));
+    assert_eq!(root.matches(SUBAGENT_GUIDANCE.trim()).count(), 1);
+    assert_eq!(root.matches(CODEY_FASTCTX_GUIDANCE).count(), 1);
+    let child = document["features"]["multi_agent_v2"]["subagent_developer_instructions"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        child,
+        format!("User child guidance.\n\n{CODEY_FASTCTX_GUIDANCE}")
+    );
+    let collaboration = document["features"]["multi_agent_v2"]["root_agent_usage_hint_text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        collaboration,
+        format!("User collaboration policy.\n\n{ROOT_AGENT_COLLABORATION_USAGE_HINT}")
+    );
+    for stale in [
+        "CODEY_DELEGATION_V2",
+        "resolve_batch",
+        "成本点预算",
+        "filter_mode=project",
+    ] {
+        assert!(!first.contains(stale), "{stale}");
+    }
+    apply_isolated_prompt_sources(
+        &mut document,
+        Some(&sources[0]),
+        Some(&sources[1]),
+        Some(&sources[2]),
+    )
+    .unwrap();
+    assert_eq!(document_string(&document).unwrap(), first);
 }
 
 #[test]
@@ -1077,6 +1169,14 @@ fn runtime_read_only_agents_are_explicitly_told_not_to_call_write_tools() {
         .unwrap();
     let worker = String::from_utf8(worker.contents.clone()).unwrap();
     assert!(!worker.contains(READ_ONLY_AGENT_WRITE_GUARD));
+
+    let default_agent = plans
+        .iter()
+        .find(|plan| plan.registration.role == crate::config::SUBAGENT_ROLE_DEFAULT)
+        .unwrap();
+    let default_agent = String::from_utf8(default_agent.contents.clone()).unwrap();
+    assert!(!default_agent.contains(READ_ONLY_AGENT_WRITE_GUARD));
+    assert!(default_agent.contains("sandbox_mode = \"workspace-write\""));
 }
 
 #[test]
@@ -1187,6 +1287,7 @@ fn native_runtime_forwards_user_catalog_with_the_same_resolved_path() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            model_contexts: None,
             stream_max_retries: 5,
             local_router: None,
             use_official_catalog: false,
@@ -1211,7 +1312,7 @@ fn native_runtime_forwards_user_catalog_with_the_same_resolved_path() {
     assert_eq!(resolved, home.join("models/custom.json"));
     assert_eq!(
         Some(resolved),
-        runtime_model_catalog_path(&home, false).unwrap()
+        runtime_model_catalog_path(&home, false, None).unwrap()
     );
     assert_eq!(
         fs::read_to_string(home.join("config.toml")).unwrap(),
@@ -1230,6 +1331,7 @@ fn native_isolated_runtime_does_not_create_a_missing_codex_config() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            model_contexts: None,
             stream_max_retries: 5,
             local_router: None,
             use_official_catalog: false,
@@ -1256,6 +1358,88 @@ fn native_isolated_runtime_does_not_create_a_missing_codex_config() {
 }
 
 #[test]
+fn runtime_context_overlay_uses_user_catalog_and_reset_restores_its_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    fs::create_dir_all(home.join("models")).unwrap();
+    let config = b"model_catalog_json = 'models/custom.json'\n";
+    fs::write(home.join("config.toml"), config).unwrap();
+    let source = home.join("models/custom.json");
+    let mut catalog = codey_runtime_core::model_suffix::bundled_model_catalog().unwrap();
+    let model = catalog["models"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|model| model["slug"] == "gpt-5.6-sol")
+        .unwrap();
+    model["context_window"] = serde_json::json!(1000000);
+    model["base_instructions"] = serde_json::json!("User instructions");
+    let original = serde_json::to_vec(&catalog).unwrap();
+    fs::write(&source, &original).unwrap();
+    let policies = BTreeMap::from([(
+        "gpt-5.6-sol".into(),
+        crate::config::ModelContextConfig {
+            context_window_tokens: 128_000,
+            auto_compact_token_limit: Some(100_000),
+            reserve_output_tokens: Some(16_000),
+        },
+    )]);
+    let empty = BTreeMap::new();
+    let marker = temp.path().join("state/lease.json");
+    let backup_root = temp.path().join("state/backups");
+    for (router, contexts) in [(true, &policies), (true, &empty), (false, &policies)] {
+        let applied = apply_isolated_runtime_router_config(
+            &home,
+            RouterApplyOptions {
+                local_router: router.then(test_runtime_router_endpoint),
+                use_official_catalog: router,
+                model_contexts: Some(contexts),
+                stream_max_retries: 5,
+                default_model: None,
+                fastctx_command: None,
+                subagent_optimization: false,
+                subagent_model: DEFAULT_SUBAGENT_MODEL,
+                subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+                subagent_roles: None,
+                marker: &marker,
+                backup_root: &backup_root,
+            },
+        )
+        .unwrap();
+        let argument = applied
+            .runtime_config_overrides
+            .iter()
+            .find(|entry| entry.starts_with("model_catalog_json="))
+            .unwrap();
+        let document = parse_document(argument).unwrap();
+        let path = PathBuf::from(document["model_catalog_json"].as_str().unwrap());
+        if router && !contexts.is_empty() {
+            assert_ne!(path, source);
+            assert_eq!(
+                Some(path.clone()),
+                runtime_model_catalog_path(&home, true, Some(contexts)).unwrap()
+            );
+            let projected: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let actual = projected["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["slug"] == "gpt-5.6-sol")
+                .unwrap();
+            assert_eq!(actual["context_window"], 128_000);
+            assert_eq!(actual["auto_compact_token_limit"], 100_000);
+            assert_eq!(actual["base_instructions"], "User instructions");
+        } else {
+            assert_eq!(path, source);
+        }
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert_eq!(fs::read(home.join("config.toml")).unwrap(), config);
+        restore_runtime_config_at(&home, &marker, false).unwrap();
+    }
+}
+
+#[test]
 fn isolated_runtime_skips_retry_overrides_for_builtin_providers() {
     // Codex 禁止在 `model_providers` 下覆盖内置 Provider，路由关闭时必须跳过
     // 这条覆盖，否则 app-server 在加载配置阶段就会退出。
@@ -1276,6 +1460,7 @@ fn isolated_runtime_skips_retry_overrides_for_builtin_providers() {
         let applied = apply_isolated_runtime_router_config(
             &home,
             RouterApplyOptions {
+                model_contexts: None,
                 stream_max_retries: 7,
                 local_router: None,
                 use_official_catalog: false,
@@ -1321,6 +1506,7 @@ fn isolated_runtime_keeps_retry_overrides_for_custom_providers() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            model_contexts: None,
             stream_max_retries: 7,
             local_router: None,
             use_official_catalog: false,
@@ -1376,6 +1562,7 @@ fn isolated_runtime_preserves_computer_use_without_adding_an_mcp() {
             let applied = apply_isolated_runtime_router_config(
                 &home,
                 RouterApplyOptions {
+                    model_contexts: None,
                     stream_max_retries: 5,
                     local_router,
                     use_official_catalog: false,
@@ -1427,6 +1614,7 @@ wire_api = "responses"
     apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            model_contexts: None,
             stream_max_retries: 5,
             local_router: None,
             use_official_catalog: false,
@@ -2753,6 +2941,7 @@ experimental_bearer_token = "upstream-secret-token"
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
             use_official_catalog: true,
@@ -2837,6 +3026,7 @@ fn official_login_uses_the_websocket_router_without_overriding_builtin_openai() 
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
             use_official_catalog: true,
@@ -2886,6 +3076,7 @@ wire_api = "responses"
     let error = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
             use_official_catalog: true,

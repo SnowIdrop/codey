@@ -156,6 +156,7 @@ async fn custom_context_cold_start_can_retry_after_restoring_defaults() {
         error.to_string(),
         model_catalog::CUSTOM_CONTEXT_CATALOG_UNAVAILABLE
     );
+    assert!(error.is::<model_catalog::ContextBudgetCatalogError>());
     config.model_context_by_provider.clear();
     let startup =
         prepare_startup_model_catalog(&config, &config.profiles[0], home.path(), home.path())
@@ -232,6 +233,15 @@ async fn disabled_official_route_does_not_install_an_empty_model_catalog() {
         assert!(!startup.use_official_catalog);
         assert!(startup.model_state.third_party_models.is_empty());
     }
+}
+
+#[test]
+fn empty_default_route_can_start_without_an_api_url() {
+    let config = CodeyConfig::default();
+    let startup = resolve_startup_profile(&config).unwrap();
+    assert!(startup.is_unconfigured_default());
+    assert!(startup.enabled);
+    assert!(startup.validate().is_err());
 }
 
 #[tokio::test]
@@ -909,8 +919,10 @@ async fn runtime_stop_preserves_resources_on_failure_and_allows_retry() {
             performance_detail: String::new(),
             startup_injection_mode: String::new(),
         },
-        applied_model_config: RwLock::new(config.clone()),
-        applied_subagent_config: RwLock::new(RuntimeSubagentConfig::from_config(&config)),
+        applied_model_config: RwLock::new(AppliedModelConfig::new(config.clone())),
+        applied_subagent_config: RwLock::new(std::sync::Arc::new(
+            RuntimeSubagentConfig::from_config(&config),
+        )),
         subagent_route_catalog_installed: false,
         applied_config: config,
         injection_statuses: Arc::new(RwLock::new(Arc::from([]))),

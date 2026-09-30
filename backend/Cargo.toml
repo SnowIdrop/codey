@@ -47,7 +47,7 @@ rusqlite = { workspace = true, features = ["hooks"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 semver = "1"
 serde.workspace = true
-serde_json = { workspace = true, features = ["raw_value"] }
+serde_json = { workspace = true, features = ["preserve_order", "raw_value"] }
 sha2.workspace = true
 socket2 = { version = "0.6.5", features = ["all"] }
 tokio = { workspace = true, features = ["io-std", "io-util", "net", "signal", "sync"] }
@@ -74,6 +74,7 @@ winres = "0.1"
 rfd = { version = "0.15", default-features = false, features = ["common-controls-v6"] }
 windows = { version = "0.58", default-features = false, features = [
   "Win32_Foundation",
+  "Win32_Globalization",
   "Win32_Security",
   "Win32_Graphics_Gdi",
   "Win32_Storage_FileSystem",

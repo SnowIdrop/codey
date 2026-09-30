@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
@@ -18,7 +19,9 @@ use super::{
 };
 use crate::codex_config::codex_home;
 use crate::error_log;
-use crate::launcher::{CodeyRuntime, restore_previous_runtime_state};
+use crate::launcher::{
+    CodeyRuntime, prepare_persistent_router_resume_shim, restore_previous_runtime_state,
+};
 
 const CODEX_APP_VERSION_CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -257,10 +260,14 @@ async fn codex_app_version_for_status(
 
 fn ensure_runtime_can_start(state: &AppState) -> Result<(), String> {
     if state.is_shutting_down() {
-        Err("Codey 正在退出，无法启动 Codex".to_string())
-    } else {
-        Ok(())
+        return Err("Codey 正在退出，无法启动 Codex".to_string());
     }
+    // 平台限制原来要等 Codex 被停掉、本地路由起来之后才发现。这里直接拒绝，
+    // 避免为一次必然失败的启动改写用户的 config.toml。
+    if !crate::codex_config::runtime_router_platform_supported() {
+        return Err(crate::codex_config::unsupported_runtime_platform_message().to_string());
+    }
+    Ok(())
 }
 
 async fn reclaim_initial_session_scan(
@@ -297,20 +304,41 @@ async fn forward_codex_exit_to_codey_shutdown(
     }
 }
 
-async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, String> {
-    ensure_runtime_can_start(state)?;
+async fn launch_codey_inner_locked(state: &Arc<AppState>) -> anyhow::Result<Value> {
+    ensure_runtime_can_start(state).map_err(anyhow::Error::msg)?;
     if state.runtime.lock().await.is_some() {
         return Ok(json!({"status":"already_running"}));
     }
     #[cfg(windows)]
-    ensure_windows_codex_app_path(state).await?;
+    ensure_windows_codex_app_path(state)
+        .await
+        .map_err(anyhow::Error::msg)?;
     stop_waiting_webhook_watcher(state).await;
     let local_router_enabled = state.config.read().await.local_router_enabled;
     restore_previous_runtime_state(codex_home(), local_router_enabled)
         .await
-        .map_err(|error| format!("恢复上次 Codey 临时 Codex 配置失败：{error}"))?;
+        .context("恢复上次 Codey 临时 Codex 配置失败")?;
+    // 恢复会拿掉上次崩溃留下的运行时表。兼容桩要在这之后写回，Codex
+    // 才能在 Codey 没起来时打开旧会话；内容没变时不会再写盘。
+    if local_router_enabled
+        && let Err(error) = prepare_persistent_router_resume_shim(codex_home()).await
+    {
+        error_log::record_failure_with_metadata(
+            "patch_failed",
+            "prepare_persistent_router_resume_shim_at_startup",
+            format!("{error:#}"),
+            error_log::FailureMetadata {
+                stage: Some("startup.prepare_router_resume_shim".to_string()),
+                recoverable: Some(true),
+            },
+            json!({}),
+        );
+        eprintln!("Codey 启动前写入 codey_router 恢复兼容桩失败：{error:#}");
+    }
     let launch_started = std::time::Instant::now();
-    prepare_routes_for_current_launch(state).await?;
+    prepare_routes_for_current_launch(state)
+        .await
+        .map_err(anyhow::Error::msg)?;
     let routes_ms = launch_started.elapsed().as_millis() as u64;
     let imported_default_route = super::ensure_default_route_imported(state).await;
     let config = sync_provider_models_for_launch(state, imported_default_route).await;
@@ -332,7 +360,7 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, Strin
     };
     if let Err(error) = ensure_runtime_can_start(state) {
         reclaim_initial_session_scan(state, initial_scan_task).await;
-        return Err(error);
+        return Err(anyhow::Error::msg(error));
     }
     let handler = make_bridge_handler(state);
     let workflow_config = config.clone();
@@ -341,7 +369,7 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, Strin
         crate::workflow::WorkflowHost::from_config(&workflow_config, &workflow_path)
     })
     .await
-    .map_err(|error| format!("初始化工作流运行时失败：{error}"))?;
+    .map_err(|error| anyhow::anyhow!("初始化工作流运行时失败：{error}"))?;
     state.workflow.store(Arc::clone(&workflow));
     let (runtime, codex_exit) = match CodeyRuntime::start(
         &config,
@@ -356,16 +384,16 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, Strin
         Ok(started) => started,
         Err(error) => {
             reclaim_initial_session_scan(state, initial_scan_task).await;
-            return Err(error.to_string());
+            return Err(error);
         }
     };
     if state.is_shutting_down() {
         let stop_error = runtime.stop().await.err();
         reclaim_initial_session_scan(state, initial_scan_task).await;
-        return Err(stop_error.map_or_else(
+        return Err(anyhow::Error::msg(stop_error.map_or_else(
             || "Codey 已进入退出流程，已取消本次 Codex 启动".to_string(),
             |error| format!("Codey 已进入退出流程，停止刚启动的 Codex 失败：{error}"),
-        ));
+        )));
     }
     *state.runtime.lock().await = Some(Arc::new(runtime));
     workflow.recover_when_ready().await;
@@ -383,28 +411,26 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, Strin
     Ok(json!({"status":"running"}))
 }
 
-pub(super) async fn launch_codey_inner(state: &Arc<AppState>) -> Result<Value, String> {
-    ensure_runtime_can_start(state)?;
+pub(super) async fn launch_codey_inner(state: &Arc<AppState>) -> anyhow::Result<Value> {
+    ensure_runtime_can_start(state).map_err(anyhow::Error::msg)?;
     let _operation = state.runtime_operation.lock().await;
-    ensure_runtime_can_start(state)?;
     launch_codey_inner_locked(state).await
 }
 
-pub async fn launch_codey_runtime(state: &Arc<AppState>) -> Result<Value, String> {
+pub async fn launch_codey_runtime(state: &Arc<AppState>) -> anyhow::Result<Value> {
     let result = launch_codey_inner(state).await;
-    *state.startup_error.write().await = result.as_ref().err().cloned();
+    *state.startup_error.write().await = result.as_ref().err().map(|error| format!("{error:#}"));
     if let Err(error) = &result {
+        let message = format!("{error:#}");
         error_log::record_failure_with_metadata(
             "runtime_start_failed",
             "launch_codey_runtime",
-            error.clone(),
+            message.clone(),
             error_log::FailureMetadata {
                 stage: Some("startup.runtime".to_string()),
-                recoverable: Some(
-                    error == crate::model_catalog::CUSTOM_CONTEXT_CATALOG_UNAVAILABLE,
-                ),
+                recoverable: Some(error.is::<crate::model_catalog::ContextBudgetCatalogError>()),
             },
-            runtime_start_failure_context(state, false, error).await,
+            runtime_start_failure_context(state, false, &message).await,
         );
     }
     result
@@ -516,12 +542,11 @@ async fn run_scheduled_restart(restart_state: Arc<AppState>, mut cancel: oneshot
     let mut launch = launch_codey_inner_locked(&restart_state).await;
     // 自定义上下文预算缺少可用的运行时模型目录时，重启同样无法完成。
     // 征询用户后清空预算并重试一次，避免仅因为预算问题关闭整个 Codey。
-    if launch
-        .as_ref()
-        .err()
-        .is_some_and(|error| error == crate::model_catalog::CUSTOM_CONTEXT_CATALOG_UNAVAILABLE)
+    if let Err(error) = &launch
+        && error.is::<crate::model_catalog::ContextBudgetCatalogError>()
     {
-        match super::recover_default_context_budgets_for_launch(&restart_state).await {
+        let reason = format!("{error:#}");
+        match super::recover_default_context_budgets_for_launch(&restart_state, &reason).await {
             Ok(true) => {
                 if restart_state.is_shutting_down() {
                     return;
@@ -540,17 +565,20 @@ async fn run_scheduled_restart(restart_state: Arc<AppState>, mut cancel: oneshot
             }
         }
     }
-    *restart_state.startup_error.write().await = launch.as_ref().err().cloned();
+    *restart_state.startup_error.write().await =
+        launch.as_ref().err().map(|error| format!("{error:#}"));
     let Err(error) = launch else {
         return;
     };
+    let context_recovery = error.is::<crate::model_catalog::ContextBudgetCatalogError>();
+    let error = format!("{error:#}");
     error_log::record_failure_with_metadata(
         "runtime_restart_failed",
         "launch_runtime_after_restart",
         error.clone(),
         error_log::FailureMetadata {
             stage: Some("startup.runtime".to_string()),
-            recoverable: Some(error == crate::model_catalog::CUSTOM_CONTEXT_CATALOG_UNAVAILABLE),
+            recoverable: Some(context_recovery),
         },
         runtime_start_failure_context(&restart_state, true, &error).await,
     );

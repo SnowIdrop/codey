@@ -1,6 +1,11 @@
 //! Codey 原生插件平台。安装不执行代码，用户显式启用后加载可信动态库。
 pub mod lifecycle;
 mod logs;
+mod provider;
+pub(crate) mod transport;
+
+#[allow(unused_imports)]
+pub(crate) use provider::{PluginRouteSpec, RouteChange, set_route_handler};
 mod native;
 mod package;
 
@@ -58,6 +63,7 @@ where
     T::deserialize(deserializer).map(Some)
 }
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -77,6 +83,9 @@ struct Record {
     directory: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     load_error: Option<String>,
+    /// 最近一次由这个插件登记的线路。用户删掉线路后，启动时不再补回，直到再次启用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    route_profile_id: Option<String>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -126,6 +135,8 @@ struct Manager {
     live: BTreeMap<String, Active>,
     errors: BTreeMap<String, String>,
     stopping: bool,
+    /// 正在执行原生初始化的插件。此期间拒绝同一插件的安装、停用、卸载和配置保存。
+    loading: HashSet<String>,
     generations: BTreeMap<String, Vec<Weak<()>>>,
 }
 
@@ -135,6 +146,15 @@ struct Active {
     manifest: Manifest,
     config: Value,
     lifecycle: Arc<lifecycle::LifecyclePlugin>,
+}
+
+struct PreparedLoad {
+    id: String,
+    directory: String,
+    manifest: Manifest,
+    config: Value,
+    library_path: PathBuf,
+    context: codey_plugin_sdk::PluginContext,
 }
 
 static MANAGER: OnceLock<Mutex<Manager>> = OnceLock::new();
@@ -149,7 +169,11 @@ pub fn initialize(root: PathBuf) -> Result<(), String> {
         };
     }
     let mut manager = Manager::open(root)?;
-    manager.load_enabled()?;
+    if let Err(error) = manager.load_enabled() {
+        manager.stopping = true;
+        manager.update_fast_path();
+        return Err(error);
+    }
     manager.update_fast_path();
     MANAGER
         .set(Mutex::new(manager))
@@ -209,6 +233,51 @@ pub fn install(path: &Path, sha256: &str) -> Result<PluginList, String> {
 }
 
 pub fn set_enabled(id: &str, enabled: bool) -> Result<PluginList, String> {
+    if enabled {
+        enable_plugin(id)
+    } else {
+        disable_plugin(id)
+    }
+}
+
+/// 一次启用的占位。只在不再持有管理锁时析构；锁损坏时仍能清除占位，
+/// 避免插件一直处于「正在启用」。提前 release 后不会清掉后来的另一次启用。
+struct LoadingReservation {
+    id: String,
+    armed: bool,
+}
+
+impl LoadingReservation {
+    fn release(&mut self, manager: &mut Manager) {
+        if self.armed {
+            manager.loading.remove(&self.id);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for LoadingReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            clear_loading_reservation(&self.id);
+        }
+    }
+}
+
+fn clear_loading_reservation(id: &str) {
+    if let Some(mutex) = MANAGER.get() {
+        clear_loading_in(mutex, id);
+    }
+}
+
+fn clear_loading_in(mutex: &Mutex<Manager>, id: &str) {
+    let mut manager = mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    manager.loading.remove(id);
+}
+
+fn disable_plugin(id: &str) -> Result<PluginList, String> {
     let mut manager = manager()?;
     if manager.stopping {
         return Err("插件管理器正在关闭".into());
@@ -216,45 +285,223 @@ pub fn set_enabled(id: &str, enabled: bool) -> Result<PluginList, String> {
     if !manager.state.plugins.contains_key(id) {
         return Err("插件未安装".into());
     }
-    if enabled {
-        // Only an explicit enable action or previously persisted consent reaches this branch.
-        let was_loaded = manager.live.contains_key(id);
-        if !was_loaded && let Err(e) = manager.load(id) {
-            manager.log_event(id, "enable_failed");
-            manager.errors.insert(id.to_owned(), e.clone());
-            return Err(e);
-        }
-        let mut state = manager.state.clone();
-        state.plugins.get_mut(id).unwrap().enabled = true;
-        state.plugins.get_mut(id).unwrap().load_error = None;
-        if let Err(e) = manager.commit(state) {
-            let rolled_back = if was_loaded {
-                None
-            } else {
-                manager.live.remove(id)
-            };
-            // 插件原生 destroy 不能在全局管理锁内执行：慢插件会卡住全部插件管理与
-            // 请求回调，与 disable 分支保持一致。
-            drop(manager);
-            drop(rolled_back);
-            return Err(e);
-        }
-        manager.errors.remove(id);
-        manager.log_event(id, "enabled");
-    } else {
-        let mut state = manager.state.clone();
-        state.plugins.get_mut(id).unwrap().enabled = false;
-        state.plugins.get_mut(id).unwrap().load_error = None;
-        manager.commit(state)?;
-        let old = manager.live.remove(id);
-        manager.errors.remove(id);
-        manager.log_event(id, "disabled");
-        manager.update_fast_path();
-        let result = manager.list();
-        drop(manager);
-        drop(old); // In-flight Arc references finish before destroy runs.
-        return Ok(result);
+    manager.reject_if_loading(id)?;
+    let mut state = manager.state.clone();
+    state.plugins.get_mut(id).unwrap().enabled = false;
+    state.plugins.get_mut(id).unwrap().load_error = None;
+    state.plugins.get_mut(id).unwrap().route_profile_id = None;
+    manager.commit(state)?;
+    let old = manager.live.remove(id);
+    manager.errors.remove(id);
+    manager.log_event(id, "disabled");
+    manager.update_fast_path();
+    // 线路释放完成前禁止重新启用，防止旧操作删除新实例刚登记的线路。
+    manager.loading.insert(id.to_owned());
+    let mut reservation = LoadingReservation {
+        id: id.to_owned(),
+        armed: true,
+    };
+    drop(manager);
+    drop(old); // In-flight Arc references finish before destroy runs.
+    let released = provider::release_route(id);
+    let mut guard = self::manager()?;
+    reservation.release(&mut guard);
+    released?;
+    Ok(guard.list())
+}
+
+fn enable_plugin(id: &str) -> Result<PluginList, String> {
+    match reserve_enable(id)? {
+        // 已加载实例只更新同意状态，不重复执行原生初始化。
+        EnableStart::AlreadyLive(guard) => commit_enabled(guard, id, false),
+        EnableStart::Reserved(reservation) => finish_enable(id, reservation),
     }
+}
+
+enum EnableStart {
+    AlreadyLive(std::sync::MutexGuard<'static, Manager>),
+    Reserved(LoadingReservation),
+}
+
+fn reserve_enable(id: &str) -> Result<EnableStart, String> {
+    let mut guard = manager()?;
+    if guard.stopping {
+        return Err("插件管理器正在关闭".into());
+    }
+    if !guard.state.plugins.contains_key(id) {
+        return Err("插件未安装".into());
+    }
+    guard.reject_if_loading(id)?;
+    if guard.live.contains_key(id) {
+        return Ok(EnableStart::AlreadyLive(guard));
+    }
+    let reserved_id = id.to_owned();
+    guard.loading.insert(reserved_id.clone());
+    // 这次尝试取代上一次失败留下的错误，避免启用过程中仍显示旧故障。
+    guard.errors.remove(&reserved_id);
+    drop(guard);
+    Ok(EnableStart::Reserved(LoadingReservation {
+        id: reserved_id,
+        armed: true,
+    }))
+}
+
+fn finish_enable(id: &str, mut reservation: LoadingReservation) -> Result<PluginList, String> {
+    let prepared = {
+        let mut guard = manager()?;
+        match guard.prepare_load(id) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                guard.note_enable_failure(id, &error);
+                reservation.release(&mut guard);
+                return Err(error);
+            }
+        }
+    };
+    // 原生 create 与 destroy 一样不能占着管理锁：慢初始化会挡住其他插件的启停和列表。
+    let mut native = match Native::load(
+        &prepared.library_path,
+        prepared.config.clone(),
+        prepared.context.clone(),
+    ) {
+        Ok(native) => native,
+        Err(error) => {
+            if let Ok(mut guard) = manager() {
+                guard.note_enable_failure(id, &error);
+                reservation.release(&mut guard);
+            }
+            return Err(error);
+        }
+    };
+    let route = match provider::describe_if_declared(&prepared.manifest, &mut native) {
+        Ok(route) => route,
+        Err(error) => {
+            if let Ok(mut guard) = manager() {
+                guard.note_enable_failure(id, &error);
+                reservation.release(&mut guard);
+            }
+            return Err(error);
+        }
+    };
+    let mut guard = match manager() {
+        Ok(guard) => guard,
+        Err(error) => {
+            drop(native);
+            return Err(error);
+        }
+    };
+    if guard.stopping || !guard.state.plugins.contains_key(id) {
+        let error = if guard.stopping {
+            "插件管理器正在关闭"
+        } else {
+            "插件未安装"
+        };
+        if !guard.stopping {
+            guard.note_enable_failure(id, error);
+        }
+        reservation.release(&mut guard);
+        drop(guard);
+        drop(native);
+        return Err(error.into());
+    }
+    if let Err(error) = guard.activation_matches(&prepared) {
+        guard.note_enable_failure(id, &error);
+        reservation.release(&mut guard);
+        drop(guard);
+        drop(native);
+        return Err(error);
+    }
+    if guard.live.contains_key(id) {
+        reservation.release(&mut guard);
+        drop(guard);
+        drop(native);
+        return Err("插件正在启用，请稍后重试".into());
+    }
+    if let Err((native, error)) = guard.publish_prepared(&prepared, native) {
+        guard.note_enable_failure(id, &error);
+        reservation.release(&mut guard);
+        drop(guard);
+        drop(native);
+        return Err(error);
+    }
+    // 保留占位直到线路登记结束，避免旧配置被发布到新一代实例。
+    commit_enabled(guard, id, true)?;
+    if let Some(spec) = route
+        && let Err(error) = publish_enabled_route(id, spec, true)
+    {
+        if let Ok(mut guard) = manager() {
+            reservation.release(&mut guard);
+        }
+        let _ = disable_plugin(id);
+        if let Ok(mut guard) = manager() {
+            guard.note_enable_failure(id, &error);
+        }
+        return Err(error);
+    }
+    let mut guard = manager()?;
+    reservation.release(&mut guard);
+    Ok(guard.list())
+}
+
+fn publish_enabled_route(
+    id: &str,
+    spec: provider::PluginRouteSpec,
+    create_if_missing: bool,
+) -> Result<(), String> {
+    let route_id = provider::publish_route(id, spec, create_if_missing)?;
+    let mut guard = manager()?;
+    if guard.stopping
+        || !guard
+            .state
+            .plugins
+            .get(id)
+            .is_some_and(|record| record.enabled)
+    {
+        drop(guard);
+        provider::release_route(id)?;
+        return Err("插件已停用".into());
+    }
+    if route_id.is_none() {
+        return Ok(());
+    }
+    let mut state = guard.state.clone();
+    if let Some(record) = state.plugins.get_mut(id) {
+        record.route_profile_id = route_id;
+    }
+    guard.commit(state)
+}
+
+fn commit_enabled(
+    mut manager: std::sync::MutexGuard<'static, Manager>,
+    id: &str,
+    rollback_live: bool,
+) -> Result<PluginList, String> {
+    let mut state = manager.state.clone();
+    let Some(record) = state.plugins.get_mut(id) else {
+        let rolled_back = if rollback_live {
+            manager.live.remove(id)
+        } else {
+            None
+        };
+        drop(manager);
+        drop(rolled_back);
+        return Err("插件未安装".into());
+    };
+    record.enabled = true;
+    record.load_error = None;
+    if let Err(error) = manager.commit(state) {
+        let rolled_back = if rollback_live {
+            manager.live.remove(id)
+        } else {
+            None
+        };
+        // 插件原生 destroy 不能在全局管理锁内执行：慢插件会卡住全部插件管理。
+        drop(manager);
+        drop(rolled_back);
+        return Err(error);
+    }
+    manager.errors.remove(id);
+    manager.log_event(id, "enabled");
     manager.update_fast_path();
     Ok(manager.list())
 }
@@ -273,12 +520,25 @@ pub fn uninstall(id: &str, remove_data: bool) -> Result<PluginList, String> {
     if !package::valid_id(id) {
         return Err("插件 ID 无效".into());
     }
-    let mut manager = manager()?;
-    manager.uninstall(id, remove_data)?;
-    Ok(manager.list())
+    let list = {
+        let mut manager = manager()?;
+        manager.uninstall(id, remove_data)?;
+        manager.list()
+    };
+    provider::release_route(id)?;
+    Ok(list)
 }
 
 pub fn invoke(id: &str, method: &str, params: Value) -> Result<Value, String> {
+    if codey_plugin_sdk::transport::is_reserved(method) {
+        return Err("该方法只允许宿主请求传输调用".into());
+    }
+    if codey_plugin_sdk::lifecycle::HOST_METHODS.contains(&method) {
+        return Err("该方法由宿主在请求生命周期中调用，不能通过管理接口调用".into());
+    }
+    if method == provider::DESCRIBE_METHOD {
+        return Err("该方法由宿主在启用插件时调用，不能通过管理接口调用".into());
+    }
     let instance = {
         manager()?
             .live
@@ -397,8 +657,13 @@ impl Manager {
         }
         let state_path = root.join("state.json");
         let state: State = if state_path.exists() {
-            let bytes = fs::read(&state_path).map_err(|e| e.to_string())?;
-            if bytes.len() > 16 * 1024 * 1024 {
+            let mut bytes = Vec::new();
+            fs::File::open(&state_path)
+                .map_err(|e| e.to_string())?
+                .take(MAX_STATE_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| e.to_string())?;
+            if bytes.len() as u64 > MAX_STATE_BYTES {
                 return Err("插件状态文件过大".into());
             }
             serde_json::from_slice(&bytes).map_err(|e| format!("插件状态损坏: {e}"))?
@@ -428,6 +693,7 @@ impl Manager {
             live: BTreeMap::new(),
             errors,
             stopping: false,
+            loading: HashSet::new(),
             generations: BTreeMap::new(),
         })
     }
@@ -499,6 +765,7 @@ impl Manager {
         if record.enabled || self.live.contains_key(id) {
             return Err("请先停用插件再卸载".into());
         }
+        self.reject_if_loading(id)?;
         if self
             .generations
             .get(id)
@@ -584,6 +851,7 @@ impl Manager {
     fn install(&mut self, package: package::Package) -> Result<(), String> {
         let inspection = package.inspection;
         let id = inspection.manifest.id.clone();
+        self.reject_if_loading(&id)?;
         let old = self.state.plugins.get(&id);
         if let Some(old) = old
             && semver::Version::parse(&inspection.manifest.version).unwrap()
@@ -644,6 +912,7 @@ impl Manager {
                 enabled,
                 directory: directory.clone(),
                 load_error: None,
+                route_profile_id: None,
             },
         );
         if let Err(e) = self.commit(state) {
@@ -708,6 +977,7 @@ impl Manager {
         if self.stopping {
             return Err("插件管理器正在关闭".into());
         }
+        self.reject_if_loading(id)?;
         parse_config(content)?;
         let current = self.get_config_file(id)?;
         if current.sha256 != expected_sha256 {
@@ -724,7 +994,67 @@ impl Manager {
         Ok(())
     }
 
+    fn reject_if_loading(&self, id: &str) -> Result<(), String> {
+        if self.loading.contains(id) {
+            Err("插件正在启用，请稍后重试".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn note_enable_failure(&mut self, id: &str, error: &str) {
+        if self.stopping || !self.state.plugins.contains_key(id) {
+            return;
+        }
+        self.log_event(id, "enable_failed");
+        self.errors.insert(id.to_owned(), error.to_owned());
+    }
+
     fn load(&mut self, id: &str) -> Result<(), String> {
+        let prepared = self.prepare_load(id)?;
+        let mut native = Native::load(
+            &prepared.library_path,
+            prepared.config.clone(),
+            prepared.context.clone(),
+        )?;
+        let route = provider::describe_if_declared(&prepared.manifest, &mut native)?;
+        let create_if_missing = self
+            .state
+            .plugins
+            .get(id)
+            .is_none_or(|record| record.route_profile_id.is_none());
+        self.publish_prepared(&prepared, native)
+            .map_err(|(_, error)| error)?;
+        // 启动恢复也必须先发布实例，再让线路热更新捕获这一代实例。
+        self.update_fast_path();
+        if let Some(spec) = route {
+            let route_id = match provider::publish_route(id, spec, create_if_missing) {
+                Ok(route_id) => route_id,
+                Err(error) => {
+                    let removed = self.live.remove(id);
+                    self.update_fast_path();
+                    drop(removed);
+                    return Err(error);
+                }
+            };
+            if let Some(route_id) = route_id {
+                let mut state = self.state.clone();
+                if let Some(record) = state.plugins.get_mut(id) {
+                    record.route_profile_id = Some(route_id);
+                }
+                if let Err(error) = self.commit(state) {
+                    let removed = self.live.remove(id);
+                    self.update_fast_path();
+                    let _ = provider::release_route(id);
+                    drop(removed);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_load(&self, id: &str) -> Result<PreparedLoad, String> {
         let record = self.state.plugins.get(id).ok_or("插件未安装")?;
         package::validate_manifest(&record.manifest)?;
         if record.manifest.id != id {
@@ -741,33 +1071,58 @@ impl Manager {
         for name in &parts[..parts.len() - 1] {
             parent = checked_child_directory(&parent, name, false)?;
         }
-        let file = parent.join(parts.last().unwrap());
-        let metadata = fs::symlink_metadata(&file).map_err(|e| e.to_string())?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err("插件动态库必须是普通文件，不能是符号链接".into());
-        }
-        let bytes = fs::read(&file).map_err(|e| e.to_string())?;
-        if bytes.len() as u64 > package::MAX_PACKAGE
-            || package::digest(&bytes) != record.manifest.library_sha256
+        let library_path = parent.join(parts.last().unwrap());
+        verify_library(&library_path, &record.manifest.library_sha256)?;
+        Ok(PreparedLoad {
+            id: id.to_owned(),
+            directory: record.directory.clone(),
+            manifest: record.manifest.clone(),
+            config,
+            library_path,
+            context,
+        })
+    }
+
+    fn activation_matches(&self, prepared: &PreparedLoad) -> Result<(), String> {
+        let record = self.state.plugins.get(&prepared.id).ok_or("插件未安装")?;
+        if record.directory != prepared.directory
+            || serde_json::to_value(&record.manifest).map_err(|error| error.to_string())?
+                != serde_json::to_value(&prepared.manifest).map_err(|error| error.to_string())?
         {
-            return Err("已安装动态库校验失败".into());
+            return Err("插件在启用过程中发生变化，请重试".into());
         }
-        let native = Native::load(&file, config.clone(), context)?;
-        let generations = self.generations.entry(id.to_owned()).or_default();
+        verify_library(&prepared.library_path, &prepared.manifest.library_sha256)?;
+        let config = parse_config(&self.get_config_file(&prepared.id)?.content)?;
+        if config != prepared.config {
+            return Err("插件配置在启用过程中发生变化，请重试".into());
+        }
+        Ok(())
+    }
+
+    fn publish_prepared(
+        &mut self,
+        prepared: &PreparedLoad,
+        native: Native,
+    ) -> Result<(), (Native, String)> {
+        let Some(record) = self.state.plugins.get(&prepared.id) else {
+            return Err((native, "插件未安装".into()));
+        };
+        let manifest = record.manifest.clone();
+        let generations = self.generations.entry(prepared.id.clone()).or_default();
         generations.retain(|generation| generation.strong_count() > 0);
         generations.push(native.lifetime());
         let instance = Arc::new(Mutex::new(native));
-        let lifecycle = lifecycle::LifecyclePlugin::native(&record.manifest, instance.clone());
+        let lifecycle = lifecycle::LifecyclePlugin::native(&manifest, instance.clone());
         self.live.insert(
-            id.to_owned(),
+            prepared.id.clone(),
             Active {
                 instance,
-                manifest: record.manifest.clone(),
-                config,
+                manifest,
+                config: prepared.config.clone(),
                 lifecycle,
             },
         );
-        self.log_event(id, "loaded");
+        self.log_event(&prepared.id, "loaded");
         Ok(())
     }
 
@@ -791,7 +1146,9 @@ impl Manager {
                     let last_error = config_error
                         .or_else(|| self.errors.get(id).cloned())
                         .or_else(|| package::validate_manifest(&r.manifest).err());
-                    let status = if last_error.is_some() {
+                    let status = if self.loading.contains(id) {
+                        "enabling"
+                    } else if last_error.is_some() {
                         "error"
                     } else if live.is_some() {
                         "enabled"
@@ -824,6 +1181,20 @@ impl Manager {
     }
 
     fn update_fast_path(&self) {
+        transport::publish(
+            self.live
+                .iter()
+                .filter(|_| !self.stopping)
+                .filter(|(_, active)| {
+                    active
+                        .manifest
+                        .capabilities
+                        .iter()
+                        .any(|c| c == codey_plugin_sdk::transport::CAPABILITY)
+                })
+                .map(|(id, active)| (id.clone(), active.lifecycle.clone()))
+                .collect(),
+        );
         lifecycle::publish(
             self.live
                 .values()
@@ -833,6 +1204,18 @@ impl Manager {
                 .collect(),
         );
     }
+}
+
+fn verify_library(path: &Path, expected_sha256: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("插件动态库必须是普通文件，不能是符号链接".into());
+    }
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > package::MAX_PACKAGE || package::digest(&bytes) != expected_sha256 {
+        return Err("已安装动态库校验失败".into());
+    }
+    Ok(())
 }
 
 fn parse_config(content: &str) -> Result<Value, String> {
@@ -1029,6 +1412,29 @@ fn checked_child_directory(parent: &Path, name: &str, create: bool) -> Result<Pa
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn state_file_read_preserves_the_size_limit_and_does_not_rewrite_input() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.json");
+        let mut state = vec![b' '; MAX_STATE_BYTES as usize];
+        state[..2].copy_from_slice(b"{}");
+        fs::write(&path, &state).unwrap();
+        assert!(
+            Manager::open(root.path().into())
+                .unwrap()
+                .state
+                .plugins
+                .is_empty()
+        );
+
+        state.push(b' ');
+        fs::write(&path, &state).unwrap();
+        assert!(
+            matches!(Manager::open(root.path().into()), Err(error) if error == "插件状态文件过大")
+        );
+        assert_eq!(fs::read(&path).unwrap(), state);
+    }
 
     #[test]
     fn config_comments_are_removed_recursively_without_changing_business_values() {
@@ -1498,6 +1904,154 @@ mod tests {
             )
             .is_ok()
         );
+        assert!(
+            validate_patches(
+                json!({"headers":[{"name":"x-example","value":"ok\t "}]}),
+                &allowed
+            )
+            .is_ok()
+        );
+        // http 1 接受 0x80–0xFF，非 ASCII 文本可以成为请求头值。
+        assert!(
+            validate_patches(
+                json!({"headers":[{"name":"x-example","value":"café"}]}),
+                &allowed
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_patches(
+                json!({"headers":[{"name":"x-example","value":"bad\u{007f}"}]}),
+                &allowed
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn management_invoke_rejects_host_lifecycle_methods() {
+        for method in codey_plugin_sdk::lifecycle::HOST_METHODS {
+            let error = invoke("test.boundary", method, json!({})).unwrap_err();
+            assert!(error.contains("生命周期"), "{method}: {error}");
+        }
+        let describe = invoke("test.boundary", provider::DESCRIBE_METHOD, json!({})).unwrap_err();
+        assert!(describe.contains("启用插件"), "{describe}");
+        let ordinary = invoke("test.boundary", "ping", json!({})).unwrap_err();
+        assert!(!ordinary.contains("生命周期"), "{ordinary}");
+    }
+
+    #[test]
+    fn enabling_blocks_conflicting_changes_until_the_reservation_is_released() {
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = Manager::open(root.path().into()).unwrap();
+        manager.install(fixture_package()).unwrap();
+        let context = manager.context("test.boundary", false).unwrap();
+        fs::write(context.data_dir.join("sentinel"), b"preserve").unwrap();
+        let config = manager.get_config_file("test.boundary").unwrap();
+        manager.loading.insert("test.boundary".into());
+        assert_eq!(manager.list().plugins[0].status, "enabling");
+        assert!(
+            manager
+                .uninstall("test.boundary", true)
+                .unwrap_err()
+                .contains("正在启用")
+        );
+        assert!(context.data_dir.join("sentinel").exists());
+        assert!(
+            manager
+                .save_config_file("test.boundary", "{\"value\":1}\n", &config.sha256)
+                .unwrap_err()
+                .contains("正在启用")
+        );
+        assert_eq!(fs::read_to_string(&config.path).unwrap(), config.content);
+        let mut upgrade = fixture_package();
+        upgrade.inspection.manifest.version = "1.0.1".into();
+        assert!(manager.install(upgrade).unwrap_err().contains("正在启用"));
+        assert_eq!(
+            manager.state.plugins["test.boundary"].manifest.version,
+            "1.0.0"
+        );
+        manager.loading.remove("test.boundary");
+        assert_eq!(manager.list().plugins[0].status, "disabled");
+        manager.uninstall("test.boundary", true).unwrap();
+        assert!(!context.plugin_dir.exists());
+    }
+
+    #[test]
+    fn poisoned_lock_still_clears_the_enable_reservation() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Mutex::new(Manager::open(root.path().into()).unwrap());
+        manager
+            .lock()
+            .unwrap()
+            .loading
+            .insert("test.boundary".into());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = manager.lock().unwrap();
+            panic!("poison the plugin manager lock");
+        }));
+        assert!(manager.lock().is_err());
+        clear_loading_in(&manager, "test.boundary");
+        let guard = manager
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(!guard.loading.contains("test.boundary"));
+    }
+
+    #[test]
+    fn released_reservation_does_not_cancel_a_later_enable() {
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = Manager::open(root.path().into()).unwrap();
+        manager.loading.insert("test.boundary".into());
+        let mut reservation = LoadingReservation {
+            id: "test.boundary".into(),
+            armed: true,
+        };
+        reservation.release(&mut manager);
+        assert!(!reservation.armed);
+        manager.loading.insert("test.boundary".into());
+        drop(reservation);
+        assert!(manager.loading.contains("test.boundary"));
+    }
+
+    #[test]
+    fn prepared_enable_rejects_config_or_library_changes_before_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = Manager::open(root.path().into()).unwrap();
+        manager.install(fixture_package()).unwrap();
+        let id = "test.boundary";
+        let directory = manager.state.plugins[id].directory.clone();
+        let entry = manager.state.plugins[id].manifest.entry.clone();
+        let library = manager
+            .plugin_directory(id)
+            .unwrap()
+            .join(&directory)
+            .join(entry);
+        let bytes = b"not-a-real-dylib";
+        fs::write(&library, bytes).unwrap();
+        let mut state = manager.state.clone();
+        state.plugins.get_mut(id).unwrap().manifest.library_sha256 = package::digest(bytes);
+        manager.commit(state).unwrap();
+        let prepared = manager.prepare_load(id).unwrap();
+        assert!(manager.activation_matches(&prepared).is_ok());
+        let config = manager.get_config_file(id).unwrap();
+        fs::write(&config.path, b"{\"value\":1}\n").unwrap();
+        assert!(
+            manager
+                .activation_matches(&prepared)
+                .unwrap_err()
+                .contains("配置")
+        );
+        fs::write(&config.path, config.content).unwrap();
+        assert!(manager.activation_matches(&prepared).is_ok());
+        fs::write(&library, b"changed").unwrap();
+        assert!(
+            manager
+                .activation_matches(&prepared)
+                .unwrap_err()
+                .contains("校验失败")
+        );
+        assert!(manager.live.is_empty());
     }
     #[test]
     fn credential_and_transport_headers_are_forbidden() {

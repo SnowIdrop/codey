@@ -51,29 +51,62 @@ test("pull requests enforce the unified Rust quality gate", () => {
   );
 });
 
+function workflowJob(name, until) {
+  return workflow.slice(
+    workflow.indexOf(`\n  ${name}:`),
+    workflow.indexOf(`\n  ${until}:`),
+  );
+}
+
 test("tag-triggered desktop releases independently enforce Rust quality gates", () => {
   assert.match(workflow, /^\s*RUSTFLAGS: -D warnings$/m);
-  const macosJob = workflow.slice(
-    workflow.indexOf("\n  macos:"),
-    workflow.indexOf("\n  windows:"),
+  const macosCheck = workflowJob("macos-check", "windows");
+  const windowsCheck = workflowJob("windows-check", "publish");
+  const publish = workflow.slice(workflow.indexOf("\n  publish:"));
+  assertRustQualityGates(macosCheck);
+  assert.match(macosCheck, /pnpm run check/);
+  assert.match(macosCheck, /pnpm run test:js/);
+  assert.match(windowsCheck, /components: clippy/);
+  assert.match(windowsCheck, /cargo test --workspace --locked/);
+  assert.match(
+    windowsCheck,
+    /cargo clippy --workspace --all-targets --locked -- -D warnings/,
   );
-  const windowsJob = workflow.slice(
-    workflow.indexOf("\n  windows:"),
-    workflow.indexOf("\n  publish:"),
-  );
-  assertRustQualityGates(macosJob);
-  assertRustQualityGates(windowsJob);
+  assert.match(windowsCheck, /overlay-recovery-native\.ps1/);
+  assert.match(publish, /- macos-check/);
+  assert.match(publish, /- windows-check/);
+  assert.doesNotMatch(workflowJob("windows", "windows-check"), /cargo test --workspace/);
+});
+
+test("ordinary desktop packages allow the built-in release endpoint while tags require configuration", () => {
+  for (const job of [
+    workflowJob("macos", "macos-check"),
+    workflowJob("windows", "windows-check"),
+  ]) {
+    assert.match(
+      job,
+      /- name: Verify release admin endpoint\s+if: vars\.CODEY_RELEASE_ADMIN_URL != '' \|\| github\.event_name == 'push' && github\.ref_type == 'tag'/,
+    );
+    assert.match(job, /CODEY_RELEASE_ADMIN_URL must be configured as an HTTPS URL/);
+  }
 });
 
 test("desktop release jobs reuse the prebuilt frontend overlay", () => {
   for (const job of [
-    workflow.slice(workflow.indexOf("\n  macos:"), workflow.indexOf("\n  windows:")),
-    workflow.slice(workflow.indexOf("\n  windows:"), workflow.indexOf("\n  publish:")),
+    workflowJob("macos", "macos-check"),
+    workflowJob("macos-check", "windows"),
+    workflowJob("windows", "windows-check"),
+    workflowJob("windows-check", "publish"),
   ]) {
     assert.match(job, /- name: Build embedded frontend assets\s+run: pnpm run vite:build/);
+    assert.match(job, /CODEY_SKIP_OVERLAY_BUILD: "1"/);
+  }
+  for (const job of [
+    workflowJob("macos-check", "windows"),
+    workflowJob("windows-check", "publish"),
+  ]) {
     assert.match(job, /cargo test --workspace --locked\s+env:\s+CODEY_SKIP_OVERLAY_BUILD: "1"/);
     assert.match(job, /cargo clippy --workspace --all-targets --locked -- -D warnings\s+env:\s+CODEY_SKIP_OVERLAY_BUILD: "1"/);
-    assert.match(job, /CODEY_SKIP_OVERLAY_BUILD: "1"/);
   }
   assert.match(macBuildScript, /CODEY_SKIP_OVERLAY_BUILD/);
 });
@@ -139,19 +172,17 @@ test("Windows release publishes the installer without a portable zip", () => {
 
   assert.match(workflow, /name: codey-windows-x64-installer/);
   assert.match(workflow, /windows-x64-setup\.exe/);
-  assert.match(nsisInstallStep, /choco install nsis\.install --version=3\.12\.0 --source=\$packageDir --yes --no-progress/);
-  assert.match(nsisInstallStep, /https:\/\/community\.chocolatey\.org\/api\/v2\/package\/nsis\.install\/3\.12\.0/);
-  assert.match(nsisInstallStep, /-MaximumRetryCount 3 -RetryIntervalSec 15/);
-  assert.match(nsisInstallStep, /Get-FileHash -LiteralPath \$package -Algorithm SHA256/);
-  assert.match(nsisInstallStep, /\$expectedHash = "[A-F0-9]{64}"/);
-  assert.ok(nsisInstallStep.indexOf("NSIS package checksum mismatch.") < nsisInstallStep.indexOf("choco install"));
+  assert.match(nsisInstallStep, /nsis-\$version\.zip/);
+  assert.match(nsisInstallStep, /nsis-\$version\/nsis-\$version\.zip/);
   assert.match(
     nsisInstallStep,
-    /if \(\$LASTEXITCODE -ne 0\)/,
+    /c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1/,
   );
-  assert.match(nsisInstallStep, /NSIS\\Bin\\makensis\.exe/);
-  assert.match(nsisInstallStep, /GITHUB_PATH/);
+  assert.match(nsisInstallStep, /curl\.exe -fL --retry 3 --retry-all-errors/);
+  assert.match(nsisInstallStep, /NSIS archive hash mismatch/);
+  assert.match(nsisInstallStep, /Join-Path \$nsisHome "Bin" "makensis\.exe"/);
   assert.match(nsisInstallStep, /MAKENSIS=/);
+  assert.doesNotMatch(nsisInstallStep, /choco install nsis/);
   assert.match(
     windowsPackageStep,
     /New-Item -ItemType Directory -Force "dist\\windows" \| Out-Null/,

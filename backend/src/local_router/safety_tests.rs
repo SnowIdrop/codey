@@ -3,6 +3,43 @@ use super::*;
 
 const TERMINAL: &[u8] = b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[]}}\n\n";
 
+// 【自动化测试】本地路由 - 不完整的协议探测按指数退避，不再每毫秒空转
+#[test]
+fn incomplete_websocket_probe_backs_off() {
+    assert_eq!(incomplete_probe_pause(1), Duration::from_millis(5));
+    assert_eq!(incomplete_probe_pause(2), Duration::from_millis(10));
+    assert_eq!(incomplete_probe_pause(4), Duration::from_millis(40));
+    assert_eq!(incomplete_probe_pause(5), Duration::from_millis(50));
+    assert_eq!(incomplete_probe_pause(u32::MAX), Duration::from_millis(50));
+}
+
+// 【自动化测试】本地路由 - WebSocket 等连接名额超时后返回忙，而不是一直阻塞
+#[tokio::test]
+async fn websocket_connection_permit_wait_times_out() {
+    let limit = Arc::new(Semaphore::new(1));
+    let held = limit.clone().try_acquire_owned().unwrap();
+    let started = Instant::now();
+    let error = acquire_connection_permit_within(&limit, Duration::from_millis(40))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConnectionPermitError::Busy));
+    assert!(started.elapsed() < Duration::from_millis(500));
+    drop(held);
+    let _permit = acquire_connection_permit_within(&limit, Duration::from_millis(40))
+        .await
+        .unwrap();
+}
+
+// 【自动化测试】本地路由 - accept 连续失败时指数退避并封顶，监听不会退出
+#[test]
+fn accept_failures_back_off_up_to_one_second() {
+    assert_eq!(accept_retry_delay(1), ACCEPT_RETRY_INITIAL_DELAY);
+    assert_eq!(accept_retry_delay(2), ACCEPT_RETRY_INITIAL_DELAY * 2);
+    assert_eq!(accept_retry_delay(7), ACCEPT_RETRY_INITIAL_DELAY * 64);
+    assert_eq!(accept_retry_delay(8), ACCEPT_RETRY_MAX_DELAY);
+    assert_eq!(accept_retry_delay(u32::MAX), ACCEPT_RETRY_MAX_DELAY);
+}
+
 #[tokio::test]
 async fn request_size_errors_are_413_and_damaged_compression_is_400() {
     let router = LocalRouter::start(&CodeyConfig::default()).await.unwrap();
@@ -152,6 +189,91 @@ async fn request_body_limit_reports_declared_size() {
             assert!(!error.decoded);
         }
     }
+}
+
+#[tokio::test]
+async fn body_budget_wait_proceeds_when_the_holder_releases() {
+    let budget = Arc::new(Semaphore::new(4));
+    let held = acquire_request_body_budget(&budget, REQUEST_BODY_BUDGET_UNIT_BYTES)
+        .unwrap()
+        .unwrap();
+    let waiting = Arc::clone(&budget);
+    let waiter = tokio::spawn(async move {
+        acquire_request_body_budget_within(
+            &waiting,
+            REQUEST_BODY_BUDGET_UNIT_BYTES,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap()
+    });
+    tokio::task::yield_now().await;
+    assert!(budget.available_permits() < 4);
+    drop(held);
+    assert!(waiter.await.unwrap().is_some());
+    assert_eq!(budget.available_permits(), 4);
+}
+
+#[tokio::test]
+async fn body_budget_wait_reports_busy_when_the_holder_keeps_it() {
+    let budget = Arc::new(Semaphore::new(4));
+    let _held = acquire_request_body_budget(&budget, REQUEST_BODY_BUDGET_UNIT_BYTES)
+        .unwrap()
+        .unwrap();
+    let error = acquire_request_body_budget_within(
+        &budget,
+        REQUEST_BODY_BUDGET_UNIT_BYTES,
+        Duration::from_millis(30),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<RequestBodyBudgetUnavailable>()
+            .is_some()
+    );
+    assert_eq!(budget.available_permits(), 0);
+}
+
+#[tokio::test]
+async fn body_budget_wait_lets_a_smaller_request_pass() {
+    let budget = Arc::new(Semaphore::new(5));
+    let held = acquire_request_body_budget(&budget, REQUEST_BODY_BUDGET_UNIT_BYTES)
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.num_permits(), 4);
+    assert_eq!(budget.available_permits(), 1);
+    let waiting = Arc::clone(&budget);
+    let large = tokio::spawn(async move {
+        acquire_request_body_budget_within(
+            &waiting,
+            REQUEST_BODY_BUDGET_UNIT_BYTES,
+            Duration::from_secs(1),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let small = acquire_request_body_budget_within(&budget, 1, Duration::from_millis(50))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(small.num_permits(), 1);
+    assert_eq!(budget.available_permits(), 0);
+    drop(held);
+    assert!(large.await.unwrap().unwrap().is_some());
+}
+
+#[test]
+fn compact_retention_frees_the_parse_working_set() {
+    let budget = Arc::new(Semaphore::new(8));
+    let mut permit = acquire_request_body_budget(&budget, REQUEST_BODY_BUDGET_UNIT_BYTES).unwrap();
+    assert_eq!(permit.as_ref().unwrap().num_permits(), 4);
+    retain_compact_request_budget(&mut permit, REQUEST_BODY_BUDGET_UNIT_BYTES);
+    assert_eq!(permit.as_ref().unwrap().num_permits(), 1);
+    assert_eq!(budget.available_permits(), 7);
+    retain_compact_request_budget(&mut permit, 0);
+    assert!(permit.is_none());
+    assert_eq!(budget.available_permits(), 8);
 }
 
 #[test]

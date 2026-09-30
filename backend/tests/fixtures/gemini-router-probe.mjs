@@ -11,7 +11,6 @@ const cli = process.env.CODEY_GEMINI_PROBE_CLI;
 const sourceCatalog = process.env.CODEY_GEMINI_PROBE_CATALOG;
 const gate = process.env.CODEY_GEMINI_PROBE_GATE;
 const baseline = process.env.CODEY_GEMINI_PROBE_BASELINE ?? 'gpt6';
-const roleInput = JSON.parse(process.env.CODEY_GEMINI_PROBE_ROLE_INPUT ?? '{"agent_type":"codey_comments"}');
 const rejected = process.env.CODEY_GEMINI_PROBE_REJECTED === '1';
 if (!root || !cli || !sourceCatalog || !gate) throw new Error('Probe paths must be supplied explicitly');
 const home=path.join(root,'home'), workspace=path.join(root,'workspace');
@@ -19,17 +18,25 @@ fs.mkdirSync(home); fs.mkdirSync(workspace);
 const template=fs.readFileSync(new URL('../../resources/gemini-antigravity-base-instructions.md',import.meta.url),'utf8');
 const legacy=fs.readFileSync(new URL('../../resources/codex-0.153.3-base-instructions.md',import.meta.url),'utf8');
 const gpt6=fs.readFileSync(new URL('../../resources/codex-0.155.0-alpha.9-gpt6-base-instructions.md',import.meta.url),'utf8');
-const parentBase=baseline==='legacy'?legacy:gpt6;
-const childRole=baseline==='deepseek'?'codey_worker':'codey_comments';
+const codingAgent=fs.readFileSync(new URL('../../resources/codex-0.153.3-coding-agent-base-instructions.md',import.meta.url),'utf8');
+const childRole=baseline==='deepseek'?'codey_worker':['coding-agent','catalog'].includes(baseline)?'codey_quick_scan':'codey_comments';
+const roleInput=JSON.parse(process.env.CODEY_GEMINI_PROBE_ROLE_INPUT ?? JSON.stringify({agent_type:childRole}));
 const childModel=baseline==='deepseek'?'deepseek-flash':'gemini-3.8-flash-high';
 const childEffort=baseline==='deepseek'?'max':'high';
 const catalog=JSON.parse(fs.readFileSync(sourceCatalog,'utf8'));
-const parent=structuredClone(catalog.models.find(m=>m.slug.endsWith('/gpt-5.6-terra') || m.slug==='gpt-5.6-terra'));
+const parentEntry=['gpt-5.6-terra','gpt-6.1-sol'].map(slug=>catalog.models.find(m=>m.slug.endsWith('/'+slug)||m.slug===slug)).find(Boolean);
+const parent=structuredClone(parentEntry);
 const gemini=structuredClone(catalog.models.find(m=>m.slug.endsWith('/'+childModel)));
 if (!parent || !gemini) throw new Error('Required catalog models absent');
-parent.slug='route-parent/gpt-5.6-terra'; gemini.slug='route-child/'+childModel;
-parent.base_instructions=parentBase.trim();
-parent.model_messages={instructions_template:parentBase.trim(),instructions_variables:null};
+const parentModel=parent.slug.split('/').at(-1);
+const overriddenBases={legacy,gpt6,'coding-agent':codingAgent,deepseek:gpt6};
+const parentBase=baseline==='catalog'?parent.base_instructions:overriddenBases[baseline];
+if(typeof parentBase!=='string'||!parentBase.trim())throw new Error('Parent catalog base instructions absent');
+parent.slug='route-parent/'+parentModel; gemini.slug='route-child/'+childModel;
+if(baseline!=='catalog') {
+  parent.base_instructions=parentBase.trim();
+  parent.model_messages={instructions_template:parentBase.trim(),instructions_variables:null};
+}
 fs.writeFileSync(path.join(home,'catalog.json'),JSON.stringify({models:[parent,gemini]}));
 fs.writeFileSync(path.join(home,'comments.toml'),`name=${JSON.stringify(childRole)}\ndescription="Native role probe"\nmodel=${JSON.stringify(gemini.slug)}\nmodel_reasoning_effort=${JSON.stringify(childEffort)}\ndeveloper_instructions="ROLE_BOUNDARY_SENTINEL: return evidence only; never change files in this probe"\nsandbox_mode="read-only"\n`);
 // Record the real native payload, then delegate its decision to the built Codey hook.
@@ -87,7 +94,7 @@ const server=http.createServer(async(req,res)=>{
   }catch(error){probeError=String(error);res.writeHead(500);res.end('local probe failed');}
 });
 await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
-fs.writeFileSync(path.join(root,'upstream.json'),JSON.stringify({base_url:`http://127.0.0.1:${server.address().port}/v1`}));
+fs.writeFileSync(path.join(root,'upstream.json'),JSON.stringify({base_url:`http://127.0.0.1:${server.address().port}/v1`,parent_model:parentModel}));
 const deadline=Date.now()+30000;
 while(!fs.existsSync(path.join(root,'router.json'))) {
   if(Date.now()>deadline)throw new Error('Router handshake timed out');
@@ -127,9 +134,10 @@ multi_agent_mode_hint_text=${JSON.stringify(endpoint.role_hint)}
 `);
 const env=Object.fromEntries(Object.entries(process.env).filter(([k])=>!/^(CODEX|CODEY|OPENAI|ANTHROPIC|GEMINI)/i.test(k)));
 env.CODEX_HOME=home;
+env.CODEY_APP_STATE_DIR=path.join(root,'state');
 env.CODEY_SUBAGENT_GATE_ACTIVE='1';
 env.CODEY_SUBAGENT_GATE_RUNTIME_ID='isolated-native-probe';
-const child=spawn(cli,['exec','--skip-git-repo-check','--ignore-rules','-C',workspace,'--json','Delegate the sentinel task to codey_comments and wait.'],{env,windowsHide:true,stdio:['ignore','pipe','pipe']});
+const child=spawn(cli,['exec','--skip-git-repo-check','--ignore-rules','-C',workspace,'--json',`Delegate the sentinel task to ${childRole} and wait.`],{env,windowsHide:true,stdio:['ignore','pipe','pipe']});
 let stdout='',stderr='';child.stdout.on('data',d=>stdout+=d);child.stderr.on('data',d=>stderr+=d);
 const timer=setTimeout(()=>{probeError='Native probe timed out';child.kill();},90000);
 const exitCode=await new Promise(resolve=>child.on('close',resolve));clearTimeout(timer);
@@ -145,7 +153,9 @@ const hookResults=fs.existsSync(path.join(root,'hook-results.jsonl'))?fs.readFil
 const tools=captures[0]?.body.tools??captures[0]?.body.input?.filter(i=>i.type==='additional_tools').flatMap(i=>i.tools);
 const spawnSchema=findTool(tools,'spawn_agent')?.tool.parameters;
 const roleRejected=hookResults.some(r=>r.output?.includes('CODEY_SUBAGENT_ROLE_')&&r.output.includes('deny'));
-const summary={baseline,roleInput,expectedRejection:rejected,exitCode,probeError,childRequestCount:childRequests.length,
+const summary={baseline,parentModel,roleInput,expectedRejection:rejected,exitCode,probeError,childRequestCount:childRequests.length,
+  catalogBaseUnmodified:baseline!=='catalog'||(parent.base_instructions===parentEntry.base_instructions&&JSON.stringify(parent.model_messages)===JSON.stringify(parentEntry.model_messages)),
+  childCompleted:childLogs.length>0&&childLogs.every(rows=>rows.some(r=>r.type==='event_msg'&&r.payload.type==='task_complete'&&r.payload.last_agent_message?.includes('CHILD_PROBE_COMPLETE'))),
   hookSawSpawn:hookInputs.some(i=>i.tool_name?.endsWith('spawn_agent')),
   roleSchemaRestricted:JSON.stringify(spawnSchema?.properties?.agent_type?.enum)===JSON.stringify([childRole])&&spawnSchema?.required?.includes('agent_type'),
   hintComplete:captures.some(c=>JSON.stringify(c.body.input).includes(JSON.stringify(endpoint.role_hint).slice(1,-1))),
@@ -159,5 +169,5 @@ const summary={baseline,roleInput,expectedRejection:rejected,exitCode,probeError
   toolsPreserved:childRequests.length>0&&childRequests.every(c=>c.body.tools?.length>0),
   reasoningPreserved:childRequests.length>0&&childRequests.every(c=>(c.body.reasoning_effort??c.body.reasoning?.effort)===childEffort)};
 fs.writeFileSync(path.join(root,'summary.json'),JSON.stringify(summary,null,2));console.log(JSON.stringify(summary));
-const required=rejected?['hookSawSpawn','roleSchemaRestricted','hintComplete','roleRejected','noChildCreated']:['hookSawSpawn','roleSchemaRestricted','hintComplete','childPersistedKnownBase','childRuntimeMatches','chatPathCorrect','baseMatches','rolePreserved','taskPreserved','toolsPreserved','reasoningPreserved'];
+const required=rejected?['hookSawSpawn','roleSchemaRestricted','hintComplete','roleRejected','noChildCreated']:['catalogBaseUnmodified','childCompleted','hookSawSpawn','roleSchemaRestricted','hintComplete','childPersistedKnownBase','childRuntimeMatches','chatPathCorrect','baseMatches','rolePreserved','taskPreserved','toolsPreserved','reasoningPreserved'];
 if(exitCode!==0||probeError||required.some(key=>summary[key]!==true))process.exitCode=1;

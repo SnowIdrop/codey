@@ -1,3 +1,5 @@
+mod legacy;
+
 const CONSERVATIVE_SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 
 默认由主代理直接处理短而明确、步骤互相依赖或即将修改关键代码/文档的任务；不要为了形式分工而派生。只在独立并行工作、宽范围检索、上下文隔离或独立高风险证据确有收益时使用子代理。不超过 2 个小文件和 3 次本地工具调用的精确任务通常由主代理完成。
@@ -14,7 +16,7 @@ const CONSERVATIVE_SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 
 ### 返回与验收
 
-- 每个子代理只执行一轮且不得继续派生。返回首行使用 `status: completed | partial | blocked`，正文只保留影响决策的结论、最多 5 条带 `file:line`/符号/链接的证据和明确 gaps；多代理证据冲突时比较出处。
+- 每个子代理默认执行一轮且不得继续派生；仅对已绑定、仍在运行且未被 fence 的 attempt 使用 `followup_task`，每个 attempt 最多追加 3 轮。返回首行使用 `status: completed | partial | blocked`，正文只保留影响决策的结论、最多 5 条带 `file:line`/符号/链接的证据和明确 gaps；多代理证据冲突时比较出处。
 - 子代理结果是候选产物，不是验收结论。所有代理结算后，由根代理结合用户要求、变更差异和必要的确定性检查统一验收；Codey 不再创建逐任务机械验收债或强制验收命令。
 
 ### 生命周期
@@ -35,7 +37,9 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 ### 派发
 
 - 直接调用 `agents.spawn_agent`，显式填写 `agent_type`，只可选择已启用的 `codey_quick_scan`、`codey_deep_research`、`codey_visual_analysis`、`codey_worker`、`codey_comments` 或 `codey_visual_worker`。禁止通用与外部角色；无合适角色时由主代理处理。`default` 仅保留旧配置值，不可派发。`task_name` 只含小写字母、数字和下划线。
+- 优先直接调用当前提供的协作工具；客户端明确提供工具目录和专用转发入口时，按目录中的准确名称与参数使用该入口。不要把专用转发入口当作 JavaScript 聚合执行器，也不要因缺少同名直接接口就忽略目录中可用的工具。
 - `message` 是唯一任务胶囊：写清目标、范围、允许操作、交付格式和必要背景，不复制整段对话，不附加 V1/V2 契约、sidecar、checks 或其他尾行协议。
+- 主代理按任务依赖和文件范围选择模式：同步任务使用 sync_ 前缀，独立旁路使用 async_ 前缀；未标注按同步处理，同一活动批次不得混合。异步任务明确文件归属，主代理不读写子代理独占范围。
 - 修改关键代码或文档时，可先派发独立的只读调查或核验；写入任务明确文件归属，避免重复调查或同时修改同一处。只读角色获得 `files.read`；写入角色获得 `command.execute`、`files.read` 和 `workspace.write`。写入角色暂按当前工作区建立互斥锁；实际权限仍由 Codex 原生 sandbox、approval policy、permission profile 和 writable roots 决定。
 
 ### 返回与验收
@@ -45,7 +49,7 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 
 ### 生命周期
 
-- 先派发不超过当前并发上限的独立任务，再进入 wait/list。任一 attempt 终态或被成功中断并 fence 后，按下一个计划任务的角色重新计算并发上限；存在空余槽位时立即使用新 `task_name` 补位，否则继续等待。所有计划任务均已派发后，继续等待剩余活动 attempt 结算。活动 attempt 期间只使用必要的 `agents.*` 协作工具，普通本地工作和 Stop 仍受生命周期门禁限制。
+- 先派发不超过当前并发上限的独立任务，再进入 wait/list。同步批次须全部结算后再补位；异步批次确认全部活动身份与 async_ 模式后，任一 attempt 终态或被成功中断并 fence 即按下一个计划任务的角色重新计算并发上限，有空余槽位时使用新 `task_name` 补位，否则继续等待。所有计划任务均已派发后，继续等待剩余活动 attempt 结算。活动 attempt 期间只使用必要的 `agents.*` 协作工具，普通本地工作和 Stop 仍受生命周期门禁限制。
 - `MESSAGE` 只保存证据并继续等待。`completed`、`errored`、`error`、`failed`、`shutdown`、`not_found`、`FINAL_ANSWER` 和 `task_complete` 为终态；`pending_init`、`running`、`interrupted` 仍是非终态，除非根代理成功中断并永久放弃该 attempt。
 - 成功的 `agents.interrupt_agent` 会永久 fence 该 attempt；不要再等待或追派。重复 task ID 时只做一次无筛选 `agents.list_agents` 对账：原代理存在则等待或消费结果，不存在则由根代理接管。只有任务范围实质改变时才用全新 task ID 最多重派一次。
 - 协作工具不可用时不要循环调用；依赖有界的 pending-init、超时和 Stop 恢复路径收敛。
@@ -59,7 +63,7 @@ const PREVIOUS_SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 
 ### 派发
 
-- 直接调用 `agents.spawn_agent`，按任务选择 `codey_quick_scan`、`codey_deep_research`、`codey_visual_analysis`、`codey_worker` 或 `codey_visual_worker`；`default` 仅兼容旧配置。`task_name` 只含小写字母、数字和下划线。
+- 按当前客户端提供的工具接口调用 `agents.spawn_agent`；原生接口直接调用，客户端明确提供工具目录和专用转发入口时，使用该入口及目录中的准确名称和参数。不要把专用转发入口当作 JavaScript 聚合执行器，也不要因缺少同名直接接口就忽略目录中可用的工具。按任务选择 `codey_quick_scan`、`codey_deep_research`、`codey_visual_analysis`、`codey_worker` 或 `codey_visual_worker`；`default` 仅兼容旧配置。`task_name` 只含小写字母、数字和下划线。
 - `message` 是唯一任务胶囊：写清目标、范围、允许操作、交付格式和必要背景，不复制整段对话，不附加 V1/V2 契约、sidecar、checks 或其他尾行协议。
 - 修改关键代码或文档时，可先派发独立的只读调查或核验；写入任务明确文件归属，避免重复调查或同时修改同一处。只读角色获得 `files.read`；写入角色获得 `command.execute`、`files.read` 和 `workspace.write`。写入角色暂按当前工作区建立互斥锁；实际权限仍由 Codex 原生 sandbox、approval policy、permission profile 和 writable roots 决定。
 
@@ -79,7 +83,9 @@ const PREVIOUS_SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] = &[
     SUBAGENT_GUIDANCE,
     PREVIOUS_SUBAGENT_GUIDANCE,
+    legacy::DIRECT_SUBAGENT_GUIDANCE,
     CONSERVATIVE_SUBAGENT_GUIDANCE,
+    legacy::DELEGATION_V2_GUIDANCE,
 ];
 
 const PRE_INTERRUPT_FENCING_USAGE_HINT: &str = "\
@@ -116,8 +122,12 @@ ownership is enforced by the agents' task contract, not a per-path sandbox. If c
 unregistered tool.";
 
 pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str = "\
-`agents.spawn_agent`, `agents.wait_agent`, and other `agents.*` collaboration tools are direct commentary \
-tools; never call them through `functions.exec`. Dispatch up to the current concurrency limit from the \
+`agents.spawn_agent`, `agents.wait_agent`, and other `agents.*` collaboration tools use the current \
+client's declared tool interface. Native clients expose direct commentary tools; never call them through \
+`functions.exec` as a JavaScript aggregate. If a client explicitly exposes a tool catalog through a \
+transport-only endpoint, use that documented endpoint with the exact catalog name and argument schema. \
+A catalog-listed collaboration tool is available even without a same-named direct schema. Do not invent \
+wrappers or bypass lifecycle and permission checks. Dispatch up to the current concurrency limit from the \
 planned independent work before the first wait. While any attempt is active, use only the relevant \
 `agents.spawn_agent`, `agents.send_message`, `agents.followup_task`, `agents.interrupt_agent`, \
 `agents.list_agents`, or `agents.wait_agent`. After a terminal or successfully fenced update, recompute the \
@@ -157,19 +167,22 @@ Never resume a fenced attempt. Join all children and review their evidence befor
 /// Remove the previous owned paragraph when installing the current guidance.
 pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS: &[&str] = &[
     ROOT_AGENT_COLLABORATION_USAGE_HINT,
+    legacy::DIRECT_COLLABORATION_USAGE_HINT,
     PRE_INTERRUPT_FENCING_USAGE_HINT,
+    legacy::BATCH_RESOLUTION_USAGE_HINT,
+    legacy::DIRECT_SCHEMA_USAGE_HINT,
 ];
 
 pub(crate) const DEFAULT_AGENT_CONFIG: &str = r#####"name = "default"
 
-description = "General-purpose exploration subagent using the configured default model and reasoning effort."
-sandbox_mode = "read-only"
+description = "General-purpose subagent using the configured default model and reasoning effort."
+sandbox_mode = "workspace-write"
 
 developer_instructions = """
 未获主代理扩展授权，不得读取、搜索或操作任务允许范围之外的文件；范围外线索只报告位置和相关性。达到任务结束证据后立即返回，不追求穷尽。
 收到主代理“停止调查”或收尾指令后，已在执行的工具可以完成，但不得启动新的调查或实施工具；下一次回复直接交付已有结论、证据、未覆盖项，未完成的工作如实标为 partial。
-你是通用子代理，是主代理派出去的探子。你只做探索、检索、核验：不改动任何东西，不做方案取舍或者最终判断——那些是主代理的事。
-不要派生、调用或者请求新的子代理；任务若是需要进一步拆分，把拆分的建议返回给主代理。
+你是通用子代理。按本次任务调用需要的工具，包括读写、命令、视觉和未归类工具；实际文件与命令访问仍受 Codex 原生权限约束。
+不要派生、调用或者请求新的子代理；任务若是需要进一步拆分，把拆分的建议返回给主代理。不做方案取舍或者最终判断——那些是主代理的事。
 
 你交回给主代理的东西：
 - 你的产出直接喂给主代理、是它据以行动的数据，并非给人看的。密而不水，不寒暄、不复述过程、不下客套结论。
@@ -298,9 +311,9 @@ pub(crate) const SUBAGENT_TASK_BOUNDARY_GUARD: &str = "\
 返回时区分本次实际修改、已清理内容和未完成要求，不能用其他尝试的结果代替本次证据。";
 
 pub(crate) const NO_WRITABLE_SUBAGENT_GUIDANCE: &str = "\
-本次运行没有启用 `codey_worker`、`codey_comments` 或 `codey_visual_worker`，因此没有可写子代理。所有创建、修改、\
+本次运行没有启用 `codey_worker`、`codey_comments`、`codey_visual_worker` 或 `default`，因此没有可写子代理。所有创建、修改、\
 删除、移动文件或其他会改变状态的工作都由主代理直接完成；只读子代理只能承担检索、分析和证据\
-收集。不得把写入任务改派给 `default` 或任何只读角色，也不得要求它们尝试 `replace`、\
+收集。不得把写入任务改派给只读角色，也不得要求它们尝试 `replace`、\
 `apply_patch` 或其他写入工具。";
 
 pub(crate) fn subagent_source_config(role: &str) -> Option<&'static str> {
@@ -317,7 +330,7 @@ pub(crate) fn subagent_source_config(role: &str) -> Option<&'static str> {
 }
 
 pub(crate) const CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled as direct \
-tools. Use `mcp__codey_fastctx__inspect_local_file` for focused inspection, \
+tools in native clients. Prefer FastCtx for supported local file operations. Use `mcp__codey_fastctx__inspect_local_file` for focused inspection, \
 `mcp__codey_fastctx__grep` for search, `mcp__codey_fastctx__glob` for discovery, and \
 `mcp__codey_fastctx__replace` only for deterministic replacement. Batch 2-32 known text files or ranges \
 per inspect call; limit large files to needed ranges. A top-level `limit` applies to entries without one. \
@@ -326,16 +339,21 @@ Pass plain absolute filesystem paths; convert local URIs and Windows paths to a 
 or count only for totals. Glob with `filter_mode=ignore`, stable sorting, and `output_mode=details` only \
 when metadata matters. Run replace as dry-run first with `max_replacements`, then inspect and test; never \
 transparently retry a write after transport failure. Follow every Complete or Partial continuation without \
-parallel page speculation. FastCtx is a direct-only tool namespace, not an MCP Resources server or \
-code-mode aggregate; call tools directly and use `tool_search` when deferred. Use terminal commands for \
+parallel page speculation. In native clients FastCtx is a direct-only tool namespace, not an MCP Resources \
+server or code-mode aggregate; call tools directly and use `tool_search` when deferred and available. \
+If a client explicitly provides a tool catalog through a transport-only endpoint, use that documented \
+endpoint with the exact catalog name and argument schema, preserving the full result and continuation \
+metadata. A catalog-listed FastCtx tool is available even without a same-named direct schema. Never \
+invent wrappers or treat an execution aggregate as a transport-only endpoint. Use terminal commands for \
 builds, tests, Git, package managers, advanced shell/streaming operations, unsupported metadata, or after \
 the applicable FastCtx tool is unavailable or fails. Use CodeGraph only for semantic symbols and call \
 paths. Every tool call must advance the task; put progress and corrections in commentary.";
 
-/// Only the current text is recognised. Codey supports upgrades from the
-/// previous two releases only, and both shipped this exact text; older
-/// guidance is left untouched instead of being migrated.
-pub(crate) const CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[CODEY_FASTCTX_GUIDANCE];
+pub(crate) const CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
+    CODEY_FASTCTX_GUIDANCE,
+    legacy::DIRECT_FASTCTX_GUIDANCE,
+    legacy::TASK_ROUTED_FASTCTX_GUIDANCE,
+];
 
 const DEFAULT_FASTCTX_TOOL_NAMESPACE: &str = "mcp__codey_fastctx";
 
@@ -435,7 +453,9 @@ pub(crate) fn remove_subagent_guidance(current: &str) -> Option<String> {
     let mut restored = current.to_string();
     let mut changed = false;
     for &guidance in SUBAGENT_GUIDANCE_VERSIONS {
-        while let Some(without_guidance) = remove_owned_guidance_block(&restored, guidance) {
+        while let Some(without_guidance) = remove_owned_guidance_block(&restored, guidance)
+            .or_else(|| remove_owned_guidance_paragraph(&restored, guidance.trim()))
+        {
             restored = without_guidance;
             changed = true;
         }
@@ -561,6 +581,44 @@ mod tests {
     }
 
     #[test]
+    fn tool_guidance_distinguishes_documented_transports_from_execution_aggregates() {
+        for guidance in [ROOT_AGENT_COLLABORATION_USAGE_HINT, CODEY_FASTCTX_GUIDANCE] {
+            assert!(guidance.contains("transport-only endpoint"));
+            assert!(guidance.contains("exact catalog name and argument schema"));
+            assert!(guidance.contains("without a same-named direct schema"));
+        }
+        assert!(
+            CODEY_FASTCTX_GUIDANCE.contains("preserving the full result and continuation metadata")
+        );
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("Never invent wrappers"));
+        assert!(
+            CODEY_FASTCTX_GUIDANCE.contains("Prefer FastCtx for supported local file operations")
+        );
+        assert!(SUBAGENT_GUIDANCE.contains("客户端明确提供工具目录和专用转发入口"));
+    }
+
+    #[test]
+    fn historical_collaboration_hints_are_removed_without_dropping_user_text() {
+        let custom = "Preserve my collaboration policy.";
+        for previous in ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS {
+            let input = format!("{custom}\n\n{previous}");
+            let output = append_root_agent_collaboration_usage_hint(&input);
+            assert_eq!(
+                output,
+                format!("{custom}\n\n{ROOT_AGENT_COLLABORATION_USAGE_HINT}")
+            );
+            assert!(!output.contains("CODEY_DELEGATION_V2"));
+            assert!(!output.contains("resolve_batch"));
+            assert_eq!(append_root_agent_collaboration_usage_hint(&output), output);
+        }
+        let customized = format!(
+            "{} Additional user restriction.",
+            legacy::DIRECT_SCHEMA_USAGE_HINT
+        );
+        assert!(append_root_agent_collaboration_usage_hint(&customized).starts_with(&customized));
+    }
+
+    #[test]
     fn default_agent_never_uses_terminal_commands_as_narration() {
         assert!(DEFAULT_AGENT_CONFIG.contains("不要派生、调用或者请求新的子代理"));
         assert!(DEFAULT_AGENT_CONFIG.contains("每次工具调用都必须推进任务本身"));
@@ -605,7 +663,13 @@ mod tests {
         assert!(combined.contains("next planned, unspawned task"));
         assert!(combined.contains("all planned work has been spawned"));
         assert!(combined.contains("do not loop on an unregistered tool"));
-        assert!(combined.contains("never call them through `functions.exec`"));
+        assert!(combined.contains("`functions.exec` as a JavaScript aggregate"));
+        assert!(combined.contains("transport-only endpoint"));
+        assert!(combined.contains("exact catalog name and argument schema"));
+        assert!(combined.contains("without a same-named direct schema"));
+        assert!(
+            combined.contains("Do not invent wrappers or bypass lifecycle and permission checks")
+        );
         assert!(!combined.contains("Write-Output"));
         assert!(!combined.contains("Write-Error"));
         assert_eq!(
@@ -624,6 +688,23 @@ mod tests {
             append_root_agent_collaboration_usage_hint(&current_before_user),
             current_before_user
         );
+    }
+
+    #[test]
+    fn historical_subagent_guidance_cleanup_handles_serialized_trailing_newlines() {
+        for previous in SUBAGENT_GUIDANCE_VERSIONS {
+            for body in [*previous, previous.trim()] {
+                assert_eq!(
+                    remove_subagent_guidance(&format!("USER\n\n{body}")),
+                    Some("USER".to_string())
+                );
+            }
+        }
+        let customized = format!(
+            "{} Additional user restriction.",
+            legacy::DIRECT_SUBAGENT_GUIDANCE.trim()
+        );
+        assert_eq!(remove_subagent_guidance(&customized), None);
     }
 
     #[test]
@@ -698,7 +779,7 @@ mod tests {
             ("codey_worker", true),
             ("codey_comments", true),
             ("codey_visual_worker", true),
-            ("default", false),
+            ("default", true),
         ] {
             let source = subagent_source_config(role).unwrap();
             assert!(source.contains(&format!("name = \"{role}\"")));

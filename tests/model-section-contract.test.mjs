@@ -37,16 +37,21 @@ test("official routes display WS while third-party routes remain explicit opt-in
   );
 });
 
-test("official routes expose no context editors and preserve context settings", async () => {
+test("official routes expose context budgets and preserve them when editing connection settings", async () => {
   const officialEditor = modelSectionSource
     .split('<div className="official-route-editor">')[1]
     .split('<div className="route-editor-form">')[0];
-  assert.doesNotMatch(officialEditor, /ModelSettingsFields/);
+  assert.match(officialEditor, /ModelSettingsFields/);
+  assert.match(modelSectionSource, /officialDialogScope === "models" \? officialModelContextDraft : undefined/);
   const backend = await readSource("backend/src/commands/models/defaults.rs");
   const saveOfficial = backend
     .split("pub async fn save_official_route_models(")[1]
     .split("pub(crate) async fn")[0];
-  assert.doesNotMatch(saveOfficial, /set_supports_1m_context_models\(|set_model_contexts\(/);
+  assert.match(saveOfficial, /set_model_contexts\(/);
+  assert.doesNotMatch(saveOfficial, /set_model_reasoning_efforts\(/);
+  const selection = await readSource("src/useModelSelection.ts");
+  assert.match(selection, /"save_official_route_models", \{[\s\S]*?\.\.\.contextUpdate/);
+  assert.match(dialogSource, /!routeConfigReadOnly && <ModelSettingsFields model=\{model.slug\}/);
 });
 
 test("model picker declares reasoning efforts and drops the 1M checkbox", () => {
@@ -63,7 +68,7 @@ test("model settings merge context budget and reasoning effort declarations", as
   ]);
   const comboboxSource = await readSource("src/components/ModelContextWindowCombobox.tsx");
   assert.match(fieldsSource, /<ModelContextWindowCombobox/);
-  assert.match(fieldsSource, /MODEL_REASONING_EFFORT_COLUMNS/);
+  assert.match(fieldsSource, /MODEL_REASONING_EFFORT_LEVELS/);
   assert.doesNotMatch(fieldsSource, /线上取值/);
   assert.match(comboboxSource, /allowsCustomValue/);
   assert.match(comboboxSource, /CONTEXT_WINDOW_PRESETS/);

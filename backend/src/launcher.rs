@@ -43,7 +43,16 @@ use crate::trace_log_guard;
 
 mod platform;
 mod process;
+mod recovery;
+#[cfg(any(windows, test))]
+mod windows_activation;
+#[cfg(any(windows, test))]
+mod windows_packaged;
+#[cfg(windows)]
+pub(crate) use windows_packaged::resume_windows_packaged_thread;
 
+#[cfg(windows)]
+pub(crate) use platform::activate_visible_windows_codex_window;
 use platform::*;
 #[cfg(windows)]
 pub(crate) use process::windows_cli_wrapper_target;
@@ -224,6 +233,21 @@ impl RuntimeModelConfig {
     }
 }
 
+struct AppliedModelConfig {
+    catalog: CodeyConfig,
+    snapshot: Arc<RuntimeModelConfig>,
+}
+
+impl AppliedModelConfig {
+    fn new(config: CodeyConfig) -> Self {
+        let snapshot = Arc::new(RuntimeModelConfig::from_config(&config));
+        Self {
+            catalog: config,
+            snapshot,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeSubagentConfig {
     model: String,
@@ -251,8 +275,8 @@ pub struct CodeyRuntime {
     pub codex_app_path: PathBuf,
     pub maintenance: MaintenanceStatus,
     pub applied_config: CodeyConfig,
-    applied_model_config: RwLock<CodeyConfig>,
-    applied_subagent_config: RwLock<RuntimeSubagentConfig>,
+    applied_model_config: RwLock<AppliedModelConfig>,
+    applied_subagent_config: RwLock<Arc<RuntimeSubagentConfig>>,
     subagent_route_catalog_installed: bool,
     pub injection_statuses: Arc<RwLock<Arc<[cdp::InjectionScriptStatus]>>>,
     injection_scripts: cdp::PreparedInjectionScripts,
@@ -486,17 +510,31 @@ async fn resolve_configured_codex_app_dir(config: &CodeyConfig) -> Result<PathBu
     let configured_app_path =
         (!configured_app_path_is_empty).then(|| PathBuf::from(configured_app_path));
     tokio::task::spawn_blocking(move || {
+        // A Store update can remove the saved version directory entirely.
+        // Resolve that registered family before requiring the old path to exist.
+        #[cfg(windows)]
+        let configured_app_path = configured_app_path
+            .map(|path| refresh_windows_packaged_app_dir(&path))
+            .transpose()?;
         let app_dir = resolve_codex_app_dir_with_saved(configured_app_path.as_deref(), None);
         if let Some(app_dir) = app_dir.as_deref() {
             error_log::refresh_codex_app_version(Some(app_dir), None);
         }
-        app_dir
+        let app_dir = app_dir
+            .map(|path| -> Result<PathBuf> {
+                #[cfg(windows)]
+                let path = refresh_windows_packaged_app_dir(&path)?;
+                codey_runtime_core::app_paths::validate_codex_app_dir(&path)?;
+                Ok(path)
+            })
+            .transpose()?;
+        Ok::<_, anyhow::Error>(app_dir)
     })
     .await
-    .map_err(|error| anyhow::Error::new(error).context("定位 Codex App 任务异常退出"))?
+    .map_err(|error| anyhow::Error::new(error).context("定位 Codex App 任务异常退出"))??
     .ok_or_else(|| {
         if configured_app_path_is_empty {
-            anyhow::anyhow!(CODEX_APP_NOT_FOUND_ERROR)
+            anyhow::anyhow!("{CODEX_APP_NOT_FOUND_ERROR}；若安装了多个版本，请明确选择安装路径")
         } else {
             anyhow::anyhow!(CODEX_APP_PATH_INVALID_ERROR)
         }
@@ -508,7 +546,7 @@ struct StartupModelCatalog {
     model_state: model_catalog::ModelSelectionState,
 }
 
-struct PreparedCodexStartupState {
+struct PreparedProviderState {
     runtime_config: CodeyConfig,
     runtime_config_overrides: Vec<String>,
 }
@@ -635,8 +673,15 @@ fn validated_router_subagent_runtime_config(
     if !config.subagent_optimization {
         return Ok(config.clone());
     }
-    let catalog_path =
-        crate::codex_config::runtime_model_catalog_path(home, route_catalog_installed)?;
+    let catalog_path = if route_catalog_installed {
+        Some(home.join(model_catalog::relative_path()))
+    } else {
+        crate::codex_config::runtime_model_catalog_path(
+            home,
+            false,
+            Some(&config.runtime_enabled_model_contexts()),
+        )?
+    };
     let runtime = router_subagent_runtime_config(config, catalog_path.is_some())?;
     if let Some(path) = catalog_path {
         model_catalog::validate_runtime_subagent_models(&path, &runtime.subagent_roles)?;
@@ -700,6 +745,8 @@ async fn prepare_startup_model_catalog(
     let runtime_image_detail_original_models = config.runtime_image_detail_original_model_aliases();
     let runtime_model_reasoning_efforts = config.runtime_model_reasoning_efforts();
     let runtime_model_contexts = config.runtime_model_contexts();
+    let runtime_plugin_model_contexts = config.runtime_plugin_model_contexts();
+    let plugin_context = !runtime_plugin_model_contexts.is_empty();
     let custom_context = !runtime_model_contexts.is_empty();
     let refresh_official_provider =
         config.official_account_available_this_launch && use_builtin_official_catalog;
@@ -758,6 +805,7 @@ async fn prepare_startup_model_catalog(
                     image_detail_original_models: Some(&runtime_image_detail_original_models),
                 },
                 model_catalog::CatalogOverrides {
+                    plugin_contexts: &runtime_plugin_model_contexts,
                     contexts: &runtime_model_contexts,
                     reasoning_efforts: &runtime_model_reasoning_efforts,
                 },
@@ -774,6 +822,7 @@ async fn prepare_startup_model_catalog(
                         model_catalog::apply_catalog_overrides(
                             &catalog_home,
                             model_catalog::CatalogOverrides {
+                                plugin_contexts: &runtime_plugin_model_contexts,
                                 contexts: &runtime_model_contexts,
                                 reasoning_efforts: &runtime_model_reasoning_efforts,
                             },
@@ -867,7 +916,13 @@ async fn prepare_startup_model_catalog(
     // Official-only launches inherit Codex metadata unless the user explicitly
     // configured a budget, in which case the generated catalog must be used.
     if custom_context && !catalog_available_for_runtime {
-        anyhow::bail!(model_catalog::CUSTOM_CONTEXT_CATALOG_UNAVAILABLE);
+        return Err(model_catalog::ContextBudgetCatalogError(anyhow::anyhow!(
+            model_catalog::CUSTOM_CONTEXT_CATALOG_UNAVAILABLE
+        ))
+        .into());
+    }
+    if plugin_context && !catalog_available_for_runtime {
+        anyhow::bail!("插件模型需要可用的运行时模型目录，请恢复目录后重试");
     }
     let use_official_catalog = should_install_codey_model_catalog(
         use_builtin_official_catalog,
@@ -901,7 +956,7 @@ async fn prepare_codex_startup_state(
     home: &std::path::Path,
     local_router: &RuntimeRouterEndpoint,
     startup_catalog: StartupModelCatalog,
-) -> Result<PreparedCodexStartupState> {
+) -> Result<PreparedProviderState> {
     let StartupModelCatalog {
         use_official_catalog,
         model_state,
@@ -910,6 +965,7 @@ async fn prepare_codex_startup_state(
     let runtime_local_router = local_router.clone();
     let stream_max_retries = config.stream_max_retries;
     let runtime_default_model = runtime_default_model(config, use_official_catalog, &model_state);
+    let runtime_model_contexts = config.runtime_enabled_model_contexts();
     let fast_context_tools = config.fast_context_tools;
     let mut runtime_subagent_config = config.clone();
     runtime_subagent_config.active_profile_id = current_profile.id.clone();
@@ -929,6 +985,7 @@ async fn prepare_codex_startup_state(
             RuntimeRouterConfigOptions {
                 local_router: Some(&runtime_local_router),
                 use_official_catalog,
+                model_contexts: Some(&runtime_model_contexts),
                 default_model: runtime_default_model.as_deref(),
                 fast_context_tools,
                 subagent_optimization,
@@ -971,7 +1028,7 @@ async fn prepare_codex_startup_state(
         error
     })?;
     runtime_subagent_config.fast_context_tools = applied.fast_context_tools_active;
-    Ok(PreparedCodexStartupState {
+    Ok(PreparedProviderState {
         runtime_config: runtime_subagent_config,
         runtime_config_overrides: applied.runtime_config_overrides,
     })
@@ -1207,7 +1264,7 @@ async fn inject_initial_renderer(
         stage: Some("startup.renderer_injection".to_string()),
         recoverable: Some(false),
     };
-    let mut error = failure.into_error();
+    let mut error = recovery::recoverable(failure.into_error());
     error_log::record_failure_with_metadata(
         "injection_failed",
         "inject_cdp_bridge",
@@ -1439,11 +1496,6 @@ struct StartupStorageState {
     session_maintenance: SessionMaintenanceSummary,
 }
 
-struct PreparedProviderState {
-    runtime_config: CodeyConfig,
-    runtime_config_overrides: Vec<String>,
-}
-
 struct StartupPatchState {
     debug_port: u16,
 }
@@ -1562,7 +1614,12 @@ fn resolve_startup_profile(config: &CodeyConfig) -> Result<ProviderProfile> {
         if current_profile.official_account && !config.official_route_usable(&current_profile) {
             anyhow::bail!("当前线路需要官方账号登录，但本次 Codex 启动未检测到可用的官方登录态");
         }
-        current_profile.validate().map_err(anyhow::Error::msg)?;
+        // The empty default placeholder is the first-run / no-route state. It
+        // is allowed by profile validation so the console can open; requiring
+        // an API URL here would exit before the user can add a route.
+        if !config.needs_initial_route_import() {
+            current_profile.validate().map_err(anyhow::Error::msg)?;
+        }
     }
     Ok(current_profile)
 }
@@ -1615,28 +1672,6 @@ async fn prepare_startup_storage(
     let prepared = preparation?;
     storage_guards?;
     Ok(prepared)
-}
-
-async fn prepare_runtime_provider_state(
-    home: &std::path::Path,
-    config: &CodeyConfig,
-    current_profile: &ProviderProfile,
-    local_router: &LocalRouter,
-    startup_catalog: StartupModelCatalog,
-) -> Result<PreparedProviderState> {
-    let router_endpoint = local_router.endpoint();
-    let prepared_startup = prepare_codex_startup_state(
-        config,
-        current_profile,
-        home,
-        &router_endpoint,
-        startup_catalog,
-    )
-    .await?;
-    Ok(PreparedProviderState {
-        runtime_config: prepared_startup.runtime_config,
-        runtime_config_overrides: prepared_startup.runtime_config_overrides,
-    })
 }
 
 fn native_subagent_model(
@@ -1743,6 +1778,7 @@ async fn prepare_native_runtime_state(
             RuntimeRouterConfigOptions {
                 local_router: None,
                 use_official_catalog: false,
+                model_contexts: None,
                 default_model: None,
                 fast_context_tools,
                 subagent_optimization,
@@ -1955,16 +1991,16 @@ impl CodeyRuntime {
         self.injection_websocket_url.read().await.clone()
     }
 
-    pub async fn applied_model_config(&self) -> RuntimeModelConfig {
-        RuntimeModelConfig::from_config(&*self.applied_model_config.read().await)
+    pub async fn applied_model_config(&self) -> Arc<RuntimeModelConfig> {
+        Arc::clone(&self.applied_model_config.read().await.snapshot)
     }
 
     pub async fn applied_model_catalog_config(&self) -> CodeyConfig {
-        self.applied_model_config.read().await.clone()
+        self.applied_model_config.read().await.catalog.clone()
     }
 
     pub async fn mark_model_config_applied(&self, config: &CodeyConfig) {
-        *self.applied_model_config.write().await = config.clone();
+        *self.applied_model_config.write().await = AppliedModelConfig::new(config.clone());
     }
 
     pub(crate) fn validate_subagent_route_hot_reload(&self, config: &CodeyConfig) -> Result<()> {
@@ -1989,12 +2025,21 @@ impl CodeyRuntime {
         Ok(())
     }
 
-    pub fn sync_local_router_routes(&self, config: &CodeyConfig) -> Result<()> {
+    pub(crate) fn sync_local_router_routes(
+        &self,
+        config: &CodeyConfig,
+    ) -> Result<Option<local_router::RouterSnapshotSwap>> {
         self.validate_subagent_route_hot_reload(config)?;
+        Ok(self
+            .local_router
+            .as_ref()
+            .map(|local_router| local_router.update_config(config)))
+    }
+
+    pub(crate) fn revert_local_router_routes(&self, swap: local_router::RouterSnapshotSwap) {
         if let Some(local_router) = self.local_router.as_ref() {
-            local_router.update_config(config);
+            local_router.revert_config(swap);
         }
-        Ok(())
     }
 
     pub(crate) async fn reconfigure_request_log(
@@ -2022,12 +2067,13 @@ impl CodeyRuntime {
         self.local_router.as_ref().map(LocalRouter::endpoint)
     }
 
-    pub async fn applied_subagent_config(&self) -> RuntimeSubagentConfig {
-        self.applied_subagent_config.read().await.clone()
+    pub async fn applied_subagent_config(&self) -> Arc<RuntimeSubagentConfig> {
+        Arc::clone(&*self.applied_subagent_config.read().await)
     }
 
     pub async fn mark_subagent_config_applied(&self, config: &CodeyConfig) {
-        *self.applied_subagent_config.write().await = RuntimeSubagentConfig::from_config(config);
+        *self.applied_subagent_config.write().await =
+            Arc::new(RuntimeSubagentConfig::from_config(config));
     }
 
     pub fn supports_subagent_config_hot_reload(&self, config: &CodeyConfig) -> bool {
@@ -2096,6 +2142,11 @@ impl CodeyRuntime {
         account_usage_cache: Arc<tokio::sync::Mutex<crate::account_usage::AccountUsageCaches>>,
         workflow_proxy: Option<&crate::codex_startup_patch::WorkflowProxyLaunchConfig>,
     ) -> Result<(Self, oneshot::Receiver<()>)> {
+        if !crate::codex_config::runtime_router_platform_supported() {
+            return Err(anyhow::anyhow!(
+                crate::codex_config::unsupported_runtime_platform_message()
+            ));
+        }
         let home = codex_home();
         repair_startup_reserved_providers(home).await;
         trace_log_write_protection_active.store(false, Ordering::Release);
@@ -2141,11 +2192,11 @@ impl CodeyRuntime {
                 local_router.as_ref(),
                 startup_catalog,
             ) {
-                prepare_runtime_provider_state(
-                    home,
+                prepare_codex_startup_state(
                     config,
                     startup_profile,
-                    local_router,
+                    home,
+                    &local_router.endpoint(),
                     startup_catalog,
                 )
                 .await
@@ -2158,6 +2209,7 @@ impl CodeyRuntime {
         } = match prepared_provider_state {
             Ok(state) => state,
             Err(error) => {
+                stop_local_router_after_failed_start(local_router.as_ref()).await;
                 return Err(restore_runtime_config_after_error(
                     home,
                     config.local_router_enabled,
@@ -2170,22 +2222,25 @@ impl CodeyRuntime {
         let patch = match prepare_startup_patches(home, config).await {
             Ok(patch) => patch,
             Err(error) => {
-                return Err(restore_runtime_config_after_error(
+                stop_local_router_after_failed_start(local_router.as_ref()).await;
+                return Err(recovery::after_integration_failure(
                     home,
+                    &storage.app_dir,
                     config.local_router_enabled,
-                    error,
+                    recovery::recoverable(error),
                 )
                 .await);
             }
         };
         stage_timings.mark("startupPatchesMs");
+        let recovery_app_dir = storage.app_dir.clone();
         let SpawnedRenderer {
             app_dir,
             spawned,
             child,
             maintenance,
             injected_target,
-        } = spawn_and_inject_runtime(
+        } = match spawn_and_inject_runtime(
             home,
             config,
             &handler,
@@ -2195,7 +2250,20 @@ impl CodeyRuntime {
             &runtime_config_overrides,
             workflow_proxy,
         )
-        .await?;
+        .await
+        {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                stop_local_router_after_failed_start(local_router.as_ref()).await;
+                return Err(recovery::after_integration_failure(
+                    home,
+                    &recovery_app_dir,
+                    config.local_router_enabled,
+                    error,
+                )
+                .await);
+            }
+        };
         stage_timings.mark("spawnAndInjectMs");
         stage_timings.report();
         #[cfg(target_os = "macos")]
@@ -2226,10 +2294,10 @@ impl CodeyRuntime {
             Self {
                 codex_app_path: app_dir,
                 maintenance,
-                applied_model_config: RwLock::new(runtime_config.clone()),
-                applied_subagent_config: RwLock::new(RuntimeSubagentConfig::from_config(
+                applied_model_config: RwLock::new(AppliedModelConfig::new(runtime_config.clone())),
+                applied_subagent_config: RwLock::new(Arc::new(RuntimeSubagentConfig::from_config(
                     &runtime_config,
-                )),
+                ))),
                 subagent_route_catalog_installed: runtime_config_overrides
                     .iter()
                     .any(|entry| entry.starts_with("model_catalog_json=")),
@@ -2348,6 +2416,22 @@ impl CodeyRuntime {
             );
         }
         local_router_stop.context("关闭本地线路路由失败")
+    }
+}
+
+/// 启动失败时路由已经在监听。直接 Drop 会中止 accept 任务，来不及排空
+/// 正在处理的请求，也不会停掉请求日志。
+async fn stop_local_router_after_failed_start(local_router: Option<&LocalRouter>) {
+    let Some(local_router) = local_router else {
+        return;
+    };
+    if let Err(error) = local_router.stop().await {
+        error_log::record_failure(
+            "cleanup_failed",
+            "stop_local_router_after_startup_failure",
+            format!("{error:#}"),
+            serde_json::json!({}),
+        );
     }
 }
 

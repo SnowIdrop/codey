@@ -1,6 +1,130 @@
 use super::*;
 
 #[test]
+fn plugin_reasoning_limits_preserve_capabilities_and_reject_unsupported_settings() {
+    use crate::config::ModelReasoningEffort;
+    let mut config = CodeyConfig::default();
+    let profile = &mut config.profiles[0];
+    profile.plugin_owner_id = Some("dev.reasoning".into());
+    profile.plugin_route_spec = Some(
+        serde_json::from_value(json!({
+            "name": "PPT Bridge",
+            "baseUrl": "https://example.test/v1",
+            "upstreamProtocol": "openaiResponses",
+            "models": ["demo"],
+            "headers": {},
+            "modelReasoningEfforts": { "demo": ["low", "medium", "high", "xhigh"] }
+        }))
+        .unwrap(),
+    );
+    let provider_id = profile.provider_id().to_string();
+    let available = vec!["demo".to_string()];
+    for (level, value) in [
+        ("max", "max"),
+        ("ultra", "ultra"),
+        ("xhigh", "ultra"),
+        ("high", "max"),
+    ] {
+        let requested = BTreeMap::from([(
+            "DEMO".into(),
+            vec![ModelReasoningEffort {
+                level: level.into(),
+                value: value.into(),
+            }],
+        )]);
+        let before = config.clone();
+        assert!(
+            set_model_reasoning_efforts(&mut config, &provider_id, Some(&requested), &available)
+                .is_err()
+        );
+        assert_eq!(config, before);
+    }
+    let high = vec![ModelReasoningEffort {
+        level: "high".into(),
+        value: "high".into(),
+    }];
+    let requested = BTreeMap::from([("demo".into(), high.clone())]);
+    set_model_reasoning_efforts(&mut config, &provider_id, Some(&requested), &available).unwrap();
+    assert_eq!(
+        config.model_reasoning_efforts_for_provider(&provider_id)["demo"],
+        high
+    );
+    let public = serde_json::to_value(redacted_config(&config)).unwrap();
+    assert_eq!(
+        public["profiles"][0]["pluginRouteSpec"]["modelReasoningEfforts"]["demo"],
+        json!(["low", "medium", "high", "xhigh"])
+    );
+    set_model_reasoning_efforts(
+        &mut config,
+        &provider_id,
+        Some(&BTreeMap::new()),
+        &available,
+    )
+    .unwrap();
+    assert_eq!(
+        config.model_reasoning_efforts_for_provider(&provider_id)["demo"].len(),
+        4
+    );
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("models_cache.json"),
+        serde_json::to_vec(&json!({
+            "models": [{
+                "slug": "demo", "display_name": "demo", "default_reasoning_level": "ultra",
+                "supported_reasoning_levels": [
+                    {"effort": "low"}, {"effort": "medium"}, {"effort": "high"},
+                    {"effort": "xhigh"}, {"effort": "max"}, {"effort": "ultra"}
+                ]
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    config
+        .selected_models_by_provider
+        .insert(provider_id.clone(), available.clone());
+    config
+        .upstream_models_by_provider
+        .insert(provider_id.clone(), available.clone());
+    let state = current_model_state_at(&config, home.path()).unwrap();
+    let model = state
+        .third_party_model_metadata
+        .iter()
+        .find(|entry| entry.slug == "demo")
+        .unwrap();
+    assert_eq!(
+        model.supported_reasoning_efforts,
+        ["low", "medium", "high", "xhigh"]
+    );
+    config.subagent_model = "demo".into();
+    config.subagent_reasoning_effort = "ultra".into();
+    crate::subagent_policy::reconcile_for_current_provider(&mut config, home.path(), false);
+    assert!(
+        ["low", "medium", "high", "xhigh"].contains(&config.subagent_reasoning_effort.as_str())
+    );
+    // 普通线路保持原有能力，未来明确声明更高档位的插件也可使用。
+    let ultra = BTreeMap::from([(
+        "demo".into(),
+        vec![ModelReasoningEffort {
+            level: "ultra".into(),
+            value: "ultra".into(),
+        }],
+    )]);
+    config.profiles[0]
+        .plugin_route_spec
+        .as_mut()
+        .unwrap()
+        .model_reasoning_efforts
+        .get_mut("demo")
+        .unwrap()
+        .push("ultra".into());
+    set_model_reasoning_efforts(&mut config, &provider_id, Some(&ultra), &available).unwrap();
+    config.profiles[0].plugin_route_spec = None;
+    config.profiles[0].plugin_owner_id = None;
+    set_model_reasoning_efforts(&mut config, &provider_id, Some(&ultra), &available).unwrap();
+}
+
+#[test]
 fn model_context_policy_validates_budgets_membership_and_restart() {
     use crate::config::ModelContextConfig;
     let policy = ModelContextConfig {
@@ -57,6 +181,88 @@ fn model_context_policy_validates_budgets_membership_and_restart() {
     config.local_router_enabled = false;
     assert!(set_model_contexts(&mut config, "route", Some(&requested), &["Model".into()]).is_err());
     assert!(set_model_contexts(&mut config, "route", Some(&BTreeMap::new()), &[]).is_ok());
+}
+
+#[test]
+fn official_context_budgets_remain_route_scoped_and_support_reset() {
+    use crate::config::{AUTH_MODE_OFFICIAL_ACCOUNT, ModelContextConfig};
+    let model = "gpt-5.6-sol";
+    let profiles = ["a", "b"].map(|id| {
+        let mut profile = ProviderProfile::new(id);
+        profile.id = format!("account-{id}");
+        profile.source_provider_id = Some(format!("provider-{id}"));
+        profile.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        profile.official_account = true;
+        profile.official_account_id = Some(id.into());
+        profile
+    });
+    let mut config = CodeyConfig {
+        local_router_enabled: true,
+        active_profile_id: profiles[0].id.clone(),
+        profiles: profiles.to_vec(),
+        upstream_models_by_provider: ["provider-a", "provider-b"]
+            .map(|provider| (provider.into(), vec![model.into()]))
+            .into(),
+        ..CodeyConfig::default()
+    };
+    let first = ModelContextConfig {
+        context_window_tokens: 128_000,
+        auto_compact_token_limit: Some(100_000),
+        reserve_output_tokens: Some(16_000),
+    };
+    let second = ModelContextConfig {
+        context_window_tokens: 64_000,
+        auto_compact_token_limit: Some(50_000),
+        reserve_output_tokens: Some(8_000),
+    };
+    for (provider, policy) in [("provider-a", &first), ("provider-b", &second)] {
+        set_model_contexts(
+            &mut config,
+            provider,
+            Some(&BTreeMap::from([(model.to_uppercase(), policy.clone())])),
+            &[model.into()],
+        )
+        .unwrap();
+    }
+    config = config.normalize();
+    assert_eq!(config.model_context("provider-a", model), Some(&first));
+    assert_eq!(config.model_context("provider-b", model), Some(&second));
+    let runtime = config.runtime_model_contexts();
+    assert_eq!(runtime.len(), 2);
+    assert_eq!(config.runtime_enabled_model_contexts(), runtime);
+    assert_eq!(
+        runtime[&local_router::model_alias("provider-a", model)],
+        first
+    );
+    assert_eq!(
+        runtime[&local_router::model_alias("provider-b", model)],
+        second
+    );
+
+    let saved = config.model_context_by_provider.clone();
+    set_model_contexts(&mut config, "provider-a", None, &[model.into()]).unwrap();
+    assert_eq!(config.model_context_by_provider, saved);
+    let invalid = BTreeMap::from([("unknown-model".into(), first.clone())]);
+    assert!(
+        set_model_contexts(&mut config, "provider-a", Some(&invalid), &[model.into()]).is_err()
+    );
+    assert_eq!(config.model_context_by_provider, saved);
+
+    config.profiles[1].enabled = false;
+    assert_eq!(config.runtime_enabled_model_contexts().len(), 1);
+    assert_eq!(
+        config.runtime_model_contexts(),
+        BTreeMap::from([(model.into(), first)])
+    );
+    set_model_contexts(
+        &mut config,
+        "provider-a",
+        Some(&BTreeMap::new()),
+        &[model.into()],
+    )
+    .unwrap();
+    assert!(config.runtime_model_contexts().is_empty());
+    assert_eq!(config.model_context("provider-b", model), Some(&second));
 }
 
 #[test]
@@ -536,6 +742,146 @@ fn route_toggle_preserves_settings_and_updates_default_without_reordering() {
     assert!(previous.profiles[1].enabled);
     let all_disabled = config_after_route_enabled_change(&disabled, "route-a", false, 8).unwrap();
     assert!(all_disabled.profiles.iter().all(|profile| !profile.enabled));
+}
+
+#[test]
+fn reordering_route_models_keeps_membership_and_rejects_partial_or_foreign_lists() {
+    let previous = CodeyConfig {
+        settings_revision: 4,
+        profiles: vec![configured_route("route", Some("model-a"))],
+        selected_models_by_provider: BTreeMap::from([(
+            "route".into(),
+            vec!["model-a".into(), "model-b".into()],
+        )]),
+        declared_official_models_by_provider: BTreeMap::from([(
+            "route".into(),
+            vec!["gpt-5.5".into()],
+        )]),
+        default_model: "route/model-b".into(),
+        ..CodeyConfig::default()
+    }
+    .normalize();
+    assert_eq!(
+        previous.enabled_route_models("route"),
+        ["model-a", "model-b", "gpt-5.5"]
+    );
+
+    let reordered = config_with_reordered_route_models(
+        &previous,
+        "route",
+        &["GPT-5.5".into(), " model-b ".into(), "model-a".into()],
+        4,
+    )
+    .unwrap();
+    assert_eq!(reordered.settings_revision, 5);
+    assert_eq!(
+        reordered.enabled_route_models("route"),
+        ["gpt-5.5", "model-b", "model-a"]
+    );
+    assert_eq!(reordered.default_model, "route/model-b");
+    assert_eq!(reordered.profiles, previous.profiles);
+    assert_eq!(
+        reordered.upstream_models_by_provider,
+        previous.upstream_models_by_provider
+    );
+
+    let complete = ["model-b".to_string(), "model-a".into(), "gpt-5.5".into()];
+    assert!(
+        config_with_reordered_route_models(&previous, "route", &complete[..2], 4)
+            .unwrap_err()
+            .contains("已变化")
+    );
+    let mut foreign = complete.to_vec();
+    foreign.push("other".into());
+    assert!(
+        config_with_reordered_route_models(&previous, "route", &foreign, 4)
+            .unwrap_err()
+            .contains("不属于")
+    );
+    assert!(
+        config_with_reordered_route_models(&previous, "route", &complete, 3)
+            .unwrap_err()
+            .contains("重新载入")
+    );
+    assert!(
+        config_with_reordered_route_models(&previous, "missing", &complete, 4)
+            .unwrap_err()
+            .contains("找不到")
+    );
+    let mut read_only = previous.clone();
+    read_only.local_router_enabled = false;
+    assert!(
+        config_with_reordered_route_models(&read_only, "route", &complete, 4)
+            .unwrap_err()
+            .contains("只读")
+    );
+}
+
+#[test]
+fn reordering_official_route_models_follows_the_requested_order() {
+    let mut route = configured_route("official", Some("gpt-5.6-sol"));
+    route.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    route.source_provider_id = Some("openai".into());
+    route.official_account_id = Some("stored-account".into());
+    let previous = CodeyConfig {
+        settings_revision: 2,
+        profiles: vec![route],
+        selected_models_by_provider: BTreeMap::from([(
+            "openai".into(),
+            vec!["gpt-5.6-sol".into(), "gpt-5.6-luna".into()],
+        )]),
+        ..CodeyConfig::default()
+    }
+    .normalize();
+    assert!(previous.official_route_usable(&previous.profiles[0]));
+
+    let reordered = config_with_reordered_route_models(
+        &previous,
+        "official",
+        &["gpt-5.6-luna".into(), "gpt-5.6-sol".into()],
+        2,
+    )
+    .unwrap();
+    assert_eq!(reordered.settings_revision, 3);
+    assert_eq!(
+        reordered.enabled_official_route_models("openai"),
+        ["gpt-5.6-luna", "gpt-5.6-sol"]
+    );
+    assert_eq!(
+        reordered.runtime_catalog_models().1,
+        ["gpt-5.6-luna", "gpt-5.6-sol"]
+    );
+}
+
+#[test]
+fn official_model_selection_keeps_the_requested_order_and_catalog_spelling() {
+    let catalog = vec![
+        "gpt-6-astra".to_string(),
+        "gpt-5.6-sol".to_string(),
+        "gpt-5.6-luna".to_string(),
+    ];
+    assert_eq!(
+        ordered_official_selection(
+            &catalog,
+            &[
+                "GPT-5.6-Luna".into(),
+                " gpt-6-astra ".into(),
+                "gpt-5.6-luna".into()
+            ]
+        )
+        .unwrap(),
+        ["gpt-5.6-luna", "gpt-6-astra"]
+    );
+    assert!(
+        ordered_official_selection(&catalog, &["gpt-4".into()])
+            .unwrap_err()
+            .contains("不在官方模型列表中")
+    );
+    assert!(
+        ordered_official_selection(&catalog, &[" ".into()])
+            .unwrap_err()
+            .contains("至少需要保留一个模型")
+    );
 }
 
 #[test]
@@ -1346,6 +1692,43 @@ fn provider_route_restart_detection_catches_route_connection_changes() {
 }
 
 #[test]
+fn official_gateway_changes_hot_reload_without_restarting_runtime() {
+    let mut official = crate::config::ProviderProfile::new("Official");
+    official.id = "official-route".into();
+    official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    official.official_account = true;
+    official.official_account_id = Some("account-1".into());
+    official.base_url = "https://gateway-a.example/v1".into();
+    official.normalize();
+    let applied = CodeyConfig {
+        active_profile_id: official.id.clone(),
+        profiles: vec![official],
+        official_account_available_this_launch: true,
+        ..CodeyConfig::default()
+    };
+
+    let mut changed = applied.clone();
+    changed.profiles[0].base_url = "https://gateway-b.example/v1".into();
+    changed.profiles[0].normalize();
+
+    assert!(!provider_route_requires_restart(&applied, &changed));
+    assert!(runtime_supports_current_routes_for_hot_reload(
+        &applied, &changed
+    ));
+    let delivered = config_with_launch_pinned_transport(&applied, &changed);
+    assert_eq!(
+        delivered.profiles[0].normalized_base_url(),
+        "https://gateway-b.example/v1"
+    );
+
+    changed.profiles[0].base_url.clear();
+    changed.profiles[0].normalize();
+    assert!(!provider_route_requires_restart(&applied, &changed));
+    let delivered = config_with_launch_pinned_transport(&applied, &changed);
+    assert!(delivered.profiles[0].normalized_base_url().is_empty());
+}
+
+#[test]
 fn built_in_router_hot_reloads_added_and_removed_third_party_routes() {
     let mut route_a = crate::config::ProviderProfile::new("Route A");
     route_a.id = "route-a".into();
@@ -1424,6 +1807,51 @@ fn websocket_model_changes_hot_reload_with_capabilities_pending_restart() {
     assert!(runtime_supports_current_routes_for_hot_reload(
         &applied,
         &after_delete
+    ));
+}
+
+#[test]
+fn reordering_models_on_websocket_and_web_search_routes_needs_no_restart() {
+    let mut route = crate::config::ProviderProfile::new("WS Route");
+    route.id = "route-ws".into();
+    route.base_url = "https://route-ws.example/v1".into();
+    route.api_key = "route-ws-secret".into();
+    route.supports_websockets = true;
+    route.supports_native_web_search = true;
+    route.normalize();
+    let mut applied = CodeyConfig {
+        active_profile_id: route.id.clone(),
+        profiles: vec![route],
+        ..CodeyConfig::default()
+    };
+    applied
+        .selected_models_by_provider
+        .insert("route-ws".into(), vec!["model-a".into(), "model-b".into()]);
+    applied = applied.normalize();
+    assert_eq!(
+        applied.runtime_websocket_model_aliases(),
+        ["route-ws/model-a", "route-ws/model-b"]
+    );
+
+    let reordered = config_with_reordered_route_models(
+        &applied,
+        "route-ws",
+        &["model-b".into(), "model-a".into()],
+        applied.settings_revision,
+    )
+    .unwrap();
+    assert_eq!(
+        reordered.runtime_websocket_model_aliases(),
+        ["route-ws/model-b", "route-ws/model-a"]
+    );
+    assert!(!websocket_transport_requires_restart(&applied, &reordered));
+    assert!(!native_web_search_capability_requires_restart(
+        &applied, &reordered
+    ));
+    assert!(!provider_route_requires_restart(&applied, &reordered));
+    assert!(!crate::commands::provider_route_restart_required_for_runtime(&applied, &reordered));
+    assert!(runtime_supports_current_routes_for_hot_reload(
+        &applied, &reordered
     ));
 }
 

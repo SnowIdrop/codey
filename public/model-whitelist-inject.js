@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "58";
+  const patchVersion = "59";
   const nativeSelectionOnly = window.__codeyNativeModelSelectionOnly === true;
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
@@ -29,6 +29,8 @@
   const groupedMenuStyleId = "codey-model-route-menu-style";
   const groupedMenuSelector = "[role='menu'], [role='listbox']";
   const groupedMenuItemSelector = "[role='menuitem'], [role='menuitemradio'], [role='option']";
+  const subagentModelLabelSelector = "[class*='max-w-1/2']";
+  const modelPickerTriggerSelector = "button[aria-haspopup='menu'], button[aria-haspopup='listbox']";
   const modelQueryKey = ["models", "list"];
   const modelResponseEvent = "message";
   const modelRequestEvent = "codex-message-from-view";
@@ -91,7 +93,8 @@
   let groupedMenuTimer = 0;
   let groupedMenuObserver = null;
   const groupedMenuTextObservers = new Map();
-  let modelDisplayTextTimer = 0;
+  const subagentModelLabels = new Map();
+  const modelPickerTriggers = new Map();
   const patchedProviderKey = Symbol("codeyPatchedModelProvider");
   const patchedRouteKey = Symbol("codeyPatchedRoute");
   const blockedProviderRequestKey = Symbol("codeyBlockedProviderRequest");
@@ -546,6 +549,29 @@
         legacyAliases.set(modelKey(alias), source.trim());
       }
     }
+    const routePrefixByProviderKey = new Map();
+    const rememberRoutePrefix = (providerId, prefix) => {
+      const key = modelKey(providerId);
+      if (!key || !prefix || routePrefixByProviderKey.has(key)) return;
+      routePrefixByProviderKey.set(key, prefix);
+    };
+    const bracketPrefix = (displayName) => {
+      const match = /^\[([^\[\]]+)\](?=\s+\S)/.exec(displayName);
+      return match ? cleanText(match[1]) : "";
+    };
+    for (const [model, metadata] of Object.entries(modelMetadata)) {
+      const prefix = metadataText(metadata, "route_prefix")
+        || bracketPrefix(metadataText(metadata, "display_name"));
+      if (!prefix) continue;
+      rememberRoutePrefix(metadataText(metadata, "route_provider_id"), prefix);
+      const separator = model.indexOf("/");
+      if (separator > 0) rememberRoutePrefix(model.slice(0, separator), prefix);
+    }
+    const historicalRouteProviderKeys = new Set();
+    for (const alias of legacyAliases.keys()) {
+      const separator = alias.indexOf("/");
+      if (separator > 0) historicalRouteProviderKeys.add(alias.slice(0, separator));
+    }
     return {
       loaded: true,
       models,
@@ -559,6 +585,8 @@
       routeByRouteProviderSource,
       routeByAnyProviderSource,
       legacyAliases,
+      routePrefixByProviderKey,
+      historicalRouteProviderKeys,
       nativeProviderId: nativeSelectionOnly ? requestProviderId(value.native_model_provider) : "",
     };
   };
@@ -622,9 +650,45 @@
     return tiers.includes(fastSpeedTierId) ? tiers : [...tiers, fastSpeedTierId];
   };
 
+  const generatedRouteProviderId = (providerId) => {
+    const key = modelKey(providerId);
+    return key.startsWith("codey-official-account-") || key.startsWith("route-");
+  };
+  // A historical thread can keep a route alias after that model leaves the
+  // enabled catalog. Sibling models on the same route still carry its short
+  // name; a removed route at least drops the provider id.
+  const routeQualifiedDisplayName = (sourceCatalog, modelName) => {
+    const model = cleanText(modelName);
+    const separator = model.indexOf("/");
+    if (separator <= 0) return "";
+    const encodedProviderId = model.slice(0, separator).trim();
+    let providerId = encodedProviderId;
+    try {
+      providerId = decodeURIComponent(encodedProviderId);
+    } catch {
+      return "";
+    }
+    const upstream = cleanText(model.slice(separator + 1).replace(/#\d+$/, ""));
+    if (!providerId || !upstream) return "";
+    const prefix = sourceCatalog.routePrefixByProviderKey?.get(modelKey(providerId))
+      || sourceCatalog.routePrefixByProviderKey?.get(modelKey(encodedProviderId))
+      || "";
+    if (prefix) return `[${prefix}] ${upstream}`;
+    const providerKey = modelKey(providerId);
+    if (
+      generatedRouteProviderId(providerId)
+      || sourceCatalog.historicalRouteProviderKeys?.has(providerKey)
+      || sourceCatalog.historicalRouteProviderKeys?.has(modelKey(encodedProviderId))
+    ) {
+      return upstream;
+    }
+    return "";
+  };
+
   const modelPresentationFromCatalog = (sourceCatalog, modelName, current = null) => {
-    const metadata = sourceCatalog.modelMetadata[modelName];
-    const route = sourceCatalog.routeMetadata[modelName];
+    const canonicalModelName = sourceCatalog.modelNamesByKey?.get(modelKey(modelName)) || modelName;
+    const metadata = sourceCatalog.modelMetadata[canonicalModelName];
+    const route = sourceCatalog.routeMetadata[canonicalModelName];
     const metadataDisplayName = metadataText(metadata, "display_name");
     const displayParts = displayNameParts(metadataDisplayName);
     const routeName = metadataText(metadata, "route_name")
@@ -636,18 +700,22 @@
     const modelLabel = metadataText(metadata, "model_display_name")
       || sourceModel
       || displayParts.modelName
-      || modelFallbackName(modelName);
+      || modelFallbackName(canonicalModelName);
     const currentDisplayName = cleanText(current?.displayName);
+    const qualifiedDisplayName = metadata
+      ? ""
+      : routeQualifiedDisplayName(sourceCatalog, modelName);
     const displayName = metadataDisplayName
       || (routeName && modelLabel ? `${routeName} / ${modelLabel}` : "")
+      || qualifiedDisplayName
       || currentDisplayName
-      || modelName;
+      || canonicalModelName;
     return {
       routeName,
       modelName: modelLabel,
       displayName,
       providerId: cleanText(route?.providerId) || metadataText(metadata, "provider_id"),
-      sourceModel: sourceModel || modelName,
+      sourceModel: sourceModel || canonicalModelName,
     };
   };
 
@@ -1117,41 +1185,6 @@
     return false;
   };
 
-  const replaceNativeModelDisplayText = () => {
-    modelDisplayTextTimer = 0;
-    if (disposed || !catalog.loaded || typeof document.createTreeWalker !== "function") return;
-    const entries = catalog.models
-      .map((modelName) => ({
-        modelName,
-        displayName: cleanText(modelPresentation(modelName).displayName),
-      }))
-      .filter(({ modelName, displayName }) => displayName && displayName !== cleanText(modelName))
-      .sort((left, right) => cleanText(right.modelName).length - cleanText(left.modelName).length);
-    if (!entries.length || !document.body) return;
-    const walker = document.createTreeWalker(document.body, 4);
-    const textNodes = [];
-    let node = walker.nextNode();
-    while (node) {
-      const parent = node.parentElement;
-      if (parent && !parent.closest?.("script,style,textarea,input")) textNodes.push(node);
-      node = walker.nextNode();
-    }
-    for (const textNode of textNodes) {
-      const text = textNode.nodeValue || "";
-      const trimmed = cleanText(text);
-      if (!trimmed) continue;
-      const entry = entries.find(({ modelName }) => cleanText(modelName) === trimmed);
-      if (!entry) continue;
-      const start = text.indexOf(trimmed);
-      textNode.nodeValue = `${text.slice(0, start)}${entry.displayName}${text.slice(start + trimmed.length)}`;
-    }
-  };
-
-  const scheduleNativeModelDisplayText = () => {
-    if (disposed || modelDisplayTextTimer || !catalog.loaded) return;
-    modelDisplayTextTimer = window.setTimeout(replaceNativeModelDisplayText, 0);
-  };
-
   const createRouteHeading = (routeName) => {
     if (typeof document.createElement !== "function") return null;
     const heading = document.createElement("div");
@@ -1308,6 +1341,195 @@
     return parent && typeof parent.matches === "function" ? parent : null;
   };
 
+  // This header is already mounted when CLI fallback injects the renderer.
+  // Update its label here instead of rewriting a lazily loaded native bundle.
+  const isSubagentModelLabel = (element) => (
+    element?.tagName === "SPAN"
+    && element.matches?.(subagentModelLabelSelector)
+    && element.closest?.("[class*='h-toolbar-pane']")
+    && !element.closest?.("[data-turn-key]")
+    && element.parentElement?.querySelector?.("button[aria-label]")
+  );
+
+  const writeSubagentModelLabel = (element, text) => {
+    // Preserve the text node owned by React whenever it is still present.
+    if (element.childNodes?.length === 1 && element.firstChild?.nodeType === 3) {
+      element.firstChild.nodeValue = text;
+    } else {
+      element.textContent = text;
+    }
+  };
+
+  const updateSubagentModelLabel = (element) => {
+    const state = subagentModelLabels.get(element);
+    if (!state || disposed || !catalog.loaded || element.isConnected === false) return;
+    const text = element.textContent || "";
+    if (text !== state.renderedText) {
+      const parts = text.match(/^(.*?)(\s+·\s+[^·]+)?$/);
+      if (!parts) return;
+      const label = parts[1].trim();
+      const suffix = parts[2] || "";
+      // React may replace only the effort while retaining our model label.
+      if (label !== state.displayName) state.model = label;
+      state.suffix = suffix;
+      state.nativeText = `${state.model}${suffix}`;
+    }
+    state.displayName = modelPresentation(state.model).displayName;
+    state.renderedText = `${state.displayName}${state.suffix}`;
+    if (text !== state.renderedText) writeSubagentModelLabel(element, state.renderedText);
+  };
+
+  const stopSubagentModelLabel = (element) => {
+    const state = subagentModelLabels.get(element);
+    if (!state) return;
+    state.observer?.disconnect?.();
+    if (element.textContent === state.renderedText) {
+      writeSubagentModelLabel(element, state.nativeText);
+    }
+    subagentModelLabels.delete(element);
+  };
+
+  const observeSubagentModelLabel = (element) => {
+    if (disposed || !isSubagentModelLabel(element)) return;
+    if (!subagentModelLabels.has(element)) {
+      const MutationObserver = window.MutationObserver || globalThis.MutationObserver;
+      const observer = typeof MutationObserver === "function"
+        ? new MutationObserver(() => updateSubagentModelLabel(element))
+        : null;
+      subagentModelLabels.set(element, { observer });
+      // CharacterData stays confined to the title, never conversation text.
+      observer?.observe(element, { childList: true, characterData: true, subtree: true });
+    }
+    updateSubagentModelLabel(element);
+  };
+
+  const discoverSubagentModelLabels = (node) => {
+    const element = groupedMenuElement(node);
+    if (!element || element.closest?.("[data-turn-key]")) return;
+    observeSubagentModelLabel(element);
+    for (const label of element.querySelectorAll?.(subagentModelLabelSelector) || []) {
+      observeSubagentModelLabel(label);
+    }
+  };
+
+  const refreshSubagentModelLabels = () => {
+    for (const element of subagentModelLabels.keys()) {
+      if (element.isConnected === false) stopSubagentModelLabel(element);
+      else updateSubagentModelLabel(element);
+    }
+  };
+
+  const pickerTextNodes = (element) => {
+    const nodes = [];
+    const visit = (node) => {
+      if (node.nodeType === 3) nodes.push(node);
+      else if (node.tagName !== "SVG" && node.tagName !== "svg") {
+        for (const child of node.childNodes || []) visit(child);
+      }
+    };
+    visit(element);
+    return nodes;
+  };
+
+  const pickerModelText = (text) => {
+    const parts = text.match(/^(\s*)([^\s·]+)([\s\S]*)$/);
+    if (!parts || !parts[2].includes("/")) return null;
+    const model = parts[2];
+    if (!catalog.modelNamesByKey.has(modelKey(model))
+      && !routeQualifiedDisplayName(catalog, model)) return null;
+    return { model, prefix: parts[1], suffix: parts[3], nativeText: text };
+  };
+
+  const restorePickerText = (node, state) => {
+    if (node.nodeValue === state.renderedText) node.nodeValue = state.nativeText;
+  };
+
+  const updateModelPickerTrigger = (element) => {
+    const state = modelPickerTriggers.get(element);
+    if (!state || disposed || !catalog.loaded || element.isConnected === false) return;
+    const nodes = new Set(pickerTextNodes(element));
+    for (const [node, textState] of state.nodes) {
+      if (nodes.has(node)) continue;
+      restorePickerText(node, textState);
+      state.nodes.delete(node);
+    }
+    for (const node of nodes) {
+      const text = node.nodeValue || "";
+      let textState = state.nodes.get(node);
+      if (!textState || text !== textState.renderedText) {
+        // Match the complete route alias, never an upstream name shared by
+        // several routes. CSS ellipsis does not truncate this text node.
+        const previousLabel = textState && `${textState.prefix}${textState.displayName}`;
+        const retainedLabel = previousLabel && text.startsWith(previousLabel)
+          && /^(?:\s|·|$)/.test(text.slice(previousLabel.length));
+        textState = retainedLabel
+          ? { ...textState, suffix: text.slice(previousLabel.length),
+            nativeText: `${textState.prefix}${textState.model}${text.slice(previousLabel.length)}` }
+          : pickerModelText(text);
+        if (!textState) {
+          state.nodes.delete(node);
+          continue;
+        }
+        state.nodes.set(node, textState);
+      }
+      textState.displayName = modelPresentation(textState.model).displayName;
+      textState.renderedText = `${textState.prefix}${textState.displayName}${textState.suffix}`;
+      // Keep React's nodes, icons, event handlers and effort label intact.
+      if (text !== textState.renderedText) node.nodeValue = textState.renderedText;
+    }
+  };
+
+  const stopModelPickerTrigger = (element) => {
+    const state = modelPickerTriggers.get(element);
+    if (!state) return;
+    state.observer?.disconnect?.();
+    for (const [node, textState] of state.nodes) restorePickerText(node, textState);
+    modelPickerTriggers.delete(element);
+  };
+
+  const observeModelPickerTrigger = (element) => {
+    if (disposed || !element?.matches?.(modelPickerTriggerSelector)
+      || element.closest?.("[data-turn-key]")) return;
+    if (!modelPickerTriggers.has(element)) {
+      let fiber = reactFiberKeys(element).map((key) => element[key]).find(Boolean);
+      let isPicker = false;
+      for (let hops = 0; fiber && hops < 80; fiber = fiber.return, hops += 1) {
+        const props = fiber.memoizedProps;
+        if (typeof props?.model === "string" && Array.isArray(props.models)
+          && (Object.hasOwn(props, "onSelectModel") || Object.hasOwn(props, "onSelectServiceTier"))) {
+          isPicker = true;
+          break;
+        }
+        if (props && Object.hasOwn(props, "conversationId") && Object.hasOwn(props, "hideLabel")) break;
+      }
+      if (!isPicker && !pickerTextNodes(element).some((node) => pickerModelText(node.nodeValue || ""))) return;
+      const MutationObserver = window.MutationObserver || globalThis.MutationObserver;
+      const observer = typeof MutationObserver === "function"
+        ? new MutationObserver(() => updateModelPickerTrigger(element))
+        : null;
+      modelPickerTriggers.set(element, { observer, nodes: new Map() });
+      observer?.observe(element, { childList: true, characterData: true, subtree: true });
+    }
+    updateModelPickerTrigger(element);
+  };
+
+  const discoverModelPickerTriggers = (node) => {
+    const element = groupedMenuElement(node);
+    if (!element || element.closest?.("[data-turn-key]")) return;
+    observeModelPickerTrigger(element);
+    for (const trigger of element.querySelectorAll?.(modelPickerTriggerSelector) || []) {
+      observeModelPickerTrigger(trigger);
+    }
+  };
+
+  const refreshModelPickerTriggers = () => {
+    for (const element of modelPickerTriggers.keys()) {
+      if (element.isConnected === false) stopModelPickerTrigger(element);
+      else updateModelPickerTrigger(element);
+    }
+    discoverModelPickerTriggers(document.body);
+  };
+
   const groupedMenuContainer = (node) => {
     const element = groupedMenuElement(node);
     if (!element) return null;
@@ -1350,7 +1572,7 @@
   };
 
   const syncGroupedMenuTextObservers = (roots = []) => {
-    if (disposed) return;
+    if (disposed || nativeSelectionOnly) return;
     const menus = roots.length > 0
       ? roots.flatMap(menusWithin)
       : Array.from(document.querySelectorAll?.(groupedMenuSelector) || []);
@@ -1386,14 +1608,20 @@
     const discoveredMenus = [];
     let relevant = false;
     for (const mutation of mutations) {
-      const targetMenu = groupedMenuContainer(mutation.target);
+      const label = groupedMenuElement(mutation.target)?.closest?.(subagentModelLabelSelector);
+      if (label) observeSubagentModelLabel(label);
+      const trigger = groupedMenuElement(mutation.target)?.closest?.(modelPickerTriggerSelector);
+      if (trigger) observeModelPickerTrigger(trigger);
+      const targetMenu = nativeSelectionOnly ? null : groupedMenuContainer(mutation.target);
       if (targetMenu) {
         relevant = true;
         discoveredMenus.push(targetMenu);
       }
       if (mutation.type === "characterData") continue;
       for (const node of mutation.addedNodes || []) {
-        const menus = menusWithin(node);
+        discoverSubagentModelLabels(node);
+        discoverModelPickerTriggers(node);
+        const menus = nativeSelectionOnly ? [] : menusWithin(node);
         if (menus.length === 0) continue;
         relevant = true;
         discoveredMenus.push(...menus);
@@ -1405,15 +1633,22 @@
       }
     }
     if (discoveredMenus.length) syncGroupedMenuTextObservers(discoveredMenus);
-    scheduleNativeModelDisplayText();
     for (const container of [...groupedMenuTextObservers.keys()]) {
       if (container.isConnected === false) stopGroupedMenuTextObserver(container);
     }
     if (relevant) scheduleGroupedModelMenuEnhancement();
+    for (const element of subagentModelLabels.keys()) {
+      if (element.isConnected === false) stopSubagentModelLabel(element);
+    }
+    for (const element of modelPickerTriggers.keys()) {
+      if (element.isConnected === false) stopModelPickerTrigger(element);
+    }
   };
 
   const installGroupedModelMenuObserver = () => {
     if (groupedMenuObserver || !document.body) return;
+    discoverSubagentModelLabels(document.body);
+    discoverModelPickerTriggers(document.body);
     const dispatcher = window.__codeyMutationDispatcher;
     if (typeof dispatcher?.subscribe === "function") {
       const unsubscribe = dispatcher.subscribe(handleGroupedMenuMutations, {
@@ -1744,7 +1979,8 @@
       reactContainers: firstPass.reactContainers + secondPass.reactContainers,
     });
     scheduleGroupedModelMenuEnhancement();
-    scheduleNativeModelDisplayText();
+    refreshSubagentModelLabels();
+    refreshModelPickerTriggers();
     return true;
   };
 
@@ -2778,10 +3014,13 @@
     );
     if (event?.type === "keydown"
       && (!pickerInteraction || !["Enter", " ", "ArrowDown"].includes(event.key))) return;
-    if (pickerInteraction) repairNativeFastControls(event.target);
+    if (pickerInteraction) {
+      repairNativeFastControls(event.target);
+      observeModelPickerTrigger(event.target.closest?.(modelPickerTriggerSelector));
+    }
+    installGroupedModelMenuObserver();
     if (nativeSelectionOnly && !pickerInteraction) return;
     if (!nativeSelectionOnly) {
-      installGroupedModelMenuObserver();
       rememberMenuRouteIntent(event);
     }
     scheduleGroupedModelMenuEnhancement();
@@ -2803,9 +3042,7 @@
   interactionEvents.forEach((eventName) => {
     document.addEventListener(eventName, handleInteraction, true);
   });
-  if (!nativeSelectionOnly) {
-    installGroupedModelMenuObserver();
-  }
+  installGroupedModelMenuObserver();
   restoreThreadRoutes();
   restoreDefaultModelHistory();
   window.addEventListener?.("focus", handleFocus);
@@ -2841,6 +3078,7 @@
     isBlockedOutgoingMessage: (detail) => Boolean(blockedProviderRequest(detail)),
     notifyBlockedOutgoingMessage: showBlockedProviderNotice,
     enhanceModelMenus: enhanceGroupedModelMenus,
+    presentModel: (modelName, current) => modelPresentation(modelName, current),
     delivery: () => ({ ...deliveryState }),
     snapshot: () => ({
       loaded: catalog.loaded,
@@ -2863,6 +3101,12 @@
         observer.disconnect?.();
       }
       groupedMenuTextObservers.clear();
+      for (const element of subagentModelLabels.keys()) {
+        stopSubagentModelLabel(element);
+      }
+      for (const element of modelPickerTriggers.keys()) {
+        stopModelPickerTrigger(element);
+      }
       interactionEvents.forEach((eventName) => {
         document.removeEventListener(eventName, handleInteraction, true);
       });

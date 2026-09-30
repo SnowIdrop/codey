@@ -1,6 +1,7 @@
 import {
   useCallback,
   useMemo,
+  useRef,
   useState,
   type Dispatch,
   type SetStateAction,
@@ -21,6 +22,7 @@ import {
   includesModelId,
   modelIdsEqual,
   modelKey,
+  orderModelIdsBy,
   partitionModelIdsByKey,
   uniqueModelIds,
   withoutModelId,
@@ -32,6 +34,7 @@ import {
   autoReasoningEfforts,
   normalizeReasoningEfforts,
   reasoningEffortsEqual,
+  resolveModelReasoningEfforts,
 } from "./modelReasoningEfforts";
 
 const MAX_MODEL_ID_BYTES = 512;
@@ -77,6 +80,8 @@ export function useModelSelection({
     defaultModel: "",
   });
   const [modelPickerVisible, setModelPickerVisible] = useState(false);
+  const [modelPickerLoading, setModelPickerLoading] = useState(false);
+  const modelPickerSession = useRef(0);
   const [modelPickerRouteId, setModelPickerRouteId] = useState<string | null>(null);
   const [modelPickerState, setModelPickerState] = useState<ModelState | null>(null);
   const [draftModels, setDraftModels] = useState<string[]>([]);
@@ -120,12 +125,32 @@ export function useModelSelection({
   const [draftAutoReviewSupported, setDraftAutoReviewSupported] = useState(false);
 
   const modelEditorState = modelPickerState ?? modelState;
+  const officialRoutePicker = Boolean(
+    modelPickerRouteId &&
+      config?.profiles.some(
+        (profile) =>
+          profile.id === modelPickerRouteId && profile.authMode === "officialAccount",
+      ),
+  );
+  const officialOnly = Boolean(
+    officialRoutePicker || (!modelPickerRouteId && currentProvider?.official),
+  );
+  const modelPickerReasoningCapabilities = useMemo(() => {
+    const profile = config?.profiles.find(
+      (entry) => entry.id === (modelPickerRouteId ?? config.activeProfileId),
+    );
+    return Object.fromEntries(Object.entries(
+      profile?.pluginOwnerId ? profile.pluginRouteSpec?.modelReasoningEfforts ?? {} : {},
+    ).map(([model, levels]) => [modelKey(model), levels]));
+  }, [config, modelPickerRouteId]);
   const officialSlugKeys = useMemo(
     () =>
       new Set(
-        modelPickerRouteId ? [] : modelEditorState.officialModelIds.map(modelKey),
+        (!modelPickerRouteId || officialRoutePicker)
+          ? modelEditorState.officialModelIds.map(modelKey)
+          : [],
       ),
-    [modelEditorState.officialModelIds, modelPickerRouteId],
+    [modelEditorState.officialModelIds, modelPickerRouteId, officialRoutePicker],
   );
   const draftModelSet = useMemo(
     () => new Set(draftModels.map(modelKey)),
@@ -145,6 +170,7 @@ export function useModelSelection({
   );
   const thirdPartyModelOptions = useMemo(
     () => {
+      if (officialOnly) return [];
       const seenKeys = new Set<string>();
       return [
         ...modelEditorState.upstreamModels,
@@ -172,6 +198,7 @@ export function useModelSelection({
       modelEditorState.thirdPartyModels,
       modelEditorState.upstreamModels,
       officialSlugKeys,
+      officialOnly,
     ],
   );
   const subagentModelOptions = useMemo(
@@ -191,9 +218,13 @@ export function useModelSelection({
     routeId: string | null = null,
     autoReviewSupported = false,
   ) => {
-    setDraftModels(pickerSelection(state));
     const profile = config?.profiles.find((candidate) => candidate.id === (routeId ?? config.activeProfileId));
     const providerId = routeId && profile ? routeProviderId(profile) : currentProvider?.id || (profile ? routeProviderId(profile) : "");
+    // 官方目录按 Codex 缓存顺序返回，草稿要沿用线路已保存的模型顺序，保存时才不会打乱。
+    setDraftModels(orderModelIdsBy(
+      pickerSelection(state),
+      config?.selectedModelsByProvider[providerId] || [],
+    ));
     setDraftModelContexts(config?.modelContextByProvider?.[providerId] || {});
     const storedReasoningEfforts = config?.modelReasoningEffortsByProvider?.[providerId];
     const reasoningModels = uniqueModelIds([
@@ -210,13 +241,20 @@ export function useModelSelection({
       const declared = state.thirdPartyModelMetadata?.find(
         (entry) => modelKey(entry.slug) === key,
       )?.autoSupportedReasoningEfforts;
-      const base = autoReasoningEfforts(
-        declared?.length ? declared : DEFAULT_THIRD_PARTY_REASONING_EFFORTS,
-      );
-      autoEfforts[key] = base;
       const stored = Object.entries(storedReasoningEfforts ?? {}).find(([name]) =>
         modelIdsEqual(name, model))?.[1];
-      draftEfforts[key] = stored ? normalizeReasoningEfforts(stored) : base;
+      const capability = profile?.pluginOwnerId
+        ? Object.entries(profile.pluginRouteSpec?.modelReasoningEfforts ?? {}).find(
+            ([name]) => modelIdsEqual(name, model),
+          )?.[1]
+        : undefined;
+      const resolved = resolveModelReasoningEfforts(
+        declared?.length ? declared : DEFAULT_THIRD_PARTY_REASONING_EFFORTS,
+        stored,
+        capability,
+      );
+      autoEfforts[key] = resolved.autoEfforts;
+      draftEfforts[key] = resolved.efforts;
     }
     setReasoningEffortAutoByModel(autoEfforts);
     setDraftReasoningEfforts(draftEfforts);
@@ -230,6 +268,46 @@ export function useModelSelection({
     setDraftAutoReviewSupported(autoReviewSupported);
     setModelPickerVisible(true);
   }, [config, currentProvider]);
+
+  const emptyModelState = useCallback((): ModelState => ({
+    officialModels: [],
+    officialModelIds: [],
+    thirdPartyModels: [],
+    manualThirdPartyModels: [],
+    upstreamModels: [],
+    defaultModel: "",
+  }), []);
+
+  const beginModelPickerLoad = useCallback((
+    routeId: string | null = null,
+    autoReviewSupported = false,
+  ) => {
+    const session = modelPickerSession.current + 1;
+    modelPickerSession.current = session;
+    setModelPickerLoading(true);
+    openModelPicker(emptyModelState(), "", routeId, autoReviewSupported);
+    return session;
+  }, [emptyModelState, openModelPicker]);
+
+  const completeModelPickerLoad = useCallback((
+    session: number,
+    state: ModelState,
+    warning = "",
+    routeId: string | null = null,
+    autoReviewSupported = false,
+  ) => {
+    if (modelPickerSession.current !== session) return;
+    setModelPickerLoading(false);
+    openModelPicker(state, warning, routeId, autoReviewSupported);
+  }, [openModelPicker]);
+
+  const setModelPickerOpen = useCallback((open: boolean) => {
+    if (!open) {
+      modelPickerSession.current += 1;
+      setModelPickerLoading(false);
+    }
+    setModelPickerVisible(open);
+  }, []);
 
   const toggleDraftModel = useCallback((model: string | readonly string[], checked: boolean) => {
     const models = typeof model === "string" ? [model] : model;
@@ -265,6 +343,10 @@ export function useModelSelection({
   }, [modelInputError]);
 
   const addCustomModel = useCallback(() => {
+    if (officialOnly) {
+      setModelInputError("官方线路只能勾选当前账号可用的模型");
+      return;
+    }
     const model = customModelInput.trim();
     if (!model) {
       setModelInputError("请输入要添加的模型 ID");
@@ -323,6 +405,7 @@ export function useModelSelection({
     modelEditorState.officialModelIds,
     modelEditorState.upstreamModels,
     modelPickerRouteId,
+    officialOnly,
   ]);
 
   const deleteDraftThirdPartyModel = useCallback((model: string) => {
@@ -377,22 +460,37 @@ export function useModelSelection({
         declaredReasoningEfforts[model] = normalized;
       }
     }
-    const result = await invoke<{
-      config: Config;
-      modelState: ModelState;
-    } & ModelRuntimeUpdate>("save_selected_models", {
-      officialModels,
-      thirdPartyModels,
-      manualThirdPartyModels,
-      deletedThirdPartyModels: deletedModels,
-      supportsAutoReview,
-      modelContexts: Object.fromEntries(Object.entries(draftModelContexts).filter(([model]) =>
-        includesModelId(modelEditorState.officialModelIds, model) || includesModelId(thirdPartyModelOptions, model))),
-      ...(config?.localRouterEnabled === true
-        ? { reasoningEfforts: declaredReasoningEfforts }
-        : {}),
-      ...(modelPickerRouteId == null ? {} : { routeId: modelPickerRouteId }),
-    });
+    const modelContexts = Object.fromEntries(
+      Object.entries(draftModelContexts).filter(([model]) =>
+        includesModelId(modelEditorState.officialModelIds, model) ||
+        (!officialOnly && includesModelId(thirdPartyModelOptions, model)),
+      ),
+    );
+    const contextUpdate = config?.localRouterEnabled === true ? { modelContexts } : {};
+    const result = officialRoutePicker
+      ? await invoke<{
+          config: Config;
+          modelState: ModelState;
+        } & ModelRuntimeUpdate>("save_official_route_models", {
+          routeId: modelPickerRouteId,
+          models: officialModels,
+          ...contextUpdate,
+        })
+      : await invoke<{
+          config: Config;
+          modelState: ModelState;
+        } & ModelRuntimeUpdate>("save_selected_models", {
+          officialModels,
+          thirdPartyModels,
+          manualThirdPartyModels,
+          deletedThirdPartyModels: deletedModels,
+          supportsAutoReview,
+          ...contextUpdate,
+          ...(config?.localRouterEnabled === true && !officialOnly
+            ? { reasoningEfforts: declaredReasoningEfforts }
+            : {}),
+          ...(modelPickerRouteId == null ? {} : { routeId: modelPickerRouteId }),
+        });
     setPersistedConfig(result.config);
     setModelState(result.modelState);
     setStatus((current) => ({
@@ -411,12 +509,14 @@ export function useModelSelection({
     setPersistedConfig,
     setStatus,
     modelPickerRouteId,
+    officialRoutePicker,
     config,
     draftReasoningEfforts,
     draftModelContexts,
     reasoningEffortAutoByModel,
     modelEditorState.officialModelIds,
     thirdPartyModelOptions,
+    officialOnly,
   ]);
 
   const saveModelSelection = useCallback(async () => {
@@ -455,9 +555,13 @@ export function useModelSelection({
     subagentModelOptions,
     modelState,
     modelEditorState,
+    officialOnly,
     setModelState,
     modelPickerVisible,
-    setModelPickerVisible,
+    modelPickerLoading,
+    setModelPickerVisible: setModelPickerOpen,
+    beginModelPickerLoad,
+    completeModelPickerLoad,
     customModelInput,
     modelInputError,
     modelSyncWarning,
@@ -468,6 +572,7 @@ export function useModelSelection({
     updateDraftModelContext,
     draftReasoningEfforts,
     reasoningEffortAutoByModel,
+    modelPickerReasoningCapabilities,
     updateDraftReasoningEffort,
     resetDraftReasoningEffort,
     draftManualThirdPartyModelKeys,

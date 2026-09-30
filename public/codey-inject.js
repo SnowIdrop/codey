@@ -50,6 +50,7 @@
     </svg>
   `;
   let lastSelectedRow = null;
+  let messageDeleteInFlight = false;
   let scanTimer = 0;
   let initialScanHandle = 0;
   let initialScanUsesIdleCallback = false;
@@ -88,20 +89,6 @@
     "[data-message-id]",
   ].join(", ");
   const canonicalConversationTurnSelector = "[data-turn-key]";
-  // Rich conversation tooltips (notably Hooks details) can be taller than the
-  // collision-limited tooltip box. Clip the overflowing children inside that
-  // box so they cannot cover their trigger and create a pointer enter/leave
-  // loop. Codex has shipped both native button and focusable-span triggers;
-  // aria-describedby is present only while the native tooltip is open.
-  // Toggle a body class from the session-tools observer instead of body:has()
-  // so streaming characterData/childList invalidation does not re-match the
-  // four descendant :has() selectors on every mutation.
-  const conversationRichTooltipOpenClass = "codey-rich-tooltip-open";
-  const conversationRichTooltipTriggerSelector = "button, [role=\"button\"], span[tabindex=\"0\"]";
-  const conversationRichTooltipHandoffMs = 150;
-  const conversationRichTooltipCloseEvent = Symbol("codey-rich-tooltip-close");
-  let conversationRichTooltipHandoffTimer = 0;
-  let conversationRichTooltipHandoffTrigger = null;
   const sidebarScanRootSelector = [
     "header",
     "nav",
@@ -158,20 +145,33 @@
     return Promise.resolve({ status: "failed", message: "Codey bridge unavailable" });
   };
 
+  const isRenderedSessionElement = (element) => (
+    element instanceof HTMLElement
+    && element.getClientRects().length > 0
+  );
+
+  const visibleSessionElement = (selector) => {
+    const first = document.querySelector(selector);
+    if (isRenderedSessionElement(first)) return first;
+    return [...document.querySelectorAll(selector)].find(isRenderedSessionElement);
+  };
+
   const getSessionId = () => {
     const attributes = [
+      // Codex keeps inactive conversations mounted. Prefer the visible
+      // composer, and never use an identifier from a hidden conversation.
+      "data-above-composer-conversation-id",
       "data-session-id",
       "data-conversation-id",
       "data-thread-id",
       "data-request-user-input-auto-resolution-conversation-id",
       "data-response-annotation-conversation",
-      "data-above-composer-conversation-id",
     ];
     for (const attribute of attributes) {
-      const value = document.querySelector(`[${attribute}]`)?.getAttribute(attribute);
+      const value = visibleSessionElement(`[${attribute}]`)?.getAttribute(attribute);
       if (value) return value.replace(/^local:/, "");
     }
-    const activeThread = document.querySelector('[data-app-action-sidebar-thread-active="true"]')
+    const activeThread = visibleSessionElement('[data-app-action-sidebar-thread-active="true"]')
       ?.getAttribute("data-app-action-sidebar-thread-id");
     if (activeThread) return activeThread.replace(/^local:/, "");
     const match = location.pathname.match(/(?:\/c\/|\/conversation\/|\/session\/)([A-Za-z0-9_-]+)/);
@@ -685,7 +685,6 @@
       [data-codey-message-row]:hover > [data-codey-message-select], [data-codey-message-select]:focus-visible, [data-codey-message-select][aria-pressed="true"] { opacity: 1; }
       [data-codey-message-select]:hover { transform: scale(1.06); }
       [data-codey-message-select][aria-pressed="true"] { background: #5968de; border-color: #a5aeff; color: white; }
-      body.${conversationRichTooltipOpenClass} [role="tooltip"] { overflow-x: hidden !important; overflow-y: auto !important; overscroll-behavior: contain; }
       @media (max-width: 760px) { [data-codey-message-select] { left: 4px; top: -34px; } }
       #${toastId} { -webkit-app-region: no-drag !important; position: fixed; right: 20px; bottom: 22px; z-index: 2147483645; max-width: 360px; border: 1px solid rgba(124, 140, 255, .4); border-radius: 11px; padding: 10px 13px; background: rgba(20, 24, 36, .97); color: #eef2ff; box-shadow: 0 12px 36px rgba(0,0,0,.4); font: 12px/1.45 system-ui, sans-serif; }
       #${toastId}[data-tone="error"] { border-color: rgba(248, 113, 113, .6); color: #fecaca; }
@@ -734,6 +733,7 @@
   };
 
   const logicalSelectionRows = () => [...document.querySelectorAll("[data-codey-message-id]")]
+    .filter(isRenderedSessionElement)
     .filter((row) => row.dataset.codeyLogicalTurn !== "continuation");
 
   const selectedRows = () => logicalSelectionRows()
@@ -766,11 +766,39 @@
     event.stopImmediatePropagation?.();
   };
 
+  // Codex 原生按钮的尺寸与前景色由 data-* 属性驱动（data-size 决定 --button-icon-size，
+  // data-color/data-variant 决定次级前景色），只复制 class 会让注入按钮退回默认值、
+  // 图标偏大且是纯黑，所以按参考按钮逐项复制属性，并补上内层容器。
   const inheritNativeButtonClass = (button, reference) => {
-    const className = reference instanceof HTMLElement
-      ? String(reference.getAttribute("class") || "").trim()
-      : "";
+    if (!(reference instanceof HTMLElement)) return;
+    const className = String(reference.getAttribute("class") || "").trim();
     if (className) button.setAttribute("class", className);
+    for (const name of ["data-color", "data-variant", "data-pill", "data-uniform", "data-size", "data-icon-size"]) {
+      const value = reference.getAttribute(name);
+      if (value === null) button.removeAttribute(name);
+      else button.setAttribute(name, value);
+    }
+  };
+
+  // 原生图标统一放在 _ButtonInner 内：它负责 flex 居中，并把图标压到
+  // --button-icon-size（3xs 按钮即 14px）。
+  const wrapNativeButtonIcon = (button, reference) => {
+    const icon = button.querySelector("svg");
+    if (!icon) return;
+    const template = reference instanceof HTMLElement
+      ? reference.querySelector("span")
+      : null;
+    const inner = template instanceof HTMLElement
+      ? document.createElement(template.tagName.toLowerCase())
+      : document.createElement("span");
+    if (template instanceof HTMLElement) {
+      const innerClass = String(template.getAttribute("class") || "").trim();
+      if (innerClass) inner.setAttribute("class", innerClass);
+    } else {
+      inner.className = "_ButtonInner_f5tnh_2";
+    }
+    inner.appendChild(icon);
+    button.appendChild(inner);
   };
 
   const hideSidebarActionTooltip = () => {
@@ -1001,6 +1029,7 @@
       button.setAttribute("aria-label", "导出会话数据");
       inheritNativeButtonClass(button, archiveControl);
       button.innerHTML = sessionExportIcon;
+      wrapNativeButtonIcon(button, archiveControl);
       attachSidebarActionTooltip(button, "导出会话数据");
       ["pointerdown", "mousedown", "mouseup", "touchstart"].forEach((eventName) => {
         button.addEventListener(eventName, stopSidebarActionEvent, true);
@@ -1041,6 +1070,7 @@
       button.setAttribute("aria-label", "导入会话数据");
       inheritNativeButtonClass(button, newTaskControl || optionsControl);
       button.innerHTML = projectImportIcon;
+      wrapNativeButtonIcon(button, newTaskControl || optionsControl);
       attachSidebarActionTooltip(button, "导入会话数据");
       ["pointerdown", "mousedown", "mouseup", "touchstart"].forEach((eventName) => {
         button.addEventListener(eventName, stopSidebarActionEvent, true);
@@ -1876,7 +1906,7 @@
 
   const codexAssetReferencesFromSource = (source, baseUrl) => {
     const references = [];
-    const pattern = /["']((?:\.\/(?:assets\/)?|\/assets\/)(?:app-initial|app-server-manager-signals)(?:-[^"'?#/]+)?\.js(?:\?[^"']*)?)["']/g;
+    const pattern = /["']((?:\.\/(?:assets\/)?|\/assets\/)(?:app-initial|app-server-manager-signals|app-shared)(?:-[^"'?#/]+)?\.js(?:\?[^"']*)?)["']/g;
     for (const match of String(source || "").matchAll(pattern)) {
       try {
         const resolved = new URL(match[1], baseUrl).href;
@@ -1894,6 +1924,7 @@
     const discoveredUrls = loadedUrls.filter((url) => (
       url.includes("app-server-manager-signals-")
       || url.includes("app-initial-")
+      || url.includes("app-shared-")
     ));
     const fetchAsset = typeof window.fetch === "function"
       ? window.fetch.bind(window)
@@ -1907,6 +1938,7 @@
       url
       && !url.includes("app-server-manager-signals-")
       && !url.includes("app-initial-")
+      && !url.includes("app-shared-")
     )).slice(0, 6);
     for (const scriptUrl of scriptUrls) {
       try {
@@ -2059,8 +2091,7 @@
             const manager = resolver(scope, "local");
             if (
               manager
-              && ["sendRequest", "discardConversationFromCache", "refreshRecentConversations",
-                "resumeConversation", "codeyReconcileCompletedConversation"]
+              && ["sendRequest", "refreshRecentConversations", "codeyReconcileCompletedConversation"]
                 .some((method) => typeof manager[method] === "function")
             ) return manager;
           } catch {
@@ -2076,57 +2107,118 @@
   const legacySessionController = (dispatcher) => ({
     kind: "signals",
     dispatcher,
-    discardConversation: (sessionId) => dispatcher("unsubscribe-thread-for-host", {
-      hostId: "local",
-      threadId: sessionId,
-    }),
-    notifyConversationDeleted: (sessionId) => dispatcher(
-      "handle-app-server-notification-for-host",
-      {
-        hostId: "local",
-        notification: {
-          method: "thread/deleted",
-          params: { threadId: sessionId },
-        },
-      },
-    ),
     refreshRecentConversations: () => dispatcher("refresh-recent-conversations-for-host", {
       hostId: "local",
     }),
-    resumeConversation: (payload) => {
-      const {
-        showThreadGoalResumeConfirmation: _showThreadGoalResumeConfirmation,
-        ...legacyPayload
-      } = payload;
-      return dispatcher("maybe-resume-conversation", {
-        hostId: "local",
-        ...legacyPayload,
-      });
-    },
   });
 
-  const managerSessionController = (manager) => ({
-    kind: "manager",
-    manager,
-    discardConversation: typeof manager.discardConversationFromCache === "function"
-      ? (sessionId) => manager.discardConversationFromCache(sessionId) : null,
-    notifyConversationDeleted: typeof manager.handleThreadDeletion === "function"
-      ? (sessionId) => manager.handleThreadDeletion([sessionId]) : null,
-    refreshRecentConversations: typeof manager.refreshRecentConversations === "function"
-      ? () => manager.refreshRecentConversations() : null,
-    reconcileCompletedConversation: typeof manager.codeyReconcileCompletedConversation === "function"
-      ? (payload) => manager.codeyReconcileCompletedConversation(payload)
-      : null,
-    resumeConversation: typeof manager.resumeConversation === "function"
-      ? (payload) => manager.resumeConversation(payload) : null,
-  });
+  const declaredMethod = (object, name) => {
+    for (let depth = 0; object && depth < 8; depth += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(object, name);
+      if (descriptor) return typeof descriptor.value === "function" ? descriptor.value : null;
+      object = Object.getPrototypeOf(object);
+    }
+    return null;
+  };
+
+  const appServerManagerRegistryResolverFromModule = (module) => {
+    const lookups = [...new Set(Object.values(module || {}))].flatMap((candidate) => {
+      if (typeof candidate !== "function") return [];
+      const prototype = Object.getOwnPropertyDescriptor(candidate, "prototype")?.value;
+      if (!prototype || !declaredMethod(prototype, "getAll")) return [];
+      const lookup = declaredMethod(prototype, "getForHostId");
+      if (!lookup || !Function.prototype.toString.call(lookup).includes(".scope.get(")) return [];
+      return [lookup];
+    });
+    return lookups.length === 1
+      ? (scope, hostId) => lookups[0].call({ scope }, hostId) : null;
+  };
+  window.__codeyAppServerManagerRegistryResolverFromModule = appServerManagerRegistryResolverFromModule;
+
+  const messageDeletionMethods = {
+    async prepare(conversationId) {
+      const conversation = this.getConversation(conversationId);
+      const history = conversation?.turnHistory;
+      if (
+        !Array.isArray(conversation?.turns)
+        || (history != null && (history.kind !== "canonical"
+          || !Array.isArray(history.history?.islands)
+          || !history.history.islands.every((island) => Array.isArray(island.entries))
+          || !Number.isInteger(history.history.generation)
+          || !history.history.entitiesByKey
+          || typeof history.history.entitiesByKey !== "object"))
+      ) throw new Error("当前会话不支持局部删除");
+      const turns = [...conversation.turns, ...Object.values(history?.history?.entitiesByKey || {})];
+      if (
+        conversation.threadRuntimeStatus?.type === "active"
+        || conversation.requests?.length
+        || turns.some((turn) => turn?.status === "inProgress")
+      ) throw new Error("当前任务仍在运行，请等待任务结束后再删除");
+      if (this.getStreamRole(conversationId)?.role === "follower") {
+        throw new Error("请在拥有当前会话的窗口中删除消息");
+      }
+      await this.sendRequest("thread/unsubscribe", { threadId: conversationId });
+    },
+    finish(conversationId, messageIds) {
+      const selected = new Set(messageIds);
+      this.updateConversationState(conversationId, (conversation) => {
+        if (selected.size) {
+          const deletedTurns = new Set();
+          const history = conversation.turnHistory?.kind === "canonical"
+            ? conversation.turnHistory.history : null;
+          if (history) {
+            history.generation += 1;
+            const deletedKeys = new Set(Object.keys(history.entitiesByKey).filter((key) => (
+              selected.has(history.entitiesByKey[key]?.turnId)
+              || selected.has(key)
+              || selected.has(`history-content:${key}`)
+            )));
+            for (const island of history.islands) {
+              island.entries = island.entries.filter((entry) => !deletedKeys.has(entry.value));
+            }
+            for (const key of deletedKeys) {
+              deletedTurns.add(history.entitiesByKey[key]);
+              delete history.entitiesByKey[key];
+            }
+          }
+          conversation.turns = conversation.turns.filter((turn) => (
+            !selected.has(turn.turnId) && !deletedTurns.has(turn)
+          ));
+        }
+        conversation.resumeState = "needs_resume";
+      });
+      this.inactiveThreadUnsubscriber.clearConversationStreamOwnership(conversationId);
+    },
+  };
+  const isLocalMessageDeletionManager = (manager) => {
+    if (!["getHostId", "getConversation", "getStreamRole", "sendRequest", "updateConversationState"]
+      .every((name) => declaredMethod(manager, name))) return false;
+    const unsubscriber = Object.getOwnPropertyDescriptor(manager, "inactiveThreadUnsubscriber")?.value;
+    return Boolean(declaredMethod(unsubscriber, "clearConversationStreamOwnership"))
+      && manager.getHostId() === "local";
+  };
+
+  const managerSessionController = (manager) => {
+    const canDeleteMessages = isLocalMessageDeletionManager(manager);
+    return {
+      kind: "manager",
+      manager,
+      prepareMessageDeletion: canDeleteMessages ? messageDeletionMethods.prepare.bind(manager) : null,
+      finishMessageDeletion: canDeleteMessages ? messageDeletionMethods.finish.bind(manager) : null,
+      refreshRecentConversations: typeof manager.refreshRecentConversations === "function"
+        ? () => manager.refreshRecentConversations() : null,
+      reconcileCompletedConversation: typeof manager.codeyReconcileCompletedConversation === "function"
+        ? (payload) => manager.codeyReconcileCompletedConversation(payload)
+        : null,
+    };
+  };
 
   const sessionControllerLooksUsable = (controller, feature = "session") => {
     if (!controller) return false;
     if (feature === "usage" || feature === "mcpReload") return typeof controller.manager?.sendRequest === "function";
     if (feature === "reconcile") return sessionControllerCanReconcileCompletedConversation(controller);
     const methods = feature === "deleteMessages"
-      ? ["discardConversation", "resumeConversation", "refreshRecentConversations"]
+      ? ["prepareMessageDeletion", "finishMessageDeletion"]
       : feature === "refresh" ? ["refreshRecentConversations"] : [];
     return methods.length ? methods.every((method) => typeof controller[method] === "function")
       : controller.kind === "manager" || controller.kind === "signals";
@@ -2169,10 +2261,14 @@
     let fallbackDispatcher = typeof window.__codeyCodexSignalDispatcher === "function"
       ? window.__codeyCodexSignalDispatcher
       : null;
+    // 新版 Codex 把 AppServerManager 解析器放在 app-shared 里，app-initial
+    // 只剩单参辅助函数；保留原有优先级，只在 app-initial 无法解析时下沉。
     const managerAssetPriority = (url) => (
       url.includes("app-initial-")
-        ? 2
-        : Number(url.includes("app-server-manager-signals-"))
+        ? 3
+        : url.includes("app-shared-")
+          ? 2
+          : Number(url.includes("app-server-manager-signals-"))
     );
     const urls = (await discoverCodexAppAssetUrls())
       .sort((left, right) => managerAssetPriority(right) - managerAssetPriority(left));
@@ -2185,15 +2281,18 @@
           : await import(url);
         // 旧安装的迟到探测不能替换新安装已确认的接口。
         if (disposed) throw unavailableCapability(feature);
-        const resolver = appServerManagerResolverFromModule(module);
-        const manager = resolver ? appServerManagerFromReact(resolver) : null;
-        if (manager) {
+        const resolvers = [
+          feature === "deleteMessages" ? appServerManagerRegistryResolverFromModule(module) : null,
+          appServerManagerResolverFromModule(module),
+        ].filter(Boolean);
+        for (const resolver of resolvers) {
+          const manager = appServerManagerFromReact(resolver);
+          if (!manager) continue;
           const controller = managerSessionController(manager);
           if (sessionControllerLooksUsable(controller, feature)) {
             window.__codeyCodexSessionController = controller;
             return controller;
           }
-          // A missing optional method must not discard other usable features.
           window.__codeyCodexSessionController ||= controller;
         }
         fallbackDispatcher ||= signalDispatcherFromModule(module, namedSignalAsset);
@@ -2202,7 +2301,7 @@
         continue;
       }
     }
-    if (fallbackDispatcher && !requireCompletionReconcile && feature !== "usage" && feature !== "mcpReload") {
+    if (fallbackDispatcher && !requireCompletionReconcile && feature !== "usage" && feature !== "mcpReload" && feature !== "deleteMessages") {
       window.__codeyCodexSignalDispatcher = fallbackDispatcher;
       const controller = legacySessionController(fallbackDispatcher);
       window.__codeyCodexSessionController = controller;
@@ -2254,7 +2353,7 @@
   };
   window.__codeyLoadCodexSignalDispatcher = loadCodexSignalDispatcher;
 
-  const getCodexSessionController = (feature = "deleteMessages") => loadCodexSessionController({ feature });
+  const getCodexSessionController = (feature) => loadCodexSessionController({ feature });
 
   const readAccountRateLimits = async () => {
     let controller;
@@ -2368,18 +2467,7 @@
     Promise.resolve().then(operation).then(resolve, reject).finally(() => window.clearTimeout(timer));
   });
 
-  const callNativeSessionOperation = async (operation, feature = "deleteMessages") => {
-    // Bound discovery separately: a late import must not start a destructive
-    // native operation after the caller has already reported a timeout.
-    const controller = await getCodexSessionController(feature);
-    return waitForNativeSessionOperation(() => operation(controller));
-  };
-
   const callNativeCompletionReconcileOperation = async (operation) => {
-    // A legacy signals controller may have been cached by account usage or
-    // message deletion before app-initial became discoverable. Completion
-    // reconciliation specifically requires the patched AppServerManager, so it
-    // must retry manager discovery instead of accepting that cached fallback.
     const controller = await loadCodexSessionController({ requireCompletionReconcile: true });
     return waitForNativeSessionOperation(() => operation(controller));
   };
@@ -2426,36 +2514,12 @@
 
   const refreshRecentLocalSessions = async () => {
     try {
-      await callNativeSessionOperation((controller) => controller.refreshRecentConversations(), "refresh");
+      const controller = await getCodexSessionController("refresh");
+      await waitForNativeSessionOperation(() => controller.refreshRecentConversations());
       return true;
     } catch {
       return false;
     }
-  };
-
-  const reloadConversationAfterHardDelete = async (sessionId, messageIds, discarded = false) => {
-    const normalizedSessionId = String(sessionId || "").replace(/^local:/, "").trim();
-    if (!normalizedSessionId || !messageIds.length) throw new Error("缺少会话或轮次 ID");
-    const controller = await getCodexSessionController("deleteMessages");
-
-    if (!discarded) await controller.discardConversation(normalizedSessionId);
-    const cleanup = await callBridge("/session/delete-messages", {
-      sessionId: normalizedSessionId,
-      messageIds,
-    });
-    if (cleanup?.status === "failed") {
-      throw new Error(cleanup.message || "卸载会话后的持久化清理失败");
-    }
-    await controller.resumeConversation({
-      conversationId: normalizedSessionId,
-      model: null,
-      serviceTier: null,
-      reasoningEffort: null,
-      workspaceRoots: [],
-      collaborationMode: null,
-      showThreadGoalResumeConfirmation: false,
-    });
-    await controller.refreshRecentConversations();
   };
 
   const importSessionFile = async (projectPath, file, button) => {
@@ -2586,6 +2650,7 @@
       button.setAttribute("aria-label", "导入会话数据到此项目");
       inheritNativeButtonClass(button, findProjectActionControl(project));
       button.innerHTML = projectImportIcon;
+      wrapNativeButtonIcon(button, findProjectActionControl(project));
       attachSidebarActionTooltip(button, "导入会话数据到此项目");
       const refreshPosition = () => positionProjectImportButton(project, button);
       project.addEventListener("mouseenter", refreshPosition);
@@ -2739,6 +2804,7 @@
       button.setAttribute("aria-label", "永久删除");
       inheritNativeButtonClass(button, archiveControl);
       button.innerHTML = sessionDeleteIcon;
+      wrapNativeButtonIcon(button, archiveControl);
       attachSidebarActionTooltip(button, "永久删除");
       ["pointerdown", "mousedown", "mouseup", "touchstart"].forEach((eventName) => {
         button.addEventListener(eventName, stopSidebarActionEvent, true);
@@ -2787,7 +2853,8 @@
   };
 
   const syncSelectionGroups = () => {
-    const rows = [...document.querySelectorAll("[data-codey-message-id]")];
+    const rows = [...document.querySelectorAll("[data-codey-message-id]")]
+      .filter(isRenderedSessionElement);
     rows.forEach((row, index) => {
       delete row.dataset.codeySelectedPrevious;
       delete row.dataset.codeySelectedNext;
@@ -2819,8 +2886,9 @@
   };
 
   const deleteSelected = async () => {
+    if (messageDeleteInFlight) return;
     const rows = selectedRows();
-    const sessionId = getSessionId();
+    const sessionId = String(getSessionId() || "").replace(/^local:/, "").trim();
     const selectedGroupsByAnchor = new Map();
     logicalMessageSelectionGroups(sessionId).forEach((messageIds) => {
       if (messageIds[0]) selectedGroupsByAnchor.set(messageIds[0], messageIds);
@@ -2842,55 +2910,82 @@
       return;
     }
     if (!window.confirm(`删除 ${logicalCount} 轮对话？\n无法撤销。`)) return;
-    showRuntimeToast(`正在永久删除 ${logicalCount} 轮对话…`);
-    let result;
+    messageDeleteInFlight = true;
+    const deleteButton = document.getElementById(toolbarId)?.querySelector?.("[data-codey-delete]");
+    if (deleteButton) deleteButton.disabled = true;
+    let controller;
+    let prepared = false;
     try {
-      await callNativeSessionOperation((controller) => controller.discardConversation(sessionId.replace(/^local:/, "").trim()));
-      result = await callBridge("/session/delete-messages", { sessionId, messageIds });
-    } catch (error) {
-      const message = typeof error?.message === "string" ? error.message : String(error);
-      if (error?.code === "codey_capability_unavailable") {
-        showRuntimeToast(message, "error");
+      showRuntimeToast(`正在永久删除 ${logicalCount} 轮对话…`);
+      let result;
+      try {
+        controller = await getCodexSessionController("deleteMessages");
+        await controller.prepareMessageDeletion(sessionId);
+        prepared = true;
+        result = await callBridge("/session/delete-messages", { sessionId, messageIds });
+      } catch (error) {
+        const message = typeof error?.message === "string" ? error.message : String(error);
+        if (error?.code === "codey_capability_unavailable") {
+          showRuntimeToast(message, "error");
+          return;
+        }
+        window.alert(`删除失败：${message}`);
         return;
       }
-      window.alert(`删除失败：${message}`);
-      return;
+      if (result?.status === "failed") {
+        window.alert(`删除失败：${result.message || "未知错误"}`);
+        return;
+      }
+      if (Array.isArray(result?.unsupportedDatabases) && result.unsupportedDatabases.length) {
+        window.alert(
+          `会话文件已处理，但索引数据库未完成清理：${result.unsupportedDatabases.join("、")}。请退出 Codex 后重试。`,
+        );
+        return;
+      }
+      const deleted = Number(result?.deleted || 0);
+      if (deleted !== messageIds.length) {
+        const partialMessage = logicalCount === messageIds.length
+          ? `只永久删除了 ${deleted}/${messageIds.length} 轮对话。`
+          : `所选 ${logicalCount} 轮对话包含 ${messageIds.length} 个连续记录片段，只永久删除了 ${deleted} 个。`;
+        window.alert(
+          deleted
+            ? `${partialMessage}页面不会隐藏未确认删除的轮次，请重启 Codex 刷新会话后重试。`
+            : "未在会话文件中找到所选轮次，页面不会再假装删除。请更新或重启 Codey 后重试。",
+        );
+        return;
+      }
+      const resolvedMessageIds = Array.isArray(result?.resolvedMessageIds)
+        && result.resolvedMessageIds.length === messageIds.length
+        ? result.resolvedMessageIds.map(normalizeMessageId).filter(Boolean)
+        : messageIds;
+      const deletedIds = [...new Set([...messageIds, ...resolvedMessageIds])];
+      try {
+        prepared = false;
+        await controller.finishMessageDeletion(sessionId, deletedIds);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        window.alert(`消息已永久删除，但页面状态更新失败，请重新打开当前对话。\n\n${message}`);
+        return;
+      }
+      forgetLogicalMessageSelections(sessionId, deletedIds);
+      forgetLogicalMessageIds(sessionId, deletedIds);
+      rememberHardDeletedMessages(sessionId, deletedIds);
+      physicalRows.forEach((row) => row.classList.remove(selectedClass));
+      lastSelectedRow = null;
+      syncSelectionGroups();
+      updateToolbar();
+      showRuntimeToast(`已永久删除 ${logicalCount} 轮对话`);
+    } finally {
+      if (prepared) {
+        try {
+          await controller.finishMessageDeletion(sessionId, []);
+        } catch {
+          showRuntimeToast("会话状态更新失败，请重新打开当前对话", "error");
+        }
+      }
+      messageDeleteInFlight = false;
+      if (deleteButton) deleteButton.disabled = false;
     }
-    if (result?.status === "failed") {
-      window.alert(`删除失败：${result.message || "未知错误"}`);
-      return;
-    }
-    const deleted = Number(result?.deleted || 0);
-    if (deleted !== messageIds.length) {
-      const partialMessage = logicalCount === messageIds.length
-        ? `只永久删除了 ${deleted}/${messageIds.length} 轮对话。`
-        : `所选 ${logicalCount} 轮对话包含 ${messageIds.length} 个连续记录片段，只永久删除了 ${deleted} 个。`;
-      window.alert(
-        deleted
-          ? `${partialMessage}页面不会隐藏未确认删除的轮次，请重启 Codex 刷新会话后重试。`
-          : "未在会话文件中找到所选轮次，页面不会再假装删除。请更新或重启 Codey 后重试。",
-      );
-      return;
-    }
-    const resolvedMessageIds = Array.isArray(result?.resolvedMessageIds)
-      && result.resolvedMessageIds.length === messageIds.length
-      ? result.resolvedMessageIds.map(normalizeMessageId).filter(Boolean)
-      : messageIds;
-    forgetLogicalMessageSelections(sessionId, [...messageIds, ...resolvedMessageIds]);
-    forgetLogicalMessageIds(sessionId, [...messageIds, ...resolvedMessageIds]);
-    rememberHardDeletedMessages(sessionId, [...messageIds, ...resolvedMessageIds]);
-    physicalRows.forEach((row) => row.remove());
-    lastSelectedRow = null;
-    syncSelectionGroups();
-    updateToolbar();
-    try {
-      await reloadConversationAfterHardDelete(sessionId, resolvedMessageIds, true);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      window.alert(`消息已从会话文件永久删除，但 Codex 会话重新加载失败。\n请重启 Codex 后再继续对话。\n\n${message}`);
-      return;
-    }
-    showRuntimeToast(`已永久删除 ${logicalCount} 轮对话`);
   };
 
   const mountToolbar = () => {
@@ -2929,7 +3024,7 @@
       root instanceof HTMLElement
       && root.matches?.(canonicalConversationTurnSelector)
     ) {
-      return hasCanonicalTurnAncestor(root) ? [] : [root];
+      return hasCanonicalTurnAncestor(root) || !isRenderedSessionElement(root) ? [] : [root];
     }
     const candidates = queryWithin(root, conversationTurnSelector);
     const canonicalRows = new Set(candidates.filter((row) => (
@@ -2953,7 +3048,9 @@
       }
       return true;
     }));
-    return candidates.filter((row) => canonicalRows.has(row) || fallbackRows.has(row));
+    return candidates.filter((row) => (
+      isRenderedSessionElement(row) && (canonicalRows.has(row) || fallbackRows.has(row))
+    ));
   };
 
   const messageSelectionRecord = (row) => {
@@ -3301,7 +3398,6 @@
   window.__codeyInstallSessionDeleteButtons = installSessionDeleteButtons;
   window.__codeySyncSelectionGroups = syncSelectionGroups;
   window.__codeyDeleteSelectedMessages = deleteSelected;
-  window.__codeyReloadConversationAfterHardDelete = reloadConversationAfterHardDelete;
   window.__codeyInstallMessageSelection = installMessageSelection;
 
   const codeyOwnedSelector = [
@@ -3435,99 +3531,6 @@
     }
   };
 
-  const isConversationRichTooltipTriggerShape = (element) => (
-    Boolean(element?.matches?.(conversationRichTooltipTriggerSelector))
-    && Boolean(element.closest?.(conversationTurnSelector))
-  );
-  const conversationHasOpenRichTooltip = () => {
-    const turns = document.querySelectorAll?.(conversationTurnSelector);
-    if (!turns) return false;
-    for (const turn of turns) {
-      const candidates = turn.querySelectorAll?.(conversationRichTooltipTriggerSelector);
-      if (!candidates) continue;
-      for (const candidate of candidates) {
-        if (candidate.hasAttribute?.("aria-describedby")) return true;
-      }
-    }
-    return false;
-  };
-  const syncConversationRichTooltipOpen = (target) => {
-    const body = document.body;
-    if (!body?.classList || typeof body.classList.toggle !== "function") return;
-    if (target && isConversationRichTooltipTriggerShape(target)) {
-      if (target.hasAttribute?.("aria-describedby")) {
-        body.classList.add(conversationRichTooltipOpenClass);
-        return;
-      }
-      if (!body.classList.contains(conversationRichTooltipOpenClass)) return;
-    } else if (target) {
-      return;
-    }
-    body.classList.toggle(conversationRichTooltipOpenClass, conversationHasOpenRichTooltip());
-  };
-  const conversationRichTooltipFor = (trigger) => String(
-    trigger?.getAttribute?.("aria-describedby") || "",
-  ).split(/\s+/).map((id) => document.getElementById(id)).find((element) => (
-    element?.getAttribute?.("role") === "tooltip"
-  )) || null;
-  const clearConversationRichTooltipHandoff = () => {
-    if (conversationRichTooltipHandoffTimer) {
-      window.clearTimeout(conversationRichTooltipHandoffTimer);
-      conversationRichTooltipHandoffTimer = 0;
-    }
-  };
-  const closeConversationRichTooltip = () => {
-    if (disposed) return;
-    const trigger = conversationRichTooltipHandoffTrigger;
-    clearConversationRichTooltipHandoff();
-    conversationRichTooltipHandoffTrigger = null;
-    if (!(trigger instanceof HTMLElement) || trigger.isConnected === false) return;
-    const event = new PointerEvent("pointerout", {
-      bubbles: true,
-      pointerType: "mouse",
-      relatedTarget: document.body,
-    });
-    Object.defineProperty(event, conversationRichTooltipCloseEvent, { value: true });
-    trigger.dispatchEvent(event);
-  };
-  const holdConversationRichTooltipOpen = (event) => {
-    if (disposed) return;
-    if (event[conversationRichTooltipCloseEvent]) return;
-    const target = event.target instanceof Element ? event.target : null;
-    const relatedTarget = event.relatedTarget instanceof Element ? event.relatedTarget : null;
-    const trigger = target?.closest?.(conversationRichTooltipTriggerSelector);
-    if (
-      trigger
-      && isConversationRichTooltipTriggerShape(trigger)
-      && trigger.hasAttribute("aria-describedby")
-      && !trigger.contains(relatedTarget)
-    ) {
-      event.stopPropagation();
-      clearConversationRichTooltipHandoff();
-      conversationRichTooltipHandoffTrigger = trigger;
-      conversationRichTooltipHandoffTimer = window.setTimeout(
-        closeConversationRichTooltip,
-        conversationRichTooltipHandoffMs,
-      );
-      return;
-    }
-    const activeTrigger = conversationRichTooltipHandoffTrigger;
-    const tooltip = conversationRichTooltipFor(activeTrigger);
-    if (
-      tooltip?.contains(target)
-      && !tooltip.contains(relatedTarget)
-      && !activeTrigger?.contains(relatedTarget)
-    ) closeConversationRichTooltip();
-  };
-  const continueConversationRichTooltipHandoff = (event) => {
-    const target = event.target instanceof Element ? event.target : null;
-    const trigger = conversationRichTooltipHandoffTrigger;
-    if (
-      trigger?.contains(target)
-      || conversationRichTooltipFor(trigger)?.contains(target)
-    ) clearConversationRichTooltipHandoff();
-  };
-
   // Lightweight observer telemetry: per-handler call count, mutation count and
   // wall time, exposed on window.__codeyObserverStats for performance triage.
   // No behavior change; timing falls back to Date.now() where performance is
@@ -3559,10 +3562,6 @@
         ? mutation.target
         : mutation.target?.parentElement;
       if (mutation.type === "attributes") {
-        if (mutation.attributeName === "aria-describedby") {
-          syncConversationRichTooltipOpen(target);
-          continue;
-        }
         if (target && !isCodeyOwned(target)) {
           const threadRow = target.closest?.(sidebarThreadRowSelector) || null;
           const relevantThreadClassChange = threadRow
@@ -3644,8 +3643,11 @@
       "aria-label",
       "aria-expanded",
       "aria-hidden",
-      "aria-describedby",
       "data-turn-key",
+      "data-message-id",
+      "data-messageid",
+      "data-item-id",
+      "data-id",
       "data-request-user-input-auto-resolution-conversation-id",
       "data-app-action-sidebar-thread-host-id",
       "data-app-action-sidebar-thread-id",
@@ -3680,8 +3682,6 @@
     }
     if (initialScanUsesIdleCallback) window.cancelIdleCallback?.(initialScanHandle);
     else window.clearTimeout(initialScanHandle);
-    clearConversationRichTooltipHandoff();
-    conversationRichTooltipHandoffTrigger = null;
     hideSidebarActionTooltip();
     for (const id of threadRunningRecheckTimers.values()) window.clearTimeout(id);
     threadRunningRecheckTimers.clear();
@@ -3720,7 +3720,6 @@
     sessionToolObserver = new MutationObserver(handleSessionToolMutations);
     sessionToolObserver.observe(document.documentElement, sessionToolMutationOptions);
   }
-  syncConversationRichTooltipOpen();
   // forceRefresh bypasses the per-session throttle and re-fetches official
   // thread metadata for every sidebar row, so alt-tabbing must stay debounced.
   let lastForcedThreadTimeRefresh = 0;
@@ -3742,15 +3741,11 @@
     installedListeners.push(
       [document, "visibilitychange", wakeSessionWatcher, undefined],
       [document, "visibilitychange", reconcileOnVisible, undefined],
-      [document, "pointerout", holdConversationRichTooltipOpen, true],
-      [document, "pointerover", continueConversationRichTooltipHandoff, true],
       [document, "pointerdown", wakeSessionWatcher, pointerdownOptions],
       [document, "keydown", wakeSessionWatcherFromKey, true],
     );
     document.addEventListener("visibilitychange", wakeSessionWatcher);
     document.addEventListener("visibilitychange", reconcileOnVisible);
-    document.addEventListener("pointerout", holdConversationRichTooltipOpen, true);
-    document.addEventListener("pointerover", continueConversationRichTooltipHandoff, true);
     document.addEventListener("pointerdown", wakeSessionWatcher, pointerdownOptions);
     document.addEventListener("keydown", wakeSessionWatcherFromKey, true);
   }

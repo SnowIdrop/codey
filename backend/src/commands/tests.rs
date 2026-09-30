@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use super::*;
 use crate::config::ProviderProfile;
 
@@ -54,24 +56,64 @@ async fn context_recovery_preserves_other_settings_and_backs_up_the_budget() {
 #[tokio::test]
 async fn launch_context_recovery_clears_budgets_only_after_confirmation() {
     let directory = tempfile::tempdir().unwrap();
-    let mut config = CodeyConfig::default();
-    config.model_context_by_provider.insert(
-        "route".into(),
-        BTreeMap::from([(
-            "gpt-5.6-sol".into(),
-            crate::config::ModelContextConfig {
-                context_window_tokens: 256_000,
-                auto_compact_token_limit: None,
-                reserve_output_tokens: None,
-            },
+    let mut profile = ProviderProfile::new("Custom");
+    profile.id = "custom".into();
+    profile.source_provider_id = Some("custom".into());
+    profile.base_url = "https://example.test/v1".into();
+    profile.api_key = "unused-test-key".into();
+    profile.normalize();
+    let mut config = CodeyConfig {
+        local_router_enabled: true,
+        active_profile_id: profile.id.clone(),
+        profiles: vec![profile],
+        selected_models_by_provider: BTreeMap::from([(
+            "custom".into(),
+            vec!["gpt-6-astra".into(), "z-model".into()],
         )]),
+        ..CodeyConfig::default()
+    }
+    .normalize();
+    let budget = crate::config::ModelContextConfig {
+        context_window_tokens: 256_000,
+        auto_compact_token_limit: None,
+        reserve_output_tokens: None,
+    };
+    config.model_context_by_provider.insert(
+        "custom".into(),
+        BTreeMap::from([
+            ("gpt-6-astra".into(), budget.clone()),
+            ("z-model".into(), budget.clone()),
+        ]),
     );
+    config.model_context_by_provider.insert(
+        "other-route".into(),
+        BTreeMap::from([("other-model".into(), budget)]),
+    );
+    let codex_config = b"model_catalog_json = 'custom.json'\n";
+    std::fs::write(directory.path().join("config.toml"), codex_config).unwrap();
+    let catalog =
+        serde_json::to_vec(&codey_runtime_core::model_suffix::bundled_model_catalog().unwrap())
+            .unwrap();
+    let source = directory.path().join("custom.json");
+    std::fs::write(&source, &catalog).unwrap();
+    let error = crate::codex_config::runtime_model_catalog_path(
+        directory.path(),
+        true,
+        Some(&config.runtime_enabled_model_contexts()),
+    )
+    .unwrap_err()
+    .context("准备运行时模型目录失败");
+    assert!(error.is::<crate::model_catalog::ContextBudgetCatalogError>());
+    let reason = format!("{error:#}");
+    assert!(reason.contains("custom/gpt-6-astra"), "{reason}");
+    assert!(reason.contains(source.to_str().unwrap()), "{reason}");
     let state = Arc::new(AppState {
         store: ConfigStore::new(directory.path().join("config.json")),
         config: RwLock::new(config.clone()),
         ..AppState::default()
     });
     state.store.save(&config).unwrap();
+    let original = std::fs::read(state.store.path()).unwrap();
     let saved_budgets = |state: &Arc<AppState>| {
         let path = state.store.path().to_path_buf();
         let saved: CodeyConfig = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
@@ -82,28 +124,35 @@ async fn launch_context_recovery_clears_budgets_only_after_confirmation() {
     let declined = recover_default_context_budgets_with_prompt(
         &state,
         crate::native_update_ui::ContextRecoveryPurpose::Launch,
+        &reason,
         |_| async { Ok(false) },
     )
     .await
     .unwrap();
     assert!(!declined);
     assert_eq!(saved_budgets(&state), config.model_context_by_provider);
+    assert_eq!(*state.config.read().await, config);
+    assert_eq!(std::fs::read(state.store.path()).unwrap(), original);
 
     // 对话框不可用时按未确认处理，同样保留预算。
     let unanswered = recover_default_context_budgets_with_prompt(
         &state,
         crate::native_update_ui::ContextRecoveryPurpose::Launch,
+        &reason,
         |_| async { Err("原生提示不可用".to_string()) },
     )
     .await
     .unwrap();
     assert!(!unanswered);
     assert_eq!(saved_budgets(&state), config.model_context_by_provider);
+    assert_eq!(*state.config.read().await, config);
+    assert_eq!(std::fs::read(state.store.path()).unwrap(), original);
 
     // 确认后清空预算并写回配置，其他设置保持不变。
     let restored = recover_default_context_budgets_with_prompt(
         &state,
         crate::native_update_ui::ContextRecoveryPurpose::Launch,
+        &reason,
         |purpose| async move {
             assert_eq!(
                 purpose,
@@ -124,6 +173,36 @@ async fn launch_context_recovery_clears_budgets_only_after_confirmation() {
             .is_empty()
     );
     assert!(saved_budgets(&state).is_empty());
+    config.model_context_by_provider.clear();
+    assert_eq!(*state.config.read().await, config);
+    assert_eq!(
+        std::fs::read(directory.path().join("config.json.bak.1")).unwrap(),
+        original
+    );
+    assert_eq!(
+        crate::codex_config::runtime_model_catalog_path(
+            directory.path(),
+            true,
+            Some(&config.runtime_enabled_model_contexts()),
+        )
+        .unwrap(),
+        Some(source.clone())
+    );
+    assert_eq!(std::fs::read(&source).unwrap(), catalog);
+    assert_eq!(
+        std::fs::read(directory.path().join("config.toml")).unwrap(),
+        codex_config
+    );
+    assert!(
+        !recover_default_context_budgets_with_prompt(
+            &state,
+            crate::native_update_ui::ContextRecoveryPurpose::Launch,
+            &reason,
+            |_| async { panic!("没有自定义预算时不应再次请求恢复") },
+        )
+        .await
+        .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -527,6 +606,38 @@ fn provider_secret_merge_allows_changing_official_routes_to_api_key() {
 }
 
 #[test]
+fn provider_secret_merge_preserves_user_remote_compaction_setting() {
+    let mut saved = ProviderProfile::new("Imported Relay");
+    saved.id = "relay-route".into();
+    saved.base_url = "https://relay.example/v1".into();
+    saved.api_key = "saved-secret".into();
+    saved.supports_remote_compaction = true;
+    saved.normalize();
+    let previous = CodeyConfig {
+        active_profile_id: saved.id.clone(),
+        profiles: vec![saved.clone()],
+        ..CodeyConfig::default()
+    };
+
+    let mut disabled = saved.clone();
+    disabled.supports_remote_compaction = false;
+    let merged = merge_profile_secrets(vec![disabled], &previous).unwrap();
+    assert!(!merged[0].supports_remote_compaction);
+
+    let mut previous_disabled_profile = saved;
+    previous_disabled_profile.supports_remote_compaction = false;
+    let previous_disabled = CodeyConfig {
+        active_profile_id: previous_disabled_profile.id.clone(),
+        profiles: vec![previous_disabled_profile.clone()],
+        ..CodeyConfig::default()
+    };
+    let mut enabled = previous_disabled_profile;
+    enabled.supports_remote_compaction = true;
+    let merged = merge_profile_secrets(vec![enabled], &previous_disabled).unwrap();
+    assert!(merged[0].supports_remote_compaction);
+}
+
+#[test]
 fn route_name_limit_matches_the_renderer_and_legacy_names_stay_saveable() {
     let mut legacy = ProviderProfile::new("一条长度超过十五个字符限制的旧线路名称");
     legacy.id = "legacy-route".to_string();
@@ -803,6 +914,26 @@ fn unavailable_official_auth_keeps_stored_account_routes() {
 }
 
 #[test]
+fn saving_a_route_keeps_the_official_account_id_when_the_form_omits_it() {
+    let mut saved = ProviderProfile::new("pro");
+    saved.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
+    saved.official_account_id = Some("acct-one".to_string());
+    saved.normalize();
+    let mut incoming = saved.clone();
+    incoming.official_account_id = None;
+    incoming.name = "主力".to_string();
+    let previous = CodeyConfig {
+        profiles: vec![saved],
+        ..CodeyConfig::default()
+    };
+
+    let merged = merge_profile_secrets(vec![incoming], &previous).unwrap();
+
+    assert_eq!(merged[0].name, "主力");
+    assert_eq!(merged[0].official_account_id.as_deref(), Some("acct-one"));
+}
+
+#[test]
 fn unavailable_official_auth_drops_routes_of_missing_accounts() {
     // 配置里留着已删除账号的线路，而账号列表已经没有这个账号。
     let mut stale = ProviderProfile::new("已删除的账号");
@@ -904,6 +1035,22 @@ fn unavailable_official_auth_returns_the_placeholder_to_initial_import() {
     assert!(next.profiles[0].is_unconfigured_default());
     assert!(!next.initial_route_import_completed);
     assert!(next.needs_initial_route_import());
+}
+
+#[test]
+fn unavailable_official_auth_does_not_treat_empty_default_as_a_third_party_route() {
+    let next = apply_unavailable_official_probe(
+        CodeyConfig::default(),
+        "not logged in".into(),
+        Vec::new(),
+        false,
+    )
+    .unwrap();
+
+    assert!(next.profiles[0].is_unconfigured_default());
+    assert!(!next.has_third_party_route());
+    assert!(next.needs_initial_route_import());
+    assert!(!next.official_account_available_this_launch);
 }
 
 #[tokio::test]

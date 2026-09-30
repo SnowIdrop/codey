@@ -226,6 +226,13 @@ pub(crate) async fn save_native_selected_models(
     if context.provider.official && requested_model_reasoning_efforts.is_some() {
         return Err("官方线路不支持声明思考强度".to_string());
     }
+    if context.provider.official
+        && requested_model_contexts
+            .as_ref()
+            .is_some_and(|contexts| !contexts.is_empty())
+    {
+        return Err("官方线路不支持配置模型上下文参数".to_string());
+    }
     if let Some(route_id) = requested_route_id
         .as_deref()
         .map(str::trim)
@@ -257,7 +264,11 @@ pub(crate) async fn save_native_selected_models(
         &requested_deleted_third_party_models,
     )?;
     let available = if context.provider.official {
-        model_catalog::default_official_model_slugs()
+        next.upstream_models_by_provider
+            .get(&context.provider.id)
+            .filter(|models| !models.is_empty())
+            .cloned()
+            .unwrap_or_else(model_catalog::default_official_model_slugs)
     } else {
         next.upstream_models_by_provider
             .get(&context.provider.id)
@@ -319,7 +330,12 @@ pub(crate) fn config_with_native_selected_models(
         {
             return Err("官方线路不支持添加第三方模型".to_string());
         }
-        let official_models = model_catalog::default_official_model_slugs();
+        let official_models = next
+            .upstream_models_by_provider
+            .get(&provider_id)
+            .filter(|models| !models.is_empty())
+            .cloned()
+            .unwrap_or_else(model_catalog::default_official_model_slugs);
         let (selected_models, third_party_models) =
             validate_manual_model_selection(&official_models, requested_official_models, &[])?;
         if selected_models.is_empty() {
@@ -334,7 +350,6 @@ pub(crate) fn config_with_native_selected_models(
             .remove(&provider_id);
         next.declared_official_models_by_provider
             .remove(&provider_id);
-        next.upstream_models_by_provider.remove(&provider_id);
         return Ok(next.normalize());
     }
 
@@ -472,6 +487,17 @@ pub(crate) fn set_model_reasoning_efforts(
                 .iter()
                 .find(|candidate| model_id::equal(candidate, model))
                 .ok_or_else(|| format!("模型 {model} 不在该线路的可用模型列表中"))?;
+            let plugin_levels = config
+                .profiles
+                .iter()
+                .find(|profile| profile.provider_id() == provider_id)
+                .and_then(|profile| profile.plugin_route_spec.as_ref())
+                .and_then(|spec| {
+                    spec.model_reasoning_efforts
+                        .iter()
+                        .find(|(candidate, _)| model_id::equal(candidate, canonical_model))
+                        .map(|(_, levels)| levels.as_slice())
+                });
             let mut seen_levels = HashSet::new();
             let mut canonical_efforts = Vec::with_capacity(efforts.len());
             for effort in efforts {
@@ -482,6 +508,21 @@ pub(crate) fn set_model_reasoning_efforts(
                 }
                 if value.is_empty() {
                     return Err(format!("模型 {model} 的思考强度 {level} 缺少线上取值"));
+                }
+                if plugin_levels.is_some_and(|levels| {
+                    matches!(value.as_str(), "max" | "ultra")
+                        && !levels.iter().any(|allowed| allowed == &value)
+                }) {
+                    return Err(format!(
+                        "插件线路模型 {canonical_model} 的思考强度取值超出线路能力"
+                    ));
+                }
+                if plugin_levels
+                    .is_some_and(|levels| !levels.iter().any(|allowed| allowed == &level))
+                {
+                    return Err(format!(
+                        "插件线路模型 {canonical_model} 不支持思考强度 {level}"
+                    ));
                 }
                 if value.len() > crate::config::MAX_MODEL_REASONING_EFFORT_VALUE_BYTES {
                     return Err(format!(

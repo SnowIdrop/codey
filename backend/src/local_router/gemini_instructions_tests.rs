@@ -276,6 +276,19 @@ fn gemini_gpt6_baseline_matches_verified_cli_0155_fingerprint() {
     );
 }
 
+#[test]
+fn gemini_coding_agent_baseline_matches_verified_cli_01533_fingerprint() {
+    let normalized = CODING_AGENT_BASE_INSTRUCTIONS.replace("\r\n", "\n");
+    assert_eq!(normalized.trim().encode_utf16().count(), 20_750);
+    assert_eq!(
+        crate::fs_util::sha256_hex(normalized.trim().as_bytes()),
+        "ebfcbdce4a6c353e85d6cde37e508b89c77a902bd27771c91caba5fd494bdb83"
+    );
+    for other in [LEGACY_BASE_INSTRUCTIONS, GPT6_BASE_INSTRUCTIONS] {
+        assert_ne!(normalized.trim(), other.replace("\r\n", "\n").trim());
+    }
+}
+
 fn gemini_config(base_url: String, protocol: &str) -> (CodeyConfig, String) {
     let (mut config, provider, _) = router_config(base_url);
     config.profiles[0].upstream_protocol = protocol.into();
@@ -288,7 +301,7 @@ fn gemini_config(base_url: String, protocol: &str) -> (CodeyConfig, String) {
 }
 
 fn payload(model: &str) -> Value {
-    payload_with(model, LEGACY_BASE_INSTRUCTIONS)
+    payload_with(model, CODING_AGENT_BASE_INSTRUCTIONS)
 }
 
 fn payload_with(model: &str, instructions: &str) -> Value {
@@ -305,7 +318,11 @@ fn payload_with(model: &str, instructions: &str) -> Value {
 
 #[test]
 fn gemini_exact_templates_and_scope() {
-    for template in [LEGACY_BASE_INSTRUCTIONS, GPT6_BASE_INSTRUCTIONS] {
+    for template in [
+        LEGACY_BASE_INSTRUCTIONS,
+        GPT6_BASE_INSTRUCTIONS,
+        CODING_AGENT_BASE_INSTRUCTIONS,
+    ] {
         for name in ["gemini", "GEMINI-3.8", "route/vendor/gemini-3.8-flash-high"] {
             let mut body = payload_with(name, template);
             let before = body.clone();
@@ -349,6 +366,7 @@ fn gemini_line_endings_and_whitespace_only_are_normalized() {
     for template in [
         LEGACY_BASE_INSTRUCTIONS,
         GPT6_BASE_INSTRUCTIONS,
+        CODING_AGENT_BASE_INSTRUCTIONS,
         GEMINI_BASE_INSTRUCTIONS,
     ] {
         for text in [
@@ -366,6 +384,8 @@ fn gemini_unknown_or_input_only_instructions_are_rejected_without_mutation() {
     for value in [
         Value::Null,
         json!(42),
+        json!(true),
+        json!({}),
         json!([]),
         json!(""),
         json!("You are Codex, a custom agent"),
@@ -380,9 +400,28 @@ fn gemini_unknown_or_input_only_instructions_are_rejected_without_mutation() {
         assert!(adapt_gemini_base_instructions(&mut body, MODEL, false).is_err());
         assert_eq!(body, before);
     }
-    for embedded in [LEGACY_BASE_INSTRUCTIONS, GPT6_BASE_INSTRUCTIONS] {
+    for embedded in [
+        LEGACY_BASE_INSTRUCTIONS,
+        GPT6_BASE_INSTRUCTIONS,
+        CODING_AGENT_BASE_INSTRUCTIONS,
+        GEMINI_BASE_INSTRUCTIONS,
+    ] {
+        for altered in [
+            format!("{embedded}CUSTOM"),
+            format!("CUSTOM\n{embedded}"),
+            embedded.replacen('a', "b", 1),
+        ] {
+            let mut body = payload_with(MODEL, &altered);
+            let before = body.clone();
+            assert!(adapt_gemini_base_instructions(&mut body, MODEL, false).is_err());
+            assert_eq!(body, before);
+        }
         let mut body =
             json!({"instructions":"custom","input":[{"role":"developer","content":embedded}]});
+        let before = body.clone();
+        assert!(adapt_gemini_base_instructions(&mut body, MODEL, false).is_err());
+        assert_eq!(body, before);
+        body.as_object_mut().unwrap().remove("instructions");
         let before = body.clone();
         assert!(adapt_gemini_base_instructions(&mut body, MODEL, false).is_err());
         assert_eq!(body, before);
@@ -399,7 +438,7 @@ async fn gemini_native_raw_rewrite_and_offload_preserve_unrelated_slices() {
         );
         let raw = format!(
             r#"{{"model":"gemini","instructions":{},"input":{input},"tools" : [ ],"custom" : 1.00}}"#,
-            serde_json::to_string(LEGACY_BASE_INSTRUCTIONS).unwrap()
+            serde_json::to_string(CODING_AGENT_BASE_INSTRUCTIONS).unwrap()
         );
         let mut body: Value = serde_json::from_str(&raw).unwrap();
         adapt_gemini_base_instructions(&mut body, MODEL, false).unwrap();
@@ -472,79 +511,87 @@ async fn send_test_request(
 
 #[tokio::test]
 async fn gemini_routes_adapt_before_all_bridges_for_http_and_websocket() {
-    for protocol in [
-        UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
-        UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
-        UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES,
+    for template in [
+        LEGACY_BASE_INSTRUCTIONS,
+        GPT6_BASE_INSTRUCTIONS,
+        CODING_AGENT_BASE_INSTRUCTIONS,
     ] {
-        for (websocket, large) in [(false, false), (true, false), (false, true)] {
-            let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-            let address = upstream.local_addr().unwrap();
-            let capture = tokio::spawn(async move {
-                let (mut stream, _) = upstream.accept().await.unwrap();
-                let request = read_http_request(&mut stream).await.unwrap();
-                let body: Value = serde_json::from_slice(&request.body).unwrap();
-                // A real upstream error also verifies it remains transparent after adaptation.
-                write_json_response(
-                    &mut stream,
-                    429,
-                    &json!({"error":{"message":"probe rate limit","code":"probe_429"}}),
-                )
-                .await
-                .unwrap();
-                body
-            });
-            let (config, provider) = gemini_config(format!("http://{address}/v1"), protocol);
-            let router = LocalRouter::start(&config).await.unwrap();
-            let alias = model_id::model_alias(&provider, MODEL);
-            let mut body = payload(
-                if protocol == UPSTREAM_PROTOCOL_OPENAI_RESPONSES && !websocket {
-                    MODEL
-                } else {
-                    &alias
-                },
-            );
-            if large {
-                body["input"][1]["content"] = json!("x".repeat(REQUEST_JSON_OFFLOAD_BYTES + 8));
-            }
-            let response = send_test_request(&router.endpoint(), &body, websocket).await;
-            assert!(
-                response.contains("probe rate limit"),
-                "{protocol}: {response}"
-            );
-            let captured = tokio::time::timeout(Duration::from_secs(5), capture)
-                .await
-                .unwrap()
-                .unwrap();
-            let mut expected = body;
-            expected["model"] = json!(MODEL);
-            expected["instructions"] = json!(GEMINI_BASE_INSTRUCTIONS.replace("\r\n", "\n").trim());
-            if websocket {
-                expected["stream"] = json!(true);
-            }
-            let bridge = ProtocolBridge::from_upstream_protocol(UpstreamProtocol::from_profile(
-                false, protocol,
-            ));
-            let expected = bridge
-                .convert_responses_body(&expected)
-                .unwrap()
-                .map_or(expected, |c| c.body);
-            for key in [
-                "instructions",
-                "input",
-                "tools",
-                "messages",
-                "system",
-                "reasoning",
-                "reasoning_effort",
-                "thinking",
-            ] {
-                assert!(
-                    captured.get(key) == expected.get(key),
-                    "{protocol}, ws={websocket}, large={large}, key={key}"
+        for protocol in [
+            UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
+            UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+            UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES,
+        ] {
+            for (websocket, large) in [(false, false), (true, false), (false, true)] {
+                let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+                let address = upstream.local_addr().unwrap();
+                let capture = tokio::spawn(async move {
+                    let (mut stream, _) = upstream.accept().await.unwrap();
+                    let request = read_http_request(&mut stream).await.unwrap();
+                    let body: Value = serde_json::from_slice(&request.body).unwrap();
+                    // A real upstream error also verifies it remains transparent after adaptation.
+                    write_json_response(
+                        &mut stream,
+                        429,
+                        &json!({"error":{"message":"probe rate limit","code":"probe_429"}}),
+                    )
+                    .await
+                    .unwrap();
+                    body
+                });
+                let (config, provider) = gemini_config(format!("http://{address}/v1"), protocol);
+                let router = LocalRouter::start(&config).await.unwrap();
+                let alias = model_id::model_alias(&provider, MODEL);
+                let mut body = payload_with(
+                    if protocol == UPSTREAM_PROTOCOL_OPENAI_RESPONSES && !websocket {
+                        MODEL
+                    } else {
+                        &alias
+                    },
+                    template,
                 );
+                if large {
+                    body["input"][1]["content"] = json!("x".repeat(REQUEST_JSON_OFFLOAD_BYTES + 8));
+                }
+                let response = send_test_request(&router.endpoint(), &body, websocket).await;
+                assert!(
+                    response.contains("probe rate limit"),
+                    "{protocol}: {response}"
+                );
+                let captured = tokio::time::timeout(Duration::from_secs(5), capture)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut expected = body;
+                expected["model"] = json!(MODEL);
+                expected["instructions"] =
+                    json!(GEMINI_BASE_INSTRUCTIONS.replace("\r\n", "\n").trim());
+                if websocket {
+                    expected["stream"] = json!(true);
+                }
+                let bridge = ProtocolBridge::from_upstream_protocol(
+                    UpstreamProtocol::from_profile(false, protocol),
+                );
+                let expected = bridge
+                    .convert_responses_body(&expected)
+                    .unwrap()
+                    .map_or(expected, |c| c.body);
+                for key in [
+                    "instructions",
+                    "input",
+                    "tools",
+                    "messages",
+                    "system",
+                    "reasoning",
+                    "reasoning_effort",
+                    "thinking",
+                ] {
+                    assert!(
+                        captured.get(key) == expected.get(key),
+                        "{protocol}, ws={websocket}, large={large}, key={key}"
+                    );
+                }
+                router.stop().await.unwrap();
             }
-            router.stop().await.unwrap();
         }
     }
 }
@@ -555,6 +602,9 @@ async fn gemini_unknown_instructions_never_connect_to_upstream() {
         "custom instructions".to_string(),
         format!("{GPT6_BASE_INSTRUCTIONS}CUSTOM"),
         format!("CUSTOM\n{LEGACY_BASE_INSTRUCTIONS}"),
+        format!("{CODING_AGENT_BASE_INSTRUCTIONS}CUSTOM"),
+        format!("CUSTOM\n{CODING_AGENT_BASE_INSTRUCTIONS}"),
+        CODING_AGENT_BASE_INSTRUCTIONS.replacen('a', "b", 1),
     ] {
         for websocket in [false, true] {
             let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -722,6 +772,12 @@ async fn gemini_native_cli_child_through_actual_router() {
     for (baseline, role, rejected) in [
         ("legacy", json!({"agent_type":"codey_comments"}), false),
         ("gpt6", json!({"agent_type":"codey_comments"}), false),
+        (
+            "coding-agent",
+            json!({"agent_type":"codey_quick_scan"}),
+            false,
+        ),
+        ("catalog", json!({"agent_type":"codey_quick_scan"}), false),
         ("gpt6", json!({"agent_type":"default"}), true),
         ("gpt6", json!({"agent_type":"explorer"}), true),
         ("gpt6", json!({"agent_type":"worker"}), true),
@@ -798,7 +854,11 @@ async fn run_native_role_probe(baseline: &str, role_input: Value, rejected: bool
         )
     } else {
         (
-            "codey_comments",
+            if matches!(baseline, "coding-agent" | "catalog") {
+                "codey_quick_scan"
+            } else {
+                "codey_comments"
+            },
             MODEL,
             "high",
             UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
@@ -807,7 +867,7 @@ async fn run_native_role_probe(baseline: &str, role_input: Value, rejected: bool
     for (id, model, protocol) in [
         (
             "route-parent",
-            "gpt-5.6-terra",
+            upstream["parent_model"].as_str().unwrap(),
             UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
         ),
         ("route-child", child_model, child_protocol),
@@ -874,6 +934,8 @@ async fn run_native_role_probe(baseline: &str, role_input: Value, rejected: bool
         return;
     }
     for key in [
+        "catalogBaseUnmodified",
+        "childCompleted",
         "childPersistedKnownBase",
         "childRuntimeMatches",
         "chatPathCorrect",

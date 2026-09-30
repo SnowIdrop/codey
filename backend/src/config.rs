@@ -40,6 +40,12 @@ pub struct ProviderProfile {
     /// Stable id of the provider in the source Codex configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_provider_id: Option<String>,
+    /// 这条线路由启用中的原生插件登记。用户填写密钥并改动线路后会清空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_owner_id: Option<String>,
+    /// 上次由插件提交并写入的线路描述，用来判断用户是否改过线路本身。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_route_spec: Option<crate::codey_plugins::PluginRouteSpec>,
     #[serde(default)]
     pub official_account: bool,
     /// Codey account id when this route is derived from one stored official
@@ -227,6 +233,8 @@ impl ProviderProfile {
             model_request_headers: BTreeMap::new(),
             upstream_proxy: String::new(),
             source_provider_id: None,
+            plugin_owner_id: None,
+            plugin_route_spec: None,
             official_account: false,
             official_account_id: None,
             supports_remote_compaction: false,
@@ -405,7 +413,7 @@ impl ProviderProfile {
         }
         validate_outbound_api_url(base_url, &format!("线路「{name}」的 API URL"))?;
         self.runtime_wire_api()?;
-        if self.api_key.trim().is_empty() {
+        if self.api_key.trim().is_empty() && self.plugin_owner_id.is_none() {
             return Err(format!("线路「{name}」缺少第三方 API Key"));
         }
         Ok(())
@@ -918,6 +926,14 @@ pub struct CodeyConfig {
         skip_deserializing
     )]
     pub update_manifest_url: String,
+    /// Optional release-admin Worker endpoint for device-aware publishing.
+    /// This is build-time configuration, never a user setting.
+    #[serde(
+        default = "default_release_admin_url",
+        skip_serializing,
+        skip_deserializing
+    )]
+    pub release_admin_url: String,
 }
 
 /// User-declared operating budget, never proof of upstream model capacity.
@@ -1027,6 +1043,7 @@ impl Default for CodeyConfig {
             official_account_available_this_launch: false,
             official_account_status_this_launch: LaunchOfficialAccountStatus::Unauthenticated,
             update_manifest_url: default_update_manifest_url(),
+            release_admin_url: default_release_admin_url(),
         }
     }
 }
@@ -1038,6 +1055,7 @@ fn default_stream_max_retries() -> u32 {
 impl CodeyConfig {
     pub fn normalize(mut self) -> Self {
         self.update_manifest_url = default_update_manifest_url();
+        self.release_admin_url = default_release_admin_url();
         self.stream_max_retries = self.stream_max_retries.min(100);
         self.route_request_log.normalize();
         self.profiles
@@ -1337,6 +1355,34 @@ impl CodeyConfig {
             .map(|(_, policy)| policy)
     }
 
+    pub(crate) fn runtime_plugin_model_contexts(&self) -> BTreeMap<String, ModelContextConfig> {
+        let qualify_official = self.qualifies_official_model_ids();
+        let mut contexts = BTreeMap::new();
+        for profile in self
+            .profiles
+            .iter()
+            .filter(|p| p.enabled && p.plugin_owner_id.is_some())
+        {
+            if let Some(transport) = profile
+                .plugin_route_spec
+                .as_ref()
+                .and_then(|s| s.transport.as_ref())
+            {
+                for (model, caps) in &transport.models {
+                    contexts.insert(
+                        runtime_catalog_model_id(profile, model, qualify_official),
+                        ModelContextConfig {
+                            context_window_tokens: caps.context_window,
+                            auto_compact_token_limit: Some(caps.auto_compact_token_limit),
+                            reserve_output_tokens: None,
+                        },
+                    );
+                }
+            }
+        }
+        contexts
+    }
+
     pub(crate) fn runtime_model_contexts(&self) -> BTreeMap<String, ModelContextConfig> {
         let qualify_official = self.qualifies_official_model_ids();
         self.profiles
@@ -1359,6 +1405,29 @@ impl CodeyConfig {
             .collect()
     }
 
+    /// 运行时覆盖仅针对启用的模型；未勾选模型的预算仍保留在配置里。
+    pub(crate) fn runtime_enabled_model_contexts(&self) -> BTreeMap<String, ModelContextConfig> {
+        if !self.local_router_enabled {
+            return BTreeMap::new();
+        }
+        let policies = self
+            .runtime_plugin_model_contexts()
+            .into_iter()
+            .chain(self.runtime_model_contexts())
+            .map(|(model, policy)| (model_id::key(&model), policy))
+            .collect::<BTreeMap<_, _>>();
+        self.runtime_catalog_models()
+            .1
+            .into_iter()
+            .filter_map(|model| {
+                policies
+                    .get(&model_id::key(&model))
+                    .cloned()
+                    .map(|policy| (model, policy))
+            })
+            .collect()
+    }
+
     /// Declared thinking levels keyed by the runtime catalog id of each model.
     pub(crate) fn runtime_model_reasoning_efforts(
         &self,
@@ -1369,19 +1438,100 @@ impl CodeyConfig {
             .filter(|profile| profile.enabled)
             .filter(|profile| !profile.official_account || self.official_route_usable(profile))
             .flat_map(|profile| {
-                self.model_reasoning_efforts_by_provider
-                    .get(profile.provider_id())
+                self.model_reasoning_efforts_for_provider(profile.provider_id())
                     .into_iter()
-                    .flat_map(move |models| {
-                        models.iter().map(move |(model, efforts)| {
-                            (
-                                runtime_catalog_model_id(profile, model, qualify_official),
-                                efforts.clone(),
-                            )
-                        })
+                    .map(move |(model, efforts)| {
+                        (
+                            runtime_catalog_model_id(profile, &model, qualify_official),
+                            efforts,
+                        )
                     })
             })
             .collect()
+    }
+
+    /// Returns the effective thinking levels for one route. Plugin declarations
+    /// form the route capability boundary; user declarations can customize the
+    /// upstream value for an allowed level but cannot add a new level.
+    pub(crate) fn model_reasoning_efforts_for_provider(
+        &self,
+        provider_id: &str,
+    ) -> BTreeMap<String, Vec<ModelReasoningEffort>> {
+        let Some(profile) = self
+            .profiles
+            .iter()
+            .find(|profile| profile.provider_id() == provider_id)
+        else {
+            return self
+                .model_reasoning_efforts_by_provider
+                .get(provider_id)
+                .cloned()
+                .unwrap_or_default();
+        };
+        let capabilities = profile
+            .plugin_route_spec
+            .as_ref()
+            .map(|spec| spec.model_reasoning_efforts.clone())
+            .unwrap_or_default();
+        let mut effective = capabilities
+            .iter()
+            .map(|(model, levels)| {
+                (
+                    model.clone(),
+                    levels
+                        .iter()
+                        .map(|level| ModelReasoningEffort {
+                            level: level.clone(),
+                            value: level.clone(),
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let Some(user_models) = self.model_reasoning_efforts_by_provider.get(provider_id) else {
+            return effective;
+        };
+        for (model, configured) in user_models {
+            let capability = capabilities
+                .iter()
+                .find(|(candidate, _)| model_id::equal(candidate, model));
+            let Some((canonical_model, allowed_levels)) = capability else {
+                effective.insert(model.clone(), configured.clone());
+                continue;
+            };
+            let mut seen = BTreeSet::new();
+            let mut values = Vec::new();
+            for effort in configured {
+                let (level, value) = if allowed_levels
+                    .iter()
+                    .any(|allowed| allowed == &effort.level)
+                {
+                    let value = if matches!(effort.value.as_str(), "max" | "ultra")
+                        && !allowed_levels
+                            .iter()
+                            .any(|allowed| allowed == &effort.value)
+                    {
+                        effort.level.clone()
+                    } else {
+                        effort.value.clone()
+                    };
+                    (effort.level.clone(), value)
+                } else if matches!(effort.level.as_str(), "max" | "ultra")
+                    && allowed_levels.iter().any(|allowed| allowed == "xhigh")
+                {
+                    ("xhigh".to_string(), "xhigh".to_string())
+                } else {
+                    continue;
+                };
+                if seen.insert(level.clone()) {
+                    values.push(ModelReasoningEffort { level, value });
+                }
+            }
+            if !values.is_empty() {
+                effective.insert(canonical_model.clone(), values);
+            }
+        }
+        effective
     }
 
     pub(crate) fn provider_is_disabled(&self, provider_id: &str) -> bool {
@@ -1455,12 +1605,37 @@ impl CodeyConfig {
             return;
         }
         let supported_models = official_models_by_key();
+        let synchronized_models = self
+            .upstream_models_by_provider
+            .iter()
+            .filter(|(_, models)| !models.is_empty())
+            .map(|(provider_id, models)| {
+                (
+                    provider_id.clone(),
+                    models
+                        .iter()
+                        .map(|model| model_id::key(model))
+                        .collect::<BTreeSet<_>>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         self.selected_models_by_provider
             .retain(|provider_id, models| {
                 if !official_provider_ids.contains(provider_id) {
                     return true;
                 }
-                models.retain(|model| supported_models.contains_key(&model_id::key(model)));
+                // A synchronized official account may expose models newer
+                // than Codey's built-in fallback list. The per-route upstream
+                // snapshot is authoritative when present; otherwise retain
+                // the historical fixed-list behavior.
+                let route_models = synchronized_models.get(provider_id);
+                models.retain(|model| {
+                    route_models
+                        .as_ref()
+                        .is_some_and(|known| known.contains(&model_id::key(model)))
+                        || (route_models.is_none()
+                            && supported_models.contains_key(&model_id::key(model)))
+                });
                 !models.is_empty()
             });
     }
@@ -1519,7 +1694,13 @@ impl CodeyConfig {
         profile: &ProviderProfile,
         outbound_proxy_configured: bool,
     ) -> bool {
-        if !profile.enabled || outbound_proxy_configured {
+        if !profile.enabled
+            || outbound_proxy_configured
+            || profile
+                .plugin_route_spec
+                .as_ref()
+                .is_some_and(|s| s.transport.is_some())
+        {
             return false;
         }
         if profile.official_account {
@@ -1569,7 +1750,12 @@ impl CodeyConfig {
         &self,
         profile: &ProviderProfile,
     ) -> bool {
-        if !profile.enabled {
+        if !profile.enabled
+            || profile
+                .plugin_route_spec
+                .as_ref()
+                .is_some_and(|s| s.transport.is_some())
+        {
             return false;
         }
         if profile.official_account {
@@ -1646,7 +1832,12 @@ impl CodeyConfig {
         &self,
         profile: &ProviderProfile,
     ) -> bool {
-        if !profile.enabled {
+        if !profile.enabled
+            || profile
+                .plugin_route_spec
+                .as_ref()
+                .is_some_and(|s| s.transport.is_some())
+        {
             return false;
         }
         if profile.official_account {
@@ -1758,9 +1949,9 @@ impl CodeyConfig {
     }
 
     pub fn has_third_party_route(&self) -> bool {
-        self.profiles
-            .iter()
-            .any(|profile| profile.enabled && !profile.official_account)
+        self.profiles.iter().any(|profile| {
+            profile.enabled && !profile.official_account && !profile.is_unconfigured_default()
+        })
     }
 
     pub(crate) fn uses_builtin_official_model_catalog(&self) -> bool {
@@ -1771,6 +1962,16 @@ impl CodeyConfig {
                 .profiles
                 .iter()
                 .any(|profile| profile.enabled && profile.official_account)
+    }
+
+    pub(crate) fn allocate_route_short_name(&self, name: &str) -> String {
+        let used = self
+            .profiles
+            .iter()
+            .map(|profile| profile.short_name.trim().to_string())
+            .filter(|short_name| !short_name.is_empty())
+            .collect::<BTreeSet<_>>();
+        unique_default_route_short_name(name, &used)
     }
 
     pub(crate) fn looks_like_empty_default_route(&self) -> bool {
@@ -2609,6 +2810,7 @@ fn default_subagent_reasoning_effort() -> String {
 }
 
 const DEFAULT_UPDATE_BASE_URL: &str = "https://pub-2d17a6a8bc22426a92e297a59f55ccc3.r2.dev";
+const DEFAULT_RELEASE_ADMIN_URL: &str = "https://codey-release-admin.kimzane9991.workers.dev";
 
 fn update_manifest_url_from_base(configured_base_url: Option<&str>) -> String {
     let base_url = configured_base_url
@@ -2621,6 +2823,15 @@ fn update_manifest_url_from_base(configured_base_url: Option<&str>) -> String {
 
 pub fn default_update_manifest_url() -> String {
     update_manifest_url_from_base(option_env!("CODEY_UPDATE_BASE_URL"))
+}
+
+pub fn default_release_admin_url() -> String {
+    option_env!("CODEY_RELEASE_ADMIN_URL")
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .unwrap_or(DEFAULT_RELEASE_ADMIN_URL)
+        .trim_end_matches('/')
+        .to_string()
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -2701,6 +2912,38 @@ impl ConfigStore {
     #[cfg(test)]
     pub fn save(&self, config: &CodeyConfig) -> Result<()> {
         self.persist(config.clone()).map(|_| ())
+    }
+
+    /// Copies the config and backups that failed to load out of the backup
+    /// rotation, so later saves of the fallback defaults cannot push the
+    /// user's original out of reach. Copies are named after their content, so
+    /// relaunching with the same broken files adds nothing.
+    pub fn preserve_unreadable(&self) -> Vec<PathBuf> {
+        use sha2::{Digest, Sha256};
+
+        std::iter::once(self.path.clone())
+            .chain((1..=CONFIG_BACKUP_COUNT).map(|index| self.backup_path(index)))
+            .filter_map(|path| {
+                let bytes = fs::read(&path).ok()?;
+                let digest = format!("{:x}", Sha256::digest(&bytes));
+                let file_name = path.file_name()?.to_string_lossy().into_owned();
+                let target =
+                    path.with_file_name(format!("{file_name}.unreadable-{}", &digest[..12]));
+                if !target.exists()
+                    && let Err(error) =
+                        crate::fs_util::atomic_write_private_with_parent(&target, &bytes)
+                {
+                    crate::error_log::record_failure(
+                        "config_preserve_failed",
+                        "preserve_unreadable_codey_config",
+                        format!("{error:#}"),
+                        serde_json::json!({ "from": path.display().to_string() }),
+                    );
+                    return None;
+                }
+                Some(target)
+            })
+            .collect()
     }
 
     fn backup_path(&self, index: usize) -> PathBuf {
@@ -3001,6 +3244,31 @@ mod tests {
 
         let recovered = store.load().unwrap();
         assert_eq!(recovered.profiles[0].name, "version-2");
+    }
+
+    // 【自动化测试】配置存储 - 无法读取的配置另存到轮转之外，保存默认值后仍可找回
+    #[test]
+    fn unreadable_configs_are_preserved_outside_the_backup_rotation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(directory.path().join("config.json"));
+        fs::write(store.path(), b"corrupt-primary").unwrap();
+        fs::write(store.backup_path(1), b"corrupt-backup").unwrap();
+        assert!(store.load().is_err());
+
+        let preserved = store.preserve_unreadable();
+        assert_eq!(preserved.len(), 2);
+        assert_eq!(fs::read(&preserved[0]).unwrap(), b"corrupt-primary");
+        assert_eq!(fs::read(&preserved[1]).unwrap(), b"corrupt-backup");
+        assert_eq!(store.preserve_unreadable(), preserved);
+
+        for version in 1..=4 {
+            store
+                .save(&named_config(&format!("version-{version}")))
+                .unwrap();
+        }
+        assert_eq!(fs::read(&preserved[0]).unwrap(), b"corrupt-primary");
+        assert_eq!(fs::read(&preserved[1]).unwrap(), b"corrupt-backup");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 6);
     }
 
     #[cfg(unix)]
@@ -3815,6 +4083,15 @@ mod tests {
         let config = config.normalize();
         assert!(config.runtime_model_targets().is_empty());
         assert!(!config.has_third_party_route());
+    }
+
+    #[test]
+    fn empty_default_route_is_not_a_third_party_route() {
+        let config = CodeyConfig::default();
+        assert!(config.profiles[0].is_unconfigured_default());
+        assert!(config.needs_initial_route_import());
+        assert!(!config.has_third_party_route());
+        assert!(validate_provider_profiles(&config.profiles).is_ok());
     }
 
     #[test]

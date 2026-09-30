@@ -169,7 +169,7 @@ impl RuleSet {
             ("codey_worker", RoleAccess::Write, false),
             ("codey_comments", RoleAccess::Write, false),
             ("codey_visual_worker", RoleAccess::Write, true),
-            ("default", RoleAccess::ReadOnly, false),
+            ("default", RoleAccess::Write, true),
         ];
         anyhow::ensure!(
             self.roles.len() == EXPECTED_ROLES.len(),
@@ -201,8 +201,13 @@ impl RuleSet {
                 tool_class: ToolClass::Unknown,
             });
             anyhow::ensure!(
-                unknown.effect == RuleEffect::Deny,
-                "子代理规则必须拒绝角色 {role} 的未知工具"
+                unknown.effect
+                    == if expected_access == RoleAccess::ReadOnly || role == "codey_comments" {
+                        RuleEffect::Deny
+                    } else {
+                        RuleEffect::Allow
+                    },
+                "子代理规则必须按角色安全边界限制角色 {role} 的未归类工具"
             );
             if expected_access == RoleAccess::ReadOnly {
                 let write = self.evaluate(&RuleContext {
@@ -510,6 +515,16 @@ fn load_file(path: &Path) -> Result<Option<(RuleSet, Vec<u8>)>> {
                 rule.roles.push("codey_comments".into());
             }
         }
+        rules.rules.push(RuleDefinition {
+            id: "deny-unknown-comments-tool".into(),
+            priority: 900,
+            effect: RuleEffect::Deny,
+            actors: vec![RuleActor::Child],
+            roles: vec!["codey_comments".into()],
+            tools: Vec::new(),
+            tool_classes: vec![ToolClass::Unknown],
+            explanation: "注释角色不得调用未归类工具。".into(),
+        });
         rules.revision = rules.revision.max(8);
     }
     rules.validate()?;
@@ -676,6 +691,68 @@ mod tests {
             tool_class: ToolClass::Unknown,
         });
         assert_eq!(decision.effect, RuleEffect::Deny);
+        assert_eq!(decision.rule_id, "deny-unknown-child-tool");
+        assert_eq!(
+            rules
+                .evaluate(&RuleContext {
+                    actor: RuleActor::Child,
+                    role: Some("codey_comments"),
+                    tool_name: "mcp__mystery__mutate",
+                    tool_class: ToolClass::Unknown,
+                })
+                .effect,
+            RuleEffect::Deny
+        );
+
+        for (role, rule_id) in [
+            ("codey_worker", "allow-general-worker-capabilities"),
+            ("codey_visual_worker", "allow-general-worker-capabilities"),
+            ("default", "allow-default-capabilities"),
+        ] {
+            let decision = rules.evaluate(&RuleContext {
+                actor: RuleActor::Child,
+                role: Some(role),
+                tool_name: "mcp_idea_apply_patch",
+                tool_class: classify_tool("mcp_idea_apply_patch"),
+            });
+            assert_eq!(decision.effect, RuleEffect::Allow, "{role}");
+            assert_eq!(decision.rule_id, rule_id, "{role}");
+            assert_eq!(
+                rules
+                    .evaluate(&RuleContext {
+                        actor: RuleActor::Child,
+                        role: Some(role),
+                        tool_name: "apply_patch",
+                        tool_class: ToolClass::Write,
+                    })
+                    .effect,
+                RuleEffect::Allow,
+                "{role}"
+            );
+            assert_eq!(
+                rules
+                    .evaluate(&RuleContext {
+                        actor: RuleActor::Child,
+                        role: Some(role),
+                        tool_name: "agents.spawn_agent",
+                        tool_class: ToolClass::Spawn,
+                    })
+                    .effect,
+                RuleEffect::Deny,
+                "{role}"
+            );
+        }
+        assert_eq!(
+            rules
+                .evaluate(&RuleContext {
+                    actor: RuleActor::Child,
+                    role: None,
+                    tool_name: "mcp_idea_apply_patch",
+                    tool_class: ToolClass::Unknown,
+                })
+                .effect,
+            RuleEffect::Deny
+        );
 
         for (role, tool, class) in [
             (None, "functions.exec", ToolClass::Command),
@@ -779,12 +856,24 @@ mod tests {
                 embedded()
                     .evaluate(&RuleContext {
                         actor: RuleActor::Child,
-                        role: Some("codey_worker"),
+                        role: Some("codey_quick_scan"),
                         tool_name: tool,
                         tool_class: classify_tool(tool),
                     })
                     .effect,
                 RuleEffect::Deny,
+                "{tool}"
+            );
+            assert_eq!(
+                embedded()
+                    .evaluate(&RuleContext {
+                        actor: RuleActor::Child,
+                        role: Some("codey_worker"),
+                        tool_name: tool,
+                        tool_class: classify_tool(tool),
+                    })
+                    .effect,
+                RuleEffect::Allow,
                 "{tool}"
             );
         }
@@ -835,6 +924,9 @@ mod tests {
         let mut legacy = embedded().clone();
         legacy.roles.remove("codey_comments");
         legacy.revision = 7;
+        legacy
+            .rules
+            .retain(|rule| rule.roles.len() != 1 || rule.roles[0] != "codey_comments");
         for rule in &mut legacy.rules {
             rule.roles.retain(|role| role != "codey_comments");
         }
@@ -948,6 +1040,9 @@ mod tests {
         }
         let mut legacy = embedded().clone();
         legacy.roles.remove("codey_comments");
+        legacy
+            .rules
+            .retain(|rule| rule.roles.len() != 1 || rule.roles[0] != "codey_comments");
         for rule in &mut legacy.rules {
             rule.roles.retain(|role| role != "codey_comments");
         }

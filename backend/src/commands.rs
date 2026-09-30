@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 #[cfg(all(test, windows))]
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,7 +31,6 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, RwLock, oneshot, watch};
 
-use diagnostics::clear_diagnostic_storage;
 pub(crate) use models::native_subagent_model_state;
 #[cfg(test)]
 use models::{
@@ -44,21 +43,11 @@ use models::{
 use models::{
     current_model_state_async, current_provider_status_async, current_renderer_model_catalog_async,
     hot_reload_runtime_models, native_web_search_capability_requires_restart,
-    official_route_snapshots, reconcile_subagent_models_for_mode,
+    official_route_snapshots_for_runtime, reconcile_subagent_models_for_mode,
     runtime_supports_current_routes_for_hot_reload, sync_current_third_party_provider_state,
     sync_provider_models_for_launch, websocket_transport_requires_restart,
 };
-pub use models::{
-    delete_route, fetch_route_models, save_default_model, save_official_route_models,
-    save_selected_models, set_route_enabled, sync_current_provider_command,
-};
-use official_accounts::{
-    cancel_official_account_login, import_current_codex_login, list_official_accounts,
-    poll_official_account_login, refresh_official_route_after_account_change,
-    remove_official_account, save_official_account_route_settings, set_default_official_account,
-    start_official_account_login,
-};
-use plugins::{plugin_marketplace_status, repair_plugin_marketplace};
+use plugins::{plugin_marketplace_status, prepare_computer_use, repair_plugin_marketplace};
 use prompt_optimization::{
     fetch_prompt_optimization_models_command, optimize_prompt_command,
     test_prompt_optimization_command,
@@ -79,9 +68,6 @@ pub(crate) use updates::{
 };
 #[cfg(test)]
 use updates::{UpdateManifest, assess_update_manifest, current_update_arch};
-pub use updates::{
-    check_for_updates, download_update, install_downloaded_update, update_install_report,
-};
 use webhooks::{
     WaitingLedgerState, WebhookNotificationState, initial_waiting_notifications,
     sync_waiting_webhook_watcher, test_notification_channel,
@@ -136,6 +122,12 @@ pub struct AppState {
     pub workflow: arc_swap::ArcSwap<WorkflowHost>,
     config_write_lock: Mutex<()>,
     provider_model_sync_lock: Mutex<()>,
+    plugin_route_reload_lock: Mutex<()>,
+    model_delivery_lock: Mutex<()>,
+    /// Captured when the state is created on the Codey runtime. Plugin route
+    /// changes arrive on plugin threads, which cannot see that runtime via
+    /// `Handle::try_current`.
+    runtime_handle: Option<tokio::runtime::Handle>,
     pub http_client: reqwest::Client,
     /// Official token refresh clients keyed by account proxy URL.
     official_proxied_clients: BlockingMutex<HashMap<String, reqwest::Client>>,
@@ -159,6 +151,9 @@ pub struct AppState {
     trace_log_write_protection_active: AtomicBool,
     pub crashpad_pending_stats: CrashpadPendingStatsHandle,
     pub startup_error: RwLock<Option<String>>,
+    /// Kept apart from `startup_error`, which each launch overwrites and hot
+    /// reloads treat as an untrusted runtime.
+    config_load_error: Option<String>,
     available_update: RwLock<Option<updates::UpdateCheck>>,
     update_candidate_cache: Mutex<Option<updates::CachedUpdateCandidate>>,
     codex_app_version_cache: Mutex<Option<runtime::CodexAppVersionCache>>,
@@ -215,18 +210,41 @@ pub enum AppShutdownReason {
     InstallUpdate,
 }
 
+/// An unreadable config falls back to defaults for this launch. The broken
+/// files are copied aside first because saving the defaults rotates them
+/// through the backup chain.
+fn load_config_or_defaults(store: &ConfigStore) -> (CodeyConfig, Option<String>) {
+    let error = match store.load() {
+        Ok(config) => return (config, None),
+        Err(error) => error,
+    };
+    let preserved = store.preserve_unreadable();
+    let preserved = if preserved.is_empty() {
+        String::new()
+    } else {
+        let paths = preserved
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join("、");
+        format!("；原文件已另存为：{paths}")
+    };
+    let message = format!(
+        "Codey 配置无法读取，已使用安全默认值启动；请先检查或恢复配置文件：{error:#}{preserved}"
+    );
+    error_log::record_failure(
+        "config_load_failed",
+        "load_codey_config_at_startup",
+        message.clone(),
+        json!({ "path": store.path().display().to_string() }),
+    );
+    (CodeyConfig::default(), Some(message))
+}
+
 impl Default for AppState {
     fn default() -> Self {
         let store = ConfigStore::default();
-        let (config, config_load_error) = match store.load() {
-            Ok(config) => (config, None),
-            Err(error) => (
-                CodeyConfig::default(),
-                Some(format!(
-                    "Codey 配置无法读取，已使用安全默认值启动；请先检查或恢复配置文件：{error:#}"
-                )),
-            ),
-        };
+        let (config, config_load_error) = load_config_or_defaults(&store);
         let workflow = WorkflowHost::from_config(&config, store.path());
         let protect_crashpad_pending = config.protect_crashpad_pending;
         let persisted_waiting_notifications = initial_waiting_notifications(&store, &[]);
@@ -237,6 +255,9 @@ impl Default for AppState {
             workflow: arc_swap::ArcSwap::from(workflow),
             config_write_lock: Mutex::new(()),
             provider_model_sync_lock: Mutex::new(()),
+            plugin_route_reload_lock: Mutex::new(()),
+            model_delivery_lock: Mutex::new(()),
+            runtime_handle: tokio::runtime::Handle::try_current().ok(),
             http_client: reqwest::Client::builder()
                 .user_agent(format!("Codey/{}", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(Duration::from_secs(5))
@@ -255,7 +276,8 @@ impl Default for AppState {
             diagnostic_storage_operation: Mutex::new(()),
             trace_log_write_protection_active: AtomicBool::new(false),
             crashpad_pending_stats: CrashpadPendingStatsHandle::idle(protect_crashpad_pending),
-            startup_error: RwLock::new(config_load_error),
+            startup_error: RwLock::new(None),
+            config_load_error,
             available_update: RwLock::new(None),
             update_candidate_cache: Mutex::new(None),
             codex_app_version_cache: Mutex::new(None),
@@ -632,11 +654,13 @@ pub(crate) async fn restore_default_context_budgets(state: &AppState) -> Result<
 /// 返回 false 表示用户选择保留预算或对话框不可用，调用方应保留原始错误。
 pub(crate) async fn recover_default_context_budgets_for_launch(
     state: &Arc<AppState>,
+    reason: &str,
 ) -> Result<bool, String> {
     recover_default_context_budgets_with_prompt(
         state,
         crate::native_update_ui::ContextRecoveryPurpose::Launch,
-        crate::native_update_ui::confirm_context_recovery,
+        reason,
+        |purpose| crate::native_update_ui::confirm_context_recovery_with_reason(purpose, reason),
     )
     .await
 }
@@ -644,12 +668,23 @@ pub(crate) async fn recover_default_context_budgets_for_launch(
 async fn recover_default_context_budgets_with_prompt<F, Fut>(
     state: &Arc<AppState>,
     purpose: crate::native_update_ui::ContextRecoveryPurpose,
+    reason: &str,
     prompt: F,
 ) -> Result<bool, String>
 where
     F: FnOnce(crate::native_update_ui::ContextRecoveryPurpose) -> Fut,
     Fut: std::future::Future<Output = Result<bool, String>>,
 {
+    if !state
+        .config
+        .read()
+        .await
+        .model_context_by_provider
+        .values()
+        .any(|models| !models.is_empty())
+    {
+        return Ok(false);
+    }
     // 询问失败按用户未确认处理：保留自定义预算比静默丢弃更安全。
     if !prompt(purpose).await.unwrap_or(false) {
         return Ok(false);
@@ -658,7 +693,7 @@ where
     error_log::record_failure(
         "context_recovery",
         "restore_default_context_budgets_for_launch",
-        crate::model_catalog::CUSTOM_CONTEXT_CATALOG_UNAVAILABLE.to_string(),
+        reason.to_string(),
         json!({ "purpose": purpose.as_str() }),
     );
     Ok(true)
@@ -916,7 +951,15 @@ fn apply_unavailable_official_probe(
     };
     let diagnostics = official_auth_route_diagnostics(&next, "unauthenticated", fallback);
     if has_official_route || keeps_account_routes {
-        if !next.has_third_party_route() && !keeps_account_routes && !has_stored_accounts {
+        // A non-empty launch profile list can be the disposable route derived
+        // from the current Codex login. When that login is unavailable, clear
+        // the route and return to the initial-import placeholder instead of
+        // asking the user to configure an account that was never stored.
+        if official_profiles.is_empty()
+            && !next.has_third_party_route()
+            && !keeps_account_routes
+            && !has_stored_accounts
+        {
             let error = format!(
                 "Codey 中没有设为默认的官方账号，也没有已保存的 API Key 线路；请先添加官方账号并设为默认，或添加第三方 API 线路。认证诊断：{reason}"
             );
@@ -1054,188 +1097,18 @@ async fn resolve_session_name_cached(
 pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Value {
     let result = match command {
         "load_codey_config" => load_codey_config(state).await,
-        "query_official_account_usage" => match (
-            optional_argument::<bool>(&args, "forceRefresh"),
-            optional_argument::<String>(&args, "accountId"),
-        ) {
-            (Ok(force), Ok(account_id)) => {
-                Ok(query_official_account_usage(state, force.unwrap_or(false), account_id).await)
-            }
-            (Err(error), _) | (_, Err(error)) => Err(error),
-        },
-        "store_official_account_usage" => match (
-            argument::<u64>(&args, "authGeneration"),
-            argument::<account_usage::AccountUsageSnapshot>(&args, "snapshot"),
-        ) {
-            (Ok(generation), Ok(snapshot)) => {
-                if !official_account_available_for_usage(&*state.config.read().await) {
-                    Err("当前没有可用的官方账号".to_string())
-                } else {
-                    state
-                        .account_usage_cache
-                        .lock()
-                        .await
-                        .for_codex_home(codex_home())
-                        .store_displayed_snapshot(
-                            &account_usage::codex_auth_path(codex_home()),
-                            generation,
-                            snapshot,
-                        )
-                        .map(|()| json!({"status": "ok"}))
-                        .map_err(|error| error.to_string())
-                }
-            }
-            (Err(error), _) | (_, Err(error)) => Err(error),
-        },
         "save_codey_config" => match codey_config_save_input(&args) {
             Ok(input) => save_codey_config_input(state, input).await,
             Err(error) => Err(error),
         },
-        "sync_current_provider" => sync_current_provider_command(state).await,
-        "set_route_enabled" => match (
-            string_argument(&args, "routeId"),
-            argument::<bool>(&args, "enabled"),
-            argument::<u64>(&args, "expectedRevision"),
-        ) {
-            (Ok(route_id), Ok(enabled), Ok(expected_revision)) => {
-                set_route_enabled(state, route_id, enabled, expected_revision).await
-            }
-            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
-        },
-        "delete_route" => match (
-            string_argument(&args, "routeId"),
-            argument::<u64>(&args, "expectedRevision"),
-        ) {
-            (Ok(route_id), Ok(expected_revision)) => {
-                delete_route(state, route_id, expected_revision).await
-            }
-            (Err(error), _) | (_, Err(error)) => Err(error),
-        },
-        "fetch_route_models" => match (
-            string_argument(&args, "routeId"),
-            argument::<u64>(&args, "expectedRevision"),
-        ) {
-            (Ok(route_id), Ok(expected_revision)) => {
-                fetch_route_models(state, route_id, expected_revision).await
-            }
-            (Err(error), _) | (_, Err(error)) => Err(error),
-        },
-        "save_selected_models" => match (
-            argument::<Vec<String>>(&args, "officialModels"),
-            argument::<Vec<String>>(&args, "thirdPartyModels"),
-            optional_argument::<Vec<String>>(&args, "manualThirdPartyModels"),
-            optional_argument::<Vec<String>>(&args, "deletedThirdPartyModels"),
-            optional_argument::<bool>(&args, "supportsAutoReview"),
-            optional_argument::<Option<String>>(&args, "routeId").map(Option::flatten),
-            optional_argument::<BTreeMap<String, Vec<crate::config::ModelReasoningEffort>>>(
-                &args,
-                "reasoningEfforts",
-            ),
-            optional_argument::<BTreeMap<String, crate::config::ModelContextConfig>>(
-                &args,
-                "modelContexts",
-            ),
-        ) {
-            (
-                Ok(official_models),
-                Ok(third_party_models),
-                Ok(manual_third_party_models),
-                Ok(deleted_third_party_models),
-                Ok(supports_auto_review),
-                Ok(route_id),
-                Ok(model_reasoning_efforts),
-                Ok(model_contexts),
-            ) => {
-                save_selected_models(
-                    state,
-                    official_models,
-                    third_party_models,
-                    manual_third_party_models.unwrap_or_default(),
-                    deleted_third_party_models.unwrap_or_default(),
-                    supports_auto_review,
-                    route_id,
-                    model_reasoning_efforts,
-                    model_contexts,
-                )
-                .await
-            }
-            (Err(error), _, _, _, _, _, _, _)
-            | (_, Err(error), _, _, _, _, _, _)
-            | (_, _, Err(error), _, _, _, _, _)
-            | (_, _, _, Err(error), _, _, _, _)
-            | (_, _, _, _, Err(error), _, _, _)
-            | (_, _, _, _, _, Err(error), _, _)
-            | (_, _, _, _, _, _, Err(error), _)
-            | (_, _, _, _, _, _, _, Err(error)) => Err(error),
-        },
-        "save_default_model" => match (
-            string_argument(&args, "model"),
-            optional_argument::<Option<String>>(&args, "routeId").map(Option::flatten),
-        ) {
-            (Ok(model), Ok(route_id)) => save_default_model(state, model, route_id).await,
-            (Err(error), _) | (_, Err(error)) => Err(error),
-        },
-        "save_official_route_models" => match (
-            string_argument(&args, "routeId"),
-            argument::<Vec<String>>(&args, "models"),
-            optional_argument::<BTreeMap<String, Vec<crate::config::ModelReasoningEffort>>>(
-                &args,
-                "reasoningEfforts",
-            ),
-            optional_argument::<bool>(&args, "enabled"),
-            optional_argument::<bool>(&args, "showAccountUsageInHeader"),
-            optional_argument::<BTreeMap<String, crate::config::ModelContextConfig>>(
-                &args,
-                "modelContexts",
-            ),
-            optional_argument::<String>(&args, "upstreamProxy"),
-        ) {
-            (
-                Ok(route_id),
-                Ok(models),
-                Ok(_context_models),
-                Ok(enabled),
-                Ok(show_usage),
-                Ok(_model_contexts),
-                Ok(upstream_proxy),
-            ) => {
-                match (
-                    optional_argument::<String>(&args, "accountId"),
-                    optional_argument::<String>(&args, "routeName"),
-                    optional_argument::<String>(&args, "routeShortName"),
-                    optional_argument::<String>(&args, "baseUrl"),
-                ) {
-                    (Ok(account_id), Ok(route_name), Ok(route_short_name), Ok(base_url)) => {
-                        save_official_route_models(
-                            state,
-                            models::OfficialRouteModelSave {
-                                route_id,
-                                models,
-                                enabled,
-                                show_account_usage: show_usage,
-                                upstream_proxy,
-                                base_url,
-                                account_id,
-                                route_name,
-                                route_short_name,
-                            },
-                        )
-                        .await
-                    }
-                    (Err(error), _, _, _)
-                    | (_, Err(error), _, _)
-                    | (_, _, Err(error), _)
-                    | (_, _, _, Err(error)) => Err(error),
-                }
-            }
-            (Err(error), _, _, _, _, _, _)
-            | (_, Err(error), _, _, _, _, _)
-            | (_, _, Err(error), _, _, _, _)
-            | (_, _, _, Err(error), _, _, _)
-            | (_, _, _, _, Err(error), _, _)
-            | (_, _, _, _, _, Err(error), _)
-            | (_, _, _, _, _, _, Err(error)) => Err(error),
-        },
+        "sync_current_provider"
+        | "set_route_enabled"
+        | "reorder_route_models"
+        | "delete_route"
+        | "fetch_route_models"
+        | "save_selected_models"
+        | "save_default_model"
+        | "save_official_route_models" => models::invoke(state, command, &args).await,
         "runtime_status" => {
             let refresh_injection_status = args
                 .get("refreshInjectionStatus")
@@ -1274,6 +1147,14 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                 Err(error) => Err(format!("模型候选查询参数无效：{error}")),
             }
         }
+        "query_route_request_log_quota_usage" => {
+            match serde_json::from_value::<crate::route_request_log::RouteRequestLogQuotaQuery>(
+                args.clone(),
+            ) {
+                Ok(query) => query_route_request_log_quota_usage(state, query).await,
+                Err(error) => Err(format!("额度用量查询参数无效：{error}")),
+            }
+        }
         "query_route_request_log_stats" => {
             match serde_json::from_value::<RouteRequestLogQuery>(args.clone()) {
                 Ok(query) => query_route_request_log_stats(state, query).await,
@@ -1282,70 +1163,30 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         }
         "clear_route_request_logs" => clear_route_request_logs(state).await,
         "restart_codey" => schedule_restart_codey_runtime(state).await,
-        "clear_diagnostic_storage" => clear_diagnostic_storage(state, &args).await,
-        "repair_codex_overlays" => crate::overlay_recovery::repair().await,
-        "repair_codex_config" => config_repair::repair_codex_config(state).await,
-        "repair_main_process_injection" => {
-            runtime::schedule_main_process_injection_repair(state).await
-        }
+        "clear_diagnostic_storage"
+        | "repair_codex_overlays"
+        | "repair_codex_config"
+        | "repair_main_process_injection" => diagnostics::invoke(state, command, &args).await,
         "test_notification_channel" => {
             match argument::<NotificationChannelConfig>(&args, "channel") {
                 Ok(channel) => test_notification_channel(state, channel).await,
                 Err(error) => Err(error),
             }
         }
-        "list_official_accounts" => list_official_accounts(state).await,
-        "refresh_official_account_routes" => {
-            refresh_official_route_after_account_change(state).await
+        "query_official_account_usage"
+        | "store_official_account_usage"
+        | "list_official_accounts"
+        | "refresh_official_account_routes"
+        | "start_official_account_login"
+        | "poll_official_account_login"
+        | "cancel_official_account_login"
+        | "import_current_codex_login"
+        | "import_official_account_credential"
+        | "set_default_official_account"
+        | "remove_official_account"
+        | "save_official_account_route_settings" => {
+            official_accounts::invoke(state, command, &args).await
         }
-        "start_official_account_login" => start_official_account_login(state).await,
-        "poll_official_account_login" => match string_argument(&args, "loginId") {
-            Ok(login_id) => poll_official_account_login(state, login_id).await,
-            Err(error) => Err(error),
-        },
-        "cancel_official_account_login" => match string_argument(&args, "loginId") {
-            Ok(login_id) => cancel_official_account_login(state, login_id).await,
-            Err(error) => Err(error),
-        },
-        "import_current_codex_login" => import_current_codex_login(state).await,
-        "set_default_official_account" => match string_argument(&args, "accountId") {
-            Ok(account_id) => set_default_official_account(state, account_id).await,
-            Err(error) => Err(error),
-        },
-        "remove_official_account" => match string_argument(&args, "accountId") {
-            Ok(account_id) => remove_official_account(state, account_id).await,
-            Err(error) => Err(error),
-        },
-        "save_official_account_route_settings" => match (
-            string_argument(&args, "accountId"),
-            optional_argument::<String>(&args, "routeName"),
-            optional_argument::<String>(&args, "routeShortName"),
-            optional_argument::<String>(&args, "upstreamProxy"),
-            optional_argument::<String>(&args, "baseUrl"),
-        ) {
-            (
-                Ok(account_id),
-                Ok(route_name),
-                Ok(route_short_name),
-                Ok(upstream_proxy),
-                Ok(base_url),
-            ) => {
-                save_official_account_route_settings(
-                    state,
-                    account_id,
-                    route_name.unwrap_or_default(),
-                    route_short_name.unwrap_or_default(),
-                    upstream_proxy.unwrap_or_default(),
-                    base_url.unwrap_or_default(),
-                )
-                .await
-            }
-            (Err(error), _, _, _, _)
-            | (_, Err(error), _, _, _)
-            | (_, _, Err(error), _, _)
-            | (_, _, _, Err(error), _)
-            | (_, _, _, _, Err(error)) => Err(error),
-        },
         "start_wechat_claw_login" => start_wechat_claw_login(state).await,
         "poll_wechat_claw_login" => match string_argument(&args, "loginId") {
             Ok(login_id) => poll_wechat_claw_login(state, login_id).await,
@@ -1367,28 +1208,27 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                 Err(error) => Err(error),
             }
         }
-        "check_for_updates" => check_for_updates(state).await,
-        "download_update" => download_update(state).await,
-        "update_install_report" => update_install_report(state).await,
-        "install_downloaded_update" => match string_argument(&args, "filePath") {
-            Ok(file_path) => install_downloaded_update(state, file_path).await,
-            Err(error) => Err(error),
-        },
+        "check_for_updates"
+        | "get_device_machine_no"
+        | "download_update"
+        | "update_install_report"
+        | "install_downloaded_update" => updates::invoke(state, command, &args).await,
         "plugin_marketplace_status" => plugin_marketplace_status().await,
         "codex_extensions" => extensions::invoke(state, &args).await,
         "repair_plugin_marketplace" => repair_plugin_marketplace().await,
-        "list_codey_plugins" => native_plugins::invoke(command, &args).await,
-        "get_codey_plugin_config_file" => native_plugins::invoke(command, &args).await,
-        "select_codey_plugin_package" => native_plugins::invoke(command, &args).await,
-        "inspect_codey_plugin" => native_plugins::invoke(command, &args).await,
-        "install_codey_plugin" => native_plugins::invoke(command, &args).await,
-        "set_codey_plugin_enabled" => native_plugins::invoke(command, &args).await,
-        "save_codey_plugin_config_file" => native_plugins::invoke(command, &args).await,
-        "uninstall_codey_plugin" => native_plugins::invoke(command, &args).await,
-        "open_codey_plugin_directory" => native_plugins::invoke(command, &args).await,
-        "open_codey_plugin_logs" => native_plugins::invoke(command, &args).await,
-        "clear_codey_plugin_logs" => native_plugins::invoke(command, &args).await,
-        "invoke_codey_plugin" => native_plugins::invoke(command, &args).await,
+        "prepare_computer_use" => prepare_computer_use().await,
+        "list_codey_plugins"
+        | "get_codey_plugin_config_file"
+        | "select_codey_plugin_package"
+        | "inspect_codey_plugin"
+        | "install_codey_plugin"
+        | "set_codey_plugin_enabled"
+        | "save_codey_plugin_config_file"
+        | "uninstall_codey_plugin"
+        | "open_codey_plugin_directory"
+        | "open_codey_plugin_logs"
+        | "clear_codey_plugin_logs"
+        | "invoke_codey_plugin" => native_plugins::invoke(command, &args).await,
         "workflow_capabilities" => workflows::capabilities(state, args).await,
         "workflow_start" => workflows::start(state, args).await,
         "workflow_steer" => workflows::steer(state, args).await,
@@ -1522,6 +1362,28 @@ pub async fn query_route_request_logs(
     serde_json::to_value(page).map_err(|error| format!("请求日志查询结果序列化失败：{error}"))
 }
 
+async fn query_route_request_log_quota_usage(
+    state: &Arc<AppState>,
+    query: crate::route_request_log::RouteRequestLogQuotaQuery,
+) -> Result<Value, String> {
+    let backend = state.config.read().await.route_request_log.backend;
+    let root = codey_runtime_core::paths::default_app_state_dir();
+    let usage = tokio::task::spawn_blocking(move || {
+        crate::route_request_log::query_route_request_log_quota_usage(&root, backend, query)
+    })
+    .await
+    .map_err(|error| format!("额度用量查询任务异常退出：{error}"))?
+    .map_err(|error| format!("查询额度用量失败：{error:#}"))?;
+    let mut value =
+        serde_json::to_value(usage).map_err(|error| format!("额度用量序列化失败：{error}"))?;
+    let runtime = state.runtime.lock().await.clone();
+    if let Some(runtime) = runtime {
+        value["recordingHealth"] = serde_json::to_value(runtime.request_log_health().await)
+            .map_err(|error| format!("请求日志状态序列化失败：{error}"))?;
+    }
+    Ok(value)
+}
+
 async fn query_route_request_log_stats(
     state: &Arc<AppState>,
     query: RouteRequestLogQuery,
@@ -1606,6 +1468,7 @@ pub async fn load_codey_config(state: &Arc<AppState>) -> Result<Value, String> {
         "config": public_config,
         "path": state.store.path().to_string_lossy(),
         "startupError": startup_error,
+        "configLoadError": state.config_load_error,
         "officialAccountAvailable": config.official_account_available_this_launch,
         "officialAccountStatus": config.official_account_status_this_launch,
         "providerStatus": provider_status,
@@ -2154,6 +2017,121 @@ async fn save_codey_config_locked(
     })
 }
 
+pub(crate) fn install_plugin_route_handler(state: Arc<AppState>) {
+    let account_state = Arc::downgrade(&state);
+    crate::codey_plugins::transport::set_account_handler(Arc::new(move |email| {
+        let weak = account_state.clone();
+        Box::pin(async move {
+            let state = weak.upgrade().ok_or("宿主正在关闭")?;
+            let store = state.official_accounts();
+            let lookup_email = email.clone();
+            let original = tokio::task::spawn_blocking(move || store.by_email(&lookup_email))
+                .await
+                .map_err(|_| "读取插件账号失败")?
+                .map_err(|e| e.to_string())?;
+            official_accounts::refresh_official_account_tokens(&state, &original.id).await?;
+            let store = state.official_accounts();
+            tokio::task::spawn_blocking(move || store.plugin_credentials(&email, &original))
+                .await
+                .map_err(|_| "读取插件账号失败")?
+                .map_err(|error| error.to_string())
+        })
+    }));
+    let state = Arc::clone(&state);
+    crate::codey_plugins::set_route_handler(Arc::new(move |plugin_id, change| {
+        let (route_id, changed) = apply_plugin_route_change(&state, plugin_id, change)?;
+        if changed {
+            schedule_plugin_route_hot_reload(&state);
+        }
+        Ok(route_id)
+    }));
+}
+
+fn apply_plugin_route_change(
+    state: &AppState,
+    plugin_id: &str,
+    change: crate::codey_plugins::RouteChange,
+) -> Result<(Option<String>, bool), String> {
+    let _write_guard = state.config_write_lock.blocking_lock();
+    let current = state.config.blocking_read().clone();
+    let mut next = current.clone();
+    let route_id = match change {
+        crate::codey_plugins::RouteChange::Upsert {
+            spec,
+            create_if_missing,
+        } => crate::plugin_routes::upsert(&mut next, plugin_id, *spec, create_if_missing)?,
+        crate::codey_plugins::RouteChange::Release => {
+            crate::plugin_routes::release(&mut next, plugin_id);
+            None
+        }
+    };
+    if next == current {
+        return Ok((route_id, false));
+    }
+    // 与手动启停线路一致：子代理不能继续引用已消失的插件模型。
+    if next.subagent_optimization
+        && let Ok(model_state) = models::current_model_state(&next)
+    {
+        reconcile_subagent_models_for_mode(&mut next, &model_state);
+        next = next.normalize();
+    }
+    next.settings_revision = current.settings_revision.saturating_add(1);
+    let stored = state
+        .store
+        .persist(next)
+        .map_err(|error| format!("{error:#}"))?;
+    *state.config.blocking_write() = stored;
+    Ok((route_id, true))
+}
+
+/// Plugin routes change on plugin-management threads rather than inside a
+/// save command, so the running router and Codex model list are updated
+/// afterwards. Reloads run one at a time and read the config inside the lock,
+/// so a burst of changes settles on the latest one.
+fn schedule_plugin_route_hot_reload(state: &Arc<AppState>) {
+    let Some(runtime) = state.runtime_handle.clone() else {
+        record_plugin_route_hot_reload_failure(
+            "插件线路已保存，但没有可用的 Codey 运行时来热更新，重启 Codex 后生效".to_string(),
+        );
+        return;
+    };
+    let state = Arc::clone(state);
+    runtime.spawn(async move {
+        let _serial = state.plugin_route_reload_lock.lock().await;
+        let config = state.config.read().await.clone();
+        let model_state = match current_model_state_async(&config).await {
+            Ok(model_state) => model_state,
+            Err(error) => {
+                record_plugin_route_hot_reload_failure(error);
+                return;
+            }
+        };
+        if let Some(error) = hot_reload_runtime_models(&state, &config, &model_state)
+            .await
+            .error
+        {
+            record_plugin_route_hot_reload_failure(error);
+        }
+        if config.subagent_optimization {
+            let outcome = hot_reload_runtime_subagent_config(&state, &config).await;
+            if outcome.requires_restart()
+                && let Some(error) = outcome.error()
+            {
+                record_plugin_route_hot_reload_failure(error.to_string());
+            }
+        }
+    });
+}
+
+fn record_plugin_route_hot_reload_failure(error: String) {
+    error_log::record_failure(
+        "plugin_route_hot_reload_failed",
+        "hot_reload_plugin_routes",
+        error,
+        json!({}),
+    );
+}
+
 fn merge_profile_secrets(
     mut profiles: Vec<crate::config::ProviderProfile>,
     previous: &CodeyConfig,
@@ -2182,14 +2160,20 @@ fn merge_profile_secrets(
                 profile.supports_auto_review = false;
                 if profile.auth_mode.trim() == crate::config::AUTH_MODE_API_KEY {
                     profile.official_account = false;
+                    profile.official_account_id = None;
                 }
             } else {
-                // Keep source-owned identity and capability fields attached to
-                // the saved route even though the renderer sends the whole form back.
+                // Keep source-owned identity fields attached to the saved route
+                // even though the renderer sends the whole form back. Transport
+                // capabilities are user-editable route settings.
                 profile.source_provider_id = previous_profile.source_provider_id.clone();
                 profile.official_account = previous_profile.official_account;
-                profile.supports_remote_compaction = previous_profile.supports_remote_compaction;
+                profile.official_account_id = previous_profile.official_account_id.clone();
             }
+            crate::plugin_routes::retain_plugin_ownership(profile, previous_profile)?;
+        } else {
+            profile.plugin_owner_id = None;
+            profile.plugin_route_spec = None;
         }
         profile.normalize();
         // 线路名上限与渲染层一致。旧配置里已经超限的名称只要这次没有改动就
@@ -2645,7 +2629,8 @@ pub(super) async fn hot_reload_runtime_subagent_config(
     if !runtime.supports_subagent_config_hot_reload(&current_config) {
         return SubagentHotReloadOutcome::default();
     }
-    let applied_config_changed = runtime.applied_subagent_config().await != desired_config;
+    let applied_config_changed =
+        runtime.applied_subagent_config().await.as_ref() != &desired_config;
     let runtime_generation = state.runtime_generation.load(Ordering::Acquire);
     let current_runtime = state.runtime.lock().await.clone();
     let same_runtime = current_runtime
@@ -2777,10 +2762,13 @@ async fn query_official_account_usage(
         .map(|account_id| account_id.trim().to_string())
         .filter(|account_id| !account_id.is_empty())
     {
-        return query_stored_official_account_usage(state, force_refresh, account_id).await;
+        // 账号列表带来的查询由用户打开「线路与模型」菜单触发，套餐跟着更新。
+        return query_stored_official_account_usage(state, force_refresh, account_id, true).await;
     }
     if let Some(account_id) = header_official_account_id(state).await {
-        return query_stored_official_account_usage(state, force_refresh, account_id).await;
+        // 页头的定时读取只刷新显示，不写回套餐：账号记录里的套餐只在打开的
+        // 线路菜单里更新，后台轮询不会悄悄改账号信息。
+        return query_stored_official_account_usage(state, force_refresh, account_id, false).await;
     }
     let official_proxy;
     {
@@ -2846,6 +2834,7 @@ async fn query_stored_official_account_usage(
     state: &Arc<AppState>,
     force_refresh: bool,
     account_id: String,
+    write_back_plan: bool,
 ) -> Value {
     let store = state.official_accounts();
     let home = codex_home().to_path_buf();
@@ -2904,6 +2893,31 @@ async fn query_stored_official_account_usage(
         )
         .await
     };
+    // 官方额度接口每次都带当前的套餐类型：降级或升级之后它最先变化，账号
+    // 记录跟着更新，卡片和账号列表才不会一直显示历史套餐。页头的定时读取
+    // 只负责显示，不带这个参数，避免后台轮询改账号信息。
+    if write_back_plan
+        && snapshot.get("status").and_then(Value::as_str) == Some("ok")
+        && let Some(plan_type) = snapshot.get("planType").and_then(Value::as_str)
+    {
+        let plan_store = store.clone();
+        let plan_id = account_id.clone();
+        let plan_type = plan_type.to_string();
+        match tokio::task::spawn_blocking(move || {
+            plan_store.update_plan_type(&plan_id, Some(&plan_type))
+        })
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => error_log::record_failure(
+                "official_account_plan_update_failed",
+                "query_official_account_usage",
+                format!("{error:#}"),
+                json!({ "accountId": account_id }),
+            ),
+            Err(_) => {}
+        }
+    }
     // 令牌刚刷新过、本地仍判定有效，官方却以 401 拒绝，说明凭据已被撤销。
     // 默认账号尚未刷新的过期令牌会落在此判断之外，不会被误标。
     let credential_rejected = snapshot.get("reason").and_then(Value::as_str)
@@ -3064,7 +3078,8 @@ pub(super) fn provider_route_restart_required_for_runtime(
     current: &CodeyConfig,
 ) -> bool {
     !runtime_supports_current_routes_for_hot_reload(applied, current)
-        || official_route_snapshots(applied) != official_route_snapshots(current)
+        || official_route_snapshots_for_runtime(applied)
+            != official_route_snapshots_for_runtime(current)
         || websocket_transport_requires_restart(applied, current)
         || native_web_search_capability_requires_restart(applied, current)
 }

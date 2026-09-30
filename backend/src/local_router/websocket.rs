@@ -399,6 +399,20 @@ impl WebSocketResponsesDownstream {
             self.upstream.take();
         }
         normalize_native_responses_context(body, discard_opaque_reasoning);
+        if route.official_account {
+            sanitize_official_upstream_history(body);
+        }
+        if route.upstream_url.as_ref().is_ok_and(|url| {
+            should_replay_reasoning_text(
+                route.official_account,
+                ProtocolBridge::NativeResponses,
+                ResponsesRequestKind::Create,
+                is_compaction_request(body, ResponsesRequestKind::Create),
+                url,
+            )
+        }) {
+            restore_reasoning_text_from_summary(body);
+        }
         let mut upstream = if let Some(cached) = self.upstream.take() {
             cached
         } else {
@@ -1162,6 +1176,7 @@ pub(crate) async fn proxy_native_response_to_websocket(
     probe: Option<&RouteRequestLogProbe>,
 ) -> Result<()> {
     let status = response.status().as_u16();
+    let xai_fix = current_xai_response_fix();
     let mut prepared = await_upstream(
         downstream,
         prepare_upstream_response(response, "读取 Responses HTTP 上游响应失败", probe),
@@ -1194,8 +1209,11 @@ pub(crate) async fn proxy_native_response_to_websocket(
                     done = true;
                     break;
                 }
-                let event = serde_json::from_str::<Value>(&data)
+                let mut event = serde_json::from_str::<Value>(&data)
                     .context("Responses HTTP 上游 SSE data 不是有效 JSON")?;
+                if let Some(fix) = xai_fix.as_ref() {
+                    fix.apply(&mut event);
+                }
                 terminal |= responses_event_is_terminal(&event);
                 if let Some(probe) = probe {
                     probe.observe_event(&event);
@@ -1221,8 +1239,11 @@ pub(crate) async fn proxy_native_response_to_websocket(
             && let Some(data) = sse_frame_data(&buffer[cursor.consumed..])?
             && data.trim() != "[DONE]"
         {
-            let event = serde_json::from_str::<Value>(&data)
+            let mut event = serde_json::from_str::<Value>(&data)
                 .context("Responses HTTP 上游 SSE 末尾 data 不是有效 JSON")?;
+            if let Some(fix) = xai_fix.as_ref() {
+                fix.apply(&mut event);
+            }
             terminal |= responses_event_is_terminal(&event);
             if let Some(probe) = probe {
                 probe.observe_event(&event);
@@ -1265,7 +1286,10 @@ pub(crate) async fn proxy_native_response_to_websocket(
             anyhow::bail!("Responses HTTP/SSE 降级响应缺少终态事件");
         }
         downstream.start_event_stream().await?;
-        for event in events {
+        for mut event in events {
+            if let Some(fix) = xai_fix.as_ref() {
+                fix.apply(&mut event);
+            }
             if let Some(probe) = probe {
                 probe.observe_event(&event);
             }
@@ -1279,7 +1303,10 @@ pub(crate) async fn proxy_native_response_to_websocket(
         return downstream.finish_event_stream().await;
     }
     match serde_json::from_slice::<Value>(&body) {
-        Ok(value) => {
+        Ok(mut value) => {
+            if let Some(fix) = xai_fix.as_ref() {
+                fix.apply(&mut value);
+            }
             if let Some(probe) = probe {
                 probe.observe_response(status, &value);
             }

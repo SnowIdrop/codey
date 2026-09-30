@@ -23,6 +23,66 @@ fn request_log_catalog_exposes_login_status_independently_of_profiles() {
 }
 
 #[test]
+fn image_request_uses_the_model_route_instead_of_a_conversation_binding() {
+    let mut chat = ProviderProfile::new("Chat");
+    chat.id = "chat".into();
+    chat.base_url = "https://chat.example/v1".into();
+    chat.api_key = "sk-chat".into();
+    chat.normalize();
+    let mut images = ProviderProfile::new("Images");
+    images.id = "images".into();
+    images.base_url = "https://images.example/v1".into();
+    images.api_key = "sk-images".into();
+    images.normalize();
+    let chat_id = chat.provider_id().to_string();
+    let images_id = images.provider_id().to_string();
+    let mut config = CodeyConfig {
+        profiles: vec![chat, images],
+        default_model: model_alias(&chat_id, "provider-model"),
+        ..CodeyConfig::default()
+    };
+    config
+        .selected_models_by_provider
+        .insert(chat_id.clone(), vec!["provider-model".into()]);
+    config
+        .selected_models_by_provider
+        .insert(images_id.clone(), vec!["gpt-image-2".into()]);
+    let snapshot = RouterSnapshot::from_config(&config);
+    assert_eq!(
+        snapshot
+            .route_for_image_request("gpt-image-2", None)
+            .unwrap()
+            .provider_id,
+        images_id
+    );
+    assert_eq!(
+        snapshot
+            .route_for_image_request("unknown-image", None)
+            .unwrap()
+            .provider_id,
+        chat_id
+    );
+    assert_eq!(
+        snapshot
+            .route_for_image_request("gpt-image-2", Some(&chat_id))
+            .unwrap()
+            .provider_id,
+        chat_id
+    );
+    config
+        .selected_models_by_provider
+        .get_mut(&chat_id)
+        .unwrap()
+        .push("gpt-image-2".into());
+    let snapshot = RouterSnapshot::from_config(&config);
+    assert!(
+        snapshot
+            .route_for_image_request("gpt-image-2", None)
+            .is_err()
+    );
+}
+
+#[test]
 fn disabled_route_has_no_request_target() {
     let mut route = ProviderProfile::new("Disabled");
     route.id = "disabled".into();
@@ -940,6 +1000,32 @@ fn only_endpoint_capability_statuses_use_long_websocket_backoff() {
     }
 }
 
+// 【自动化测试】本地路由 - 热更新送达失败时退回原快照，不覆盖之后装入的快照
+#[tokio::test]
+async fn failed_delivery_reverts_only_its_own_router_snapshot() {
+    let (config, provider_id, model) = router_config("http://127.0.0.1:9/v1".into());
+    let router = LocalRouter::start(&config).await.unwrap();
+    let original = router.snapshot.read().unwrap().model_ids().to_vec();
+    let mut added = config.clone();
+    added.selected_models_by_provider.insert(
+        provider_id.clone(),
+        vec![model.clone(), "added-model".into()],
+    );
+    let current_models = || router.snapshot.read().unwrap().model_ids().to_vec();
+
+    let swap = router.update_config(&added);
+    assert_ne!(current_models(), original);
+    assert!(router.revert_config(swap));
+    assert_eq!(current_models(), original);
+
+    let stale = router.update_config(&added);
+    let newer = current_models();
+    router.update_config(&added);
+    assert!(!router.revert_config(stale));
+    assert_eq!(current_models(), newer);
+    router.stop().await.unwrap();
+}
+
 #[tokio::test]
 async fn router_config_update_invalidates_only_changed_websocket_routes() {
     let (mut config, provider_id, _) = router_config("http://127.0.0.1:9/v1".into());
@@ -1722,6 +1808,139 @@ async fn local_responses_websocket_rejects_missing_router_token() {
 }
 
 #[tokio::test]
+async fn task_activity_is_readable_without_the_router_token() {
+    let (config, _, _) = router_config("http://127.0.0.1:9/v1".into());
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let url = reqwest::Url::parse(&endpoint.base_url).unwrap();
+    let mut stream = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+        .await
+        .unwrap();
+    let body = r#"{"schema":"codey.appserver.v1","call":"codey://getTasks"}"#;
+    stream
+        .write_all(
+            format!(
+                "POST /codey/api/appserver HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut rejected = String::new();
+    tokio::time::timeout(Duration::from_secs(2), stream.read_to_string(&mut rejected))
+        .await
+        .expect("task counts should reject an anonymous request")
+        .unwrap();
+    assert!(rejected.starts_with("HTTP/1.1 401 "), "{rejected}");
+    assert!(rejected.contains("invalid_router_token"), "{rejected}");
+
+    let mut stream = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /codey/api/appserver HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                endpoint.token,
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        stream.read_to_string(&mut response),
+    )
+    .await
+    .expect("task counts should respond")
+    .unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+    assert!(
+        response.contains("\"schema\":\"codey.appserver.v1\""),
+        "{response}"
+    );
+    assert!(response.contains("\"running\""), "{response}");
+    assert!(response.contains("\"failed\""), "{response}");
+    assert!(!response.contains(&endpoint.token), "{response}");
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn app_server_call_rejects_an_invalid_method_without_the_router_token() {
+    let (config, _, _) = router_config("http://127.0.0.1:9/v1".into());
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let url = reqwest::Url::parse(&endpoint.base_url).unwrap();
+    let mut stream = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            b"POST /codey/api/appserver HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        )
+        .await
+        .unwrap();
+    let mut rejected = String::new();
+    tokio::time::timeout(Duration::from_secs(2), stream.read_to_string(&mut rejected))
+        .await
+        .expect("anonymous app-server call should be rejected")
+        .unwrap();
+    assert!(rejected.starts_with("HTTP/1.1 401 "), "{rejected}");
+    assert!(rejected.contains("invalid_router_token"), "{rejected}");
+
+    let mut stream = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /codey/api/appserver HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}",
+                endpoint.token
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(Duration::from_secs(2), stream.read_to_string(&mut response))
+        .await
+        .expect("invalid app-server call should respond")
+        .unwrap();
+    assert!(response.starts_with("HTTP/1.1 400 "), "{response}");
+    assert!(response.contains("\"error\""), "{response}");
+    assert!(!response.contains(&endpoint.token), "{response}");
+
+    let method =
+        r#"{"schema":"codey.appserver.v1","call":"codey://appServer/thread/list","params":{}}"#;
+    let mut stream = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /codey/api/appserver HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{method}",
+                endpoint.token,
+                method.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(Duration::from_secs(2), stream.read_to_string(&mut response))
+        .await
+        .expect("unlisted app-server method should be rejected")
+        .unwrap();
+    assert!(response.starts_with("HTTP/1.1 400 "), "{response}");
+    assert!(response.contains("\"error\""), "{response}");
+    assert!(!response.contains(&endpoint.token), "{response}");
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn idle_connection_receives_a_request_timeout_without_a_router_failure() {
     let (config, _, _) = router_config("http://127.0.0.1:9/v1".into());
     let router = LocalRouter::start(&config).await.unwrap();
@@ -2238,6 +2457,342 @@ async fn native_route_retries_once_with_a_reasoning_text_placeholder() {
         json!([{"type":"reasoning_text","text":"(thinking unavailable)"}])
     );
     assert_eq!(attempts[0]["input"][1], attempts[1]["input"][1]);
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn reasoning_content_missing_replays_a_placeholder_for_the_previous_turn() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let mut attempts = Vec::new();
+        'connections: loop {
+            let Ok((mut stream, _)) = upstream.accept().await else {
+                break;
+            };
+            loop {
+                let Ok(request) = read_http_request(&mut stream).await else {
+                    continue 'connections;
+                };
+                let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+                attempts.push(body.clone());
+                if attempts.len() == 1 {
+                    write_json_response(
+                        &mut stream,
+                        400,
+                        &json!({
+                            "error": {
+                                "message": "{\"code\":11155,\"msg\":\"the reasoning content from the previous turn must be passed back in thinking mode\",\"extError\":{\"code\":\"reasoning_content_missing\",\"message\":\"the reasoning content from the previous turn must be passed back in thinking mode\",\"type\":\"invalid_request_error\",\"StatusCode\":400}}",
+                                "type": "invalid_request_error",
+                            }
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        &json!({
+                            "id":"resp-reasoning-content",
+                            "object":"response",
+                            "status":"completed",
+                            "model":body["model"],
+                            "output":[],
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                    break 'connections;
+                }
+            }
+        }
+        attempts
+    });
+    let (config, provider_id, model) = router_config(format!("http://{upstream_address}/v1"));
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({
+            "model": model_alias(&provider_id, &model),
+            "input":[
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"先看文件"}]},
+                {"role":"user","content":[{"type":"input_text","text":"继续"}]},
+            ],
+            "store": false,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["id"],
+        "resp-reasoning-content"
+    );
+    let attempts = upstream_task.await.unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_ne!(attempts[0]["input"][0]["type"], "reasoning");
+    assert_eq!(attempts[1]["input"][0]["type"], "reasoning");
+    assert_eq!(
+        attempts[1]["input"][0]["content"][0]["text"],
+        "(thinking unavailable)"
+    );
+    assert_eq!(attempts[1]["input"][1]["role"], "assistant");
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn chat_route_retries_reasoning_content_missing_with_a_placeholder() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let mut attempts = Vec::new();
+        'connections: loop {
+            let Ok((mut stream, _)) = upstream.accept().await else {
+                break;
+            };
+            loop {
+                let Ok(request) = read_http_request(&mut stream).await else {
+                    continue 'connections;
+                };
+                let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+                attempts.push(body);
+                if attempts.len() == 1 {
+                    write_json_response(
+                        &mut stream,
+                        400,
+                        &json!({
+                            "error": {
+                                "message": "the reasoning content from the previous turn must be passed back in thinking mode",
+                                "type": "invalid_request_error",
+                                "code": "reasoning_content_missing",
+                            }
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        &json!({
+                            "id": "chatcmpl-reasoning",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop"
+                            }]
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                    break 'connections;
+                }
+            }
+        }
+        attempts
+    });
+    let (mut config, provider_id, model) = router_config(format!("http://{upstream_address}/v1"));
+    config.profiles[0].upstream_protocol =
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+    config.profiles[0].normalize();
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({
+            "model": model_alias(&provider_id, &model),
+            "input":[
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"先看文件"}]},
+                {"role":"user","content":"继续"},
+            ],
+            "store": false,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let attempts = upstream_task.await.unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert!(
+        attempts[0]["messages"][0]
+            .get("reasoning_content")
+            .is_none()
+    );
+    assert_eq!(
+        attempts[1]["messages"][0]["reasoning_content"],
+        "(thinking unavailable)"
+    );
+    assert_eq!(attempts[1]["messages"][0]["content"], "先看文件");
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn chat_route_retries_reasoning_content_missing_with_the_saved_summary() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let mut attempts = Vec::new();
+        'connections: loop {
+            let Ok((mut stream, _)) = upstream.accept().await else {
+                break;
+            };
+            loop {
+                let Ok(request) = read_http_request(&mut stream).await else {
+                    continue 'connections;
+                };
+                let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+                attempts.push(body);
+                if attempts.len() == 1 {
+                    write_json_response(
+                        &mut stream,
+                        400,
+                        &json!({
+                            "error": {
+                                "message": "the reasoning content from the previous turn must be passed back in thinking mode",
+                                "type": "invalid_request_error",
+                                "code": "reasoning_content_missing",
+                            }
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        &json!({
+                            "id": "chatcmpl-summary",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop"
+                            }]
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                    break 'connections;
+                }
+            }
+        }
+        attempts
+    });
+    let (mut config, provider_id, model) = router_config(format!("http://{upstream_address}/v1"));
+    config.profiles[0].upstream_protocol =
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+    config.profiles[0].normalize();
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({
+            "model": model_alias(&provider_id, &model),
+            "input":[
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "先看文件"}],
+                    "content": []
+                },
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "已完成"}]},
+                {"role": "user", "content": "继续"},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "第二轮"}]}
+            ],
+            "store": false,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let attempts = upstream_task.await.unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert!(
+        attempts[0]["messages"][0]
+            .get("reasoning_content")
+            .is_none()
+    );
+    assert!(
+        attempts[0]["messages"][2]
+            .get("reasoning_content")
+            .is_none()
+    );
+    assert_eq!(attempts[1]["messages"][0]["reasoning_content"], "先看文件");
+    assert_eq!(attempts[1]["messages"][0]["content"], "已完成");
+    assert_eq!(
+        attempts[1]["messages"][2]["reasoning_content"],
+        "(thinking unavailable)"
+    );
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn deepseek_chat_route_sends_the_reasoning_summary_on_the_first_attempt() {
+    let proxy = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let proxy_address = proxy.local_addr().unwrap();
+    let proxy_task = tokio::spawn(async move {
+        let (mut stream, _) = proxy.accept().await.unwrap();
+        let request = read_http_request(&mut stream).await.unwrap();
+        let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+        write_json_response(
+            &mut stream,
+            200,
+            &json!({
+                "id": "chatcmpl-deepseek",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+        (request.path, body)
+    });
+    let (mut config, provider_id, model) = router_config("http://api.deepseek.com/v1".into());
+    config.profiles[0].upstream_protocol =
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+    config.profiles[0].upstream_proxy = format!("http://{proxy_address}");
+    config.profiles[0].normalize();
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({
+            "model": model_alias(&provider_id, &model),
+            "input":[
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "先看文件"}],
+                    "content": []
+                },
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "已完成"}]},
+                {"role": "user", "content": "继续"}
+            ],
+            "store": false,
+            "stream": false,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let (path, body) = proxy_task.await.unwrap();
+    assert_eq!(path, "http://api.deepseek.com/v1/chat/completions");
+    assert_eq!(body["messages"][0]["reasoning_content"], "先看文件");
+    assert_eq!(body["messages"][0]["content"], "已完成");
+    assert!(body["messages"][1].get("reasoning_content").is_none());
     router.stop().await.unwrap();
 }
 
@@ -6321,6 +6876,146 @@ fn responses_request_converts_messages_images_tools_and_results_to_anthropic() {
     assert_eq!(anthropic["stream"], true);
 }
 
+#[tokio::test]
+async fn omitted_high_effort_output_limit_reaches_every_upstream_protocol() {
+    let cases = [
+        (
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
+            "claude-opus-5",
+            "high",
+            None,
+            "/v1/responses",
+            "max_output_tokens",
+            Some(64_000_u64),
+        ),
+        (
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+            "claude-opus-5",
+            "ultra",
+            None,
+            "/v1/chat/completions",
+            "max_tokens",
+            Some(64_000),
+        ),
+        (
+            crate::config::UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES,
+            "claude-opus-5",
+            "xhigh",
+            None,
+            "/v1/messages",
+            "max_tokens",
+            Some(64_000),
+        ),
+        (
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
+            "provider-model",
+            "high",
+            None,
+            "/v1/responses",
+            "max_output_tokens",
+            None,
+        ),
+        (
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+            "claude-opus-5",
+            "high",
+            Some(2048_u64),
+            "/v1/chat/completions",
+            "max_tokens",
+            Some(2048),
+        ),
+        (
+            crate::config::UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES,
+            "claude-3-5-sonnet",
+            "high",
+            None,
+            "/v1/messages",
+            "max_tokens",
+            Some(DEFAULT_ANTHROPIC_MAX_TOKENS),
+        ),
+        (
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
+            "claude-opus-5",
+            "medium",
+            None,
+            "/v1/responses",
+            "max_output_tokens",
+            None,
+        ),
+    ];
+    for (protocol, model, effort, explicit_limit, path, field, expected) in cases {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let protocol_name = protocol.to_string();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+            let response = if protocol_name == crate::config::UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES {
+                json!({
+                    "id":"msg-1",
+                    "type":"message",
+                    "role":"assistant",
+                    "model":"claude",
+                    "content":[{"type":"text","text":"ok"}],
+                    "stop_reason":"end_turn"
+                })
+            } else if protocol_name == crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS {
+                json!({
+                    "id":"chatcmpl-1",
+                    "choices":[{
+                        "index":0,
+                        "message":{"role":"assistant","content":"ok"},
+                        "finish_reason":"stop"
+                    }]
+                })
+            } else {
+                json!({"id":"resp-1","object":"response","status":"completed","output":[]})
+            };
+            write_json_response(&mut stream, 200, &response)
+                .await
+                .unwrap();
+            (request.path, body)
+        });
+        let (mut config, provider_id, _) = router_config(format!("http://{upstream_address}/v1"));
+        config.profiles[0].upstream_protocol = protocol.into();
+        config.profiles[0].normalize();
+        config
+            .selected_models_by_provider
+            .insert(provider_id.clone(), vec![model.to_string()]);
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+        let mut request = json!({
+            "model": model_alias(&provider_id, model),
+            "input": "hello",
+            "reasoning": {"effort": effort}
+        });
+        if let Some(limit) = explicit_limit {
+            request["max_output_tokens"] = json!(limit);
+        }
+        let response = reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "{protocol} {model} {effort}"
+        );
+        let (actual_path, body) = upstream_task.await.unwrap();
+        assert_eq!(actual_path, path, "{protocol}");
+        assert_eq!(
+            body.get(field).and_then(Value::as_u64),
+            expected,
+            "{protocol} {model} {effort} {body}"
+        );
+        router.stop().await.unwrap();
+    }
+}
+
 #[test]
 fn removed_minimal_effort_still_maps_to_low_for_anthropic() {
     // `minimal` 已不再是界面档位，但旧会话和自定义档位的 value 仍可能带上它；
@@ -6902,8 +7597,11 @@ async fn model_switch_sized_upload_does_not_spend_the_header_timeout() {
         let std_socket = socket.into_std().unwrap();
         std_socket.set_nonblocking(false).unwrap();
         let socket = socket2::Socket::from(std_socket);
-        // 不读正文时，小接收窗口会把上传堵在半路，旧的 60 秒期限会把这次上传记成 504。
-        socket.set_recv_buffer_size(1024).unwrap();
+        // 不读正文时，收紧的接收窗口会把上传堵在半路，旧的 60 秒期限会把这次上传
+        // 记成 504。窗口要保持在回环 MSS 的数倍以上（回环 MTU 在部分系统上有
+        // 64 KiB），并且全程不再改动：窗口一旦小于一个报文段，发送端会退进零窗口
+        // 探测，之后再调大缓冲也补不回这段正文的传输速度。
+        socket.set_recv_buffer_size(256 * 1024).unwrap();
         let std_socket: std::net::TcpStream = socket.into();
         std_socket.set_nonblocking(true).unwrap();
         let mut socket = TcpStream::from_std(std_socket).unwrap();
@@ -6928,14 +7626,11 @@ async fn model_switch_sized_upload_does_not_spend_the_header_timeout() {
             .unwrap();
         headers_read.send(length).unwrap();
         release_rx.await.unwrap();
-        socket2::SockRef::from(&socket)
-            .set_recv_buffer_size(1024 * 1024)
-            .unwrap();
         let mut body = vec![0_u8; length];
-        tokio::time::timeout(Duration::from_secs(30), socket.read_exact(&mut body))
+        socket
+            .read_exact(&mut body)
             .await
-            .expect("上传仍应在进行，不能被响应头期限提前掐断")
-            .unwrap();
+            .expect("上传仍应在进行，不能被响应头期限提前掐断");
         let sse = concat!(
             "data: {\"type\":\"response.completed\",\"response\":{",
             "\"id\":\"resp-after-upload\",\"object\":\"response\",\"status\":\"completed\",\"output\":[]}}\n\n"
@@ -6992,12 +7687,17 @@ async fn model_switch_sized_upload_does_not_spend_the_header_timeout() {
         "header timeout included the blocked history upload"
     );
     release.send(()).unwrap();
-    let response = tokio::time::timeout(Duration::from_secs(10), pending)
+    // 断言关心的是上传最终走完而不是被记成 504，等待要宽到不会把慢机器误报成
+    // 失败，同时短到能及时暴露真正卡死的上传。
+    tokio::time::timeout(Duration::from_secs(30), upstream_task)
+        .await
+        .expect("上游应当读完整段正文并回包")
+        .unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(30), pending)
         .await
         .expect("upstream response should arrive after the body upload")
         .unwrap();
     assert_eq!(response.status().as_u16(), 200);
-    upstream_task.await.unwrap();
     router.stop().await.unwrap();
 }
 
@@ -7041,6 +7741,83 @@ async fn streaming_header_timeout_still_bounds_the_wait_after_upload() {
     let body = response.text().await.unwrap();
     assert!(body.contains("upstream_header_timeout"), "{body}");
     upstream_task.abort();
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn replayed_history_still_waiting_after_the_nominal_header_timeout() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let (config, provider_id, model) =
+        router_config(format!("http://{}/v1", upstream.local_addr().unwrap()));
+    let (received, received_rx) = oneshot::channel();
+    let (release, release_rx) = oneshot::channel::<()>();
+    let upstream_task = tokio::spawn(async move {
+        let (mut socket, _) = upstream.accept().await.unwrap();
+        let request = read_http_request(&mut socket).await.unwrap();
+        let length = request.body.len();
+        received.send(length).unwrap();
+        release_rx.await.unwrap();
+        let sse = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{",
+            "\"id\":\"resp-after-replay\",\"object\":\"response\",\"status\":\"completed\",\"output\":[]}}\n\n"
+        );
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                    sse.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    // 模拟切模型后重放的历史：正文已经进了上游读缓冲，但网关还没给出首字。
+    let padding = "x".repeat(4 * 1024 * 1024);
+    let mut pending = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(endpoint.token)
+            .json(&json!({
+                "model": model_alias(&provider_id, &model),
+                "stream": true,
+                "input": padding,
+            }))
+            .send()
+            .await
+            .unwrap()
+    });
+    let length = received_rx.await.unwrap();
+    let budget =
+        super::lifecycle::response_header_timeout(length, UPSTREAM_RESPONSE_HEADER_TIMEOUT);
+    assert!(
+        budget > UPSTREAM_RESPONSE_HEADER_TIMEOUT + Duration::from_secs(30),
+        "replayed body of {length} bytes did not extend the header budget"
+    );
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::pause();
+    tokio::time::advance(UPSTREAM_RESPONSE_HEADER_TIMEOUT + Duration::from_secs(10)).await;
+    tokio::time::resume();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut pending)
+            .await
+            .is_err(),
+        "nominal header timeout fired while the replayed upload was still buffered"
+    );
+    release.send(()).unwrap();
+    upstream_task.await.unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(30), pending)
+        .await
+        .expect("upstream response should arrive inside the extended header budget")
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
     router.stop().await.unwrap();
 }
 
@@ -7495,6 +8272,9 @@ async fn invalid_compaction_result_does_not_prevent_a_later_valid_request() {
     let upstream_task = tokio::spawn(async move {
         for value in [
             json!({"output":[{"type":"message","content":"not a compaction"}]}),
+            json!({"status":"failed","output":[{"type":"compaction","encrypted_content":"failed"}]}),
+            json!({"status":"incomplete","output":[{"type":"compaction","encrypted_content":"partial"}]}),
+            json!({"status":"completed","error":{"code":"server_error"},"output":[{"type":"compaction","encrypted_content":"failed"}]}),
             json!({"output":[{"type":"compaction","encrypted_content":"valid"}]}),
         ] {
             let (mut socket, _) = upstream.accept().await.unwrap();
@@ -7505,7 +8285,7 @@ async fn invalid_compaction_result_does_not_prevent_a_later_valid_request() {
     let router = LocalRouter::start(&config).await.unwrap();
     let endpoint = router.endpoint();
     let body = json!({"model":model_alias(&provider_id, &model),"input":"full context"});
-    for status in [502, 200] {
+    for status in [502, 502, 502, 502, 200] {
         let response = reqwest::Client::new()
             .post(format!("{}/responses/compact", endpoint.base_url))
             .bearer_auth(&endpoint.token)
@@ -8430,16 +9210,16 @@ async fn model_switch_from_chat_to_native_expands_synthetic_history_in_order() {
     let sent = upstream_task.await.unwrap();
     assert!(sent.get("previous_response_id").is_none());
     assert_eq!(sent["input"][0], "original task");
-    assert_eq!(sent["input"][1]["role"], "assistant");
-    assert_eq!(sent["input"][1]["content"][0]["text"], "remembered answer");
-    assert_eq!(sent["input"][2], "continue");
-    assert!(
-        sent["input"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|item| { item.get("type").and_then(Value::as_str) != Some("reasoning") })
+    assert_eq!(sent["input"][1]["type"], "reasoning");
+    assert!(sent["input"][1].get("encrypted_content").is_none());
+    assert_eq!(sent["input"][1]["content"], json!([]));
+    assert_eq!(
+        sent["input"][1]["summary"][0]["text"],
+        "private bridge reasoning"
     );
+    assert_eq!(sent["input"][2]["role"], "assistant");
+    assert_eq!(sent["input"][2]["content"][0]["text"], "remembered answer");
+    assert_eq!(sent["input"][3], "continue");
     socket.close(None).await.unwrap();
     router.stop().await.unwrap();
 }
@@ -10394,6 +11174,117 @@ async fn router_rejects_unknown_raw_models_instead_of_guessing_a_route() {
 }
 
 #[tokio::test]
+async fn request_log_preserves_subagent_source_before_route_resolution() {
+    for backend in [
+        RouteRequestLogBackend::Sqlite,
+        RouteRequestLogBackend::Ndjson,
+    ] {
+        let logs = tempfile::tempdir().unwrap();
+        let (mut config, _, _) = router_config("http://127.0.0.1:9/v1".to_string());
+        config.route_request_log.enabled = true;
+        config.route_request_log.backend = backend;
+        let router = LocalRouter::start_with_logger(
+            &config,
+            Arc::new(RouteRequestLogController::with_root(
+                logs.path().to_path_buf(),
+            )),
+        )
+        .await
+        .unwrap();
+        let endpoint = router.endpoint();
+        let client = reqwest::Client::new();
+        for (model, subagent, parent) in [
+            ("missing-memory-model", true, None),
+            ("missing-worker-model", true, Some("parent-thread")),
+            ("missing-main-model", false, None),
+        ] {
+            let mut request = client
+                .post(format!("{}/responses", endpoint.base_url))
+                .bearer_auth(&endpoint.token)
+                .header("thread-id", "request-thread")
+                .json(&json!({"model":model,"reasoning":{"effort":"medium"},"input":"private content"}));
+            if subagent {
+                request = request.header("x-openai-subagent", "memory_consolidation");
+            }
+            if let Some(parent) = parent {
+                request = request.header("x-codex-parent-thread-id", parent);
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"]["code"],
+                "model_not_enabled"
+            );
+        }
+        let response = client
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .header("x-codex-parent-thread-id", "early-parent")
+            .body("invalid json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        router.stop().await.unwrap();
+        let items: Vec<Value> = match backend {
+            RouteRequestLogBackend::Sqlite => {
+                let page = crate::route_request_log::query_route_request_logs(
+                    logs.path(),
+                    backend,
+                    RouteRequestLogQuery::default(),
+                )
+                .unwrap();
+                assert!(page.queryable);
+                page.items
+                    .into_iter()
+                    .map(|item| serde_json::to_value(item).unwrap())
+                    .collect()
+            }
+            RouteRequestLogBackend::Ndjson => {
+                std::fs::read_to_string(logs.path().join("route-requests.ndjson"))
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect()
+            }
+        };
+        assert_eq!(items.len(), 4, "{backend:?}");
+        for item in &items {
+            assert!(item["provider"].is_null());
+            assert!(item["upstreamTransport"].is_null());
+            assert!(item["totalTokens"].is_null());
+            assert!(item["tokenUsage"]["totalTokens"].is_null());
+            assert_eq!(item["usageReported"], false);
+            assert!(!item.to_string().contains("private content"));
+            match item["requestedModel"].as_str().unwrap() {
+                "missing-memory-model" => {
+                    assert_eq!(item["subagent"], true);
+                    assert_eq!(item["codexSessionIsParent"], true);
+                    assert!(item["codexSessionId"].is_null());
+                }
+                "missing-worker-model" => {
+                    assert_eq!(item["subagent"], true);
+                    assert_eq!(item["codexSessionIsParent"], true);
+                    assert_eq!(item["codexSessionId"], "parent-thread");
+                }
+                "missing-main-model" => {
+                    assert_eq!(item["subagent"], false);
+                    assert_eq!(item["codexSessionIsParent"], false);
+                    assert_eq!(item["codexSessionId"], "request-thread");
+                }
+                "" => {
+                    assert_eq!(item["subagent"], true);
+                    assert_eq!(item["codexSessionIsParent"], true);
+                    assert_eq!(item["codexSessionId"], "early-parent");
+                    assert_eq!(item["errorCode"], "invalid_request_body");
+                }
+                model => panic!("unexpected request model: {model}"),
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn router_rejects_requests_without_the_launch_token() {
     let (config, provider_id, model) = router_config("http://127.0.0.1:9/v1".to_string());
     let router = LocalRouter::start(&config).await.unwrap();
@@ -10536,6 +11427,52 @@ async fn request_log_excludes_non_model_paths_but_keeps_rejected_model_requests(
 }
 
 #[tokio::test]
+async fn request_log_quota_api_returns_aggregates_and_health_with_authentication() {
+    let logs = tempfile::tempdir().unwrap();
+    let (mut config, _, _) = router_config("http://127.0.0.1:9/v1".to_string());
+    config.route_request_log.backend = RouteRequestLogBackend::Sqlite;
+    let router = LocalRouter::start_with_logger(
+        &config,
+        Arc::new(RouteRequestLogController::with_root(
+            logs.path().to_path_buf(),
+        )),
+    )
+    .await
+    .unwrap();
+    let endpoint = router.endpoint();
+    let url = format!(
+        "{}/codey/api/query_route_request_log_quota_usage",
+        endpoint.base_url.trim_end_matches("/v1")
+    );
+    let client = reqwest::Client::new();
+    let unauthorized = client.post(&url).json(&json!({})).send().await.unwrap();
+    assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let invalid = client
+        .post(&url)
+        .header(ROUTER_AUTH_HEADER, &endpoint.token)
+        .json(&json!({"toUnixMs": 300}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+    let response = client
+        .post(&url)
+        .header(ROUTER_AUTH_HEADER, &endpoint.token)
+        .json(&json!({"fromUnixMs": 100, "toUnixMs": 300}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let value = response.json::<Value>().await.unwrap();
+    assert_eq!(value["queryable"], true);
+    assert_eq!(value["totalCalls"], 0);
+    assert_eq!(value["groups"], json!([]));
+    assert!(value["recordingHealth"]["enabled"].is_boolean());
+    assert!(value.get("items").is_none());
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn request_log_page_is_public_but_its_api_requires_the_launch_token() {
     let (config, provider_id, model) = router_config("http://127.0.0.1:9/v1".to_string());
     let router = LocalRouter::start(&config).await.unwrap();
@@ -10651,6 +11588,22 @@ async fn request_log_page_is_public_but_its_api_requires_the_launch_token() {
     assert_eq!(
         usage.json::<Value>().await.unwrap()["status"],
         "unavailable"
+    );
+    let invalid_usage = client
+        .post(format!(
+            "{gateway_root}/codey/api/query_official_account_usage"
+        ))
+        .header(ROUTER_AUTH_HEADER, &endpoint.token)
+        .json(&json!({"forceRefresh": "yes"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid_usage.status(), reqwest::StatusCode::BAD_REQUEST);
+    let invalid_usage = invalid_usage.json::<Value>().await.unwrap();
+    assert!(
+        invalid_usage["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("额度查询参数无效"))
     );
 
     // 系统浏览器里的请求日志页无法走 Codey 应用桥，账号筛选、账号名显示和按
@@ -11114,4 +12067,115 @@ async fn chat_stream_keeps_distinct_tools_separate_across_both_shapes() {
         names.sort();
         assert_eq!(names, vec!["alpha", "beta"], "{output:#?}");
     }
+}
+
+#[tokio::test]
+async fn router_listener_binds_loopback_and_never_repeats_live_ports() {
+    // 绑定成功即独占端口，所以并发/连续启动不会把同一个端口分配两次。
+    let mut listeners: Vec<TcpListener> = Vec::new();
+    for _ in 0..16 {
+        let listener = bind_router_listener().await.unwrap();
+        let address = listener.local_addr().unwrap();
+        assert_eq!(address.ip(), std::net::Ipv4Addr::LOCALHOST);
+        let port = address.port();
+        assert_ne!(port, 0);
+        for existing in &listeners {
+            assert_ne!(
+                existing.local_addr().unwrap().port(),
+                port,
+                "端口 {port} 被重复分配"
+            );
+        }
+        listeners.push(listener);
+    }
+}
+
+#[tokio::test]
+async fn an_occupied_candidate_port_is_skipped() {
+    // 模拟区间末尾被占用，确认探测回到起点，不依赖本机端口状态。
+    let mut attempted = Vec::new();
+    let offset = u32::from(ROUTER_PORT_RANGE_END - ROUTER_PORT_RANGE_START);
+    let port = bind_router_listener_with(offset, |address| {
+        attempted.push(address.port());
+        std::future::ready(if address.port() == ROUTER_PORT_RANGE_END {
+            Err(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+        } else {
+            Ok(address.port())
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(port, ROUTER_PORT_RANGE_START);
+    assert_eq!(
+        attempted,
+        vec![ROUTER_PORT_RANGE_END, ROUTER_PORT_RANGE_START]
+    );
+}
+
+#[tokio::test]
+async fn router_listener_uses_the_first_available_high_port() {
+    for offset in [
+        0,
+        123,
+        u32::from(ROUTER_PORT_RANGE_END - ROUTER_PORT_RANGE_START),
+    ] {
+        let mut attempted = Vec::new();
+        let port = bind_router_listener_with(offset, |address| {
+            assert_eq!(*address.ip(), std::net::Ipv4Addr::LOCALHOST);
+            attempted.push(address.port());
+            std::future::ready(Ok(address.port()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(port, ROUTER_PORT_RANGE_START + offset as u16);
+        assert_eq!(attempted, vec![port]);
+    }
+}
+
+#[tokio::test]
+async fn router_listener_falls_back_after_all_candidates_fail() {
+    for kind in [
+        std::io::ErrorKind::AddrInUse,
+        std::io::ErrorKind::PermissionDenied,
+    ] {
+        let mut attempted = Vec::new();
+        let port = bind_router_listener_with(0, |address| {
+            assert_eq!(*address.ip(), std::net::Ipv4Addr::LOCALHOST);
+            attempted.push(address.port());
+            std::future::ready(if address.port() == 0 {
+                Ok(59_775)
+            } else {
+                Err(std::io::Error::from(kind))
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(port, 59_775);
+        let expected: Vec<_> = (ROUTER_PORT_RANGE_START
+            ..ROUTER_PORT_RANGE_START + ROUTER_PORT_PROBES)
+            .chain(std::iter::once(0))
+            .collect();
+        assert_eq!(attempted, expected);
+    }
+}
+
+#[tokio::test]
+async fn router_listener_reports_kernel_allocation_failure() {
+    let mut attempts = 0;
+    let error = bind_router_listener_with::<u16, _, _>(0, |address| {
+        attempts += 1;
+        std::future::ready(Err(std::io::Error::from(if address.port() == 0 {
+            std::io::ErrorKind::PermissionDenied
+        } else {
+            std::io::ErrorKind::AddrInUse
+        })))
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(attempts, usize::from(ROUTER_PORT_PROBES) + 1);
+    assert_eq!(error.to_string(), "启动 Codey 本地路由失败");
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
 }

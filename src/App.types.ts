@@ -20,6 +20,9 @@ export type Profile = {
   modelRequestHeaders?: Record<string, string>;
   upstreamProxy?: string;
   sourceProviderId?: string;
+  pluginOwnerId?: string;
+  /** 宿主已返回的插件声明；这里只使用独立于用户设置的模型能力。 */
+  pluginRouteSpec?: { modelReasoningEfforts?: Record<string, string[]> };
   officialAccount: boolean;
   /** 该线路来自哪个已保存的官方账号；多条官方线路靠它区分。 */
   officialAccountId?: string;
@@ -245,6 +248,7 @@ export type RuntimeStatus = {
 
 export type PluginMarketplaceStatus = {
   status: "ready" | "needs_repair" | "error";
+  computerUse?: { supported: boolean; ready: boolean };
   needsRepair?: boolean;
   officialMarketplace?: boolean;
   officialPath?: string | null;
@@ -282,6 +286,7 @@ export type Confirmation = {
     | "install-update"
     | "download-update"
     | "disable-auto-update-check"
+    | "discard-settings-changes"
     | "delete-notification-channel"
     | "delete-route"
     | "delete-official-account";
@@ -319,11 +324,17 @@ export type CrashpadCleanup = {
   errors: string[];
 };
 
+export type RollbackDirective = { id: string; sourceVersion: string; targetVersion: string; reason: string };
+
 export type UpdateCheck = {
   currentVersion: string;
   latestVersion: string;
   updateAvailable: boolean;
   selectedAsset?: UpdateAsset;
+  releaseNotes?: string | null;
+  publishId?: string | null;
+  policyId?: string | null;
+  rollback?: RollbackDirective | null;
 };
 
 export type UpdateAsset = {
@@ -343,6 +354,9 @@ export type UpdateDownload = {
   size: number;
   sha256: string;
   asset: UpdateAsset;
+  publishId?: string | null;
+  policyId?: string | null;
+  rollback?: RollbackDirective | null;
 };
 
 /// 上一次更新安装留给本次启动的结果。助手在退出前写下，控制台读取后删除，

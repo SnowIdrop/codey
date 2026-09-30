@@ -213,10 +213,13 @@ pub(crate) fn upstream_request_id_from_headers(headers: &HeaderMap) -> Option<St
     .and_then(bounded_upstream_request_id)
 }
 
-/// 部分第三方 thinking 模式要求把上一轮的 reasoning 明文原样回传。
-/// 明文字段缺失或 opaque 状态失效时上游拒绝请求；由调用方选择兼容方式重试一次。
+/// 部分第三方 thinking 模式要求回传 reasoning 明文，字段缺失或 opaque 状态失效时
+/// 由调用方按协议重放真实明文、已有摘要或缺失标记，并只重试一次。
 pub(crate) fn requires_reasoning_text_fallback(body: &[u8]) -> bool {
-    String::from_utf8_lossy(body).contains("reasoning_text")
+    let text = String::from_utf8_lossy(body);
+    text.contains("reasoning_text")
+        || text.contains("reasoning_content")
+        || text.contains("reasoning content")
 }
 
 /// 上游非 2xx 错误正文读取超时：与压缩路径一致返回结构化 504，而不是让

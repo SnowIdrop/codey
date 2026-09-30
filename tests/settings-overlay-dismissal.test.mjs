@@ -7,8 +7,9 @@ import { loadTypeScriptModule } from "./helpers/load-typescript-module.mjs";
 const root = new URL("../", import.meta.url);
 
 test("settings modal keeps dismissal and stacking inside the overlay", async () => {
-  const [appSource, shellSource, overlaySource, stylesSource, constants] = await Promise.all([
+  const [appSource, draftSource, shellSource, overlaySource, stylesSource, constants] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
+    readFile(new URL("src/useDraftConfig.ts", root), "utf8"),
     readFile(new URL("src/SettingsModalShell.tsx", root), "utf8"),
     readFile(new URL("src/overlay.tsx", root), "utf8"),
     readFile(new URL("src/styles.css", root), "utf8"),
@@ -17,7 +18,11 @@ test("settings modal keeps dismissal and stacking inside the overlay", async () 
 
   assert.match(
     appSource,
-    /function closeSettings\(\) \{[\s\S]*setConfig\(persistedConfigRef\.current\)[\s\S]*setDirty\(false\)[\s\S]*onClose\?\.\(\)/,
+    /function closeSettings\(\) \{[\s\S]*discardDraft\(\)[\s\S]*onClose\?\.\(\)/,
+  );
+  assert.match(
+    draftSource,
+    /function discardDraft\(\) \{[\s\S]*setConfig\(persistedConfigRef\.current\)[\s\S]*setDirty\(false\)/,
   );
   assert.match(appSource, /function closeSettings\(\) \{\s*if \(isBusy\) return;/);
   assert.match(
@@ -28,9 +33,10 @@ test("settings modal keeps dismissal and stacking inside the overlay", async () 
     shellSource,
     /<Modal[\s\S]*isOpen=\{visible\}[\s\S]*onOpenChange=\{\(open\) => \{\s*if \(!open\) onCancel\(\);/,
   );
-  assert.match(shellSource, /<Modal\.Backdrop\s+isDismissable=\{false\}\s+isKeyboardDismissDisabled/);
+  assert.match(shellSource, /<Modal\.Backdrop\s+isDismissable\s+isKeyboardDismissDisabled/);
   assert.match(shellSource, /<UNSAFE_PortalProvider getContainer=\{getContainer\}>/);
   assert.match(shellSource, /className="settings-modal-shell /);
+  assert.ok(shellSource.includes('<Modal.Container placement="center" className="p-3 sm:p-3">'));
   assert.doesNotMatch(shellSource, /backdrop-blur|overlayProps=/);
   assert.match(shellSource, /settings-modal-body flex min-h-0 flex-1 flex-col overflow-hidden/);
   assert.doesNotMatch(overlaySource, /addEventListener\("wheel"/);

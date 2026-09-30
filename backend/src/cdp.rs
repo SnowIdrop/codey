@@ -39,6 +39,7 @@ const PET_CONTROL_SHIELD_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/pet-control-shield.js");
 const SECURITY_WARNING_SHIELD_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/security-warning-shield.js");
+const QUOTA_UNLOCK_SCRIPT: &str = include_str!("../../dist-overlay/inject/quota-unlock.js");
 pub(crate) const SETTINGS_OVERLAY_SCRIPT: &str =
     include_str!("../../dist-overlay/codey-overlay.js");
 const PLUGIN_MARKETPLACE_FIX_SCRIPT: &str =
@@ -219,7 +220,7 @@ pub fn prepare_injection_scripts(
 ) -> PreparedInjectionScripts {
     use InjectionScriptVisibility::{Feature, Internal};
 
-    let builtin_scripts = [
+    let mut builtin_scripts = vec![
         (
             "bridge-helpers",
             "桥接辅助",
@@ -349,6 +350,22 @@ pub fn prepare_injection_scripts(
             Feature,
         ),
     ];
+    if local_router_enabled {
+        builtin_scripts.push((
+            "quota-unlock",
+            "额度状态兼容",
+            QUOTA_UNLOCK_SCRIPT,
+            r#"(() => {
+              const status = window.__codeyQuotaUnlock?.status?.();
+              if (!status) return "";
+              return status.enabled === true
+                ? { effective: true, detail: `额度状态兼容已处理 ${status.sanitized ?? 0} 次` }
+                : { effective: false, inactive: true, detail: "额度状态兼容已关闭" };
+            })()"#
+                .to_string(),
+            Feature,
+        ));
+    }
     let mut core_bundle = String::with_capacity(
         CODEY_BRIDGE_SCRIPT.len()
             + WORKFLOW_MODE_SCRIPT.len()
@@ -356,6 +373,7 @@ pub fn prepare_injection_scripts(
             + RENDERER_INJECT_SCRIPT.len()
             + PET_CONTROL_SHIELD_SCRIPT.len()
             + SECURITY_WARNING_SHIELD_SCRIPT.len()
+            + QUOTA_UNLOCK_SCRIPT.len()
             + PLUGIN_MARKETPLACE_FIX_SCRIPT.len()
             + PROMPT_OPTIMIZE_SCRIPT.len()
             + 4096,
@@ -1951,9 +1969,13 @@ assert.equal(nextPage.window.attempts, 1);
         assert!(prepared.scripts[1].contains("window.userScriptRan = true;"));
         assert!(prepared.scripts[1].contains(r#"status = "executed""#));
         assert!(prepared.scripts[1].contains("用户脚本 1 injection failed"));
-        assert_eq!(prepared.descriptors.len(), 10);
-        assert_eq!(prepared.descriptors[9].id, "user-script-1");
-        assert_eq!(prepared.descriptors[9].source, "user");
+        assert_eq!(prepared.descriptors.len(), 11);
+        let user_script = prepared
+            .descriptors
+            .iter()
+            .find(|descriptor| descriptor.id == "user-script-1")
+            .expect("user script descriptor should be present");
+        assert_eq!(user_script.source, "user");
         assert_eq!(
             prepared.descriptors[0].visibility,
             InjectionScriptVisibility::Internal
@@ -1963,10 +1985,14 @@ assert.equal(nextPage.window.attempts, 1);
             prepared.descriptors[6].visibility,
             InjectionScriptVisibility::Internal
         );
-        assert_eq!(
-            prepared.descriptors[9].visibility,
-            InjectionScriptVisibility::Feature
+        assert!(
+            prepared
+                .descriptors
+                .iter()
+                .any(|descriptor| descriptor.id == "quota-unlock")
         );
+        assert!(core.contains("__codeyQuotaUnlock"));
+        assert_eq!(user_script.visibility, InjectionScriptVisibility::Feature);
         let snapshot_script = injection_status_snapshot_script(&prepared.descriptors);
         assert!(snapshot_script.contains("bridge-helpers"));
         assert!(snapshot_script.contains("effective: false"));
@@ -2013,6 +2039,12 @@ assert.equal(nextPage.window.attempts, 1);
                 .descriptors
                 .iter()
                 .any(|descriptor| descriptor.id == "settings-overlay-loader")
+        );
+        assert!(
+            !prepared
+                .descriptors
+                .iter()
+                .any(|descriptor| descriptor.id == "quota-unlock")
         );
     }
 

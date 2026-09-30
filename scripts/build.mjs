@@ -25,7 +25,15 @@ if (process.env.CODEY_SKIP_OVERLAY_BUILD === "1") {
 
 const cargo = spawnSync(
   "cargo",
-  ["build", "--release", "--manifest-path", join(root, "Cargo.toml")],
+  [
+    "build",
+    "--release",
+    "-p",
+    "codey",
+    "--bins",
+    "--manifest-path",
+    join(root, "Cargo.toml"),
+  ],
   {
     cwd: root,
     stdio: "inherit",
@@ -60,6 +68,7 @@ for (const [source, destination] of [
   ["licenses/FastCtx/NOTICE", "licenses/FastCtx/NOTICE"],
   ["licenses/PetDragRecovery/LICENSE", "licenses/PetDragRecovery/LICENSE"],
   ["licenses/ChatGPTOverlayFix/LICENSE", "licenses/ChatGPTOverlayFix/LICENSE"],
+  ["vendor/ComputerUse/LICENSE", "licenses/ComputerUse/LICENSE"],
 ]) {
   const bundledDestination = join(resources, ...destination.split("/"));
   mkdirSync(dirname(bundledDestination), { recursive: true });

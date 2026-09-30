@@ -38,14 +38,24 @@ impl NativeUpdateUi {
         &self,
         current_version: &str,
         latest_version: &str,
+        release_notes: Option<&str>,
     ) -> Result<bool, String> {
+        let rollback = semver::Version::parse(latest_version)
+            .ok()
+            .zip(semver::Version::parse(current_version).ok())
+            .is_some_and(|(target, current)| target < current);
+        let notes = release_notes
+            .map(str::trim)
+            .filter(|notes| !notes.is_empty())
+            .map(|notes| format!("\n\n更新日志：\n{notes}"))
+            .unwrap_or_default();
         show_dialog(
-            format!("发现 Codey v{latest_version} 更新"),
-            format!(
-                "当前版本为 v{current_version}。是否现在下载、校验并安装更新？安装时会退出 Codex 和 Codey，并尝试启动新版。"
-            ),
+            if rollback { format!("回退 Codey 至 v{latest_version}") } else { format!("发现 Codey v{latest_version} 更新") },
+            if rollback { format!("管理员已授权将 v{current_version} 降级至 v{latest_version}。请保存工作；确认后下载安装旧版本并重启，安装前将再次校验授权。{notes}") } else { format!(
+                "当前版本为 v{current_version}。是否现在下载、校验并安装更新？安装时会退出 Codex 和 Codey，并尝试启动新版。{notes}"
+            ) },
             DialogKind::Confirm,
-            "更新并重启".to_string(),
+            if rollback { "回退并重启" } else { "更新并重启" }.to_string(),
             Some("稍后".to_string()),
         )
         .await
@@ -58,6 +68,18 @@ impl NativeUpdateUi {
             format!("{error}\n\n你可以进入 Codex 后，从 Codey 设置中重试。"),
             DialogKind::Failure,
             "进入 Codex".to_string(),
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn show_startup_failure(&self, error: &str) -> Result<(), String> {
+        show_dialog(
+            "Codey 启动失败".to_string(),
+            format!("{error}\n\nCodey 将退出。处理上述问题后，请重新启动 Codey。"),
+            DialogKind::Failure,
+            "退出".to_string(),
             None,
         )
         .await
@@ -99,21 +121,55 @@ impl ContextRecoveryPurpose {
 pub(crate) async fn confirm_context_recovery(
     purpose: ContextRecoveryPurpose,
 ) -> Result<bool, String> {
-    let (description, primary_label, secondary_label) = match purpose {
-        ContextRecoveryPurpose::Launch => (
-            "本机 Codex 模型缓存不完整，暂时无法应用自定义上下文预算。\n\n可以恢复所有模型的默认预算并重新启动，其他设置不受影响。原配置会自动备份。若要继续使用自定义预算，请先直接打开官方 Codex 刷新模型缓存，再返回 Codey 设置。",
-            "恢复默认预算并重试",
-            "退出",
-        ),
-        ContextRecoveryPurpose::ModelSync => (
-            "本机 Codex 模型缓存不完整，暂时无法应用自定义上下文预算。\n\n可以恢复所有模型的默认预算并继续保存本次改动，其他设置不受影响。原配置会自动备份。若要继续使用自定义预算，请先直接打开官方 Codex 刷新模型缓存，再返回 Codey 设置；也可以先取消，从模型缓存刷新后再保存。",
-            "恢复默认预算并继续",
-            "取消",
-        ),
+    confirm_context_recovery_with_reason(
+        purpose,
+        crate::model_catalog::CUSTOM_CONTEXT_CATALOG_UNAVAILABLE,
+    )
+    .await
+}
+
+fn context_recovery_description(purpose: ContextRecoveryPurpose, reason: &str) -> String {
+    let action = match purpose {
+        ContextRecoveryPurpose::Launch => "重新启动",
+        ContextRecoveryPurpose::ModelSync => "继续保存本次改动",
+    };
+    format!(
+        "{reason}\n\n可以恢复所有模型的默认上下文预算并{action}，其他设置不受影响。原配置会自动备份，自定义模型目录保持不变。若要保留预算，请先检查模型目录与线路中的模型标识，或重新同步模型后重试。"
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn context_recovery_prompt_preserves_the_catalog_error_and_reset_scope() {
+    let reason = "自定义模型目录缺少已启用的预算模型：custom/gpt-6-astra（custom.json）";
+    for purpose in [
+        ContextRecoveryPurpose::Launch,
+        ContextRecoveryPurpose::ModelSync,
+    ] {
+        let description = context_recovery_description(purpose, reason);
+        assert!(description.starts_with(reason));
+        assert!(description.contains("所有模型"));
+        assert!(description.contains("自动备份"));
+        assert!(description.contains("自定义模型目录保持不变"));
+        let action = match purpose {
+            ContextRecoveryPurpose::Launch => "重新启动",
+            ContextRecoveryPurpose::ModelSync => "继续保存本次改动",
+        };
+        assert!(description.contains(action));
+    }
+}
+
+pub(crate) async fn confirm_context_recovery_with_reason(
+    purpose: ContextRecoveryPurpose,
+    reason: &str,
+) -> Result<bool, String> {
+    let (primary_label, secondary_label) = match purpose {
+        ContextRecoveryPurpose::Launch => ("恢复默认预算并重试", "退出"),
+        ContextRecoveryPurpose::ModelSync => ("恢复默认预算并继续", "取消"),
     };
     show_dialog(
         "Codey 上下文设置暂时无法使用".to_string(),
-        description.to_string(),
+        context_recovery_description(purpose, reason),
         DialogKind::RestoreContext,
         primary_label.to_string(),
         Some(secondary_label.to_string()),

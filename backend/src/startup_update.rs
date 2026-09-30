@@ -29,6 +29,7 @@ trait StartupUpdateUi: Send + Sync {
         &self,
         current_version: &str,
         latest_version: &str,
+        release_notes: Option<&str>,
     ) -> Result<bool, String>;
     async fn show_update_failure(&self, error: &str) -> Result<(), String>;
 }
@@ -47,8 +48,9 @@ impl StartupUpdateUi for NativeUpdateUi {
         &self,
         current_version: &str,
         latest_version: &str,
+        release_notes: Option<&str>,
     ) -> Result<bool, String> {
-        NativeUpdateUi::confirm_update(self, current_version, latest_version).await
+        NativeUpdateUi::confirm_update(self, current_version, latest_version, release_notes).await
     }
 
     async fn show_update_failure(&self, error: &str) -> Result<(), String> {
@@ -143,10 +145,20 @@ async fn run_with_mode(
         return StartupUpdateOutcome::Continue;
     }
 
+    let confirmation_notes = candidate.check.rollback.as_ref().map(|r| {
+        format!(
+            "回退原因：{}\n{}",
+            r.reason,
+            candidate.check.release_notes.as_deref().unwrap_or("")
+        )
+    });
     let should_update = ui
         .confirm_update(
             &candidate.check.current_version,
             &candidate.check.latest_version,
+            confirmation_notes
+                .as_deref()
+                .or(candidate.check.release_notes.as_deref()),
         )
         .await
         .unwrap_or_default();
@@ -224,6 +236,7 @@ mod tests {
             &self,
             _current_version: &str,
             _latest_version: &str,
+            _release_notes: Option<&str>,
         ) -> Result<bool, String> {
             self.confirmations.fetch_add(1, Ordering::Relaxed);
             Ok(self.confirm.load(Ordering::Relaxed))
@@ -297,6 +310,10 @@ mod tests {
                 },
                 update_available,
                 selected_asset: installable.then(asset),
+                release_notes: None,
+                publish_id: None,
+                policy_id: None,
+                rollback: None,
             },
         }
     }
@@ -310,6 +327,9 @@ mod tests {
             size: asset.size,
             sha256: asset.sha256.clone(),
             asset,
+            publish_id: None,
+            policy_id: None,
+            rollback: None,
         }
     }
 

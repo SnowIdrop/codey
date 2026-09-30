@@ -4,7 +4,10 @@ use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
 
+pub mod appserver;
 pub mod lifecycle;
+pub mod provider;
+pub mod transport;
 
 pub use serde_json;
 use serde_json::Value;

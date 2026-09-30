@@ -1,6 +1,9 @@
 //! 可选的通用请求生命周期。原生回调超时只能停止等待，不能强制终止原生代码。
 use super::{HeaderPatch, Manifest, Native, allowed_header_name, validate_patches};
-use codey_plugin_sdk::lifecycle::{AUTH_CAPABILITY, Action, CAPABILITY};
+use codey_plugin_sdk::lifecycle::{
+    AUTH_CAPABILITY, Action, CAPABILITY, METHOD_AFTER_HEADERS, METHOD_BEFORE_SEND,
+    METHOD_CANCELLED, METHOD_COMPLETED, METHOD_FAILED, METHOD_RESUME,
+};
 pub use codey_plugin_sdk::lifecycle::{Response as LifecycleResponse, Stage as LifecycleStage};
 use serde_json::{Value, json};
 use std::{
@@ -85,13 +88,22 @@ impl LifecyclePlugin {
         })
     }
 
-    async fn call(
+    pub(super) fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::Release);
+        self.waiters.notify_waiters();
+    }
+
+    pub(super) fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    pub(super) async fn call(
         self: &Arc<Self>,
         method: &'static str,
         params: Value,
         deadline: Option<Instant>,
     ) -> Result<Value, LifecycleError> {
-        if !self.active.load(Ordering::Acquire) {
+        if !self.active.load(Ordering::Acquire) && method != codey_plugin_sdk::transport::STOP {
             return Err(failure("plugin_disabled"));
         }
         let call_deadline = (Instant::now() + self.invoke_timeout)
@@ -100,7 +112,7 @@ impl LifecyclePlugin {
         // 排队和原生调用共用一次回调期限，挂起实例不会积累阻塞线程。
         // 先订阅 Notify 再 CAS，避免实例刚释放时丢掉唤醒。
         let guard = loop {
-            if !self.active.load(Ordering::Acquire) {
+            if !self.active.load(Ordering::Acquire) && method != codey_plugin_sdk::transport::STOP {
                 return Err(failure("plugin_disabled"));
             }
             let remaining = call_deadline.saturating_duration_since(Instant::now());
@@ -119,7 +131,8 @@ impl LifecyclePlugin {
         let plugin = self.clone();
         let mut task = tokio::task::spawn_blocking(move || {
             let _guard = guard;
-            if !plugin.active.load(Ordering::Acquire) {
+            if !plugin.active.load(Ordering::Acquire) && method != codey_plugin_sdk::transport::STOP
+            {
                 return Err("插件已停用".into());
             }
             (plugin.callback)(method, params)
@@ -131,14 +144,16 @@ impl LifecyclePlugin {
             loop {
                 tokio::select! {
                     result = &mut task => return result.map_err(|_| failure("plugin_callback_failed"))?
-                        .map_err(|_| failure("plugin_callback_failed")),
+                        .map_err(|error| failure(if codey_plugin_sdk::transport::is_reserved(method) {
+                            codey_plugin_sdk::transport::public_error_code(&error)
+                        } else { "plugin_callback_failed" })),
                     _ = sleep(Duration::from_millis(50)) => {
-                        if !self.active.load(Ordering::Acquire) { return Err(failure("plugin_disabled")); }
+                        if !self.active.load(Ordering::Acquire) && method != codey_plugin_sdk::transport::STOP { return Err(failure("plugin_disabled")); }
                     }
                 }
             }
         }).await.map_err(|_| failure("plugin_callback_timeout"))?;
-        if !self.active.load(Ordering::Acquire) {
+        if !self.active.load(Ordering::Acquire) && method != codey_plugin_sdk::transport::STOP {
             return Err(failure("plugin_disabled"));
         }
         result
@@ -329,9 +344,9 @@ impl LifecycleRequest {
         }
         self.finished = true;
         let method = match outcome {
-            LifecycleOutcome::Completed => "request.completed",
-            LifecycleOutcome::Failed => "request.failed",
-            LifecycleOutcome::Cancelled => "request.cancelled",
+            LifecycleOutcome::Completed => METHOD_COMPLETED,
+            LifecycleOutcome::Failed => METHOD_FAILED,
+            LifecycleOutcome::Cancelled => METHOD_CANCELLED,
         };
         for entry in std::mem::take(&mut self.entries) {
             let metadata = self.metadata.clone();
@@ -461,20 +476,32 @@ async fn dispatch_one(
 ) -> Result<ParsedAction, LifecycleError> {
     let plugin = entry.plugin.clone();
     let mut method = match stage {
-        LifecycleStage::BeforeSend => "request.beforeSend",
-        LifecycleStage::AfterHeaders => "request.afterHeaders",
+        LifecycleStage::BeforeSend => METHOD_BEFORE_SEND,
+        LifecycleStage::AfterHeaders => METHOD_AFTER_HEADERS,
     };
     let mut deadline = None;
     let mut token: Option<String> = None;
     loop {
         let call_deadline = deadline.unwrap_or(overall_deadline).min(overall_deadline);
-        let value = plugin
+        let value = match plugin
             .call(
                 method,
                 entry.context.as_ref().unwrap().clone(),
                 Some(call_deadline),
             )
-            .await?;
+            .await
+        {
+            Ok(value) => value,
+            // 续发排队和回调共用等待期限。期限正好在这次调用里耗尽时，对外的
+            // 原因仍是等待超时，而不是实例忙或回调慢；停用是另一种状态，保留。
+            Err(error)
+                if error.code != "plugin_disabled"
+                    && deadline.is_some_and(|end| Instant::now() >= end) =>
+            {
+                return Err(failure("plugin_wait_timeout"));
+            }
+            Err(error) => return Err(error),
+        };
         let action = parse_action(value, stage, &plugin.request_headers)?;
         match action {
             ParsedAction::Wait(next_token, delay) => {
@@ -489,7 +516,9 @@ async fn dispatch_one(
                 let wake = Instant::now() + delay;
                 while Instant::now() < wake {
                     let notified = plugin.waiters.notified();
-                    if !plugin.active.load(Ordering::Acquire) {
+                    if !plugin.active.load(Ordering::Acquire)
+                        && method != codey_plugin_sdk::transport::STOP
+                    {
                         return Err(failure("plugin_disabled"));
                     }
                     if Instant::now() >= end {
@@ -509,7 +538,7 @@ async fn dispatch_one(
                 if Instant::now() >= end {
                     return Err(failure("plugin_wait_timeout"));
                 }
-                method = "request.resume";
+                method = METHOD_RESUME;
             }
             other => return Ok(other),
         }
@@ -520,7 +549,7 @@ async fn dispatch_one(
 tokio::task_local! { static TEST_PLUGINS: Arc<Vec<Arc<LifecyclePlugin>>>; }
 #[cfg(test)]
 pub(crate) struct TestPlugin {
-    plugin: Arc<LifecyclePlugin>,
+    pub(super) plugin: Arc<LifecyclePlugin>,
 }
 #[cfg(test)]
 impl TestPlugin {
@@ -734,13 +763,20 @@ mod tests {
 
     #[tokio::test]
     async fn token_changes_and_fixed_wait_deadlines_are_rejected() {
-        for change_token in [true, false] {
+        // 续发换令牌要被拒；等待期限耗尽时，无论是轮询排队还是回调自己用光
+        // 期限，对外都只报等待超时。
+        for case in ["change_token", "poll_until_deadline", "slow_resume"] {
             let mut plugin = TestPlugin::new("a", move |method, _| {
-                Ok(if method == "request.resume" && change_token {
-                    json!({"action":"wait","token":"other","pollAfterMs":50})
-                } else {
-                    json!({"action":"wait","token":"same","pollAfterMs":50})
-                })
+                if method == "request.resume" {
+                    match case {
+                        "change_token" => {
+                            return Ok(json!({"action":"wait","token":"other","pollAfterMs":50}));
+                        }
+                        "slow_resume" => std::thread::sleep(Duration::from_millis(200)),
+                        _ => {}
+                    }
+                }
+                Ok(json!({"action":"wait","token":"same","pollAfterMs":50}))
             });
             Arc::get_mut(&mut plugin.plugin).unwrap().max_wait = Duration::from_millis(120);
             with_test_plugins(vec![plugin], async {
@@ -751,7 +787,7 @@ mod tests {
                     .unwrap_err();
                 assert_eq!(
                     error.code,
-                    if change_token {
+                    if case == "change_token" {
                         "plugin_invalid_token"
                     } else {
                         "plugin_wait_timeout"

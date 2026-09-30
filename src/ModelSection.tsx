@@ -24,6 +24,7 @@ import type { Confirmation, Config, ModelContextConfig, ModelState, OfficialAcco
 import { OfficialAccountsPanel } from "./OfficialAccountsPanel";
 import { SettingsPageHeader } from "./SettingsPageHeader";
 import { ModelCombobox } from "./components/ModelCombobox";
+import { ModelSettingsFields } from "./components/ModelSettingsFields";
 import type { SubagentModelOption } from "./subagentModels";
 import {
   Badge,
@@ -42,7 +43,7 @@ import {
   Switch,
   Tooltip,
 } from "./components/ui";
-import { modelIdsEqual, modelKey, uniqueModelIds } from "./modelIds";
+import { modelIdsEqual, modelKey, moveModelId, uniqueModelIds } from "./modelIds";
 import {
   MAX_ROUTE_NAME_CHARACTERS,
   validateOfficialRouteSettings,
@@ -65,6 +66,8 @@ type ModelSectionProps = {
   currentProvider: ProviderStatus["provider"] | null;
   officialAccountAvailable: boolean;
   popupContainer: HTMLElement | null;
+  /** 该页是否正显示在设置里：额度等官方数据只在打开「线路与模型」时获取。 */
+  active: boolean;
   modelState: ModelState;
   dirty: boolean;
   canSyncCurrentProvider: boolean;
@@ -78,6 +81,7 @@ type ModelSectionProps = {
   onSaveRoute: (route: Profile) => Promise<boolean>;
   onSetRouteEnabled: (routeId: string, enabled: boolean) => Promise<boolean>;
   onReorderRoute: (sourceId: string, targetId: string) => Promise<void>;
+  onReorderRouteModels: (routeId: string, models: string[]) => Promise<void>;
   onDeleteRoute: (routeId: string) => void;
   onFetchRouteModels: (route: Profile) => void;
   onOfficialAccountsChanged: (result: OfficialAccountsResult) => void;
@@ -87,7 +91,7 @@ type ModelSectionProps = {
     models: string[],
     showAccountUsageInHeader: boolean,
     enabled: boolean,
-    modelContexts: Record<string, ModelContextConfig>,
+    modelContexts: Record<string, ModelContextConfig> | undefined,
     upstreamProxy?: string,
     routeSettings?: {
       accountId: string;
@@ -100,6 +104,8 @@ type ModelSectionProps = {
   onConfigChange?: (config: Config) => void;
   onRequestConfirmation?: (confirmation: Confirmation) => void;
 };
+
+type RouteModelRef = { routeId: string; model: string };
 
 type RouteModelGroup = {
   profile: Profile;
@@ -214,6 +220,7 @@ function ModelSectionComponent({
   currentProvider,
   officialAccountAvailable,
   popupContainer,
+  active,
   modelState,
   dirty,
   canSyncCurrentProvider,
@@ -227,6 +234,7 @@ function ModelSectionComponent({
   onSaveRoute,
   onSetRouteEnabled,
   onReorderRoute,
+  onReorderRouteModels,
   onDeleteRoute,
   onFetchRouteModels,
   onOfficialAccountsChanged,
@@ -239,6 +247,9 @@ function ModelSectionComponent({
   const [routeDialogOpen, setRouteDialogOpen] = useState(false);
   const [draggedRouteId, setDraggedRouteId] = useState<string | null>(null);
   const [dropRouteId, setDropRouteId] = useState<string | null>(null);
+  // 模型只能在所属线路内拖动排序，因此拖动状态同时记录线路和模型。
+  const [draggedModel, setDraggedModel] = useState<RouteModelRef | null>(null);
+  const [dropModel, setDropModel] = useState<RouteModelRef | null>(null);
   const [pendingRouteToggle, setPendingRouteToggle] = useState<{
     id: string;
     enabled: boolean;
@@ -250,6 +261,8 @@ function ModelSectionComponent({
   const [headerDialogProfile, setHeaderDialogProfile] = useState<Profile | null>(null);
   const [headerError, setHeaderError] = useState("");
   const [officialModelDraft, setOfficialModelDraft] = useState<string[]>([]);
+  const [officialModelContextDraft, setOfficialModelContextDraft] =
+    useState<Record<string, ModelContextConfig>>({});
   const [officialAccounts, setOfficialAccounts] = useState<OfficialAccount[] | null>(null);
   // 脱敏只作用于当前页面显示，每次进入页面默认关闭。
   const [maskSensitive, setMaskSensitive] = useState(false);
@@ -421,10 +434,10 @@ function ModelSectionComponent({
                   : modelState.officialModelIds,
               )
             : modelState.thirdPartyModels
-          : official
-            ? configuredModels.length > 0
-              ? configuredModels
-              : officialCatalog
+            : official
+              ? uniqueModelIds(
+                  configuredModels.length > 0 ? configuredModels : officialCatalog,
+                )
             : uniqueModelIds([
                 ...configuredModels,
                 ...(config.declaredOfficialModelsByProvider[providerId] || []),
@@ -505,13 +518,17 @@ function ModelSectionComponent({
     if (official && officialScope === "models") {
       const providerId = routeProviderId(profile);
       const configuredModels = config.selectedModelsByProvider[providerId] || [];
+      const catalogKeys = new Set(officialCatalog.map(modelKey));
+      const enabledModels = configuredModels.filter((model) => catalogKeys.has(modelKey(model)));
       setOfficialModelDraft(
-        configuredModels.length > 0
-          ? configuredModels
-          : officialCatalog,
+        uniqueModelIds(enabledModels.length > 0 ? enabledModels : officialCatalog),
+      );
+      setOfficialModelContextDraft(
+        config.modelContextByProvider?.[providerId] || {},
       );
     } else {
       setOfficialModelDraft([]);
+      setOfficialModelContextDraft({});
     }
     setOfficialDialogScope(official ? officialScope : null);
     setRouteDialogOpen(true);
@@ -595,7 +612,7 @@ function ModelSectionComponent({
               officialDialogScope === "models" ? officialModelDraft : currentOfficialModels,
               showAccountUsageInHeader,
               routeDraft.enabled !== false,
-              {},
+              officialDialogScope === "models" ? officialModelContextDraft : undefined,
               upstreamProxy,
               savingOfficialSettings && accountId && officialRouteDraft
                 ? {
@@ -755,6 +772,7 @@ function ModelSectionComponent({
               <OfficialAccountsPanel
                 officialAccountAvailable={officialAccountAvailable}
                 isBusy={isBusy}
+                active={active}
                 maskSensitive={maskSensitive}
                 popupContainer={popupContainer}
                 onAccountsLoaded={setOfficialAccounts}
@@ -775,7 +793,7 @@ function ModelSectionComponent({
                 <small>
                   {routeConfigReadOnly
                     ? "模型请求由 Codex 当前 Provider 直接处理"
-                    : "点击模型设为全局默认；拖动线路左侧手柄调整顺序"}
+                    : "点击模型设为全局默认；拖动线路或模型左侧手柄调整顺序"}
                 </small>
               </div>
               {!routeConfigReadOnly && (
@@ -810,10 +828,7 @@ function ModelSectionComponent({
                 const officialLoginLabel = officialLoginLabelFor(
                   isOfficial ? accountForRoute(profile) : null,
                 );
-                const syncModels = () => {
-                  if (isOfficial && !routeConfigReadOnly) openRouteDialog(profile, "models");
-                  else onFetchRouteModels(profile);
-                };
+                const syncModels = () => onFetchRouteModels(profile);
                 return (
                   <section
                     className={`provider-model-group${disabled ? " is-disabled" : ""}${dropRouteId === profile.id ? " is-drop-target" : ""}`}
@@ -976,22 +991,86 @@ function ModelSectionComponent({
                           {group.models.map((model) => {
                             const isDefault = !routeConfigReadOnly && modelIdsEqual(group.defaultModel, model);
                             const displayName = group.official ? officialDisplayNames.get(modelKey(model)) || model : model;
+                            const isDraggedModel = draggedModel?.routeId === profile.id
+                              && modelIdsEqual(draggedModel.model, model);
+                            const acceptsModelDrop = Boolean(draggedModel)
+                              && draggedModel?.routeId === profile.id
+                              && !isDraggedModel;
+                            const isModelDropTarget = acceptsModelDrop
+                              && dropModel?.routeId === profile.id
+                              && modelIdsEqual(dropModel.model, model);
+                            const reorderModels = (source: string, target: string) => {
+                              const models = moveModelId(group.models, source, target);
+                              if (models) void onReorderRouteModels(profile.id, models);
+                            };
                             return (
-                              <button
-                                type="button"
+                              <div
                                 key={`${group.providerId}:${model}`}
-                                className={`model-tag-pill${isDefault ? " is-default" : ""}`}
-                                disabled={routeConfigReadOnly || isBusy || dirty || isDefault}
-                                onClick={() => onSetDefaultModel(profile.id, model)}
-                                title={routeConfigReadOnly ? displayName : isDefault ? `${displayName}（当前默认模型）` : `点击设为默认模型：${displayName}`}
-                                aria-label={routeConfigReadOnly ? displayName : isDefault ? `${displayName}，当前默认模型` : `设 ${displayName} 为默认模型`}
+                                className={`model-tag-item${isModelDropTarget ? " is-drop-target" : ""}`}
+                                onDragOver={(event) => {
+                                  if (!acceptsModelDrop || isBusy || dirty) return;
+                                  event.preventDefault();
+                                  event.dataTransfer.dropEffect = "move";
+                                  setDropModel({ routeId: profile.id, model });
+                                }}
+                                onDrop={(event) => {
+                                  if (!draggedModel) return;
+                                  event.preventDefault();
+                                  if (acceptsModelDrop && !isBusy && !dirty) {
+                                    reorderModels(draggedModel.model, model);
+                                  }
+                                  setDraggedModel(null);
+                                  setDropModel(null);
+                                }}
                               >
-                                <span className="model-tag-indicator" aria-hidden="true">
-                                  {isDefault ? <Check size={11} strokeWidth={2.5} /> : <span className="model-tag-dot" />}
-                                </span>
-                                <span className="model-tag-name">{displayName}</span>
-                                {isDefault && <span className="model-tag-badge">默认</span>}
-                              </button>
+                                {!routeConfigReadOnly && (
+                                  <button
+                                    type="button"
+                                    className="model-tag-drag-handle cursor-grab text-gray-400 dark:text-gray-400 hover:text-gray-600 active:cursor-grabbing disabled:cursor-default"
+                                    disabled={isBusy || dirty}
+                                    draggable={!isBusy && !dirty}
+                                    aria-label={`调整模型 ${displayName} 的顺序`}
+                                    title="在同一线路内拖动排序，也可按方向键调整"
+                                    onDragStart={(event) => {
+                                      event.dataTransfer.setData("text/plain", model);
+                                      event.dataTransfer.effectAllowed = "move";
+                                      setDraggedModel({ routeId: profile.id, model });
+                                    }}
+                                    onDragEnd={() => {
+                                      setDraggedModel(null);
+                                      setDropModel(null);
+                                    }}
+                                    onKeyDown={(event) => {
+                                      const step = event.key === "ArrowLeft" || event.key === "ArrowUp"
+                                        ? -1
+                                        : event.key === "ArrowRight" || event.key === "ArrowDown"
+                                          ? 1
+                                          : 0;
+                                      if (step === 0) return;
+                                      event.preventDefault();
+                                      const index = group.models.findIndex((candidate) => modelIdsEqual(candidate, model));
+                                      const target = group.models[index + step];
+                                      if (target) reorderModels(model, target);
+                                    }}
+                                  >
+                                    <IconGripVertical size={13} aria-hidden="true" />
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  className={`model-tag-pill${isDefault ? " is-default" : ""}`}
+                                  disabled={routeConfigReadOnly || isBusy || dirty || isDefault}
+                                  onClick={() => onSetDefaultModel(profile.id, model)}
+                                  title={routeConfigReadOnly ? displayName : isDefault ? `${displayName}（当前默认模型）` : `点击设为默认模型：${displayName}`}
+                                  aria-label={routeConfigReadOnly ? displayName : isDefault ? `${displayName}，当前默认模型` : `设 ${displayName} 为默认模型`}
+                                >
+                                  <span className="model-tag-indicator" aria-hidden="true">
+                                    {isDefault ? <Check size={11} strokeWidth={2.5} /> : <span className="model-tag-dot" />}
+                                  </span>
+                                  <span className="model-tag-name">{displayName}</span>
+                                  {isDefault && <span className="model-tag-badge">默认</span>}
+                                </button>
+                              </div>
                             );
                           })}
                         </div>
@@ -1351,7 +1430,26 @@ function ModelSectionComponent({
                                 </strong>
                                 <small>{model}</small>
                               </span>
-
+                              {!routeConfigReadOnly && (
+                                <ModelSettingsFields
+                                  model={model}
+                                  disabled={isBusy}
+                                  policy={Object.entries(officialModelContextDraft).find(
+                                    ([candidate]) => modelIdsEqual(candidate, model),
+                                  )?.[1]}
+                                  onChange={(policy) => {
+                                    setOfficialModelContextDraft((current) => {
+                                      const next = Object.fromEntries(
+                                        Object.entries(current).filter(
+                                          ([candidate]) => !modelIdsEqual(candidate, model),
+                                        ),
+                                      );
+                                      if (policy) next[model] = policy;
+                                      return next;
+                                    });
+                                  }}
+                                />
+                              )}
                             </div>
                           );
                         })}
@@ -1438,6 +1536,10 @@ function ModelSectionComponent({
                       const upstreamProtocol = value as Profile["upstreamProtocol"];
                       updateRouteDraft({
                         upstreamProtocol,
+                        supportsRemoteCompaction:
+                          upstreamProtocol === "openaiResponses"
+                            ? Boolean(routeDraft.supportsRemoteCompaction)
+                            : false,
                         supportsWebsockets:
                           upstreamProtocol === "openaiResponses"
                             ? Boolean(routeDraft.supportsWebsockets)
@@ -1454,6 +1556,29 @@ function ModelSectionComponent({
 
                 {routeDraft.upstreamProtocol === "openaiResponses" && (
                   <div className="route-protocol-options route-editor-span-all">
+                    <div className="route-option-item">
+                      <div className="route-option-header">
+                        <div className="route-option-title-group">
+                          <strong className="route-option-title">原生远程压缩</strong>
+                          <Tooltip content="仅在上游实现 OpenAI Responses 原生压缩协议时开启；所有启用线路都支持时 Codex 才会使用，能力变更需重启。">
+                            <span className="route-option-info-trigger" aria-label="原生远程压缩详细说明">
+                              <IconInfoCircle size={13} />
+                            </span>
+                          </Tooltip>
+                        </div>
+                        <Switch
+                          size="sm"
+                          checked={Boolean(routeDraft.supportsRemoteCompaction)}
+                          disabled={isBusy}
+                          onCheckedChange={(checked) =>
+                            updateRouteDraft({ supportsRemoteCompaction: checked })}
+                          aria-label="原生远程压缩"
+                        />
+                      </div>
+                      <small className="route-field-hint">
+                        仅在上游明确支持时开启；所有启用线路都支持时才会使用
+                      </small>
+                    </div>
                     <div className="route-option-item">
                       <div className="route-option-header">
                         <div className="route-option-title-group">

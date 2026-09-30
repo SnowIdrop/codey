@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use super::*;
 
 #[test]
@@ -261,7 +263,7 @@ fn full_config_save_restores_route_secrets_and_source_owned_identity() {
 
     assert_eq!(merged[0].api_key, "saved-secret");
     assert_eq!(merged[0].provider_id(), "source-provider");
-    assert!(merged[0].supports_remote_compaction);
+    assert!(!merged[0].supports_remote_compaction);
     assert_eq!(
         merged[0]
             .model_request_headers
@@ -970,6 +972,7 @@ fn request_log_hot_reload_status_contract_is_stable() {
     assert_eq!(failed.error(), Some("sink failed"));
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 #[tokio::test]
 async fn shutdown_cancels_a_restart_waiting_for_the_runtime_lock() {
     let state = Arc::new(AppState::default());
@@ -990,6 +993,17 @@ async fn shutdown_cancels_a_restart_waiting_for_the_runtime_lock() {
     assert!(state.restart_task.lock().await.is_none());
 }
 
+#[cfg(not(any(windows, target_os = "macos")))]
+#[tokio::test]
+async fn restart_rejects_unsupported_runtime_platform() {
+    let state = Arc::new(AppState::default());
+    let error = schedule_restart_codey_runtime(&state).await.unwrap_err();
+    assert_eq!(
+        error,
+        crate::codex_config::unsupported_runtime_platform_message()
+    );
+}
+
 #[tokio::test]
 async fn shutdown_rejects_new_runtime_launches_and_restarts() {
     let state = Arc::new(AppState::default());
@@ -999,6 +1013,7 @@ async fn shutdown_rejects_new_runtime_launches_and_restarts() {
         launch_codey_inner(&state)
             .await
             .unwrap_err()
+            .to_string()
             .contains("正在退出")
     );
     assert!(
@@ -1047,11 +1062,16 @@ async fn runtime_status_does_not_wait_for_a_lifecycle_operation() {
 #[tokio::test]
 async fn runtime_status_exposes_cached_available_update() {
     let state = Arc::new(AppState::default());
+    *state.config.write().await = CodeyConfig::default();
     *state.available_update.write().await = Some(UpdateCheck {
         current_version: "1.0.0".to_string(),
         latest_version: "2.0.0".to_string(),
         update_available: true,
         selected_asset: None,
+        release_notes: None,
+        publish_id: None,
+        policy_id: None,
+        rollback: None,
     });
 
     let status = runtime_status(&state).await.unwrap();

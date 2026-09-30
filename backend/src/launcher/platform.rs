@@ -9,6 +9,8 @@ use anyhow::Result;
 #[cfg(windows)]
 use tokio::process::Command;
 
+#[cfg(any(windows, test))]
+use super::recovery;
 #[cfg(windows)]
 use super::{SpawnedCodex, build_codex_command, reap_child_after_cleanup};
 #[cfg(windows)]
@@ -20,11 +22,11 @@ const WINDOWS_CODEX_STOP_TIMEOUT: Duration = Duration::from_secs(8);
 const WINDOWS_STARTUP_PATCH_FAILURE_STOP_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[cfg(windows)]
-pub(super) struct WindowsStartupProcess(std::os::windows::io::OwnedHandle);
+pub(super) struct WindowsStartupProcess(pub(super) std::os::windows::io::OwnedHandle);
 
 #[cfg(windows)]
 impl WindowsStartupProcess {
-    fn package_full_name(&self) -> Result<String> {
+    pub(super) fn package_full_name(&self) -> Result<String> {
         use std::os::windows::io::AsRawHandle;
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::Storage::Packaging::Appx::{
@@ -110,6 +112,7 @@ pub(super) fn windows_startup_process_details(
                         "executableName": process.exe_file,
                         "executablePath": process.executable_path,
                         "creationTime": process.creation_time,
+                        "sessionId": process.session_id,
                     })
                 })
                 .collect(),
@@ -119,15 +122,8 @@ pub(super) fn windows_startup_process_details(
 }
 
 #[cfg(any(windows, test))]
-fn windows_package_full_name(app_dir: &Path) -> Option<String> {
-    codey_runtime_core::app_paths::packaged_app_user_model_id(app_dir)?;
-    let path = app_dir.to_string_lossy().replace('\\', "/");
-    let mut parts = path.split('/').filter(|part| !part.is_empty());
-    let mut package_name = parts.next_back()?;
-    if package_name.eq_ignore_ascii_case("app") {
-        package_name = parts.next_back()?;
-    }
-    Some(package_name.to_string())
+pub(super) fn windows_package_full_name(app_dir: &Path) -> Option<String> {
+    codey_runtime_core::app_paths::packaged_app_full_name(app_dir)
 }
 
 #[cfg(any(windows, test))]
@@ -145,7 +141,7 @@ impl std::fmt::Display for WindowsPackageChanged {
 impl std::error::Error for WindowsPackageChanged {}
 
 #[cfg(windows)]
-fn registered_windows_packages(package_full_name: &str) -> Result<Vec<String>> {
+pub(super) fn registered_windows_packages(package_full_name: &str) -> Result<Vec<String>> {
     use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
     use windows::Win32::Storage::Packaging::Appx::{
         FindPackagesByPackageFamily, PACKAGE_FILTER_HEAD,
@@ -248,192 +244,6 @@ pub(super) fn refresh_windows_packaged_app_dir(app_dir: &Path) -> Result<std::pa
 }
 
 #[cfg(any(windows, test))]
-fn windows_package_was_replaced(previous: &str, registered: &[String]) -> bool {
-    let family = codey_runtime_core::app_paths::packaged_app_user_model_id(Path::new(previous));
-    family.is_some()
-        && !registered.is_empty()
-        && registered.iter().all(|current| {
-            current != previous
-                && codey_runtime_core::app_paths::packaged_app_user_model_id(Path::new(current))
-                    == family
-        })
-}
-
-#[cfg(any(windows, test))]
-fn windows_environment_block(environment: &[(String, String)]) -> Result<Vec<u16>> {
-    let mut entries = environment
-        .iter()
-        .map(|(name, value)| {
-            anyhow::ensure!(
-                !name.is_empty() && !name.contains(['=', '\0']) && !value.contains('\0'),
-                "Windows Codex 兼容环境包含无效字符"
-            );
-            Ok(format!("{name}={value}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    entries.sort_by_key(|entry| entry.to_ascii_uppercase());
-    let mut block = Vec::new();
-    for entry in entries {
-        block.extend(entry.encode_utf16());
-        block.push(0);
-    }
-    if block.is_empty() {
-        block.push(0);
-    }
-    block.push(0);
-    Ok(block)
-}
-
-#[cfg(windows)]
-pub(super) struct WindowsPackageDebugSession {
-    package_full_name: Option<String>,
-}
-
-#[cfg(windows)]
-impl WindowsPackageDebugSession {
-    fn start(app_dir: &Path, environment: &[(String, String)]) -> Result<Self> {
-        let package_full_name =
-            windows_package_full_name(app_dir).context("无法识别 Windows Store Codex 包全名")?;
-        enable_windows_packaged_environment(&package_full_name, environment)?;
-        let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
-            "launcher.windows_package_environment_enabled",
-            serde_json::json!({ "package": package_full_name }),
-        );
-        Ok(Self {
-            package_full_name: Some(package_full_name),
-        })
-    }
-
-    pub(super) fn finish(mut self) -> Result<()> {
-        let package_full_name = self
-            .package_full_name
-            .as_deref()
-            .expect("active package debug session should have a package name");
-        disable_windows_packaged_environment(package_full_name)?;
-        let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
-            "launcher.windows_package_environment_cleared",
-            serde_json::json!({ "package": package_full_name }),
-        );
-        self.package_full_name.take();
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-impl Drop for WindowsPackageDebugSession {
-    fn drop(&mut self) {
-        if let Some(package_full_name) = self.package_full_name.take() {
-            let _ = disable_windows_packaged_environment(&package_full_name);
-        }
-    }
-}
-
-#[cfg(windows)]
-fn with_windows_package_debug_settings<T>(
-    operation: impl FnOnce(
-        &windows::Win32::UI::Shell::IPackageDebugSettings,
-    ) -> windows::core::Result<T>,
-) -> Result<T> {
-    use windows::Win32::System::Com::{
-        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
-        CoUninitialize,
-    };
-    use windows::Win32::UI::Shell::{IPackageDebugSettings, PackageDebugSettings};
-
-    unsafe {
-        let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let should_uninitialize = initialized.is_ok();
-        initialized.ok().or_else(|error| {
-            const RPC_E_CHANGED_MODE: i32 = -2147417850;
-            if error.code().0 == RPC_E_CHANGED_MODE {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        })?;
-        let result = (|| {
-            let settings: IPackageDebugSettings =
-                CoCreateInstance(&PackageDebugSettings, None, CLSCTX_INPROC_SERVER)?;
-            operation(&settings)
-        })();
-        if should_uninitialize {
-            CoUninitialize();
-        }
-        result.map_err(Into::into)
-    }
-}
-
-#[cfg(windows)]
-fn enable_windows_packaged_environment(
-    package_full_name: &str,
-    environment: &[(String, String)],
-) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::core::PCWSTR;
-
-    let package_full_name = package_full_name
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let executable = std::env::current_exe().context("定位 Codey 包启动恢复助手失败")?;
-    let mut debugger_command = vec![u16::from(b'"')];
-    debugger_command.extend(executable.as_os_str().encode_wide());
-    debugger_command.extend(
-        format!(
-            "\" {}",
-            crate::codex_startup_patch::WINDOWS_PACKAGE_RESUME_ARGUMENT
-        )
-        .encode_utf16(),
-    );
-    debugger_command.push(0);
-    let environment = windows_environment_block(environment)?;
-
-    with_windows_package_debug_settings(|settings| unsafe {
-        let package = PCWSTR(package_full_name.as_ptr());
-        settings.DisableDebugging(package)?;
-        settings.EnableDebugging(
-            package,
-            PCWSTR(debugger_command.as_ptr()),
-            PCWSTR(environment.as_ptr()),
-        )
-    })
-    .context("为 Windows Store Codex 安装一次性 CLI 兼容环境失败")
-}
-
-#[cfg(windows)]
-fn disable_windows_packaged_environment(package_full_name: &str) -> Result<()> {
-    use windows::core::PCWSTR;
-
-    let name = package_full_name
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let result = with_windows_package_debug_settings(|settings| unsafe {
-        settings.DisableDebugging(PCWSTR(name.as_ptr()))
-    });
-    if result
-        .as_ref()
-        .err()
-        .and_then(|error| error.downcast_ref::<windows::core::Error>())
-        .is_some_and(|error| {
-            error.code() == windows::Win32::Foundation::ERROR_NOT_FOUND.to_hresult()
-        })
-    {
-        // An update can unregister the old package between EnableDebugging and cleanup.
-        // Query failures and an unchanged registration must remain fatal.
-        let registered = registered_windows_packages(package_full_name)?;
-        if windows_package_was_replaced(package_full_name, &registered) {
-            let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
-                "launcher.windows_package_cleanup_after_update",
-                serde_json::json!({ "previousPackage": package_full_name, "registeredPackages": registered }),
-            );
-            return Ok(());
-        }
-    }
-    result.context("清理 Windows Store Codex 一次性 CLI 兼容环境失败")
-}
-
-#[cfg(any(windows, test))]
 pub(super) fn normalized_windows_path(path: &std::path::Path) -> String {
     path.to_string_lossy()
         .replace('/', "\\")
@@ -442,7 +252,7 @@ pub(super) fn normalized_windows_path(path: &std::path::Path) -> String {
 }
 
 #[cfg(any(windows, test))]
-fn windows_codex_launch_environment(
+pub(super) fn windows_codex_launch_environment(
     environment: &[(String, String)],
     home: &Path,
 ) -> Result<Vec<(String, String)>> {
@@ -459,8 +269,23 @@ fn windows_codex_launch_environment(
 }
 
 #[cfg(any(windows, test))]
-fn requires_codex_home_environment(configured_home: Option<&std::ffi::OsStr>) -> bool {
+pub(super) fn requires_codex_home_environment(configured_home: Option<&std::ffi::OsStr>) -> bool {
     configured_home.is_some_and(|home| !home.to_string_lossy().trim().is_empty())
+}
+
+#[cfg(any(windows, test))]
+fn windows_packaged_launch_needs_environment(
+    environment: &[(String, String)],
+    configured_home: Option<&std::ffi::OsStr>,
+) -> bool {
+    !environment.is_empty() || requires_codex_home_environment(configured_home)
+}
+
+#[cfg(any(windows, test))]
+fn windows_can_fallback_to_activation(environment_required: bool, error: &anyhow::Error) -> bool {
+    // IntegrationFailure is created only before spawn or after confirmed
+    // cleanup. Identity changes require package refresh, never this fallback.
+    !environment_required && error.is::<recovery::IntegrationFailure>()
 }
 
 #[cfg(windows)]
@@ -470,15 +295,19 @@ pub(super) async fn spawn_windows_codex(
     extra_args: &[String],
     environment: &[(String, String)],
     require_wrapper_environment: bool,
-) -> Result<(SpawnedCodex, Option<WindowsPackageDebugSession>, bool)> {
+) -> Result<(SpawnedCodex, bool)> {
     anyhow::ensure!(
         !require_wrapper_environment || !environment.is_empty(),
         "Codex CLI 兼容入口缺少运行环境，已停止启动"
     );
+    let needs_packaged_environment = windows_packaged_launch_needs_environment(
+        environment,
+        std::env::var_os("CODEX_HOME").as_deref(),
+    );
+    let environment_required = require_wrapper_environment
+        || requires_codex_home_environment(std::env::var_os("CODEX_HOME").as_deref());
     let environment =
         windows_codex_launch_environment(environment, crate::codex_config::codex_home())?;
-    let require_home_environment =
-        requires_codex_home_environment(std::env::var_os("CODEX_HOME").as_deref());
     if let Some(activation) =
         codey_runtime_core::launcher::build_packaged_activation(app_dir, debug_port, extra_args)
         && let codey_runtime_core::launcher::CodexLaunch::PackagedActivation {
@@ -487,156 +316,14 @@ pub(super) async fn spawn_windows_codex(
             ..
         } = activation
     {
-        let package_debug_session = match WindowsPackageDebugSession::start(app_dir, &environment) {
-            Ok(session) => Some(session),
-            Err(error) => {
-                let package_name = windows_package_full_name(app_dir)
-                    .context("无法识别待清理的 Windows Store Codex 包全名")?;
-                if let Err(cleanup) = disable_windows_packaged_environment(&package_name) {
-                    return Err(startup_activation_error_after_cleanup(
-                        error,
-                        Ok(()),
-                        Err(cleanup),
-                    ));
-                }
-                if windows_package_was_replaced(
-                    &package_name,
-                    &registered_windows_packages(&package_name)?,
-                ) {
-                    return Err(WindowsPackageChanged.into());
-                }
-                if require_wrapper_environment {
-                    return Err(error).context("Codex CLI 兼容入口无法应用运行环境，已停止启动");
-                }
-                if require_home_environment {
-                    return Err(error).context(
-                        "Windows Store Codex 无法应用 CODEX_HOME；为避免读取其他配置目录，已停止启动",
-                    );
-                }
-                error_log::record_failure(
-                    "compatibility_fallback",
-                    "enable_windows_packaged_cli_environment",
-                    format!("{error:#}"),
-                    serde_json::json!({ "appPath": app_dir }),
-                );
-                None
-            }
-        };
-        let environment_applied = package_debug_session.is_some();
-        let activation_result = async {
-            let existing_process_ids = codey_runtime_core::windows_enumerate_processes()
-                .context("检测 Windows Store 激活前的已有进程失败")?
-                .into_iter()
-                .map(|process| process.process_id)
-                .collect::<HashSet<_>>();
-            let mut process_id =
-                codey_runtime_core::launcher::activate_packaged_app(&app_user_model_id, &arguments)
-                    .await?;
-            if activation_reused_existing_process(&existing_process_ids, process_id) {
-                // ActivateApplication can return an existing single instance.
-                // Its original command line cannot carry this launch's ports.
-                terminate_windows_codex_processes(app_dir, Some(process_id))
-                    .await
-                    .context("停止被 Windows Store 激活复用的旧 Codex 实例失败")?;
-                let retry_existing_process_ids = codey_runtime_core::windows_enumerate_processes()
-                    .context("检测 Windows Store 重新激活前的已有进程失败")?
-                    .into_iter()
-                    .map(|process| process.process_id)
-                    .collect::<HashSet<_>>();
-                process_id = codey_runtime_core::launcher::activate_packaged_app(
-                    &app_user_model_id, &arguments,
-                ).await.context("重新激活 Windows Store Codex 失败")?;
-                if activation_reused_existing_process(&retry_existing_process_ids, process_id) {
-                    anyhow::bail!(
-                        "Windows Store Codex 再次复用了已有进程 {process_id}，本次 CDP 启动参数未能可靠生效"
-                    );
-                }
-            }
-            Ok::<_, anyhow::Error>(process_id)
-        }
+        return activate_windows_codex(
+            app_dir,
+            &app_user_model_id,
+            &arguments,
+            needs_packaged_environment.then_some(environment.as_slice()),
+            environment_required,
+        )
         .await;
-        let process_id = match activation_result {
-            Ok(process_id) => process_id,
-            Err(error) => {
-                // Activation may start a process even when it returns an error.
-                // Cleanup must be confirmed before the outer loop can retry.
-                let stopped = terminate_windows_codex_processes_with_timeout(
-                    app_dir,
-                    None,
-                    WINDOWS_STARTUP_PATCH_FAILURE_STOP_TIMEOUT,
-                )
-                .await;
-                let cleared = package_debug_session
-                    .map(WindowsPackageDebugSession::finish)
-                    .transpose();
-                return Err(startup_activation_error_after_cleanup(
-                    error,
-                    stopped,
-                    cleared.map(|_| ()),
-                ));
-            }
-        };
-        let startup_process = match WindowsStartupProcess::open(process_id) {
-            Ok(process) => Some(process),
-            Err(error) => {
-                let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
-                    "launcher.process_probe_failed",
-                    serde_json::json!({ "processId": process_id, "detail": format!("{error:#}") }),
-                );
-                None
-            }
-        };
-        let package_check = startup_process.as_ref()
-            .context("无法确认实际启动的 Windows Store Codex 包")
-            .and_then(WindowsStartupProcess::package_full_name)
-            .and_then(|actual| {
-                if windows_package_full_name(app_dir).as_deref() == Some(actual.as_str()) {
-                    Ok(())
-                } else {
-                    let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
-                        "launcher.windows_package_changed_during_activation",
-                        serde_json::json!({ "expectedPackage": windows_package_full_name(app_dir), "actualPackage": actual, "processId": process_id }),
-                    );
-                    Err(WindowsPackageChanged.into())
-                }
-            });
-        if let Err(error) = package_check {
-            let stopped = terminate_windows_codex_processes_with_timeout(
-                app_dir,
-                Some(process_id),
-                WINDOWS_STARTUP_PATCH_FAILURE_STOP_TIMEOUT,
-            )
-            .await;
-            let cleared = package_debug_session
-                .map(WindowsPackageDebugSession::finish)
-                .transpose();
-            return Err(startup_activation_error_after_cleanup(
-                error,
-                stopped,
-                cleared.map(|_| ()),
-            ));
-        }
-        let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
-            "launcher.windows_package_activated",
-            serde_json::json!({
-                "processId": process_id,
-                "wrapperEnvironmentApplied": environment_applied,
-                "processHandleCaptured": startup_process.is_some(),
-                "processes": windows_startup_process_details(app_dir, Some(process_id)),
-            }),
-        );
-        return Ok((
-            SpawnedCodex {
-                child: None,
-                process_id: Some(process_id),
-                startup_process,
-                performance_status: String::new(),
-                performance_detail: String::new(),
-                startup_injection_mode: String::new(),
-            },
-            package_debug_session,
-            environment_applied,
-        ));
     }
 
     let command = build_codex_command(app_dir, debug_port, extra_args);
@@ -663,9 +350,181 @@ pub(super) async fn spawn_windows_codex(
             performance_detail: String::new(),
             startup_injection_mode: String::new(),
         },
-        None,
         !environment.is_empty(),
     ))
+}
+
+#[cfg(windows)]
+pub(super) async fn activate_windows_codex(
+    app_dir: &Path,
+    app_user_model_id: &str,
+    arguments: &str,
+    environment: Option<&[(String, String)]>,
+    environment_required: bool,
+) -> Result<(SpawnedCodex, bool)> {
+    use super::windows_activation::ActivationSupervisor;
+    use super::windows_packaged::{
+        WindowsPackageDebugSession, cancel_resume_feedback, wait_for_resume,
+        wait_for_resume_failure,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    };
+
+    let (mut package_debug_session, environment_applied) = if let Some(environment) = environment {
+        match WindowsPackageDebugSession::start(app_dir, environment) {
+            Ok(session) => (session, true),
+            Err(error) if windows_can_fallback_to_activation(environment_required, &error) => {
+                let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+                    "launcher.windows_package_environment_unavailable",
+                    serde_json::json!({"detail": format!("{error:#}"), "fallback": "ordinary_activation"}),
+                );
+                (WindowsPackageDebugSession::clean()?, false)
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        (WindowsPackageDebugSession::clean()?, false)
+    };
+    let feedback = package_debug_session.feedback_path();
+    package_debug_session.begin_activation();
+    let diagnostics_app_dir = app_dir.to_path_buf();
+    let app_dir = app_dir.to_path_buf();
+    let app_user_model_id = app_user_model_id.to_owned();
+    let arguments = arguments.to_owned();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let last_process_id = AtomicU32::new(0);
+    let (reply, response) = tokio::sync::oneshot::channel();
+    // Cleanup ownership survives the caller's timeout or cancellation.
+    tokio::spawn(async move {
+        let activation = async {
+            let existing_process_ids = codey_runtime_core::windows_enumerate_processes()
+                .context("检测 Windows Store 激活前的已有进程失败")?
+                .into_iter()
+                .map(|process| process.process_id)
+                .collect::<HashSet<_>>();
+            anyhow::ensure!(
+                !cancelled.load(Ordering::Acquire),
+                "Windows Store 启动已取消"
+            );
+            let mut process_id =
+                codey_runtime_core::launcher::activate_packaged_app(&app_user_model_id, &arguments)
+                    .await?;
+            last_process_id.store(process_id, Ordering::Release);
+            if activation_reused_existing_process(&existing_process_ids, process_id) {
+                // Reused processes cannot carry this attempt's ports or environment.
+                terminate_windows_codex_processes(&app_dir, Some(process_id))
+                    .await
+                    .context("停止被 Windows Store 激活复用的旧 Codex 实例失败")?;
+                last_process_id.store(0, Ordering::Release);
+                let retry_existing_process_ids = codey_runtime_core::windows_enumerate_processes()
+                    .context("检测 Windows Store 重新激活前的已有进程失败")?
+                    .into_iter()
+                    .map(|process| process.process_id)
+                    .collect::<HashSet<_>>();
+                anyhow::ensure!(
+                    !cancelled.load(Ordering::Acquire),
+                    "Windows Store 启动已取消"
+                );
+                process_id = codey_runtime_core::launcher::activate_packaged_app(
+                    &app_user_model_id,
+                    &arguments,
+                )
+                .await
+                .context("重新激活 Windows Store Codex 失败")?;
+                last_process_id.store(process_id, Ordering::Release);
+                anyhow::ensure!(
+                    !activation_reused_existing_process(&retry_existing_process_ids, process_id),
+                    "Windows Store Codex 再次复用了已有进程 {process_id}，本次 CDP 启动参数未能可靠生效"
+                );
+            }
+            let startup_process = WindowsStartupProcess::open(process_id)
+                .map_err(|error| {
+                    let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+                        "launcher.process_probe_failed",
+                        serde_json::json!({"processId": process_id, "detail": format!("{error:#}")}),
+                    );
+                    error
+                })
+                .context("无法确认实际启动的 Windows Store Codex 包")?;
+            let actual = startup_process.package_full_name()?;
+            let package_check =
+                windows_package_full_name(&app_dir).as_deref() == Some(actual.as_str());
+            if !package_check {
+                let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+                    "launcher.windows_package_changed_during_activation",
+                    serde_json::json!({"expectedPackage": windows_package_full_name(&app_dir), "actualPackage": actual, "processId": process_id}),
+                );
+                return Err(WindowsPackageChanged.into());
+            }
+            // ActivateApplication can return before Windows runs our debugger.
+            // Keep its state file and package settings until the helper has
+            // actually resumed this process, within the supervised timeout.
+            wait_for_resume(feedback.as_deref(), process_id).await?;
+            Ok((
+                SpawnedCodex {
+                    child: None,
+                    process_id: Some(process_id),
+                    startup_process: Some(startup_process),
+                    performance_status: String::new(),
+                    performance_detail: String::new(),
+                    startup_injection_mode: String::new(),
+                },
+                environment_applied,
+            ))
+        };
+        let stop = || async {
+            let cancelled_feedback = if cancelled.load(Ordering::Acquire) {
+                cancel_resume_feedback(feedback.as_deref())
+            } else {
+                Ok(())
+            };
+            let process_id = last_process_id.load(Ordering::Acquire);
+            let stopped = terminate_windows_codex_processes_with_timeout(
+                &app_dir,
+                (process_id != 0).then_some(process_id),
+                WINDOWS_STARTUP_PATCH_FAILURE_STOP_TIMEOUT,
+            )
+            .await;
+            cancelled_feedback?;
+            stopped
+        };
+        if let Err(error) = (ActivationSupervisor {
+            cancelled: cancelled.clone(),
+            timeout: Duration::from_secs(30),
+            settle_timeout: Duration::from_secs(5),
+        })
+        .run(
+            activation,
+            wait_for_resume_failure(feedback.clone()),
+            stop,
+            || package_debug_session.finish(),
+            reply,
+        )
+        .await
+        {
+            error_log::record_failure(
+                "cleanup_failed",
+                "cleanup_deferred_windows_activation",
+                format!("{error:#}"),
+                serde_json::json!({"appPath": app_dir}),
+            );
+        }
+    });
+    let result = response
+        .await
+        .context("Windows Store 启动监督任务中断，已保留待清理状态")??;
+    let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+        "launcher.windows_package_activated",
+        serde_json::json!({
+            "processId": result.0.process_id,
+            "wrapperEnvironmentApplied": result.1,
+            "processHandleCaptured": result.0.startup_process.is_some(),
+            "processes": windows_startup_process_details(&diagnostics_app_dir, result.0.process_id),
+        }),
+    );
+    Ok(result)
 }
 
 #[cfg(any(windows, test))]
@@ -675,7 +534,7 @@ pub(super) fn startup_activation_error_after_cleanup(
     cleared: Result<()>,
 ) -> anyhow::Error {
     match (stopped, cleared) {
-        (Ok(()), Ok(())) => error,
+        (Ok(()), Ok(())) => recovery::recoverable_after_cleanup(error),
         (stopped, cleared) => anyhow::anyhow!(
             "{error:#}；Windows 启动清理未完成，已停止重试；进程：{}；兼容环境：{}",
             stopped
@@ -1049,24 +908,41 @@ pub(super) fn windows_codex_instances_summary(instances: &[WindowsCodexInstance]
     }
 }
 
-/// Stops every Codex desktop instance, whichever install it belongs to, and
-/// returns what was running before the stop. Each instance's own directory is
-/// passed to the terminator so its renderer and app-server children go with it.
+#[cfg(any(windows, test))]
+fn ensure_selected_windows_instances(
+    app_dir: &Path,
+    instances: &[WindowsCodexInstance],
+) -> Result<()> {
+    anyhow::ensure!(
+        instances
+            .iter()
+            .all(|instance| windows_path_is_within(&instance.executable_path, app_dir)),
+        "检测到其他安装目录的 Codex 正在运行，请自行退出后重试：{}",
+        windows_codex_instances_summary(instances),
+    );
+    Ok(())
+}
+
+/// Stops only the selected installation. Another channel may own the global
+/// single-instance lock; report that conflict without terminating its processes.
 #[cfg(windows)]
 pub(super) async fn stop_running_windows_codex_instances(
     app_dir: &Path,
 ) -> Result<Vec<WindowsCodexInstance>> {
     let processes = codey_runtime_core::windows_enumerate_processes()
         .context("检测正在运行的 Windows Codex 失败")?;
+    let current_session = codey_runtime_core::windows_process_session_id(std::process::id());
     let instances = windows_codex_instances_from_snapshot(
         app_dir,
         processes
             .iter()
+            .filter(|process| windows_process_in_session(process.session_id, current_session))
             .map(|process| (process.process_id, process.executable_path.as_deref())),
     );
     if instances.is_empty() {
         return Ok(instances);
     }
+    ensure_selected_windows_instances(app_dir, &instances)?;
     let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
         "launcher.windows_codex_instances_stopping",
         serde_json::json!({
@@ -1098,6 +974,44 @@ pub(super) async fn stop_running_windows_codex_instances(
             .with_context(|| format!("停止正在运行的 Codex 失败：{}", directory.display()))?;
     }
     Ok(instances)
+}
+
+/// Brings forward a visible Codex window, e.g. one owned by another Codey
+/// instance. Only standard install layouts are recognised because the
+/// configured app directory has not been loaded at this point.
+#[cfg(windows)]
+pub(crate) fn activate_visible_windows_codex_window() -> bool {
+    let Ok(processes) = codey_runtime_core::windows_enumerate_processes() else {
+        return false;
+    };
+    let current_session = codey_runtime_core::windows_process_session_id(std::process::id());
+    windows_codex_instances_from_snapshot(
+        Path::new(""),
+        processes
+            .iter()
+            .filter(|process| windows_process_in_session(process.session_id, current_session))
+            .map(|process| (process.process_id, process.executable_path.as_deref())),
+    )
+    .iter()
+    .any(|instance| {
+        codey_runtime_core::windows_activate_visible_process_window(instance.process_id)
+    })
+}
+
+/// Codey manages only its own logon session. Services shipped inside the Codex
+/// install (such as `codex-windows-sandbox-service.exe`) run in session 0 under
+/// another account: they hold no desktop single-instance lock and refuse
+/// termination. An unknown session stays in scope so an unreadable process is
+/// never assumed stopped.
+#[cfg(any(windows, test))]
+pub(crate) fn windows_process_in_session(
+    process_session: Option<u32>,
+    current_session: Option<u32>,
+) -> bool {
+    match (process_session, current_session) {
+        (Some(process_session), Some(current_session)) => process_session == current_session,
+        _ => true,
+    }
 }
 
 #[cfg(any(windows, test))]
@@ -1169,7 +1083,12 @@ async fn terminate_windows_codex_processes_with_snapshot(
     stop_timeout: Duration,
     mut snapshot: impl FnMut() -> Result<Vec<codey_runtime_core::WindowsProcessInfo>>,
 ) -> Result<()> {
-    let processes = snapshot().context("检测待停止的 Windows Codex 进程失败")?;
+    let current_session = codey_runtime_core::windows_process_session_id(std::process::id());
+    let processes = snapshot()
+        .context("检测待停止的 Windows Codex 进程失败")?
+        .into_iter()
+        .filter(|process| windows_process_in_session(process.session_id, current_session))
+        .collect::<Vec<_>>();
     let mut process_ids = windows_owned_process_ids_from_snapshot(
         app_dir,
         process_id,
@@ -1359,6 +1278,25 @@ pub(super) fn windows_stop_failure_summary(remaining: &[(u32, String, Option<u64
 mod compatibility_tests {
     use super::*;
 
+    #[test]
+    fn process_cleanup_refuses_other_installations_before_stopping_anything() {
+        let selected = Path::new(r"C:\Apps\Codex");
+        let owned = WindowsCodexInstance {
+            process_id: 10,
+            executable_path: selected.join("Codex.exe"),
+        };
+        assert!(ensure_selected_windows_instances(selected, std::slice::from_ref(&owned)).is_ok());
+        for path in [r"D:\Apps\Codex\Codex.exe", r"C:\Apps\CodexBeta\Codex.exe"] {
+            let unrelated = WindowsCodexInstance {
+                process_id: 11,
+                executable_path: path.into(),
+            };
+            assert!(
+                ensure_selected_windows_instances(selected, &[owned.clone(), unrelated]).is_err()
+            );
+        }
+    }
+
     // 【自动化测试】启动 - 单实例锁：任何安装目录的 Codex 实例都要在启动前识别
     #[test]
     fn codex_instances_are_found_across_installs_but_not_the_chatgpt_app() {
@@ -1460,6 +1398,16 @@ mod compatibility_tests {
         assert_eq!(process_ids, vec![30, 31, 32, 33]);
     }
 
+    // 【自动化测试】Windows 清理 - 会话 0 的系统服务不属于 Codey 可停止的 Codex 进程
+    #[test]
+    fn processes_outside_the_desktop_session_are_not_cleanup_targets() {
+        assert!(windows_process_in_session(Some(1), Some(1)));
+        assert!(!windows_process_in_session(Some(0), Some(1)));
+        assert!(!windows_process_in_session(Some(2), Some(1)));
+        assert!(windows_process_in_session(None, Some(1)));
+        assert!(windows_process_in_session(Some(0), None));
+    }
+
     #[test]
     fn codex_instance_summary_lists_a_few_processes() {
         let instances = (1..=4)
@@ -1472,27 +1420,6 @@ mod compatibility_tests {
         assert!(summary.starts_with("PID 1（C:\\Codex\\Codex.exe）、PID 2"));
         assert!(summary.ends_with(" 等 4 个进程"));
         assert!(!windows_codex_instances_summary(&instances[..2]).contains("等"));
-    }
-
-    #[test]
-    fn package_cleanup_requires_confirmed_replacement_in_the_same_family() {
-        let old = "OpenAI.Codex_26.901.6511.0_x64__2p2nqsd0c76g0";
-        let new = "OpenAI.Codex_26.903.8094.0_x64__2p2nqsd0c76g0";
-        assert!(windows_package_was_replaced(old, &[new.into()]));
-        assert!(!windows_package_was_replaced(
-            old,
-            &[old.into(), new.into()]
-        ));
-        assert!(!windows_package_was_replaced(old, &[]));
-        assert!(!windows_package_was_replaced(
-            old,
-            &[new.replace("Codex_", "CodexBeta_")]
-        ));
-        assert!(!windows_package_was_replaced(
-            old,
-            &[new.replace("2p2nqsd0c76g0", "otherpublisher")]
-        ));
-        assert!(!windows_package_was_replaced(old, &["invalid".into()]));
     }
 
     #[cfg(windows)]
@@ -1541,21 +1468,30 @@ mod compatibility_tests {
     }
 
     #[test]
-    fn windows_packaged_cli_environment_is_valid_and_scoped_to_the_codex_package() {
-        let app_dir = Path::new(
-            r"C:\Program Files\WindowsApps\OpenAI.Codex_26.901.20858.0_x64__2p2nqsd0c76g0\app",
+    fn windows_package_identity_is_scoped_to_the_codex_package() {
+        for entry in [
+            "",
+            "app",
+            "bin",
+            "current",
+            r"versions\current",
+            r"VERSIONS\CURRENT",
+        ] {
+            let app_dir = format!(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_26.901.20858.0_x64__2p2nqsd0c76g0\{entry}"
+            );
+            assert_eq!(
+                windows_package_full_name(Path::new(&app_dir)).as_deref(),
+                Some("OpenAI.Codex_26.901.20858.0_x64__2p2nqsd0c76g0"),
+                "{entry}"
+            );
+        }
+        assert!(
+            windows_package_full_name(Path::new(
+                r"C:\Program Files\WindowsApps\Other.App_1.2.3.4_x64__2p2nqsd0c76g0\app"
+            ))
+            .is_none()
         );
-        assert_eq!(
-            windows_package_full_name(app_dir).as_deref(),
-            Some("OpenAI.Codex_26.901.20858.0_x64__2p2nqsd0c76g0")
-        );
-
-        let block = windows_environment_block(&[
-            ("B".to_string(), "two".to_string()),
-            ("A".to_string(), "1".to_string()),
-        ])
-        .unwrap();
-        assert_eq!(block, "A=1\0B=two\0\0".encode_utf16().collect::<Vec<_>>());
     }
 
     #[test]
@@ -1573,20 +1509,17 @@ mod compatibility_tests {
             &home,
         )
         .unwrap();
-        let block = String::from_utf16(&windows_environment_block(&environment).unwrap()).unwrap();
-        let homes = block
-            .split('\0')
-            .filter_map(|entry| entry.split_once('='))
+        let homes = environment
+            .iter()
             .filter(|(name, _)| name.eq_ignore_ascii_case("CODEX_HOME"))
-            .map(|(_, value)| value)
+            .map(|(_, value)| value.as_str())
             .collect::<Vec<_>>();
         assert_eq!(homes, vec![home.to_str().unwrap()]);
         assert_eq!(
             std::fs::read_to_string(Path::new(homes[0]).join("config.toml")).unwrap(),
             "model = 'custom-model'\n"
         );
-        assert!(block.contains("CODEY_TEST_WRAPPER=enabled\0"));
-        assert!(block.ends_with("\0\0"));
+        assert!(environment.contains(&("CODEY_TEST_WRAPPER".into(), "enabled".into())));
     }
 
     #[test]
@@ -1608,5 +1541,67 @@ mod compatibility_tests {
         for value in [r"D:\Codex 配置", "relative-codex-home"] {
             assert!(requires_codex_home_environment(Some(OsStr::new(value))));
         }
+    }
+
+    #[test]
+    fn windows_store_delivers_optional_wrapper_and_custom_home_environments() {
+        use std::ffi::OsStr;
+
+        for home in [None, Some(OsStr::new("")), Some(OsStr::new("  "))] {
+            assert!(!windows_packaged_launch_needs_environment(&[], home));
+            // Even an optional wrapper must be delivered when Inspector exists,
+            // so its confirmation remains available if Inspector fails.
+            assert!(windows_packaged_launch_needs_environment(
+                &[("CODEX_CLI_PATH".into(), "Codey.exe".into())],
+                home,
+            ));
+        }
+        assert!(windows_packaged_launch_needs_environment(
+            &[],
+            Some(OsStr::new("relative-home")),
+        ));
+    }
+
+    #[test]
+    fn windows_activation_fallback_requires_optional_environment_and_confirmed_cleanup() {
+        let stopped = recovery::recoverable("environment unavailable");
+        assert!(windows_can_fallback_to_activation(false, &stopped));
+        assert!(!windows_can_fallback_to_activation(true, &stopped));
+        assert!(!windows_can_fallback_to_activation(
+            false,
+            &WindowsPackageChanged.into()
+        ));
+        let unconfirmed = startup_activation_error_after_cleanup(
+            recovery::recoverable("environment unavailable"),
+            Err(anyhow::anyhow!("process still running")),
+            Ok(()),
+        );
+        assert!(!windows_can_fallback_to_activation(false, &unconfirmed));
+    }
+
+    #[test]
+    fn cleaned_activation_failure_preserves_package_retry_and_native_recovery() {
+        let error =
+            startup_activation_error_after_cleanup(WindowsPackageChanged.into(), Ok(()), Ok(()));
+        assert!(error.is::<WindowsPackageChanged>());
+        assert!(error.is::<recovery::IntegrationFailure>());
+        let error = startup_activation_error_after_cleanup(
+            error,
+            Ok(()),
+            Err(anyhow::anyhow!("cleanup failed")),
+        );
+        assert!(!error.is::<WindowsPackageChanged>());
+        assert!(!error.is::<recovery::IntegrationFailure>());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleaned_activation_failure_preserves_hresult() {
+        let native = windows::core::Error::from(
+            windows::Win32::Foundation::E_APPLICATION_ACTIVATION_TIMED_OUT,
+        );
+        let error = startup_activation_error_after_cleanup(native.into(), Ok(()), Ok(()));
+        assert!(error.is::<windows::core::Error>());
+        assert!(error.is::<recovery::IntegrationFailure>());
     }
 }

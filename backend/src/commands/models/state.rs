@@ -6,7 +6,8 @@ pub(crate) fn provider_route_requires_restart(
     current: &CodeyConfig,
 ) -> bool {
     applied.local_router_enabled != current.local_router_enabled
-        || provider_route_snapshots(applied) != provider_route_snapshots(current)
+        || provider_route_snapshots_for_runtime(applied)
+            != provider_route_snapshots_for_runtime(current)
         || websocket_transport_requires_restart(applied, current)
         || native_web_search_capability_requires_restart(applied, current)
         || remote_compaction_transport_requires_restart(applied, current)
@@ -17,7 +18,13 @@ pub(crate) fn websocket_transport_requires_restart(
     current: &CodeyConfig,
 ) -> bool {
     applied.runtime_supports_websockets() != current.runtime_supports_websockets()
-        || applied.runtime_websocket_model_aliases() != current.runtime_websocket_model_aliases()
+        || alias_set(applied.runtime_websocket_model_aliases())
+            != alias_set(current.runtime_websocket_model_aliases())
+}
+
+/// 运输能力按模型集合判断；模型顺序随目录热更新，不构成重启条件。
+fn alias_set(aliases: Vec<String>) -> std::collections::BTreeSet<String> {
+    aliases.into_iter().collect()
 }
 
 pub(crate) fn remote_compaction_transport_requires_restart(
@@ -31,8 +38,8 @@ pub(crate) fn native_web_search_capability_requires_restart(
     applied: &CodeyConfig,
     current: &CodeyConfig,
 ) -> bool {
-    applied.runtime_native_web_search_model_aliases()
-        != current.runtime_native_web_search_model_aliases()
+    alias_set(applied.runtime_native_web_search_model_aliases())
+        != alias_set(current.runtime_native_web_search_model_aliases())
 }
 
 pub(crate) fn runtime_supports_current_routes_for_hot_reload(
@@ -89,8 +96,8 @@ pub(crate) fn runtime_supports_current_routes_for_hot_reload(
     {
         return false;
     }
-    let applied = official_route_snapshots(applied);
-    official_route_snapshots(current)
+    let applied = official_route_snapshots_for_runtime(applied);
+    official_route_snapshots_for_runtime(current)
         .into_iter()
         .all(|(provider_id, route)| applied.get(&provider_id) == Some(&route))
 }
@@ -133,10 +140,28 @@ pub(crate) fn provider_route_snapshots(
         .collect()
 }
 
-pub(crate) fn official_route_snapshots(
+/// Route identity used to decide whether the running app-server still supports
+/// the saved configuration. Official gateway addresses are consumed directly
+/// by the local router and can change without restarting app-server, while the
+/// remaining route fields still describe launch-scoped transport state.
+pub(crate) fn provider_route_snapshots_for_runtime(
     config: &CodeyConfig,
 ) -> BTreeMap<String, ProviderRouteSnapshot> {
     provider_route_snapshots(config)
+        .into_iter()
+        .map(|(provider_id, mut route)| {
+            if route.official_account {
+                route.base_url.clear();
+            }
+            (provider_id, route)
+        })
+        .collect()
+}
+
+pub(crate) fn official_route_snapshots_for_runtime(
+    config: &CodeyConfig,
+) -> BTreeMap<String, ProviderRouteSnapshot> {
+    provider_route_snapshots_for_runtime(config)
         .into_iter()
         .filter(|(_, route)| route.official_account)
         .collect()
@@ -165,7 +190,16 @@ pub(crate) fn config_with_launch_pinned_transport(
         // 协议决定上面三个能力的实际取值，必须一起固定在启动时的状态。
         profile.upstream_protocol = previous.upstream_protocol.clone();
         if profile.official_account && previous.official_account {
-            profile.base_url = previous.base_url.clone();
+            let launch_scoped_official_change = profile.api_key != previous.api_key
+                || profile.auth_mode != previous.auth_mode
+                || profile.model_request_headers != previous.model_request_headers
+                || profile.upstream_protocol != previous.upstream_protocol
+                || profile.supports_remote_compaction != previous.supports_remote_compaction
+                || profile.supports_websockets != previous.supports_websockets
+                || profile.supports_native_web_search != previous.supports_native_web_search;
+            if launch_scoped_official_change {
+                profile.base_url = previous.base_url.clone();
+            }
             profile.api_key = previous.api_key.clone();
             profile.auth_mode = previous.auth_mode.clone();
             profile.model_request_headers = previous.model_request_headers.clone();
@@ -364,7 +398,7 @@ pub(crate) fn renderer_route_model_catalog(
             .upstream_models_by_provider
             .get(&provider_id)
             .map(Vec::as_slice);
-        let reasoning_efforts = config.model_reasoning_efforts_by_provider.get(&provider_id);
+        let reasoning_efforts = config.model_reasoning_efforts_for_provider(&provider_id);
         let default_model = config.default_model_for_profile(profile);
         let state = if provider_id == config.current_provider_id().unwrap_or_default() {
             active_model_state.clone()
@@ -375,7 +409,7 @@ pub(crate) fn renderer_route_model_catalog(
                 upstream_models,
                 &selected_models,
                 manual_models,
-                reasoning_efforts,
+                Some(&reasoning_efforts),
                 default_model.as_deref(),
             )
             .unwrap_or_default()
@@ -390,7 +424,7 @@ pub(crate) fn renderer_route_model_catalog(
             "" if profile.official_account => OFFICIAL_ROUTE_SHORT_NAME.to_string(),
             short_name => short_name.to_string(),
         };
-        let official_models = state
+        let mut official_models = state
             .official_models
             .iter()
             .filter(|model| model.supported)
@@ -400,7 +434,14 @@ pub(crate) fn renderer_route_model_catalog(
                     model.supported_reasoning_efforts.clone(),
                     model.default_reasoning_effort.clone(),
                 )
-            });
+            })
+            .collect::<Vec<_>>();
+        // 官方目录按 Codex 缓存顺序列出模型，选择器要按线路保存的顺序显示。
+        model_id::sort_by_selection_order(
+            &mut official_models,
+            &selected_models,
+            |(slug, _, _)| Some(slug.as_str()),
+        );
         let third_party_metadata = state
             .third_party_model_metadata
             .iter()
@@ -426,7 +467,7 @@ pub(crate) fn renderer_route_model_catalog(
             )
         });
         for (model, supported_reasoning_efforts, default_reasoning_effort) in
-            official_models.chain(third_party_models)
+            official_models.into_iter().chain(third_party_models)
         {
             let alias = if profile.official_account && !qualify_official {
                 aliases.insert(model.clone());

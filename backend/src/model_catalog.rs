@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -64,6 +64,17 @@ struct RuntimeModelCacheUnavailable;
 
 pub(crate) const CUSTOM_CONTEXT_CATALOG_UNAVAILABLE: &str =
     "无法生成带有自定义上下文预算的模型目录，请恢复默认预算或重新同步模型";
+
+#[derive(Debug)]
+pub(crate) struct ContextBudgetCatalogError(pub(crate) anyhow::Error);
+
+impl fmt::Display for ContextBudgetCatalogError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for ContextBudgetCatalogError {}
 
 impl fmt::Display for RuntimeModelCacheUnavailable {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -150,9 +161,12 @@ pub fn relative_path() -> &'static str {
 
 /// Model ids available to native dispatch, not merely configured upstream ids.
 pub(crate) fn dispatch_model_ids(home: &Path, generated_catalog: bool) -> Result<HashSet<String>> {
-    let models = if let Some(path) =
-        crate::codex_config::runtime_model_catalog_path(home, generated_catalog)?
-    {
+    let catalog_path = if generated_catalog {
+        Some(home.join(relative_path()))
+    } else {
+        crate::codex_config::runtime_model_catalog_path(home, false, None)?
+    };
+    let models = if let Some(path) = catalog_path {
         read_runtime_catalog_models_at(&path)?
     } else {
         // Do not use read_official_entries: it merges templates and generated
@@ -221,6 +235,8 @@ pub(crate) struct CapabilityLists<'a> {
 /// 生成目录时一并应用的上下文与思考等级覆盖。
 #[derive(Clone, Copy)]
 pub(crate) struct CatalogOverrides<'a> {
+    pub(crate) plugin_contexts:
+        &'a std::collections::BTreeMap<String, crate::config::ModelContextConfig>,
     pub(crate) contexts: &'a std::collections::BTreeMap<String, crate::config::ModelContextConfig>,
     pub(crate) reasoning_efforts:
         &'a std::collections::BTreeMap<String, Vec<crate::config::ModelReasoningEffort>>,
@@ -312,8 +328,93 @@ pub(crate) fn apply_catalog_overrides(home: &Path, overrides: CatalogOverrides<'
     Ok(())
 }
 
+/// 用户目录只覆盖明确配置的预算，保留模型指令和其余元数据，也不执行
+/// Codey 缓存迁移。每次从原目录生成，恢复默认不会继承旧副本的预算。
+pub(crate) fn render_context_catalog_overlay(
+    source: &Path,
+    contexts: &BTreeMap<String, crate::config::ModelContextConfig>,
+) -> Result<Option<Vec<u8>>> {
+    if contexts.is_empty() {
+        return Ok(None);
+    }
+    let bytes = fs::read(source)
+        .with_context(|| format!("读取自定义模型目录失败：{}", source.display()))?;
+    let mut catalog: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("解析自定义模型目录失败：{}", source.display()))?;
+    let models = catalog
+        .get_mut("models")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("自定义模型目录缺少 models 数组：{}", source.display()))?;
+    let mut indices = BTreeMap::new();
+    for (index, model) in models.iter().enumerate() {
+        if let Some(slug) = model.get("slug").and_then(Value::as_str) {
+            indices
+                .entry(model_id::key(slug))
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(index));
+        }
+    }
+    for (model, policy) in contexts {
+        let index = match indices.get(&model_id::key(model)) {
+            Some(Some(index)) => *index,
+            Some(None) => {
+                return Err(ContextBudgetCatalogError(anyhow::anyhow!(
+                    "自定义模型目录中的预算模型重复：{model}（{}）",
+                    source.display()
+                ))
+                .into());
+            }
+            None => {
+                return Err(ContextBudgetCatalogError(anyhow::anyhow!(
+                    "自定义模型目录缺少已启用的预算模型：{model}（{}）",
+                    source.display()
+                ))
+                .into());
+            }
+        };
+        apply_model_context(&mut models[index], Some(policy)).map_err(ContextBudgetCatalogError)?;
+    }
+    let mut bytes = serde_json::to_vec_pretty(&catalog).context("序列化模型预算副本失败")?;
+    bytes.push(b'\n');
+    Ok(Some(bytes))
+}
+
+pub(crate) fn prepare_context_catalog_overlay(
+    home: &Path,
+    source: &Path,
+    contexts: &BTreeMap<String, crate::config::ModelContextConfig>,
+) -> Result<PathBuf> {
+    let Some(bytes) = render_context_catalog_overlay(source, contexts)? else {
+        return Ok(source.to_path_buf());
+    };
+    // 内容变化使用新路径，保存设置或另一个进程启动不会改写运行中的目录。
+    let path = home
+        .join("model-catalogs/context-overrides")
+        .join(format!("{}.json", crate::fs_util::sha256_hex(&bytes)));
+    if fs::read(&path).is_ok_and(|current| current == bytes) {
+        protect_catalog_file(&path)?;
+    } else {
+        atomic_write(&path, &bytes)?;
+    }
+    Ok(path)
+}
+
 fn apply_overrides_to_models(models: &mut [Value], overrides: CatalogOverrides<'_>) -> Result<()> {
     for model in models {
+        // Always start from the catalog declaration, including when an override
+        // was removed or only a plugin policy remains.
+        prepare_cached_context_window(model);
+        let plugin_policy = model.get("slug").and_then(Value::as_str).and_then(|slug| {
+            overrides
+                .plugin_contexts
+                .iter()
+                .find(|(key, _)| model_id::equal(key, slug))
+                .map(|(_, policy)| policy)
+        });
+        if let Some(policy) = plugin_policy {
+            apply_model_context(model, Some(policy))?;
+            model["codey_context_source"] = json!("plugin_declared");
+        }
         let policy = model.get("slug").and_then(Value::as_str).and_then(|slug| {
             overrides
                 .contexts
@@ -627,6 +728,10 @@ fn render_catalog_for_provider(
             ));
         }
     }
+    // 目录顺序跟随线路配置里的模型顺序，Codex 原生列表与 Codey 分组菜单才一致。
+    model_id::sort_by_selection_order(&mut catalog_models, selected_models, |model| {
+        model.get("slug").and_then(Value::as_str)
+    });
     if let Some(websocket_models) = websocket_models {
         let websocket_model_keys = websocket_models
             .iter()
@@ -659,6 +764,9 @@ fn render_catalog_for_provider(
     }
     for model in &mut catalog_models {
         prepare_cached_context_window(model);
+        // Codex 只发送模型目录里声明过的思考强度。目录没有 ultra 时，界面仍能
+        // 选中它，请求会被静默改成该模型的默认档（luna 是 medium）。
+        ensure_forwarded_ultra_level(model);
     }
     // Third-party routes still fail closed when their template lacks runtime
     // fields. Official-only catalogs never drop incompatible slugs above, so
@@ -708,16 +816,31 @@ pub fn selection_state_with_manual_models(
         Err(error) if official_provider => return Err(error),
         Err(_) => Arc::new(Vec::new()),
     };
+    let requested_upstream_keys =
+        upstream_models
+            .filter(|models| !models.is_empty())
+            .map(|models| {
+                models
+                    .iter()
+                    .map(|model| model_id::key(model))
+                    .collect::<HashSet<_>>()
+            });
     let official_model_ids = official_entries
         .iter()
         .filter_map(|model| model.get("slug").and_then(Value::as_str))
+        .filter(|slug| {
+            requested_upstream_keys
+                .as_ref()
+                .is_none_or(|keys| keys.contains(&model_id::key(slug)))
+        })
         .map(ToString::to_string)
         .collect::<Vec<_>>();
     let selected_official_keys = selected_models
         .iter()
         .map(|model| model_id::key(model))
         .collect::<HashSet<_>>();
-    let filter_official_selection = official_provider && !selected_official_keys.is_empty();
+    let filter_official_selection = official_provider
+        && (!selected_official_keys.is_empty() || requested_upstream_keys.is_some());
     let provider_models_synced = official_provider || upstream_models.is_some();
     let upstream_models = upstream_models.unwrap_or_default();
     let upstream = upstream_models
@@ -728,12 +851,27 @@ pub fn selection_state_with_manual_models(
         official_entries
             .iter()
             .filter_map(|model| {
-                let supported_reasoning_efforts = reasoning_efforts_from_value(model);
+                let slug = model.get("slug").and_then(Value::as_str).unwrap_or("");
+                let supported_reasoning_efforts =
+                    with_forwarded_ultra(slug, reasoning_efforts_from_value(model));
                 let default_reasoning_effort =
                     default_reasoning_effort_from_value(model, &supported_reasoning_efforts);
                 let model = official_model_from_value(model)?;
-                let supported = !filter_official_selection
-                    || selected_official_keys.contains(&model_id::key(&model.slug));
+                let model_key = model_id::key(&model.slug);
+                // 同步结果只说明账号能调用哪些模型。用户勾选的子集才是启用
+                // 集合；有勾选时，未勾选的同步模型不能再进入运行时列表。
+                let known_to_account = requested_upstream_keys
+                    .as_ref()
+                    .is_none_or(|keys| keys.contains(&model_key));
+                let supported = if !filter_official_selection {
+                    true
+                } else if selected_official_keys.is_empty() {
+                    requested_upstream_keys
+                        .as_ref()
+                        .is_some_and(|keys| keys.contains(&model_key))
+                } else {
+                    selected_official_keys.contains(&model_key) && known_to_account
+                };
                 Some(OfficialModelAvailability {
                     slug: model.slug,
                     display_name: model.display_name,
@@ -982,6 +1120,7 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
     let mut catalogs = Vec::new();
     let mut bundled_fast_model_slugs = HashSet::new();
     let mut last_error = None;
+    let mut account_snapshot_models = None;
     for path in paths {
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
@@ -998,7 +1137,15 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
                 continue;
             }
         };
+        let account_snapshot = path.ends_with(DEBUG_CATALOG_RELATIVE_PATH)
+            && value
+                .get("codey_account_snapshot")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
         let models = official_models_from_value(&value);
+        if account_snapshot {
+            account_snapshot_models = Some(models.clone());
+        }
         if !models.is_empty() {
             catalogs.push(models);
         }
@@ -1020,6 +1167,57 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
             "{}",
             last_error.unwrap_or_else(|| "找不到可用的 Codex 模型模板".to_string())
         );
+    }
+
+    // A Codey-owned CLI snapshot is account-backed and therefore the source
+    // of truth. Keeping the old fixed list below is still useful for first-run
+    // and offline fallback, but it must not hide newly released models that
+    // the signed-in account can actually use. A generic models_cache.json is
+    // intentionally not treated as dynamic input because older Codex builds
+    // can leave retired models in that file.
+    let dynamic_source = account_snapshot_models;
+    // Account `/models` payloads name the slugs the signed-in account can call,
+    // but they omit the instruction templates Codex needs to launch a model.
+    // Fill those from the local cache before deciding the snapshot is unusable,
+    // so a newly released slug is not dropped back to the fixed fallback list.
+    let dynamic_source = dynamic_source.map(|models| {
+        let templates = catalogs.iter().flatten().cloned().collect::<Vec<_>>();
+        complete_account_models(&models, &templates)
+    });
+    if let Some(source) = dynamic_source
+        .as_deref()
+        .filter(|models| snapshot_has_runtime_models(models))
+    {
+        let mut seen = HashSet::new();
+        let models = source
+            .iter()
+            .filter(|model| {
+                model_instruction_source(model).is_some()
+                    && model
+                        .get("visibility")
+                        .and_then(Value::as_str)
+                        .is_none_or(|visibility| visibility != "hide")
+            })
+            .filter_map(|model| {
+                let slug = model.get("slug").and_then(Value::as_str)?.trim();
+                if slug.is_empty() || !seen.insert(model_id::key(slug)) {
+                    return None;
+                }
+                let mut model = model.clone();
+                let display_name = model
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(slug)
+                    .to_string();
+                normalize_official_model(&mut model, slug, &display_name, seen.len() - 1);
+                Some(model)
+            })
+            .collect::<Vec<_>>();
+        if !models.is_empty() {
+            return Ok(models);
+        }
     }
 
     OFFICIAL_MODELS
@@ -1074,6 +1272,14 @@ fn codex_cli_stamp_for(candidates: &[PathBuf]) -> Option<std::time::SystemTime> 
 /// instruction-bearing source would otherwise suppress the capture.
 #[cfg(not(test))]
 fn runtime_snapshot_is_stale(home: &Path, codex_app_path: &str) -> bool {
+    let snapshot = home.join(DEBUG_CATALOG_RELATIVE_PATH);
+    let snapshot_is_account_backed = read_catalog_value(&snapshot)
+        .and_then(|value| value.get("codey_account_snapshot").cloned())
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if !snapshot_is_account_backed {
+        return true;
+    }
     let snapshot_mtime = fs::metadata(home.join(DEBUG_CATALOG_RELATIVE_PATH))
         .and_then(|metadata| metadata.modified())
         .ok();
@@ -1149,11 +1355,227 @@ fn sync_runtime_catalog_snapshot(home: &Path, codex_app_path: &str) -> Result<bo
         release_snapshot_sync_slot(&RUNTIME_SNAPSHOT_SYNC_ATTEMPTED, stamp);
         return Ok(false);
     };
-    let catalog = serde_json::to_vec_pretty(&json!({ "models": models }))
-        .context("序列化 Codex 内置模型目录快照失败")?;
+    let catalog = serde_json::to_vec_pretty(&json!({
+        "models": models,
+        "codey_account_snapshot": true,
+    }))
+    .context("序列化 Codex 内置模型目录快照失败")?;
     atomic_write(&home.join(DEBUG_CATALOG_RELATIVE_PATH), &catalog)
         .context("写入 Codex 内置模型目录快照失败")?;
     Ok(true)
+}
+
+/// Explicit model synchronization must be allowed to observe account changes
+/// even when the installed Codex binary has not changed since the last launch.
+pub(crate) fn refresh_account_runtime_snapshot(home: &Path, codex_app_path: &str) -> Result<bool> {
+    #[cfg(not(test))]
+    {
+        if let Ok(mut attempted) = RUNTIME_SNAPSHOT_SYNC_ATTEMPTED.lock() {
+            *attempted = None;
+        }
+    }
+    sync_runtime_catalog_snapshot(home, codex_app_path)
+}
+
+/// Merges the account-specific model response into the Codey-owned runtime
+/// catalog. The catalog is shared, while each route keeps its own upstream
+/// model IDs and filters this union when building its selection state.
+///
+/// The account response is the availability list. It usually has no Codex
+/// instruction template, so an existing runtime entry keeps those fields, and
+/// a slug the local catalog has never seen borrows the closest template.
+pub(crate) fn merge_account_runtime_models(home: &Path, models: &[Value]) -> Result<()> {
+    let path = home.join(DEBUG_CATALOG_RELATIVE_PATH);
+    let mut catalog = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or_else(|| json!({"models": [], "codey_account_snapshot": true}));
+    let entries = catalog
+        .get_mut("models")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("Codex 模型目录快照格式无效"))?;
+    let mut templates = cached_instruction_templates(home);
+    templates.extend(entries.iter().cloned());
+    let mut positions = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, model)| {
+            model
+                .get("slug")
+                .and_then(Value::as_str)
+                .map(|slug| (model_id::key(slug), index))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    for model in models.iter().filter(|model| {
+        model
+            .get("slug")
+            .and_then(Value::as_str)
+            .is_some_and(|slug| !slug.trim().is_empty())
+    }) {
+        let key = model_id::key(model["slug"].as_str().unwrap_or_default());
+        let existing = positions
+            .get(&key)
+            .copied()
+            .map(|index| entries[index].clone());
+        let merged = merge_account_model(existing.as_ref(), model, &templates);
+        if model_instruction_source(&merged).is_some() {
+            templates.push(merged.clone());
+        }
+        if let Some(index) = positions.get(&key).copied() {
+            entries[index] = merged;
+        } else {
+            positions.insert(key, entries.len());
+            entries.push(merged);
+        }
+    }
+    catalog["codey_account_snapshot"] = Value::Bool(true);
+    let bytes = serde_json::to_vec_pretty(&catalog).context("序列化官方模型目录快照失败")?;
+    atomic_write(&path, &bytes).context("写入官方模型目录快照失败")
+}
+
+fn cached_instruction_templates(home: &Path) -> Vec<Value> {
+    fs::read(home.join("models_cache.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .map(|value| official_models_from_value(&value))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|model| model_instruction_source(model).is_some())
+        .collect()
+}
+
+fn complete_account_models(models: &[Value], templates: &[Value]) -> Vec<Value> {
+    models
+        .iter()
+        .map(|model| {
+            if model_instruction_source(model).is_some() || model_is_hidden(model) {
+                return model.clone();
+            }
+            let slug = model.get("slug").and_then(Value::as_str).unwrap_or("");
+            instruction_template_for(slug, templates)
+                .map(|template| account_model_with_runtime_template(template, model))
+                .unwrap_or_else(|| model.clone())
+        })
+        .collect()
+}
+
+fn merge_account_model(existing: Option<&Value>, incoming: &Value, templates: &[Value]) -> Value {
+    if model_instruction_source(incoming).is_some() {
+        return existing
+            .map(|existing| account_model_with_runtime_template(existing, incoming))
+            .unwrap_or_else(|| incoming.clone());
+    }
+    if let Some(existing) = existing.filter(|model| model_instruction_source(model).is_some()) {
+        return account_model_with_runtime_template(existing, incoming);
+    }
+    let slug = incoming.get("slug").and_then(Value::as_str).unwrap_or("");
+    if let Some(template) = instruction_template_for(slug, templates) {
+        return account_model_with_runtime_template(template, incoming);
+    }
+    existing.cloned().unwrap_or_else(|| incoming.clone())
+}
+
+/// `gpt-6-sol` and `gpt-5.6-sol` share the trailing family token.
+fn model_family_key(slug: &str) -> &str {
+    slug.rsplit_once('-')
+        .map(|(_, family)| family)
+        .unwrap_or(slug)
+}
+
+fn model_is_hidden(model: &Value) -> bool {
+    model.get("visibility").and_then(Value::as_str) == Some("hide")
+}
+
+fn instruction_template_for<'a>(slug: &str, templates: &'a [Value]) -> Option<&'a Value> {
+    let same_slug = templates.iter().find(|model| {
+        model
+            .get("slug")
+            .and_then(Value::as_str)
+            .is_some_and(|candidate| model_id::equal(candidate, slug))
+            && model_instruction_source(model).is_some()
+    });
+    if let Some(model) = same_slug {
+        return Some(model);
+    }
+    let family = model_family_key(slug);
+    templates
+        .iter()
+        .find(|model| {
+            !model_is_hidden(model)
+                && model_instruction_source(model).is_some()
+                && model
+                    .get("slug")
+                    .and_then(Value::as_str)
+                    .is_some_and(|candidate| model_family_key(candidate) == family)
+        })
+        .or_else(|| {
+            templates
+                .iter()
+                .find(|model| !model_is_hidden(model) && model_instruction_source(model).is_some())
+        })
+}
+
+fn account_model_with_runtime_template(base: &Value, account: &Value) -> Value {
+    let base_slug = base.get("slug").and_then(Value::as_str).unwrap_or("");
+    let account_slug = account.get("slug").and_then(Value::as_str).unwrap_or("");
+    let mut merged = overlay_account_fields(base, account);
+    if !account_slug.is_empty() && !model_id::equal(base_slug, account_slug) {
+        if account
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_none_or(|description| description.is_empty())
+        {
+            let name = account
+                .get("display_name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or(account_slug);
+            merged["description"] = json!(name);
+        }
+        if let Some(object) = merged.as_object_mut() {
+            object.remove("upgrade");
+            object.remove("availability_nux");
+        }
+    }
+    merged
+}
+
+fn overlay_account_fields(base: &Value, account: &Value) -> Value {
+    let Some(account_object) = account.as_object() else {
+        return base.clone();
+    };
+    let mut merged = base.clone();
+    let Some(merged_object) = merged.as_object_mut() else {
+        return account.clone();
+    };
+    for (key, value) in account_object {
+        if value.is_null() {
+            continue;
+        }
+        if key == "base_instructions"
+            && value
+                .as_str()
+                .is_none_or(|instructions| instructions.trim().is_empty())
+        {
+            continue;
+        }
+        if key == "model_messages"
+            && model_instruction_source(&json!({ "model_messages": value })).is_none()
+        {
+            continue;
+        }
+        if key == "description"
+            && value
+                .as_str()
+                .is_some_and(|description| description.trim().is_empty())
+        {
+            continue;
+        }
+        merged_object.insert(key.clone(), value.clone());
+    }
+    merged
 }
 
 /// Unit tests must never invoke the Codex CLI installed on the machine running
@@ -1175,7 +1597,7 @@ fn debug_model_entries(home: &Path, candidates: &[PathBuf]) -> Option<Vec<Value>
                 continue;
             };
             let models = official_models_from_value(&value);
-            if snapshot_covers_official_models(&models) {
+            if snapshot_has_runtime_models(&models) {
                 return Some(models);
             }
         }
@@ -1183,14 +1605,17 @@ fn debug_model_entries(home: &Path, candidates: &[PathBuf]) -> Option<Vec<Value>
     None
 }
 
-/// A snapshot is only worth persisting when it can serve every fixed official
-/// model. A partial render (for example one that lost a model to an upstream
-/// retirement, or a signed-out render missing account models) would otherwise
-/// be frozen on disk and quietly suppress later capture attempts.
-///
-/// Only the instruction source is checked: `normalize_official_model` fills a
-/// missing description from the display name, while nothing can invent the
-/// instructions a model needs to run.
+/// A runtime snapshot is useful even when upstream has added or retired a
+/// model that Codey has not learned about yet. The account-backed directory
+/// only needs at least one complete model entry; the fixed list remains the
+/// fallback for installations that cannot produce a snapshot at all.
+fn snapshot_has_runtime_models(models: &[Value]) -> bool {
+    models
+        .iter()
+        .any(|model| model_instruction_source(model).is_some())
+}
+
+#[cfg(test)]
 fn snapshot_covers_official_models(models: &[Value]) -> bool {
     OFFICIAL_MODELS.iter().all(|(slug, _)| {
         models.iter().any(|model| {
@@ -1469,7 +1894,43 @@ fn third_party_reasoning_efforts_from_value(model: &Value) -> Vec<String> {
             efforts.push(effort);
         }
     }
+    let slug = model.get("slug").and_then(Value::as_str).unwrap_or("");
+    with_forwarded_ultra(slug, efforts)
+}
+
+/// Luna 的上游目录停在 max，但桌面档位选择器仍提供 ultra。不补上这一档时，
+/// 客户端会把选中的 ultra 退回默认强度。
+fn forwards_ultra_despite_template(slug: &str) -> bool {
+    let slug = route_scoped_upstream_model_id(slug);
+    model_id::equal(slug, "gpt-6-luna") || model_id::equal(slug, "gpt-5.6-luna")
+}
+
+fn with_forwarded_ultra(slug: &str, mut efforts: Vec<String>) -> Vec<String> {
+    if forwards_ultra_despite_template(slug)
+        && efforts.iter().any(|effort| effort == "max")
+        && !efforts.iter().any(|effort| effort == "ultra")
+    {
+        efforts.push("ultra".to_string());
+    }
     efforts
+}
+
+fn ensure_forwarded_ultra_level(model: &mut Value) {
+    let slug = model.get("slug").and_then(Value::as_str).unwrap_or("");
+    let current = reasoning_efforts_from_value(model);
+    if with_forwarded_ultra(slug, current.clone())
+        .iter()
+        .any(|effort| effort == "ultra")
+        && !current.iter().any(|effort| effort == "ultra")
+        && let Some(levels) = model
+            .get_mut("supported_reasoning_levels")
+            .and_then(Value::as_array_mut)
+    {
+        levels.push(json!({
+            "effort": "ultra",
+            "description": reasoning_level_description("ultra"),
+        }));
+    }
 }
 
 fn third_party_template_supports_ultra(model: &Value) -> bool {
@@ -1479,6 +1940,8 @@ fn third_party_template_supports_ultra(model: &Value) -> bool {
         .is_some_and(|slug| {
             [
                 "gpt-6-astra",
+                "gpt-6-sol",
+                "gpt-6-luna",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
@@ -2058,6 +2521,182 @@ fn prepare_cached_context_window(model: &mut Value) {
 
 #[cfg(test)]
 #[test]
+fn removing_context_override_restores_the_original_model_budget() {
+    let original = json!({
+        "slug":"gpt-5.6-sol",
+        "context_window":272000,
+        "max_context_window":1000000,
+        "effective_context_window_percent":95,
+        "auto_compact_token_limit":null,
+        "codey_context_source":"official_catalog"
+    });
+    let mut models = vec![original.clone()];
+    let empty = std::collections::BTreeMap::new();
+    let contexts = std::collections::BTreeMap::from([(
+        "gpt-5.6-sol".to_string(),
+        crate::config::ModelContextConfig {
+            context_window_tokens: 128_000,
+            auto_compact_token_limit: Some(100_000),
+            reserve_output_tokens: Some(16_000),
+        },
+    )]);
+    for overrides in [&contexts, &empty] {
+        apply_overrides_to_models(
+            &mut models,
+            CatalogOverrides {
+                plugin_contexts: &empty,
+                contexts: overrides,
+                reasoning_efforts: &Default::default(),
+            },
+        )
+        .unwrap();
+        if !overrides.is_empty() {
+            assert_eq!(models[0]["context_window"], 128_000);
+            assert_eq!(models[0]["auto_compact_token_limit"], 100_000);
+        }
+    }
+    models[0]
+        .as_object_mut()
+        .unwrap()
+        .remove("codey_context_base");
+    assert_eq!(models[0], original);
+}
+
+#[cfg(test)]
+#[test]
+fn custom_context_overlay_preserves_source_and_uses_immutable_versions() {
+    let home = tempfile::tempdir().unwrap();
+    let source = home.path().join("custom.json");
+    let original = json!({
+        "revision": "user-owned",
+        "models": [
+            {"slug": "GPT-5.6-SOL", "context_window": 1000000,
+             "base_instructions": "Keep user instructions", "custom_field": [1, 2]},
+            {"slug": "unmodified", "context_window": 1000000,
+             "effective_context_window_percent": 95}
+        ]
+    });
+    let source_bytes = serde_json::to_vec(&original).unwrap();
+    fs::write(&source, &source_bytes).unwrap();
+    let mut policies = BTreeMap::from([(
+        "gpt-5.6-sol".into(),
+        crate::config::ModelContextConfig {
+            context_window_tokens: 272_000,
+            auto_compact_token_limit: Some(220_000),
+            reserve_output_tokens: Some(16_000),
+        },
+    )]);
+    let first = prepare_context_catalog_overlay(home.path(), &source, &policies).unwrap();
+    assert_ne!(first, source);
+    assert_eq!(
+        first,
+        prepare_context_catalog_overlay(home.path(), &source, &policies).unwrap()
+    );
+    let first_bytes = fs::read(&first).unwrap();
+    let first_value: Value = serde_json::from_slice(&first_bytes).unwrap();
+    let mut expected = original.clone();
+    apply_model_context(&mut expected["models"][0], policies.values().next()).unwrap();
+    assert_eq!(first_value, expected);
+    assert_eq!(fs::read(&source).unwrap(), source_bytes);
+    policies
+        .get_mut("gpt-5.6-sol")
+        .unwrap()
+        .context_window_tokens = 400_000;
+    let second = prepare_context_catalog_overlay(home.path(), &source, &policies).unwrap();
+    assert_ne!(first, second);
+    assert_eq!(fs::read(&first).unwrap(), first_bytes);
+    assert_eq!(
+        prepare_context_catalog_overlay(home.path(), &source, &BTreeMap::new()).unwrap(),
+        source
+    );
+    assert_eq!(fs::read(&source).unwrap(), source_bytes);
+    let mut updated = original;
+    updated["models"][0]["base_instructions"] = json!("Updated by user");
+    fs::write(&source, serde_json::to_vec(&updated).unwrap()).unwrap();
+    let third = prepare_context_catalog_overlay(home.path(), &source, &policies).unwrap();
+    assert_ne!(second, third);
+    let latest: Value = serde_json::from_slice(&fs::read(third).unwrap()).unwrap();
+    assert_eq!(latest["models"][0]["base_instructions"], "Updated by user");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&first).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn custom_context_overlay_rejects_missing_ambiguous_or_invalid_models() {
+    let home = tempfile::tempdir().unwrap();
+    let source = home.path().join("custom.json");
+    let policies = BTreeMap::from([(
+        "route/model".into(),
+        crate::config::ModelContextConfig {
+            context_window_tokens: 128_000,
+            auto_compact_token_limit: None,
+            reserve_output_tokens: None,
+        },
+    )]);
+    for (catalog, message) in [
+        (json!({"models": []}), "缺少已启用的预算模型"),
+        (
+            json!({"models": [{"slug": "other/model"}]}),
+            "缺少已启用的预算模型",
+        ),
+        (
+            json!({"models": [{"slug": "route/model"}, {"slug": "ROUTE/MODEL"}]}),
+            "预算模型重复",
+        ),
+        (json!({"models": {}}), "缺少 models 数组"),
+    ] {
+        let bytes = serde_json::to_vec(&catalog).unwrap();
+        fs::write(&source, &bytes).unwrap();
+        let error = prepare_context_catalog_overlay(home.path(), &source, &policies).unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+        assert_eq!(
+            error.is::<ContextBudgetCatalogError>(),
+            message != "缺少 models 数组"
+        );
+        assert!(!anyhow::anyhow!(error.to_string()).is::<ContextBudgetCatalogError>());
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+        assert!(
+            !home
+                .path()
+                .join("model-catalogs/context-overrides")
+                .exists()
+        );
+    }
+    fs::write(&source, b"not json").unwrap();
+    let error = render_context_catalog_overlay(&source, &policies).unwrap_err();
+    assert!(!error.is::<ContextBudgetCatalogError>());
+    assert!(
+        render_context_catalog_overlay(&source, &BTreeMap::new())
+            .unwrap()
+            .is_none()
+    );
+    let original = br#"{"models":[{"slug":"route/model"}]}"#;
+    fs::write(&source, original).unwrap();
+    let mut invalid = policies;
+    invalid
+        .get_mut("route/model")
+        .unwrap()
+        .auto_compact_token_limit = Some(128_000);
+    let error = prepare_context_catalog_overlay(home.path(), &source, &invalid).unwrap_err();
+    assert!(error.is::<ContextBudgetCatalogError>());
+    assert_eq!(fs::read(&source).unwrap(), original);
+    assert!(
+        !home
+            .path()
+            .join("model-catalogs/context-overrides")
+            .exists()
+    );
+}
+
+#[cfg(test)]
+#[test]
 fn cached_context_projection_preserves_missing_fields_and_is_idempotent() {
     for mut model in [
         json!({"slug": "route/gpt-5.6-sol", "codey_source": "third_party"}),
@@ -2493,6 +3132,191 @@ mod tests {
         assert!(dispatch_model_ids(home.path(), false).is_err());
     }
 
+    #[test]
+    fn account_snapshot_exposes_models_unknown_to_the_fallback_list() {
+        let home = tempfile::tempdir().unwrap();
+        let snapshot = json!({
+            "codey_account_snapshot": true,
+            "models": [
+                {
+                    "slug": "gpt-6-sol",
+                    "display_name": "GPT-6-Sol",
+                    "visibility": "list",
+                    "description": "GPT-6-Sol",
+                    "base_instructions": "account instructions",
+                    "supported_reasoning_levels": [{"effort": "low"}]
+                },
+                {
+                    "slug": "gpt-6-luna",
+                    "display_name": "GPT-6-Luna",
+                    "visibility": "list",
+                    "description": "GPT-6-Luna",
+                    "base_instructions": "account instructions",
+                    "supported_reasoning_levels": [{"effort": "low"}]
+                }
+            ]
+        });
+        fs::create_dir_all(home.path().join("model-catalogs")).unwrap();
+        fs::write(
+            home.path().join(DEBUG_CATALOG_RELATIVE_PATH),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let state = selection_state(home.path(), true, None, &[], None).unwrap();
+        assert_eq!(state.official_model_ids, ["gpt-6-sol", "gpt-6-luna"]);
+    }
+
+    #[test]
+    fn account_snapshot_borrows_a_local_template_for_slugs_the_fallback_list_omits() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+        let snapshot = json!({
+            "codey_account_snapshot": true,
+            "models": [
+                {
+                    "slug": "gpt-6-sol",
+                    "display_name": "GPT-6-Sol",
+                    "visibility": "list",
+                    "description": "GPT-6-Sol"
+                },
+                {
+                    "slug": "gpt-6-luna",
+                    "display_name": "GPT-6-Luna",
+                    "visibility": "list"
+                },
+                {"slug": "codex-auto-review", "visibility": "hide"}
+            ]
+        });
+        fs::create_dir_all(home.path().join("model-catalogs")).unwrap();
+        fs::write(
+            home.path().join(DEBUG_CATALOG_RELATIVE_PATH),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let state = selection_state(home.path(), true, None, &[], None).unwrap();
+        assert_eq!(state.official_model_ids, ["gpt-6-sol", "gpt-6-luna"]);
+        let sol = state
+            .official_models
+            .iter()
+            .find(|model| model.slug == "gpt-6-sol")
+            .unwrap();
+        assert!(
+            sol.supported_reasoning_efforts
+                .iter()
+                .any(|effort| effort == "ultra")
+        );
+        assert_eq!(
+            refresh_for_provider(home.path(), true, None, &[]).unwrap(),
+            2
+        );
+        let catalog: Value = serde_json::from_slice(
+            &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
+        )
+        .unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        assert!(
+            models
+                .iter()
+                .all(|model| model_instruction_source(model).is_some())
+        );
+        let luna = models
+            .iter()
+            .find(|model| model["slug"] == "gpt-6-luna")
+            .unwrap();
+        assert_eq!(luna["description"], "GPT-6-Luna");
+        assert_eq!(luna["multi_agent_version"], "v1");
+        let sol = models
+            .iter()
+            .find(|model| model["slug"] == "gpt-6-sol")
+            .unwrap();
+        assert_eq!(sol["multi_agent_version"], "v2");
+        assert_eq!(sol["description"], "GPT-6-Sol");
+    }
+
+    #[test]
+    fn merging_account_models_preserves_runtime_templates_for_new_slugs() {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join("model-catalogs")).unwrap();
+        let snapshot = json!({
+            "codey_account_snapshot": true,
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "display_name": "GPT-5.6-Sol",
+                    "visibility": "list",
+                    "description": "Local Sol",
+                    "base_instructions": "sol instructions",
+                    "multi_agent_version": "v2"
+                },
+                {
+                    "slug": "gpt-5.6-luna",
+                    "display_name": "GPT-5.6-Luna",
+                    "visibility": "list",
+                    "description": "Local Luna",
+                    "base_instructions": "luna instructions",
+                    "multi_agent_version": "v1"
+                }
+            ]
+        });
+        fs::write(
+            home.path().join(DEBUG_CATALOG_RELATIVE_PATH),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        merge_account_runtime_models(
+            home.path(),
+            &[
+                json!({
+                    "slug": "gpt-5.6-sol",
+                    "display_name": "GPT-5.6-Sol",
+                    "visibility": "list",
+                    "description": "Updated Sol"
+                }),
+                json!({
+                    "slug": "gpt-6-sol",
+                    "display_name": "GPT-6-Sol",
+                    "visibility": "list",
+                    "description": "GPT-6-Sol"
+                }),
+                json!({
+                    "slug": "gpt-6-luna",
+                    "display_name": "GPT-6-Luna",
+                    "visibility": "list"
+                }),
+            ],
+        )
+        .unwrap();
+
+        let saved: Value = serde_json::from_slice(
+            &fs::read(home.path().join(DEBUG_CATALOG_RELATIVE_PATH)).unwrap(),
+        )
+        .unwrap();
+        let models = saved["models"].as_array().unwrap();
+        let sol = models
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(sol["base_instructions"], "sol instructions");
+        assert_eq!(sol["description"], "Updated Sol");
+        let gpt6_sol = models
+            .iter()
+            .find(|model| model["slug"] == "gpt-6-sol")
+            .unwrap();
+        assert_eq!(gpt6_sol["base_instructions"], "sol instructions");
+        assert_eq!(gpt6_sol["description"], "GPT-6-Sol");
+        assert_eq!(gpt6_sol["multi_agent_version"], "v2");
+        let gpt6_luna = models
+            .iter()
+            .find(|model| model["slug"] == "gpt-6-luna")
+            .unwrap();
+        assert_eq!(gpt6_luna["base_instructions"], "luna instructions");
+        assert_eq!(gpt6_luna["description"], "GPT-6-Luna");
+        assert_eq!(gpt6_luna["multi_agent_version"], "v1");
+    }
+
     fn staged_catalog_refresh(home: &Path, selected: &[String], overrides: CatalogOverrides<'_>) {
         refresh_for_provider_with_capabilities(
             home,
@@ -2545,6 +3369,7 @@ mod tests {
             }],
         )]);
         let overrides = CatalogOverrides {
+            plugin_contexts: &Default::default(),
             contexts: &contexts,
             reasoning_efforts: &efforts,
         };
@@ -2570,6 +3395,7 @@ mod tests {
         apply_catalog_overrides(
             combined.path(),
             CatalogOverrides {
+                plugin_contexts: &Default::default(),
                 contexts: &contexts,
                 reasoning_efforts: &no_efforts,
             },
@@ -2607,6 +3433,7 @@ mod tests {
         )]);
         let efforts = std::collections::BTreeMap::new();
         let overrides = CatalogOverrides {
+            plugin_contexts: &Default::default(),
             contexts: &contexts,
             reasoning_efforts: &efforts,
         };
@@ -2659,6 +3486,7 @@ mod tests {
             .collect();
         let efforts = std::collections::BTreeMap::new();
         let overrides = CatalogOverrides {
+            plugin_contexts: &Default::default(),
             contexts: &contexts,
             reasoning_efforts: &efforts,
         };
@@ -2907,6 +3735,48 @@ mod tests {
                 "gpt-5.5",
             ]
         );
+    }
+
+    #[test]
+    fn generated_catalog_follows_the_configured_model_order() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+        let catalog_slugs = || {
+            let catalog: Value = serde_json::from_slice(
+                &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
+            )
+            .unwrap();
+            catalog["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|model| model["slug"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let official_selection = vec![
+            "gpt-5.6-luna".to_string(),
+            "gpt-5.5".to_string(),
+            "gpt-6-astra".to_string(),
+        ];
+        assert_eq!(
+            refresh_for_provider(home.path(), true, None, &official_selection).unwrap(),
+            3
+        );
+        assert_eq!(catalog_slugs(), official_selection);
+
+        // 本地路由目录里官方原生 ID 与第三方别名混排，也按线路配置的顺序输出。
+        let mixed_selection = vec![
+            "kimi/k3".to_string(),
+            "gpt-5.6-sol".to_string(),
+            "kimi/kimi-for-coding".to_string(),
+        ];
+        assert_eq!(
+            refresh_for_provider(home.path(), false, Some(&mixed_selection), &mixed_selection)
+                .unwrap(),
+            3
+        );
+        assert_eq!(catalog_slugs(), mixed_selection);
     }
 
     #[test]
@@ -3380,9 +4250,9 @@ mod tests {
                 .map(|model| model["slug"].as_str().unwrap())
                 .collect::<Vec<_>>(),
             [
-                "gpt-6-astra",
                 "gpt-5.6-sol",
                 "gpt-5.6-luna",
+                "gpt-6-astra",
                 "route-oc/deepseek-flash",
             ]
         );
@@ -3428,9 +4298,9 @@ mod tests {
                 .map(|model| model["slug"].as_str().unwrap())
                 .collect::<Vec<_>>(),
             [
-                "gpt-6-astra",
                 "gpt-5.6-sol",
                 "gpt-5.6-luna",
+                "gpt-6-astra",
                 "route-oc/deepseek-flash",
             ]
         );
@@ -3739,6 +4609,46 @@ mod tests {
     }
 
     #[test]
+    fn plugin_reasoning_capability_stays_bounded_after_template_metadata() {
+        let mut model = json!({
+            "slug": "plugin/gpt-6-astra",
+            "supported_reasoning_levels": [
+                {"effort": "low"},
+                {"effort": "medium"},
+                {"effort": "high"},
+                {"effort": "xhigh"},
+                {"effort": "max"},
+                {"effort": "ultra"}
+            ],
+            "default_reasoning_level": "ultra"
+        });
+        let declaration = vec![
+            crate::config::ModelReasoningEffort {
+                level: "low".into(),
+                value: "low".into(),
+            },
+            crate::config::ModelReasoningEffort {
+                level: "medium".into(),
+                value: "medium".into(),
+            },
+            crate::config::ModelReasoningEffort {
+                level: "high".into(),
+                value: "high".into(),
+            },
+            crate::config::ModelReasoningEffort {
+                level: "xhigh".into(),
+                value: "xhigh".into(),
+            },
+        ];
+        apply_model_reasoning_efforts(&mut model, Some(&declaration));
+        assert_eq!(
+            reasoning_efforts_from_value(&model),
+            ["low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(model["default_reasoning_level"], "low");
+    }
+
+    #[test]
     fn websocket_preference_is_isolated_per_route_model_alias() {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
@@ -3932,8 +4842,19 @@ mod tests {
         )
         .unwrap();
         let models = catalog["models"].as_array().unwrap();
-        let model = models.last().unwrap();
+        // 已配置的模型排在最前，未同步时补入的官方模型保持固定顺序跟在后面。
+        let model = models.first().unwrap();
         assert_eq!(model["slug"], "provider-fast-coder");
+        assert_eq!(
+            models[1..]
+                .iter()
+                .map(|model| model["slug"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            OFFICIAL_MODELS
+                .iter()
+                .map(|(slug, _)| *slug)
+                .collect::<Vec<_>>()
+        );
         assert_eq!(model["codey_source"], "third_party");
         assert_eq!(model["visibility"], "list");
         assert_eq!(model["supported_in_api"], true);
@@ -4018,6 +4939,69 @@ mod tests {
         );
         assert!(astra.get("multi_agent_version").is_none());
         assert!(astra.get("multi_agent_reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn luna_forwards_ultra_even_when_the_template_stops_at_max() {
+        let luna = json!({
+            "slug": "gpt-6-luna",
+            "default_reasoning_level": "medium",
+            "base_instructions": "luna instructions",
+            "supported_reasoning_levels": [
+                {"effort": "low"}, {"effort": "medium"}, {"effort": "high"},
+                {"effort": "xhigh"}, {"effort": "max"}
+            ]
+        });
+        assert_eq!(
+            third_party_reasoning_efforts_from_value(&luna),
+            ["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert!(!third_party_template_supports_coordination(&luna));
+
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join("model-catalogs")).unwrap();
+        fs::write(
+            home.path().join(DEBUG_CATALOG_RELATIVE_PATH),
+            serde_json::to_vec(&json!({
+                "codey_account_snapshot": true,
+                "models": [luna.clone()]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let route = vec![
+            "codey-official-account-67fa10d5-0cf6-4653-ad8b-34664dde569e/gpt-6-luna".to_string(),
+        ];
+        refresh_for_provider(home.path(), false, Some(&route), &route).unwrap();
+        let catalog = read_catalog_value(&home.path().join(relative_path())).unwrap();
+        let written = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| {
+                model["slug"]
+                    .as_str()
+                    .is_some_and(|slug| slug.ends_with("/gpt-6-luna"))
+            })
+            .unwrap();
+        assert_eq!(
+            reasoning_efforts_from_value(written),
+            ["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+
+        let state = selection_state(home.path(), true, None, &["gpt-6-luna".into()], None).unwrap();
+        let metadata = state
+            .official_models
+            .iter()
+            .find(|model| model.slug == "gpt-6-luna")
+            .unwrap();
+        assert!(
+            metadata
+                .supported_reasoning_efforts
+                .iter()
+                .any(|effort| effort == "ultra")
+        );
+        assert_eq!(metadata.default_reasoning_effort, "medium");
     }
 
     #[test]
@@ -4376,6 +5360,38 @@ mod tests {
                 .iter()
                 .filter(|model| model.slug != "gpt-5.6-sol")
                 .all(|model| !model.supported)
+        );
+    }
+
+    #[test]
+    fn synced_official_account_keeps_unchecked_models_disabled() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+        let upstream = vec![
+            "gpt-5.6-sol".into(),
+            "gpt-5.6-luna".into(),
+            "gpt-5.5".into(),
+        ];
+        let selected = vec!["gpt-5.6-sol".into()];
+
+        let state = selection_state(
+            home.path(),
+            true,
+            Some(&upstream),
+            &selected,
+            Some("gpt-5.6-luna"),
+        )
+        .unwrap();
+
+        assert_eq!(state.default_model, "gpt-5.6-sol");
+        assert_eq!(
+            state
+                .official_models
+                .iter()
+                .filter(|model| model.supported)
+                .map(|model| model.slug.as_str())
+                .collect::<Vec<_>>(),
+            ["gpt-5.6-sol"]
         );
     }
 
@@ -4774,4 +5790,62 @@ mod tests {
             "CACHED instructions for gpt-5.6-sol"
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn plugin_context_defaults_yield_to_users_and_restore_after_override_removal() {
+    use crate::config::ModelContextConfig;
+    use std::collections::BTreeMap;
+    let plugin = BTreeMap::from([(
+        "route/model".into(),
+        ModelContextConfig {
+            context_window_tokens: 918000,
+            auto_compact_token_limit: Some(826000),
+            reserve_output_tokens: None,
+        },
+    )]);
+    let user = BTreeMap::from([(
+        "route/model".into(),
+        ModelContextConfig {
+            context_window_tokens: 100000,
+            auto_compact_token_limit: Some(80000),
+            reserve_output_tokens: None,
+        },
+    )]);
+    let empty = BTreeMap::new();
+    let reasoning = BTreeMap::new();
+    let mut models = vec![json!({"slug":"route/model"})];
+    apply_overrides_to_models(
+        &mut models,
+        CatalogOverrides {
+            plugin_contexts: &plugin,
+            contexts: &empty,
+            reasoning_efforts: &reasoning,
+        },
+    )
+    .unwrap();
+    assert_eq!(models[0]["context_window"], 918000);
+    assert_eq!(models[0]["codey_context_source"], "plugin_declared");
+    apply_overrides_to_models(
+        &mut models,
+        CatalogOverrides {
+            plugin_contexts: &plugin,
+            contexts: &user,
+            reasoning_efforts: &reasoning,
+        },
+    )
+    .unwrap();
+    assert_eq!(models[0]["context_window"], 100000);
+    assert_eq!(models[0]["codey_context_source"], "user_declared");
+    apply_overrides_to_models(
+        &mut models,
+        CatalogOverrides {
+            plugin_contexts: &plugin,
+            contexts: &empty,
+            reasoning_efforts: &reasoning,
+        },
+    )
+    .unwrap();
+    assert_eq!(models[0]["context_window"], 918000);
 }
