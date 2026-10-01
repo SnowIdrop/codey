@@ -13,7 +13,9 @@ const gate = process.env.CODEY_GEMINI_PROBE_GATE;
 const baseline = process.env.CODEY_GEMINI_PROBE_BASELINE ?? 'gpt6';
 const rejected = process.env.CODEY_GEMINI_PROBE_REJECTED === '1';
 const payloadMode = process.env.CODEY_GEMINI_PROBE_PAYLOAD ?? 'plaintext';
-if (!['plaintext','ciphertext'].includes(payloadMode)) throw new Error('Unsupported probe task payload');
+const schemaShape = process.env.CODEY_GEMINI_PROBE_SCHEMA_SHAPE ?? 'top';
+if (!['plaintext','ciphertext','schema'].includes(payloadMode)) throw new Error('Unsupported probe task payload');
+if (!['top','children','additional','search'].includes(schemaShape)) throw new Error('Unsupported probe schema shape');
 const expectedTaskBodyUnavailable = payloadMode === 'ciphertext';
 const plaintextTask = 'TASK_BODY_SENTINEL: preserve strings and docstrings; return CHILD_PROBE_COMPLETE without tools';
 const syntheticCiphertext = Buffer.alloc(73);
@@ -59,15 +61,19 @@ const hooksPath=path.join(home,'hooks.json');
 fs.writeFileSync(hooksPath,JSON.stringify({hooks:{PreToolUse:[{matcher:'*',hooks:[{type:'command',command:hookCommand,commandWindows:hookCommand,timeout:5}]}]}}));
 const identity={event_name:'pre_tool_use',hooks:[{async:false,command:hookCommand,timeout:5,type:'command'}],matcher:'*'};
 const trustedHash='sha256:'+crypto.createHash('sha256').update(JSON.stringify(identity)).digest('hex');
-const captures=[]; let parentTurns=0; let probeError;
+const captures=[]; let parentTurns=0; let probeError; let producedTaskFormat;
+function nativeTools(body) {
+  const input=Array.isArray(body.input)?body.input:[body.input];
+  return [...body.tools??[],...input.filter(i=>i&&(i.type==='additional_tools'||i.type==='tool_search_output'&&i.execution==='client')).flatMap(i=>i.tools??[])];
+}
 function findTool(tools,name,namespace) {
   for (const tool of tools??[]) {
-    if (tool.type==='namespace') { const found=findTool(tool.tools,name,tool.name); if (found) return found; }
+    if (tool.type==='namespace') { const found=findTool([...tool.tools??[],...tool.children??[]],name,tool.name); if (found) return found; }
     if (tool.name===name) return {namespace,tool};
   }
 }
 function callTool(body,name,args) {
-  const found=findTool(body.tools??body.input?.filter(i=>i.type==='additional_tools').flatMap(i=>i.tools),name);
+  const found=findTool(nativeTools(body),name);
   if (!found) throw new Error(`Missing native tool: ${name}`);
   return {type:'function_call',id:`fc_${captures.length}`,call_id:`call_${captures.length}`,name,
     ...(found.namespace?{namespace:found.namespace}:{}),arguments:JSON.stringify(args),status:'completed'};
@@ -95,7 +101,11 @@ const server=http.createServer(async(req,res)=>{
       return;
     }
     parentTurns++;
-    if(parentTurns===1)return nativeResponse(res,[callTool(body,'spawn_agent',{task_name:'gateway_probe_child',...roleInput,fork_turns:'none',message:taskPayload})]);
+    if(parentTurns===1) {
+      const encrypted=payloadMode==='ciphertext'||payloadMode==='schema'&&findTool(nativeTools(body),'spawn_agent')?.tool.parameters?.properties?.message?.encrypted===true;
+      producedTaskFormat=encrypted?'ciphertext':'plaintext';
+      return nativeResponse(res,[callTool(body,'spawn_agent',{task_name:'gateway_probe_child',...roleInput,fork_turns:'none',message:encrypted?syntheticCiphertext.toString('base64url'):taskPayload})]);
+    }
     if(parentTurns===2&&!rejected)return nativeResponse(res,[callTool(body,'wait_agent',{timeout_ms:10000})]);
     nativeResponse(res,[{type:'message',id:'msg_parent',role:'assistant',status:'completed',content:[{type:'output_text',text:'PARENT_PROBE_COMPLETE',annotations:[]}]}]);
   }catch(error){probeError=String(error);res.writeHead(500);res.end('local probe failed');}
@@ -108,6 +118,37 @@ while(!fs.existsSync(path.join(root,'router.json'))) {
   await new Promise(resolve=>setTimeout(resolve,50));
 }
 const endpoint=JSON.parse(fs.readFileSync(path.join(root,'router.json'),'utf8'));
+const schemaIngress=http.createServer(async(req,res)=>{
+  try {
+    const chunks=[];for await(const chunk of req)chunks.push(chunk);
+    let bytes=Buffer.concat(chunks);
+    if(req.headers['content-encoding']==='zstd')bytes=zlib.zstdDecompressSync(bytes);
+    if(req.headers['content-encoding']==='gzip')bytes=zlib.gunzipSync(bytes);
+    const body=JSON.parse(bytes.toString());
+    if((body.model===parent.slug||body.model===parentModel)&&schemaShape!=='top') {
+      const agents=body.tools?.find(tool=>tool.type==='namespace'&&tool.name==='agents');
+      if(agents) {
+        if(schemaShape==='children') {agents.children=agents.tools;delete agents.tools;}
+        else {
+          body.tools=body.tools.filter(tool=>tool!==agents);
+          const input=Array.isArray(body.input)?body.input:[body.input];
+          const definitions=schemaShape==='additional'
+            ?[{type:'additional_tools',role:'developer',tools:[agents]}]
+            :[{type:'tool_search_call',execution:'client',call_id:'call_probe_search',arguments:{goal:'load collaboration tools'}},
+              {type:'tool_search_output',execution:'client',call_id:'call_probe_search',tools:[agents]}];
+          body.input=[...definitions,...input];
+        }
+      }
+    }
+    const headers=Object.fromEntries(Object.entries(req.headers).filter(([key])=>!['host','connection','content-length','content-encoding'].includes(key)));
+    const response=await fetch(endpoint.base_url.replace(/\/v1\/?$/,'')+req.url,{method:'POST',headers,body:JSON.stringify(body)});
+    res.writeHead(response.status,{'Content-Type':response.headers.get('content-type')??'application/json'});
+    for await(const chunk of response.body)res.write(chunk);
+    res.end();
+  }catch(error){probeError=String(error);res.writeHead(500);res.end('local schema ingress failed');}
+});
+await new Promise(resolve=>schemaIngress.listen(0,'127.0.0.1',resolve));
+const cliBaseURL=`http://127.0.0.1:${schemaIngress.address().port}/v1`;
 const slash=p=>p.replaceAll('\\','/');
 fs.writeFileSync(path.join(home,'config.toml'),`model=${JSON.stringify(parent.slug)}
 model_provider="probe"
@@ -121,7 +162,7 @@ hooks=true
 trusted_hash=${JSON.stringify(trustedHash)}
 [model_providers.probe]
 name="Local Codey route probe"
-base_url=${JSON.stringify(endpoint.base_url)}
+base_url=${JSON.stringify(cliBaseURL)}
 wire_api="responses"
 requires_openai_auth=false
 request_max_retries=0
@@ -148,6 +189,7 @@ const child=spawn(cli,['exec','--skip-git-repo-check','--ignore-rules','-C',work
 let stdout='',stderr='';child.stdout.on('data',d=>stdout+=d);child.stderr.on('data',d=>stderr+=d);
 const timer=setTimeout(()=>{probeError='Native probe timed out';child.kill();},90000);
 const exitCode=await new Promise(resolve=>child.on('close',resolve));clearTimeout(timer);
+schemaIngress.closeAllConnections();await new Promise(resolve=>schemaIngress.close(resolve));
 server.closeAllConnections();await new Promise(resolve=>server.close(resolve));
 fs.writeFileSync(path.join(root,'stdout.jsonl'),stdout);fs.writeFileSync(path.join(root,'stderr.log'),stderr);
 const childRequests=captures.filter(c=>c.body.model===childModel);
@@ -157,11 +199,11 @@ const childLogs=fs.existsSync(sessions)?fs.readdirSync(sessions,{recursive:true}
 const childMetadata=childLogs.map(rows=>rows[0].payload);
 const hookInputs=fs.existsSync(path.join(root,'hooks.jsonl'))?fs.readFileSync(path.join(root,'hooks.jsonl'),'utf8').trim().split('\n').map(JSON.parse):[];
 const hookResults=fs.existsSync(path.join(root,'hook-results.jsonl'))?fs.readFileSync(path.join(root,'hook-results.jsonl'),'utf8').trim().split('\n').map(JSON.parse):[];
-const tools=captures[0]?.body.tools??captures[0]?.body.input?.filter(i=>i.type==='additional_tools').flatMap(i=>i.tools);
+const tools=captures[0]?nativeTools(captures[0].body):[];
 const spawnSchema=findTool(tools,'spawn_agent')?.tool.parameters;
 const roleRejected=hookResults.some(r=>r.output?.includes('CODEY_SUBAGENT_ROLE_')&&r.output.includes('deny'));
 const taskBodyUnavailable=childLogs.some(rows=>JSON.stringify(rows).includes('agent_task_body_unavailable'))||stdout.includes('agent_task_body_unavailable')||stderr.includes('agent_task_body_unavailable')||captures.some(c=>JSON.stringify(c.body).includes('agent_task_body_unavailable'));
-const summary={baseline,parentModel,roleInput,payloadMode,expectedTaskBodyUnavailable,expectedRejection:rejected,exitCode,probeError,childRequestCount:childRequests.length,
+const summary={baseline,parentModel,roleInput,payloadMode,schemaShape,producedTaskFormat,expectedTaskBodyUnavailable,expectedRejection:rejected,exitCode,probeError,childRequestCount:childRequests.length,
   plaintextSchemaRequested:spawnSchema?.properties?.message?.encrypted!==true,
   taskBodyUnavailable,
   noChildUpstreamRequest:childRequests.length===0,

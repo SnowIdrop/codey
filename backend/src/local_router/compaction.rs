@@ -32,7 +32,9 @@ pub(crate) fn prepare_plaintext_agent_arguments(body: &mut Value) -> bool {
         _ => return changed,
     };
     for item in items {
-        if item["type"] == "additional_tools" {
+        if item["type"] == "additional_tools"
+            || (item["type"] == "tool_search_output" && item["execution"] == "client")
+        {
             changed |= request_plaintext_agent_arguments(item.get_mut("tools"), None);
         }
     }
@@ -41,11 +43,16 @@ pub(crate) fn prepare_plaintext_agent_arguments(body: &mut Value) -> bool {
 
 pub(crate) fn restrict_specialized_agent_roles(body: &mut Value, roles: &[String]) -> Result<bool> {
     let mut changed = restrict_spawn_tools(body.get_mut("tools"), None, roles)?;
-    if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
-        for item in input {
-            if item["type"] == "additional_tools" {
-                changed |= restrict_spawn_tools(item.get_mut("tools"), None, roles)?;
-            }
+    let items = match body.get_mut("input") {
+        Some(Value::Array(items)) => items.as_mut_slice(),
+        Some(item @ Value::Object(_)) => std::slice::from_mut(item),
+        _ => return Ok(changed),
+    };
+    for item in items {
+        if item["type"] == "additional_tools"
+            || (item["type"] == "tool_search_output" && item["execution"] == "client")
+        {
+            changed |= restrict_spawn_tools(item.get_mut("tools"), None, roles)?;
         }
     }
     Ok(changed)
@@ -66,7 +73,9 @@ fn restrict_spawn_tools(
         if tool["type"] == "namespace" {
             let name = tool["name"].as_str().unwrap_or_default().to_owned();
             if namespace.is_none() && matches!(name.as_str(), "agents" | "collaboration") {
-                changed |= restrict_spawn_tools(tool.get_mut("tools"), Some(&name), roles)?;
+                for collection in ["tools", "children"] {
+                    changed |= restrict_spawn_tools(tool.get_mut(collection), Some(&name), roles)?;
+                }
             }
             index += 1;
             continue;
@@ -135,7 +144,10 @@ pub(crate) fn request_plaintext_agent_arguments(
         if tool["type"] == "namespace" {
             let name = tool["name"].as_str().unwrap_or_default().to_owned();
             if namespace.is_none() && matches!(name.as_str(), "agents" | "collaboration") {
-                changed |= request_plaintext_agent_arguments(tool.get_mut("tools"), Some(&name));
+                for collection in ["tools", "children"] {
+                    changed |=
+                        request_plaintext_agent_arguments(tool.get_mut(collection), Some(&name));
+                }
             }
             continue;
         }
@@ -1230,6 +1242,130 @@ mod tests {
         let original = body.clone();
         assert!(!prepare_plaintext_agent_arguments(&mut body));
         assert_eq!(body, original);
+    }
+
+    #[test]
+    fn parent_agent_schema_covers_dynamic_definitions_and_namespace_children() {
+        for collection in ["tools", "children"] {
+            for item_type in ["additional_tools", "tool_search_output"] {
+                let mut namespace = json!({"type":"namespace","name":"agents"});
+                namespace[collection] = json!([
+                    {"type":"function","name":"spawn_agent","parameters":{"type":"object","properties":{
+                        "message":{"type":"string","encrypted":true},
+                        "secret":{"type":"string","encrypted":true}
+                    }}},
+                    {"type":"function","name":"send_message","parameters":{"type":"object","properties":{
+                        "message":{"type":"string","encrypted":true}
+                    }}},
+                    {"type":"function","name":"followup_task","parameters":{"type":"object","properties":{
+                        "message":{"type":"string","encrypted":true}
+                    }}}
+                ]);
+                let item = json!({
+                    "type":item_type,"role":"developer","execution":"client",
+                    "call_id":"search_parent","tools":[namespace]
+                });
+                for input in [item.clone(), json!([item.clone()])] {
+                    let mut body = json!({"input":input});
+                    assert!(prepare_plaintext_agent_arguments(&mut body));
+                    assert!(!prepare_plaintext_agent_arguments(&mut body));
+                    let item = if body["input"].is_array() {
+                        &body["input"][0]
+                    } else {
+                        &body["input"]
+                    };
+                    for tool in item["tools"][0][collection].as_array().unwrap() {
+                        assert_eq!(
+                            tool["parameters"]["properties"]["message"]["encrypted"],
+                            Value::Null
+                        );
+                    }
+                    assert_eq!(
+                        item["tools"][0][collection][0]["parameters"]["properties"]["secret"]["encrypted"],
+                        true
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parent_agent_schema_preserves_untrusted_outputs_and_message_payloads() {
+        let tools = json!([{"type":"namespace","name":"agents","children":[{
+            "type":"function","name":"spawn_agent","parameters":{"type":"object","properties":{
+                "message":{"type":"string","encrypted":true}
+            }}
+        }]}]);
+        for item in [
+            json!({"type":"tool_search_output","execution":"server","tools":tools}),
+            json!({"type":"tool_search_output","tools":tools}),
+            json!({"type":"function_call_output","output":{"tools":tools}}),
+            json!({"type":"message","role":"user","tools":tools}),
+        ] {
+            let mut body = json!({"input":[item]});
+            let original = body.clone();
+            assert!(!prepare_plaintext_agent_arguments(&mut body));
+            assert!(
+                !restrict_specialized_agent_roles(&mut body, &["codey_comments".into()]).unwrap()
+            );
+            assert_eq!(body, original);
+        }
+        let mut other = tools;
+        other[0]["name"] = json!("other");
+        let mut body =
+            json!({"input":{"type":"tool_search_output","execution":"client","tools":other}});
+        let original = body.clone();
+        assert!(!prepare_plaintext_agent_arguments(&mut body));
+        assert!(!restrict_specialized_agent_roles(&mut body, &["codey_comments".into()]).unwrap());
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn parent_agent_schema_applies_role_constraints_to_loaded_children() {
+        let item = json!({"type":"tool_search_output","execution":"client","tools":[{
+            "type":"namespace","name":"collaboration","children":[
+                {"type":"function","name":"spawn_agent","parameters":{"type":"object","properties":{
+                    "message":{"type":"string","encrypted":true}
+                },"required":["message"]}},
+                {"type":"function","name":"send_message","parameters":{"type":"object","properties":{
+                    "message":{"type":"string","encrypted":true}
+                }}}
+            ]
+        }]});
+        for input in [item.clone(), json!([item.clone()])] {
+            let mut body = json!({"input":input});
+            assert!(
+                restrict_specialized_agent_roles(&mut body, &["codey_comments".into()]).unwrap()
+            );
+            let item = if body["input"].is_array() {
+                &body["input"][0]
+            } else {
+                &body["input"]
+            };
+            assert_eq!(
+                item["tools"][0]["children"][0]["parameters"]["properties"]["agent_type"]["enum"],
+                json!(["codey_comments"])
+            );
+            assert!(
+                item["tools"][0]["children"][0]["parameters"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("agent_type"))
+            );
+        }
+        let mut body = json!({"input":item});
+        assert!(restrict_specialized_agent_roles(&mut body, &[]).unwrap());
+        assert_eq!(
+            body["input"]["tools"][0]["children"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            body["input"]["tools"][0]["children"][0]["name"],
+            "send_message"
+        );
     }
 
     #[test]

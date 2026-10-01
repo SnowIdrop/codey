@@ -10297,6 +10297,131 @@ async fn portable_agent_schema_opt_in_reaches_native_upstream() {
 }
 
 #[tokio::test]
+async fn parent_agent_schema_controls_task_generation_on_native_routes() {
+    use base64::Engine as _;
+    let mut bytes = vec![0u8; 73];
+    bytes[0] = 0x80;
+    let ciphertext = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let task = "PARENT_TASK_BODY_SENTINEL: inspect the isolated fixture only.";
+    for enabled in [true, false] {
+        for placement in [
+            "top_children",
+            "additional_object",
+            "search_object",
+            "search_array_children",
+        ] {
+            let schema_path = match placement {
+                "top_children" => "/tools/0/children/0/parameters",
+                "additional_object" | "search_object" => "/input/tools/0/tools/0/parameters",
+                _ => "/input/0/tools/0/children/0/parameters",
+            };
+            let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let opaque = ciphertext.clone();
+            let captured = tokio::spawn(async move {
+                let (mut stream, _) = upstream.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await.unwrap();
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                let schema = body.pointer(schema_path).unwrap();
+                let message = if schema["properties"]["message"]["encrypted"] == true {
+                    opaque.as_str()
+                } else {
+                    task
+                };
+                write_json_response(&mut stream, 200, &json!({
+                    "id":"resp_parent_generation","object":"response","status":"completed","model":body["model"],
+                    "output":[{"type":"function_call","id":"fc_parent_generation","call_id":"call_parent_generation",
+                        "name":"spawn_agent","namespace":"agents","arguments":json!({
+                            "task_name":"sync_parent_probe","agent_type":"codey_quick_scan","fork_turns":"none","message":message
+                        }).to_string()}]
+                })).await.unwrap();
+                body
+            });
+            let (mut config, provider, model) = router_config(format!("http://{address}/v1"));
+            config.subagent_optimization = true;
+            config.subagent_plaintext_messages = enabled;
+            for (role, selection) in &mut config.subagent_roles {
+                selection.enabled = role == "codey_quick_scan";
+            }
+            let router = LocalRouter::start(&config).await.unwrap();
+            let endpoint = router.endpoint();
+            let functions = json!([{"type":"function","name":"spawn_agent","parameters":{
+                "type":"object","properties":{
+                    "message":{"type":"string","encrypted":true},
+                    "secret":{"type":"string","encrypted":true}
+                },"required":["message"]
+            }}]);
+            let mut namespace = json!({"type":"namespace","name":"agents"});
+            namespace[if placement.ends_with("children") {
+                "children"
+            } else {
+                "tools"
+            }] = functions;
+            let mut body = json!({"model":model_alias(&provider, &model)});
+            match placement {
+                "top_children" => {
+                    body["tools"] = json!([namespace]);
+                    body["input"] = json!("generate the sentinel");
+                }
+                "additional_object" => {
+                    body["input"] =
+                        json!({"type":"additional_tools","role":"developer","tools":[namespace]});
+                }
+                "search_object" => {
+                    body["input"] = json!({"type":"tool_search_output","execution":"client","call_id":"call_search","tools":[namespace]});
+                }
+                _ => {
+                    body["input"] = json!([
+                        {"type":"tool_search_output","execution":"client","call_id":"call_search","tools":[namespace]},
+                        {"role":"user","content":"x".repeat(2 * 1024 * 1024)}
+                    ]);
+                }
+            }
+            let response = reqwest::Client::new()
+                .post(format!("{}/responses", endpoint.base_url))
+                .bearer_auth(&endpoint.token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let response: Value = response.json().await.unwrap();
+            let args: Value =
+                serde_json::from_str(response["output"][0]["arguments"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                args["message"],
+                if enabled { task } else { ciphertext.as_str() },
+                "{placement}"
+            );
+            let body = captured.await.unwrap();
+            let schema = body.pointer(schema_path).unwrap();
+            assert_eq!(
+                schema["properties"]["message"]["encrypted"],
+                if enabled { Value::Null } else { json!(true) }
+            );
+            assert_eq!(schema["properties"]["secret"]["encrypted"], true);
+            assert_eq!(
+                schema["properties"]["agent_type"]["enum"],
+                json!(["codey_quick_scan"])
+            );
+            assert!(
+                schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("agent_type"))
+            );
+            if placement == "search_array_children" {
+                assert_eq!(
+                    body["input"][1]["content"].as_str().unwrap().len(),
+                    2 * 1024 * 1024
+                );
+            }
+            router.stop().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn unsupported_agent_ciphertext_is_rejected_before_upstream_connection() {
     use base64::Engine as _;
     // Structurally valid token, no actual secret or provider key involved.

@@ -793,7 +793,7 @@ async fn gemini_native_cli_child_through_actual_router() {
             true,
         ),
     ] {
-        run_native_role_probe(baseline, role, rejected, true, "plaintext").await;
+        run_native_role_probe(baseline, role, rejected, true, "plaintext", "top").await;
     }
 }
 
@@ -803,6 +803,7 @@ async fn run_native_role_probe(
     rejected: bool,
     plaintext_messages: bool,
     payload: &str,
+    schema_shape: &str,
 ) {
     let cli = std::env::var_os("CODEY_GEMINI_PROBE_CLI").expect("set native CLI path");
     let catalog =
@@ -826,6 +827,7 @@ async fn run_native_role_probe(
         )
         .env("CODEY_GEMINI_PROBE_BASELINE", baseline)
         .env("CODEY_GEMINI_PROBE_PAYLOAD", payload)
+        .env("CODEY_GEMINI_PROBE_SCHEMA_SHAPE", schema_shape)
         .env("CODEY_GEMINI_PROBE_ROLE_INPUT", role_input.to_string())
         .env(
             "CODEY_GEMINI_PROBE_REJECTED",
@@ -976,6 +978,7 @@ async fn deepseek_native_cli_preserves_max_reasoning() {
         false,
         true,
         "plaintext",
+        "top",
     )
     .await;
 }
@@ -998,8 +1001,25 @@ async fn gemini_native_cli_agent_task_delivery_probe() {
                 false,
                 plaintext_messages,
                 payload,
+                "top",
             )
             .await;
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires native CLI, captured catalog and built Codey gate paths; loopback model traffic only"]
+async fn parent_native_cli_schema_driven_task_generation() {
+    for schema_shape in ["children", "additional", "search"] {
+        run_native_role_probe(
+            "coding-agent",
+            json!({"agent_type":"codey_quick_scan"}),
+            false,
+            true,
+            "schema",
+            schema_shape,
+        )
+        .await;
     }
 }
