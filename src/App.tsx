@@ -319,15 +319,12 @@ export function App({
     setNotice,
   });
   const {
-    automaticallyChecking,
     updateResult,
     updateCheck,
     downloadedUpdate,
     checkForUpdates,
   } = useAppUpdates({
-    embedded,
     configLoaded,
-    autoCheckCodeyUpdates: config?.autoCheckCodeyUpdates !== false,
     isBusy,
     setBusy,
     setNotice,
@@ -451,24 +448,6 @@ export function App({
       setPluginMarketplaceStatus(next);
       return next;
     }
-  }
-
-  function changeAutomaticUpdateChecks(enabled: boolean) {
-    if (!config || isBusy) return;
-    if (enabled) {
-      editConfig({ ...config, autoCheckCodeyUpdates: true });
-      return;
-    }
-    setConfirmation({
-      action: "disable-auto-update-check",
-      title: "关闭自动检查 Codey 更新？",
-      description: "关闭后，若 Codex 更新导致 Codey 插件无法启动，需要手动下载最新版插件包。",
-      confirmLabel: "确认关闭",
-      run: () => {
-        setConfig((current) => current ? { ...current, autoCheckCodeyUpdates: false } : current);
-        setDirty(true);
-      },
-    });
   }
 
   async function persist(next: Config) {
@@ -1395,7 +1374,7 @@ export function App({
   const hasUpdate =
     updateCheck?.updateAvailable === true &&
     Boolean(updateCheck.selectedAsset);
-  const isCheckingUpdate = busy === "check-update" || automaticallyChecking;
+  const isCheckingUpdate = busy === "check-update";
   const isDownloadingUpdate = busy === "download-update";
   const isInstallingUpdate = busy === "install-update";
   const updateTooltipText = downloadedUpdate
@@ -1807,8 +1786,6 @@ export function App({
         busy={busy}
         onRepairCodexConfig={askRepairCodexConfig}
         configRepairNotice={configRepairNotice}
-        autoCheckCodeyUpdates={config.autoCheckCodeyUpdates !== false}
-        onAutoCheckCodeyUpdatesChange={changeAutomaticUpdateChecks}
       />
     </main>
   );

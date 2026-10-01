@@ -42,7 +42,7 @@ Object.defineProperty(globalThis, "navigator", {
 
 function renderDialog(overrides = {}) {
   reset();
-  const calls = { repair: 0, autoCheck: [] };
+  const calls = { repair: 0 };
   const props = {
     open: true,
     onOpenChange: () => {},
@@ -56,10 +56,6 @@ function renderDialog(overrides = {}) {
       calls.repair += 1;
     },
     configRepairNotice: null,
-    autoCheckCodeyUpdates: true,
-    onAutoCheckCodeyUpdatesChange: (checked) => {
-      calls.autoCheck.push(checked);
-    },
     ...overrides,
   };
   return { calls, props, tree: dialog.SystemSettingsDialog(props) };
@@ -165,7 +161,7 @@ test("设备号复制失败不显示成功反馈", async (t) => {
   assert.equal(collectElements(tree, e => elementProps(e).content === "复制失败，请选中设备号手动复制").length, 1);
 });
 
-test("复制路径、修复配置与自动更新开关都接到真实回调", async (t) => {
+test("复制路径与修复配置接到真实回调，自动更新开关已移除", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   clipboardWrites.length = 0;
   const { calls, tree } = renderDialog();
@@ -191,27 +187,13 @@ test("复制路径、修复配置与自动更新开关都接到真实回调", as
   elementProps(repairButton).onClick();
   assert.equal(calls.repair, 1, "点击修复必须触发修复回调");
 
-  const [autoSwitch] = switches(tree);
-  assert.ok(autoSwitch, "自动检查更新必须是开关控件");
-  assert.equal(elementProps(autoSwitch).checked, true);
-  assert.equal(elementProps(autoSwitch).disabled, false);
-  const labelId = elementProps(autoSwitch)["aria-labelledby"];
-  assert.ok(labelId, "开关必须带可访问名");
-  assert.equal(
-    collectElements(tree, (element) => elementProps(element).id === labelId)
-      .length,
-    1,
-    "开关的可访问名必须指向渲染出的标题",
-  );
-  elementProps(autoSwitch).onCheckedChange(false);
-  elementProps(autoSwitch).onCheckedChange(true);
-  assert.deepEqual(calls.autoCheck, [false, true]);
+  assert.equal(switches(tree).length, 0);
+  assert.doesNotMatch(text, /自动检查 Codey 更新/);
 });
 
-test("开关跟随配置、修复中显示进行态", () => {
-  const off = renderDialog({ autoCheckCodeyUpdates: false });
-  assert.equal(elementProps(switches(off.tree)[0]).checked, false);
-
+test("旧配置无法恢复自动检查开关，修复中显示进行态", () => {
+  const legacy = renderDialog({ autoCheckCodeyUpdates: true });
+  assert.equal(switches(legacy.tree).length, 0);
   const busy = renderDialog({ busy: "repair-codex-config", isBusy: true });
   const [busyButton] = byText(busy.tree, "修复中…");
   assert.ok(busyButton, "修复进行中必须显示进行态");
@@ -229,10 +211,9 @@ test("系统设置不出现冗余状态文案", () => {
   assert.doesNotMatch(dialogSource, /检查配置文件并修复异常/);
 });
 
-test("App 把系统设置对话框接到修复命令与自动更新保存入口", () => {
+test("App 保留修复命令与手动更新入口，不再提供自动更新设置", () => {
   assert.match(appSource, /onRepairCodexConfig=\{askRepairCodexConfig\}/);
-  assert.match(appSource, /onAutoCheckCodeyUpdatesChange=\{changeAutomaticUpdateChecks\}/);
-  assert.match(appSource, /autoCheckCodeyUpdates=\{config\.autoCheckCodeyUpdates !== false\}/);
+  assert.doesNotMatch(appSource, /autoCheckCodeyUpdates|changeAutomaticUpdateChecks/);
   assert.match(appSource, /invoke<[\s\S]{0,240}?>\("repair_codex_config"\)/);
   assert.match(appSource, /className="sidebar-footer-bar"/);
   assert.match(appSource, /className="sidebar-footer-left"/);

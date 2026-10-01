@@ -4,44 +4,37 @@ import test from "node:test";
 
 const root = new URL("../", import.meta.url);
 
-test("automatic update checks start after Codex launches and share runtime shutdown", async () => {
+test("startup and launch failures never check for updates; manual installs retain shutdown", async () => {
   const library = await readFile(
     new URL("backend/src/lib.rs", root),
     "utf8",
   );
-  const update = library.indexOf("startup_update::run(&state, &ui)");
   const launch = library.indexOf(
     "commands::launch_codey_runtime(&state).await",
   );
 
   assert.notEqual(launch, -1);
-  assert.ok(launch < update);
-  assert.match(
-    library.slice(launch, update),
-    /Ok\(_\) => \{\s*break wait_for_runtime_shutdown\(/,
-  );
+  assert.doesNotMatch(library, /startup_update|check_for_update_candidate|run_after_launch_failure/);
   assert.match(
     library,
-    /StartupUpdateOutcome::InstallScheduled \{[\s\S]*?return ShutdownReason::InstallUpdate;/,
+    /AppShutdownReason::InstallUpdate => ShutdownReason::InstallUpdate/,
   );
 });
 
-test("Windows startup update UI uses a dedicated message loop and custom task-dialog buttons", async () => {
+test("native error and context dialogs retain custom buttons without an update status thread", async () => {
   const [ui, manifest, cargo] = await Promise.all([
     readFile(new URL("backend/src/native_update_ui.rs", root), "utf8"),
     readFile(new URL("backend/build.rs", root), "utf8"),
     readFile(new URL("backend/Cargo.toml", root), "utf8"),
   ]);
 
-  assert.match(ui, /name\("codey-native-update-ui"\.to_string\(\)\)/);
-  assert.match(ui, /GetMessageW\(&mut message, None, 0, 0\)/);
-  assert.match(ui, /PostThreadMessageW\(self\.thread\.thread_id, WM_APP/);
+  assert.doesNotMatch(ui, /codey-native-update-ui|confirm_update|show_update_failure|show_status/);
   assert.match(
     ui,
     /rfd::MessageButtons::OkCancelCustom\(primary_label, secondary_label\)/,
   );
-  assert.match(ui, /if rollback[\s\S]*?"回退并重启"[\s\S]*?"更新并重启"/);
-  assert.match(ui, /Some\("稍后"\.to_string\(\)\)/);
+  assert.match(ui, /恢复默认预算并重试/);
+  assert.match(ui, /Codey 启动失败/);
   assert.match(manifest, /Microsoft\.Windows\.Common-Controls/);
   assert.match(manifest, /version="6\.0\.0\.0"/);
   assert.match(cargo, /features = \["common-controls-v6"\]/);
@@ -78,7 +71,7 @@ test("macOS keeps AppKit on the main thread without a Dock icon", async () => {
 
   assert.match(ui, /MainThreadMarker::new\(\)/);
   assert.match(ui, /NSApplicationActivationPolicy::Accessory/);
-  assert.match(ui, /NSPanel::initWithContentRect_styleMask_backing_defer/);
+  assert.doesNotMatch(ui, /NSPanel::initWithContentRect_styleMask_backing_defer/);
   assert.match(ui, /name\("codey-runtime"\.to_string\(\)\)/);
   assert.match(ui, /app\.run\(\)/);
   assert.match(build, /<key>LSUIElement<\/key><true\/>/);

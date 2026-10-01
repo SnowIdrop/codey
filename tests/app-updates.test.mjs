@@ -70,7 +70,7 @@ function harness(enabled, installReport = null) {
 const available = { currentVersion: "1.1.1", latestVersion: "1.2.0", updateAvailable: true };
 const settle = async () => { for (let i = 0; i < 5; i++) await Promise.resolve(); };
 
-test("disabled automatic checks still allow a manual check", async () => {
+test("only a manual check requests update information", async () => {
   const h = harness(false);
   assert.equal(h.requests.length, 0);
   const checking = h.render().checkForUpdates();
@@ -82,39 +82,22 @@ test("disabled automatic checks still allow a manual check", async () => {
   assert.deepEqual(h.render().updateCheck, available);
 });
 
-for (const automaticFirst of [true, false]) {
-  test(`手动检查发起新请求，${automaticFirst ? "先" : "后"}返回的自动检查不覆盖结果`, async () => {
+for (const embedded of [false, true]) {
+  test(`挂载与旧设置变更不会自动检查更新：embedded=${embedded}`, async () => {
     const h = harness(true);
-    let confirmation = null;
-    h.options.setConfirmation = value => { confirmation = value; };
+    h.options.embedded = embedded;
+    for (const enabled of [true, false, true]) {
+      h.options.autoCheckCodeyUpdates = enabled;
+      h.render();
+      await settle();
+      assert.equal(h.requests.length, 0);
+      assert.equal(h.timers.size, 0);
+    }
     const manual = h.render().checkForUpdates();
-    assert.equal(h.requests.length, 2);
-    assert.deepEqual(h.requests[0].args, { forceRefresh: false });
-    assert.deepEqual(h.requests[1].args, { forceRefresh: true });
-    const oldUpdate = {
-      ...available,
-      selectedAsset: { fileName: "Codey-1.2.0.dmg", size: 1048576, url: "https://example.com/old" },
-    };
-    const newUpdate = {
-      ...oldUpdate,
-      latestVersion: "1.3.0",
-      selectedAsset: { ...oldUpdate.selectedAsset, fileName: "Codey-1.3.0.dmg", url: "https://example.com/new" },
-    };
-    if (automaticFirst) {
-      h.requests[0].resolve(oldUpdate);
-      await settle();
-      assert.equal(h.render().updateCheck, null);
-      assert.equal(confirmation, null);
-    }
-    h.requests[1].resolve(newUpdate);
+    h.requests[0].resolve(available);
     await manual;
-    if (!automaticFirst) {
-      h.requests[0].resolve(oldUpdate);
-      await settle();
-    }
-    assert.deepEqual(h.render().updateCheck, newUpdate);
-    assert.deepEqual(h.window.__codeyUpdateAvailability, newUpdate);
-    assert.match(confirmation.title, /1\.3\.0/);
+    assert.deepEqual(h.render().updateCheck, available);
+    assert.equal(h.timers.size, 0);
   });
 }
 
@@ -208,33 +191,6 @@ for (const policyId of [undefined, null]) {
   });
 }
 
-test("disabling an in-flight automatic check ignores its result and clears pending", async () => {
-  const h = harness(true);
-  assert.equal(h.render().automaticallyChecking, true);
-  h.options.autoCheckCodeyUpdates = false;
-  h.render();
-  assert.equal(h.render().automaticallyChecking, false);
-  h.requests[0].resolve(available);
-  await settle();
-  assert.equal(h.render().updateCheck, null);
-  assert.equal(h.window.__codeyUpdateAvailability, undefined);
-  assert.equal(h.timers.size, 0);
-});
-
-test("disabling cancels the next automatic check and enabling starts again", async () => {
-  const h = harness(true);
-  h.requests[0].resolve({ ...available, updateAvailable: false });
-  await settle();
-  h.render();
-  assert.equal(h.timers.size, 1);
-  h.options.autoCheckCodeyUpdates = false;
-  h.render();
-  assert.equal(h.timers.size, 0);
-  h.options.autoCheckCodeyUpdates = true;
-  h.render();
-  assert.equal(h.requests.length, 2);
-});
-
 test("detecting an update with an asset prompts the confirmation dialog", async () => {
   const h = harness(false);
   let confirmation = null;
@@ -270,13 +226,13 @@ test("发布更新日志会同时显示在检查结果和下载确认中", async
   assert.match(confirmation.description, /修复启动稳定性/);
 });
 
-test("发现更新后定时器链仍在，可用更新被清空后继续自动检查", async () => {
+test("手动检查完成或清空可用更新后均不排程自动检查", async () => {
   const h = harness(true);
+  const first = h.render().checkForUpdates();
   h.requests[0].resolve({ ...available, updateAvailable: true });
-  await settle();
+  await first;
   h.render();
-  // 暂停只影响本次检查：下一次 tick 必须仍然排程，否则手动清空状态后自动检查会永久失效。
-  assert.equal(h.timers.size, 1, "发现可用更新后仍要保留下一次检查");
+  assert.equal(h.timers.size, 0);
 
   const manual = h.render().checkForUpdates();
   h.requests[1].resolve({ currentVersion: "1.1.1", latestVersion: "1.1.1", updateAvailable: false });
@@ -284,15 +240,11 @@ test("发现更新后定时器链仍在，可用更新被清空后继续自动�
   await settle();
   h.render();
 
-  const [tick] = [...h.timers.values()];
-  assert.ok(tick, "下一次检查必须已排程");
-  h.timers.clear();
-  tick();
-  await settle();
-  assert.equal(h.requests.length, 3, "状态清空后自动检查必须重新发起请求");
+  assert.equal(h.timers.size, 0);
+  assert.equal(h.requests.length, 2);
 });
 
-test("点「稍后」会记下这个版本，自动检查不再重复弹窗", async () => {
+test("手动下载提示不会开启后台检查或主动下载", async () => {
   const h = harness(true);
   await settle();
   const updateWithAsset = {
@@ -300,7 +252,6 @@ test("点「稍后」会记下这个版本，自动检查不再重复弹窗", as
     selectedAsset: { fileName: "Codey-1.2.0-setup.exe", size: 1048576, url: "https://example.com" },
   };
 
-  // 「稍后」按钮 = 对话框关闭回调，这里直接驱动它。
   let confirmation = null;
   h.options.setConfirmation = (value) => {
     confirmation = value;
@@ -308,34 +259,10 @@ test("点「稍后」会记下这个版本，自动检查不再重复弹窗", as
   h.render().askDownloadUpdate(updateWithAsset);
   assert.ok(confirmation, "应当弹出下载确认");
   assert.equal(confirmation.action, "download-update");
-  confirmation.onDismiss();
-  assert.equal(
-    h.window.sessionStorage.getItem("codey.deferredUpdateVersion"),
-    "1.2.0",
-    "推迟必须被记录",
-  );
-
-  // 首次自动检查返回"无更新"，hook 收尾并排程下一次检查。
-  h.requests[0].resolve({ ...available, updateAvailable: false });
+  confirmation.onDismiss?.();
   await settle();
-  h.render();
-  assert.equal(
-    h.window.sessionStorage.getItem("codey.deferredUpdateVersion"),
-    "1.2.0",
-    "推迟必须被记录",
-  );
-
-  // 下一次检查发现同一个版本：检查照常进行，但不该再打扰用户。
-  const [tick] = [...h.timers.values()];
-  assert.ok(tick, "自动检查必须已排程");
-  h.timers.clear();
-  confirmation = null;
-  tick();
-  await settle();
-  assert.equal(h.requests.length, 2, "自动检查本身仍然继续");
-  h.requests[1].resolve(updateWithAsset);
-  await settle();
-  assert.equal(confirmation, null, "已推迟的版本不应再次弹窗");
+  assert.equal(h.requests.length, 0);
+  assert.equal(h.timers.size, 0);
 });
 
 test("上一次安装失败会在下次启动时提示而不是静默", async () => {
@@ -396,8 +323,6 @@ test('回退需要下载与安装两次确认，下载携带用户确认的授�
   assert.equal(confirmation.title, '回退 Codey 至 v1.0.0');
   assert.match(confirmation.description, /启动异常/);
   assert.equal(confirmation.confirmLabel, '下载回退版本');
-  confirmation.onDismiss();
-  assert.equal(h.sessionStorage.getItem('codey.deferredUpdateVersion'), 'rollback:rollback-1');
   confirmation.run();
   assert.equal(h.requests[1].command, 'download_update');
   assert.deepEqual(h.requests[1].args, { expectedVersion: '1.0.0', expectedPolicyId: 'rollback-1' });
@@ -426,11 +351,13 @@ test('下载前回退授权已失效时展示错误且不进入安装确认', as
 });
 
 for (const deferred of ['rollback:rollback-1', 'rollback:older-rollback', '1.0.0']) {
-  test(`自动回退提醒按授权批次区分：${deferred}`, async () => {
+  test(`旧的稍后记录不影响手动回退确认：${deferred}`, async () => {
     const h = harness(false); let confirmation = null;
     h.options.setConfirmation = value => { confirmation = value; };
-    h.sessionStorage.setItem('codey.deferredUpdateVersion', deferred); h.options.autoCheckCodeyUpdates = true; h.render();
-    h.requests[0].resolve(rollbackUpdate); await settle();
-    assert.equal(confirmation !== null, deferred !== 'rollback:rollback-1');
+    h.sessionStorage.setItem('codey.deferredUpdateVersion', deferred);
+    const checking = h.render().checkForUpdates();
+    h.requests[0].resolve(rollbackUpdate); await checking;
+    assert.equal(confirmation.action, 'download-update');
+    assert.equal(h.timers.size, 0);
   });
 }

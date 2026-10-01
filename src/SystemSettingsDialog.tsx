@@ -16,7 +16,6 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  Switch,
   Tooltip,
 } from "./components/ui";
 import { invoke } from "./api";
@@ -32,8 +31,6 @@ export type SystemSettingsDialogProps = {
   busy: string | null;
   onRepairCodexConfig: () => void;
   configRepairNotice?: { tone: "info" | "success" | "error"; text: string } | null;
-  autoCheckCodeyUpdates: boolean;
-  onAutoCheckCodeyUpdatesChange: (checked: boolean) => void;
 };
 
 function SystemSettingsDialogComponent({
@@ -47,8 +44,6 @@ function SystemSettingsDialogComponent({
   busy,
   onRepairCodexConfig,
   configRepairNotice,
-  autoCheckCodeyUpdates,
-  onAutoCheckCodeyUpdatesChange,
 }: SystemSettingsDialogProps) {
   const [copied, setCopied] = useState(false);
   const [machineNo, setMachineNo] = useState<string | null>(null);
@@ -123,7 +118,7 @@ function SystemSettingsDialogComponent({
             <div className="min-w-0 flex-1">
               <DialogTitle>系统设置与偏好</DialogTitle>
               <DialogDescription>
-                查看版本、设备号与本地路径，管理 Codex 维护与更新策略。
+                查看版本、设备号与本地路径，维护 Codex 配置。
               </DialogDescription>
             </div>
           </div>
@@ -261,19 +256,6 @@ function SystemSettingsDialogComponent({
             )}
           </div>
 
-          {/* 自动检查更新开关 */}
-          <div className="flex items-center justify-between gap-3 rounded-xl border border-[var(--codey-border-subtle)] bg-[var(--codey-surface-muted)] p-3">
-            <span id="system-settings-auto-update-label" className="text-xs font-semibold text-[var(--codey-text)]">
-              自动检查 Codey 更新
-            </span>
-            <Switch
-              size="sm"
-              aria-labelledby="system-settings-auto-update-label"
-              checked={autoCheckCodeyUpdates}
-              disabled={isBusy}
-              onCheckedChange={onAutoCheckCodeyUpdatesChange}
-            />
-          </div>
         </div>
 
         <DialogFooter>

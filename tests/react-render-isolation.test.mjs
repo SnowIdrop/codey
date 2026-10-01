@@ -39,17 +39,12 @@ test("settings panels declare render-isolation hooks and stable handlers", async
   assert.match(confirmation, /export const ConfirmationDialogHost = memo\(/);
   assert.doesNotMatch(app, /async function checkForUpdates\(/);
   assert.match(appUpdates, /export function useAppUpdates/);
-  assert.match(appUpdates, /invoke<UpdateCheck>\("check_for_updates", \{ forceRefresh \}\)/);
+  assert.match(appUpdates, /invoke<UpdateCheck>\("check_for_updates", \{ forceRefresh: true \}\)/);
   assert.equal(
     appUpdates.match(/invoke<UpdateCheck>\("check_for_updates",/g)?.length,
     1,
   );
-  assert.match(
-    appUpdates,
-    /updateCheckInFlightRef = useRef<Promise<UpdateCheck> \| null>/,
-  );
-  assert.match(appUpdates, /const result = await requestUpdateCheck\(\)/);
-  assert.match(appUpdates, /const result = await requestUpdateCheck\(true\)/);
+  assert.doesNotMatch(appUpdates, /checkForUpdatesSilently|AUTO_UPDATE_CHECK_INTERVAL_MS/);
   assert.match(
     app,
     /const handleFooterUpdateClick = useStableEvent\(\(\) => void checkForUpdates\(\)\)/,

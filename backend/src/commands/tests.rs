@@ -1536,7 +1536,7 @@ async fn native_model_cache_without_saved_route_does_not_block_settings_or_reena
 }
 
 #[tokio::test]
-async fn auto_check_codey_updates_save_persists_explicit_and_legacy_values() {
+async fn retired_auto_update_preference_is_not_saved() {
     let directory = tempfile::tempdir().unwrap();
     let state = Arc::new(AppState {
         store: ConfigStore::new(directory.path().join("config.json")),
@@ -1548,23 +1548,13 @@ async fn auto_check_codey_updates_save_persists_explicit_and_legacy_values() {
         payload["autoCheckCodeyUpdates"] = json!(enabled);
         let input = codey_config_save_input(&json!({ "config": payload })).unwrap();
         save_codey_config_locked(&state, input).await.unwrap();
-        assert_eq!(state.config.read().await.auto_check_codey_updates, enabled);
-        assert_eq!(
-            state.store.load().unwrap().auto_check_codey_updates,
-            enabled
-        );
-
-        let mut legacy = serde_json::to_value(state.config.read().await.clone()).unwrap();
-        legacy
-            .as_object_mut()
-            .unwrap()
-            .remove("autoCheckCodeyUpdates");
-        legacy["slimCodexPet"] = json!(false);
-        let input = codey_config_save_input(&json!({ "config": legacy })).unwrap();
-        save_codey_config_locked(&state, input).await.unwrap();
         let saved = state.config.read().await.clone();
-        assert_eq!(saved.auto_check_codey_updates, enabled);
-        assert!(!saved.slim_codex_pet);
+        assert!(
+            serde_json::to_value(&saved)
+                .unwrap()
+                .get("autoCheckCodeyUpdates")
+                .is_none()
+        );
         assert_eq!(state.store.load().unwrap(), saved);
     }
 }
