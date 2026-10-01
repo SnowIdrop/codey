@@ -793,11 +793,17 @@ async fn gemini_native_cli_child_through_actual_router() {
             true,
         ),
     ] {
-        run_native_role_probe(baseline, role, rejected).await;
+        run_native_role_probe(baseline, role, rejected, true, "plaintext").await;
     }
 }
 
-async fn run_native_role_probe(baseline: &str, role_input: Value, rejected: bool) {
+async fn run_native_role_probe(
+    baseline: &str,
+    role_input: Value,
+    rejected: bool,
+    plaintext_messages: bool,
+    payload: &str,
+) {
     let cli = std::env::var_os("CODEY_GEMINI_PROBE_CLI").expect("set native CLI path");
     let catalog =
         std::env::var_os("CODEY_GEMINI_PROBE_CATALOG").expect("set captured catalog path");
@@ -819,6 +825,7 @@ async fn run_native_role_probe(baseline: &str, role_input: Value, rejected: bool
             std::env::var_os("CODEY_GEMINI_PROBE_GATE").expect("set built Codey path"),
         )
         .env("CODEY_GEMINI_PROBE_BASELINE", baseline)
+        .env("CODEY_GEMINI_PROBE_PAYLOAD", payload)
         .env("CODEY_GEMINI_PROBE_ROLE_INPUT", role_input.to_string())
         .env(
             "CODEY_GEMINI_PROBE_REJECTED",
@@ -893,7 +900,7 @@ async fn run_native_role_probe(baseline: &str, role_input: Value, rejected: bool
         profiles,
         selected_models_by_provider: selected,
         subagent_optimization: true,
-        subagent_plaintext_messages: true,
+        subagent_plaintext_messages: plaintext_messages,
         subagent_roles: roles,
         ..CodeyConfig::default()
     }
@@ -924,6 +931,10 @@ async fn run_native_role_probe(baseline: &str, role_input: Value, rejected: bool
     let summary: Value =
         serde_json::from_slice(&std::fs::read(root.join("summary.json")).unwrap()).unwrap();
     assert!(status.success(), "{summary}");
+    assert_eq!(
+        summary["plaintextSchemaRequested"], plaintext_messages,
+        "{summary}"
+    );
     for key in ["hookSawSpawn", "roleSchemaRestricted", "hintComplete"] {
         assert_eq!(summary[key], true, "{summary}");
     }
@@ -931,6 +942,13 @@ async fn run_native_role_probe(baseline: &str, role_input: Value, rejected: bool
         assert_eq!(summary["roleRejected"], true, "{summary}");
         assert_eq!(summary["noChildCreated"], true, "{summary}");
         assert_eq!(summary["childRequestCount"], 0, "{summary}");
+        return;
+    }
+    if payload == "ciphertext" {
+        assert_eq!(summary["taskBodyUnavailable"], true, "{summary}");
+        assert_eq!(summary["noChildUpstreamRequest"], true, "{summary}");
+        assert_eq!(summary["childRequestCount"], 0, "{summary}");
+        assert_eq!(summary["childCompleted"], false, "{summary}");
         return;
     }
     for key in [
@@ -952,5 +970,36 @@ async fn run_native_role_probe(baseline: &str, role_input: Value, rejected: bool
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires native CLI, captured catalog and built Codey gate paths; loopback model traffic only"]
 async fn deepseek_native_cli_preserves_max_reasoning() {
-    run_native_role_probe("deepseek", json!({"agent_type":"codey_worker"}), false).await;
+    run_native_role_probe(
+        "deepseek",
+        json!({"agent_type":"codey_worker"}),
+        false,
+        true,
+        "plaintext",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires native CLI, captured catalog and built Codey gate paths; loopback model traffic only"]
+async fn gemini_native_cli_agent_task_delivery_probe() {
+    for (baseline, role) in [
+        ("gpt6", "codey_comments"),
+        ("coding-agent", "codey_quick_scan"),
+    ] {
+        for (plaintext_messages, payload) in [
+            (false, "ciphertext"),
+            (true, "ciphertext"),
+            (true, "plaintext"),
+        ] {
+            run_native_role_probe(
+                baseline,
+                json!({"agent_type":role}),
+                false,
+                plaintext_messages,
+                payload,
+            )
+            .await;
+        }
+    }
 }

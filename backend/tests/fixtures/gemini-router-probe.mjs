@@ -12,6 +12,13 @@ const sourceCatalog = process.env.CODEY_GEMINI_PROBE_CATALOG;
 const gate = process.env.CODEY_GEMINI_PROBE_GATE;
 const baseline = process.env.CODEY_GEMINI_PROBE_BASELINE ?? 'gpt6';
 const rejected = process.env.CODEY_GEMINI_PROBE_REJECTED === '1';
+const payloadMode = process.env.CODEY_GEMINI_PROBE_PAYLOAD ?? 'plaintext';
+if (!['plaintext','ciphertext'].includes(payloadMode)) throw new Error('Unsupported probe task payload');
+const expectedTaskBodyUnavailable = payloadMode === 'ciphertext';
+const plaintextTask = 'TASK_BODY_SENTINEL: preserve strings and docstrings; return CHILD_PROBE_COMPLETE without tools';
+const syntheticCiphertext = Buffer.alloc(73);
+syntheticCiphertext[0] = 0x80;
+const taskPayload = expectedTaskBodyUnavailable ? syntheticCiphertext.toString('base64url') : plaintextTask;
 if (!root || !cli || !sourceCatalog || !gate) throw new Error('Probe paths must be supplied explicitly');
 const home=path.join(root,'home'), workspace=path.join(root,'workspace');
 fs.mkdirSync(home); fs.mkdirSync(workspace);
@@ -88,7 +95,7 @@ const server=http.createServer(async(req,res)=>{
       return;
     }
     parentTurns++;
-    if(parentTurns===1)return nativeResponse(res,[callTool(body,'spawn_agent',{task_name:'gateway_probe_child',...roleInput,fork_turns:'none',message:'TASK_BODY_SENTINEL: preserve strings and docstrings; return CHILD_PROBE_COMPLETE without tools'})]);
+    if(parentTurns===1)return nativeResponse(res,[callTool(body,'spawn_agent',{task_name:'gateway_probe_child',...roleInput,fork_turns:'none',message:taskPayload})]);
     if(parentTurns===2&&!rejected)return nativeResponse(res,[callTool(body,'wait_agent',{timeout_ms:10000})]);
     nativeResponse(res,[{type:'message',id:'msg_parent',role:'assistant',status:'completed',content:[{type:'output_text',text:'PARENT_PROBE_COMPLETE',annotations:[]}]}]);
   }catch(error){probeError=String(error);res.writeHead(500);res.end('local probe failed');}
@@ -153,7 +160,11 @@ const hookResults=fs.existsSync(path.join(root,'hook-results.jsonl'))?fs.readFil
 const tools=captures[0]?.body.tools??captures[0]?.body.input?.filter(i=>i.type==='additional_tools').flatMap(i=>i.tools);
 const spawnSchema=findTool(tools,'spawn_agent')?.tool.parameters;
 const roleRejected=hookResults.some(r=>r.output?.includes('CODEY_SUBAGENT_ROLE_')&&r.output.includes('deny'));
-const summary={baseline,parentModel,roleInput,expectedRejection:rejected,exitCode,probeError,childRequestCount:childRequests.length,
+const taskBodyUnavailable=childLogs.some(rows=>JSON.stringify(rows).includes('agent_task_body_unavailable'))||stdout.includes('agent_task_body_unavailable')||stderr.includes('agent_task_body_unavailable')||captures.some(c=>JSON.stringify(c.body).includes('agent_task_body_unavailable'));
+const summary={baseline,parentModel,roleInput,payloadMode,expectedTaskBodyUnavailable,expectedRejection:rejected,exitCode,probeError,childRequestCount:childRequests.length,
+  plaintextSchemaRequested:spawnSchema?.properties?.message?.encrypted!==true,
+  taskBodyUnavailable,
+  noChildUpstreamRequest:childRequests.length===0,
   catalogBaseUnmodified:baseline!=='catalog'||(parent.base_instructions===parentEntry.base_instructions&&JSON.stringify(parent.model_messages)===JSON.stringify(parentEntry.model_messages)),
   childCompleted:childLogs.length>0&&childLogs.every(rows=>rows.some(r=>r.type==='event_msg'&&r.payload.type==='task_complete'&&r.payload.last_agent_message?.includes('CHILD_PROBE_COMPLETE'))),
   hookSawSpawn:hookInputs.some(i=>i.tool_name?.endsWith('spawn_agent')),
@@ -169,5 +180,5 @@ const summary={baseline,parentModel,roleInput,expectedRejection:rejected,exitCod
   toolsPreserved:childRequests.length>0&&childRequests.every(c=>c.body.tools?.length>0),
   reasoningPreserved:childRequests.length>0&&childRequests.every(c=>(c.body.reasoning_effort??c.body.reasoning?.effort)===childEffort)};
 fs.writeFileSync(path.join(root,'summary.json'),JSON.stringify(summary,null,2));console.log(JSON.stringify(summary));
-const required=rejected?['hookSawSpawn','roleSchemaRestricted','hintComplete','roleRejected','noChildCreated']:['catalogBaseUnmodified','childCompleted','hookSawSpawn','roleSchemaRestricted','hintComplete','childPersistedKnownBase','childRuntimeMatches','chatPathCorrect','baseMatches','rolePreserved','taskPreserved','toolsPreserved','reasoningPreserved'];
+const required=rejected?['hookSawSpawn','roleSchemaRestricted','hintComplete','roleRejected','noChildCreated']:expectedTaskBodyUnavailable?['taskBodyUnavailable','noChildUpstreamRequest','hookSawSpawn','roleSchemaRestricted','hintComplete','childPersistedKnownBase','childRuntimeMatches']:['catalogBaseUnmodified','childCompleted','hookSawSpawn','roleSchemaRestricted','hintComplete','childPersistedKnownBase','childRuntimeMatches','chatPathCorrect','baseMatches','rolePreserved','taskPreserved','toolsPreserved','reasoningPreserved'];
 if(exitCode!==0||probeError||required.some(key=>summary[key]!==true))process.exitCode=1;

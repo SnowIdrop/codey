@@ -640,17 +640,25 @@ pub(crate) fn normalize_tool_name(tool_name: &str) -> String {
         | "agents__interrupt_agent"
         | "agentsinterrupt_agent" => Some("interrupt_agent"),
         "apply_patch" | "functions.apply_patch" => Some("apply_patch"),
-        "replace" | "mcp__codey_fastctx__replace" => Some("replace"),
+        "replace"
+        | "mcp__codey_fastctx__replace"
+        | "mcp__fastctx__replace"
+        | "mcp__fastctx.replace" => Some("replace"),
         "write_file" => Some("write_file"),
         "edit_file" => Some("edit_file"),
         "create_file" => Some("create_file"),
         "delete_file" => Some("delete_file"),
         "read_file" => Some("read_file"),
-        "inspect_local_file" | "mcp__codey_fastctx__inspect_local_file" => {
-            Some("inspect_local_file")
+        "inspect_local_file"
+        | "mcp__codey_fastctx__inspect_local_file"
+        | "mcp__fastctx__inspect_local_file"
+        | "mcp__fastctx.inspect_local_file" => Some("inspect_local_file"),
+        "grep" | "mcp__codey_fastctx__grep" | "mcp__fastctx__grep" | "mcp__fastctx.grep" => {
+            Some("grep")
         }
-        "grep" | "mcp__codey_fastctx__grep" => Some("grep"),
-        "glob" | "mcp__codey_fastctx__glob" => Some("glob"),
+        "glob" | "mcp__codey_fastctx__glob" | "mcp__fastctx__glob" | "mcp__fastctx.glob" => {
+            Some("glob")
+        }
         "tool_search" => Some("tool_search"),
         "view_image" | "functions.view_image" => Some("view_image"),
         "mcp__cua_repl__js" => Some("cua_repl_js"),
@@ -842,12 +850,60 @@ mod tests {
     }
 
     #[test]
+    fn fastctx_namespace_aliases_preserve_read_write_classification() {
+        for prefix in ["mcp__codey_fastctx__", "mcp__fastctx__", "mcp__fastctx."] {
+            for operation in ["inspect_local_file", "grep", "glob"] {
+                let tool = format!("{prefix}{operation}");
+                assert_eq!(normalize_tool_name(&tool), operation, "{tool}");
+                assert_eq!(classify_tool(&tool), ToolClass::Read, "{tool}");
+                for role in [
+                    "codey_quick_scan",
+                    "codey_deep_research",
+                    "codey_visual_analysis",
+                    "codey_comments",
+                ] {
+                    assert_eq!(
+                        embedded()
+                            .evaluate(&RuleContext {
+                                actor: RuleActor::Child,
+                                role: Some(role),
+                                tool_name: &tool,
+                                tool_class: classify_tool(&tool),
+                            })
+                            .effect,
+                        RuleEffect::Allow,
+                        "{role}: {tool}"
+                    );
+                }
+            }
+            let tool = format!("{prefix}replace");
+            assert_eq!(normalize_tool_name(&tool), "replace", "{tool}");
+            assert_eq!(classify_tool(&tool), ToolClass::Write, "{tool}");
+            assert_eq!(
+                embedded()
+                    .evaluate(&RuleContext {
+                        actor: RuleActor::Child,
+                        role: Some("codey_quick_scan"),
+                        tool_name: &tool,
+                        tool_class: classify_tool(&tool),
+                    })
+                    .effect,
+                RuleEffect::Deny,
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
     fn untrusted_namespaces_cannot_spoof_trusted_tool_leaf_names() {
         for tool in [
             "mcp__evil__grep",
+            "mcp__evil__inspect_local_file",
             "mcp__evil__replace",
             "mcp__evil__bash",
             "mcp__evil__send_message",
+            "mcp__fastctx__inspect_local_file_extra",
+            "mcp__fastctx__exec",
             "attacker.spawn_agent",
         ] {
             assert_eq!(classify_tool(tool), ToolClass::Unknown, "{tool}");

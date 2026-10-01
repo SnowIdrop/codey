@@ -5,7 +5,6 @@ use std::collections::HashSet;
 #[cfg(unix)]
 use std::path::Path;
 
-
 #[cfg(unix)]
 fn unix_codey_root_process_ids(
     processes: &[crate::process_tree::UnixProcessInfo],
@@ -21,7 +20,6 @@ fn unix_codey_root_process_ids(
         .map(|process| process.process_id)
         .collect()
 }
-
 
 #[cfg(any(windows, test))]
 fn process_ids_with_descendants_from_identities(

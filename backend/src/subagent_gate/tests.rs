@@ -101,6 +101,94 @@ fn hook_trace_records_allow_and_protocol_denial_without_reason_payload() {
 }
 
 #[test]
+fn fastctx_namespace_aliases_pass_attested_child_hooks_without_broadening_permissions() {
+    for role in ["codey_quick_scan", "codey_comments"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-fastctx-aliases";
+        write_test_runtime_policy(root);
+        let mut spawn = input("PreToolUse", "fastctx-alias-session");
+        spawn.turn_id = Some("fastctx-root-turn".into());
+        spawn.tool_name = Some("agents.spawn_agent".into());
+        spawn.tool_input = Some(json!({
+            "task_name":"sync_fastctx_reader",
+            "agent_type":role,
+            "fork_turns":"none",
+            "message":"Read-only FastCtx alias probe; return evidence without modifying files."
+        }));
+        assert_eq!(
+            handle_hook_for_runtime_at(&spawn, root, runtime_id, 1).unwrap(),
+            json!({})
+        );
+        let mut spawned = input("PostToolUse", &spawn.session_id);
+        spawned.turn_id = spawn.turn_id;
+        spawned.tool_name = spawn.tool_name;
+        spawned.tool_input = spawn.tool_input;
+        spawned.tool_response = Some(json!({"agent_id":"fastctx-alias-child"}));
+        assert_eq!(
+            handle_hook_for_runtime_at(&spawned, root, runtime_id, 2).unwrap(),
+            json!({})
+        );
+        let mut started = input("SubagentStart", "fastctx-alias-session");
+        started.agent_id = Some("fastctx-alias-child".into());
+        started.agent_type = Some(role.into());
+        assert_eq!(
+            handle_hook_for_runtime_at(&started, root, runtime_id, 3).unwrap(),
+            json!({})
+        );
+        let mut child = input("PreToolUse", "fastctx-alias-session");
+        child.agent_id = Some("fastctx-alias-child".into());
+        child.agent_type = Some(role.into());
+        attest_test_child(&child, root, runtime_id);
+        for tool in [
+            "mcp__fastctx__inspect_local_file",
+            "mcp__fastctx__grep",
+            "mcp__fastctx__glob",
+            "mcp__fastctx.inspect_local_file",
+            "mcp__fastctx.grep",
+            "mcp__fastctx.glob",
+        ] {
+            child.tool_name = Some(tool.into());
+            assert_eq!(
+                handle_hook_for_runtime_at(&child, root, runtime_id, 10).unwrap(),
+                json!({}),
+                "{role}: {tool}"
+            );
+            let mut completed = input("PostToolUse", &child.session_id);
+            completed.agent_id = child.agent_id.clone();
+            completed.agent_type = child.agent_type.clone();
+            completed.tool_name = child.tool_name.clone();
+            completed.tool_response = Some(json!({"result":"read-only probe"}));
+            assert_eq!(
+                handle_hook_for_runtime_at(&completed, root, runtime_id, 11).unwrap(),
+                json!({})
+            );
+        }
+        for tool in [
+            "mcp__evil__inspect_local_file",
+            "mcp__fastctx__inspect_local_file_extra",
+            "mcp__fastctx__exec",
+        ] {
+            child.tool_name = Some(tool.into());
+            let output = handle_hook_for_runtime_at(&child, root, runtime_id, 12).unwrap();
+            assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+            assert!(
+                output["hookSpecificOutput"]["permissionDecisionReason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("deny-unknown-child-tool"),
+                "{role}: {tool}: {output}"
+            );
+        }
+        if role == "codey_quick_scan" {
+            child.tool_name = Some("mcp__fastctx__replace".into());
+            let output = handle_hook_for_runtime_at(&child, root, runtime_id, 13).unwrap();
+            assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+        }
+    }
+}
+
+#[test]
 fn child_tools_require_turn_context_model_attestation_and_cache_success() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path();
