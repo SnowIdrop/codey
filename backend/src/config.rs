@@ -2663,7 +2663,7 @@ pub const SUBAGENT_ROLE_QUICK_SCAN: &str = "codey_quick_scan";
 pub const SUBAGENT_ROLE_DEEP_RESEARCH: &str = "codey_deep_research";
 pub const SUBAGENT_ROLE_VISUAL_ANALYSIS: &str = "codey_visual_analysis";
 pub const SUBAGENT_ROLE_WORKER: &str = "codey_worker";
-pub const SUBAGENT_ROLE_COMMENTS: &str = "codey_comments";
+pub const SUBAGENT_ROLE_COPYWRITER: &str = "codey_copywriter";
 pub const SUBAGENT_ROLE_VISUAL_WORKER: &str = "codey_visual_worker";
 pub const SUBAGENT_ROLE_DEFAULT: &str = "default";
 pub const SUBAGENT_ROLE_IDS: [&str; 7] = [
@@ -2671,7 +2671,7 @@ pub const SUBAGENT_ROLE_IDS: [&str; 7] = [
     SUBAGENT_ROLE_DEEP_RESEARCH,
     SUBAGENT_ROLE_VISUAL_ANALYSIS,
     SUBAGENT_ROLE_WORKER,
-    SUBAGENT_ROLE_COMMENTS,
+    SUBAGENT_ROLE_COPYWRITER,
     SUBAGENT_ROLE_VISUAL_WORKER,
     SUBAGENT_ROLE_DEFAULT,
 ];
@@ -2682,7 +2682,7 @@ pub fn default_subagent_roles() -> BTreeMap<String, SubagentRoleConfig> {
         (SUBAGENT_ROLE_DEEP_RESEARCH, "high"),
         (SUBAGENT_ROLE_VISUAL_ANALYSIS, "high"),
         (SUBAGENT_ROLE_WORKER, "medium"),
-        (SUBAGENT_ROLE_COMMENTS, "medium"),
+        (SUBAGENT_ROLE_COPYWRITER, "medium"),
         (SUBAGENT_ROLE_VISUAL_WORKER, "high"),
         (SUBAGENT_ROLE_DEFAULT, DEFAULT_SUBAGENT_REASONING_EFFORT),
     ]
@@ -2768,14 +2768,14 @@ fn normalize_subagent_config(
             .get(SUBAGENT_ROLE_DEFAULT)
             .cloned()
             .unwrap_or_else(|| SubagentRoleConfig::new(model.clone(), reasoning_effort.clone()));
-        let comments_fallback = roles
+        let copywriter_fallback = roles
             .get(SUBAGENT_ROLE_WORKER)
             .cloned()
             .unwrap_or_else(|| fallback.clone());
         for role in SUBAGENT_ROLE_IDS {
             roles.entry(role.to_string()).or_insert_with(|| {
-                if role == SUBAGENT_ROLE_COMMENTS {
-                    comments_fallback.clone()
+                if role == SUBAGENT_ROLE_COPYWRITER {
+                    copywriter_fallback.clone()
                 } else {
                     fallback.clone()
                 }
@@ -4704,7 +4704,7 @@ mod tests {
 
         assert!(!config.subagent_roles[SUBAGENT_ROLE_WORKER].enabled);
         assert_eq!(
-            config.subagent_roles[SUBAGENT_ROLE_COMMENTS],
+            config.subagent_roles[SUBAGENT_ROLE_COPYWRITER],
             config.subagent_roles[SUBAGENT_ROLE_WORKER]
         );
         assert!(config.subagent_roles[SUBAGENT_ROLE_QUICK_SCAN].enabled);
@@ -4712,42 +4712,63 @@ mod tests {
     }
 
     #[test]
-    fn comments_role_copies_worker_once_and_preserves_independent_selection() {
+    fn old_comments_selection_is_discarded_without_migration() {
         let mut config = CodeyConfig::default();
+        config.subagent_roles.remove(SUBAGENT_ROLE_COPYWRITER);
+        config.subagent_roles.insert(
+            "codey_comments".into(),
+            SubagentRoleConfig::new("old-comments-selection", "xhigh"),
+        );
+        let config = config.normalize();
+        assert!(!config.subagent_roles.contains_key("codey_comments"));
         assert_eq!(
-            config.subagent_roles[SUBAGENT_ROLE_COMMENTS],
+            config.subagent_roles[SUBAGENT_ROLE_COPYWRITER],
             config.subagent_roles[SUBAGENT_ROLE_WORKER]
         );
-        config.subagent_roles.remove(SUBAGENT_ROLE_COMMENTS);
+        assert!(
+            !serde_json::to_string(&config)
+                .unwrap()
+                .contains("codey_comments")
+        );
+    }
+
+    #[test]
+    fn copywriter_role_copies_worker_once_and_preserves_independent_selection() {
+        let mut config = CodeyConfig::default();
+        assert_eq!(
+            config.subagent_roles[SUBAGENT_ROLE_COPYWRITER],
+            config.subagent_roles[SUBAGENT_ROLE_WORKER]
+        );
+        config.subagent_roles.remove(SUBAGENT_ROLE_COPYWRITER);
         let worker = config.subagent_roles.get_mut(SUBAGENT_ROLE_WORKER).unwrap();
         worker.model = "route/worker-choice".into();
         worker.reasoning_effort = "high".into();
         worker.enabled = false;
         let mut config = config.normalize();
-        let copied = config.subagent_roles[SUBAGENT_ROLE_COMMENTS].clone();
+        let copied = config.subagent_roles[SUBAGENT_ROLE_COPYWRITER].clone();
         assert_eq!(copied, config.subagent_roles[SUBAGENT_ROLE_WORKER]);
         config.subagent_roles.insert(
             SUBAGENT_ROLE_WORKER.into(),
             SubagentRoleConfig::new("changed-worker", "low"),
         );
         let config = config.normalize();
-        assert_eq!(config.subagent_roles[SUBAGENT_ROLE_COMMENTS], copied);
+        assert_eq!(config.subagent_roles[SUBAGENT_ROLE_COPYWRITER], copied);
         let mut json = serde_json::to_value(&config).unwrap();
-        json["subagentRoles"][SUBAGENT_ROLE_COMMENTS] = serde_json::json!({
-            "model": "independent-comments", "reasoningEffort": "xhigh", "enabled": true
+        json["subagentRoles"][SUBAGENT_ROLE_COPYWRITER] = serde_json::json!({
+            "model": "independent-copywriter", "reasoningEffort": "xhigh", "enabled": true
         });
         let config = serde_json::from_value::<CodeyConfig>(json)
             .unwrap()
             .normalize();
         assert_eq!(
-            config.subagent_roles[SUBAGENT_ROLE_COMMENTS].model,
-            "independent-comments"
+            config.subagent_roles[SUBAGENT_ROLE_COPYWRITER].model,
+            "independent-copywriter"
         );
         assert_eq!(
-            config.subagent_roles[SUBAGENT_ROLE_COMMENTS].reasoning_effort,
+            config.subagent_roles[SUBAGENT_ROLE_COPYWRITER].reasoning_effort,
             "xhigh"
         );
-        assert!(config.subagent_roles[SUBAGENT_ROLE_COMMENTS].enabled);
+        assert!(config.subagent_roles[SUBAGENT_ROLE_COPYWRITER].enabled);
         assert_eq!(
             config.clone().normalize().subagent_roles,
             config.subagent_roles

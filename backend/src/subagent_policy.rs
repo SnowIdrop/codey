@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::config::{
-    CodeyConfig, DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT, SUBAGENT_ROLE_COMMENTS,
+    CodeyConfig, DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT, SUBAGENT_ROLE_COPYWRITER,
     SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS, SUBAGENT_ROLE_WORKER, SubagentRoleConfig,
     uniform_subagent_roles,
 };
@@ -170,7 +170,7 @@ fn prepare_subagent_roles(config: &mut CodeyConfig) {
         .get(SUBAGENT_ROLE_DEFAULT)
         .cloned()
         .expect("fallback subagent role was inserted");
-    let comments_fallback = config
+    let copywriter_fallback = config
         .subagent_roles
         .get(SUBAGENT_ROLE_WORKER)
         .cloned()
@@ -180,8 +180,8 @@ fn prepare_subagent_roles(config: &mut CodeyConfig) {
             .subagent_roles
             .entry(role.to_string())
             .or_insert_with(|| {
-                if role == SUBAGENT_ROLE_COMMENTS {
-                    comments_fallback.clone()
+                if role == SUBAGENT_ROLE_COPYWRITER {
+                    copywriter_fallback.clone()
                 } else {
                     fallback.clone()
                 }
@@ -274,28 +274,28 @@ mod tests {
     use crate::config::ProviderProfile;
 
     #[test]
-    fn comments_role_reconciliation_copies_worker_only_when_missing() {
+    fn copywriter_role_reconciliation_copies_worker_only_when_missing() {
         let mut config = CodeyConfig::default();
-        config.subagent_roles.remove(SUBAGENT_ROLE_COMMENTS);
+        config.subagent_roles.remove(SUBAGENT_ROLE_COPYWRITER);
         let mut worker = SubagentRoleConfig::new("route/worker", "high");
         worker.enabled = false;
         config
             .subagent_roles
             .insert(SUBAGENT_ROLE_WORKER.into(), worker.clone());
         prepare_subagent_roles(&mut config);
-        assert_eq!(config.subagent_roles[SUBAGENT_ROLE_COMMENTS], worker);
+        assert_eq!(config.subagent_roles[SUBAGENT_ROLE_COPYWRITER], worker);
         config.subagent_roles.insert(
             SUBAGENT_ROLE_WORKER.into(),
             SubagentRoleConfig::new("other", "low"),
         );
         prepare_subagent_roles(&mut config);
-        assert_eq!(config.subagent_roles[SUBAGENT_ROLE_COMMENTS], worker);
+        assert_eq!(config.subagent_roles[SUBAGENT_ROLE_COPYWRITER], worker);
     }
 
     #[test]
     fn role_policies_keep_access_and_visual_capabilities_explicit() {
         assert_eq!(
-            role_policy(SUBAGENT_ROLE_COMMENTS),
+            role_policy(SUBAGENT_ROLE_COPYWRITER),
             Some(RolePolicy {
                 access: RoleAccess::Write,
                 visual: false

@@ -102,7 +102,7 @@ fn hook_trace_records_allow_and_protocol_denial_without_reason_payload() {
 
 #[test]
 fn fastctx_namespace_aliases_pass_attested_child_hooks_without_broadening_permissions() {
-    for role in ["codey_quick_scan", "codey_comments"] {
+    for role in ["codey_quick_scan", "codey_copywriter"] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let runtime_id = "runtime-fastctx-aliases";
@@ -425,6 +425,7 @@ fn specialized_spawn_policy_rejects_invalid_roles_without_reserving_work() {
         ),
         (json!({"agentType":"codey_quick_scan"}), "ROLE_REQUIRED"),
         (json!({"agent_type":"default"}), "ROLE_NOT_ALLOWED"),
+        (json!({"agent_type":"codey_comments"}), "ROLE_NOT_ALLOWED"),
         (json!({"agent_type":"explorer"}), "ROLE_NOT_ALLOWED"),
         (json!({"agent_type":"worker"}), "ROLE_NOT_ALLOWED"),
         (json!({"agent_type":"ds-flash"}), "ROLE_NOT_ALLOWED"),
@@ -494,7 +495,7 @@ fn specialized_spawn_policy_accepts_only_enabled_specialized_roles() {
 fn disabled_runtime_role_is_rejected_before_spawn_reservation() {
     for role in [
         crate::config::SUBAGENT_ROLE_WORKER,
-        crate::config::SUBAGENT_ROLE_COMMENTS,
+        crate::config::SUBAGENT_ROLE_COPYWRITER,
     ] {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path();

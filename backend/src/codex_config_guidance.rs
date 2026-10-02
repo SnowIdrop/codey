@@ -36,7 +36,7 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 
 ### 派发
 
-- 直接调用 `agents.spawn_agent`，显式填写 `agent_type`，只可选择已启用的 `codey_quick_scan`、`codey_deep_research`、`codey_visual_analysis`、`codey_worker`、`codey_comments` 或 `codey_visual_worker`。禁止通用与外部角色；无合适角色时由主代理处理。`default` 仅保留旧配置值，不可派发。`task_name` 只含小写字母、数字和下划线。
+- 直接调用 `agents.spawn_agent`，显式填写 `agent_type`，只可选择已启用的 `codey_quick_scan`、`codey_deep_research`、`codey_visual_analysis`、`codey_worker`、`codey_copywriter` 或 `codey_visual_worker`。禁止通用与外部角色；无合适角色时由主代理处理。`default` 仅保留旧配置值，不可派发。`task_name` 只含小写字母、数字和下划线。
 - 优先直接调用当前提供的协作工具；客户端明确提供工具目录和专用转发入口时，按目录中的准确名称与参数使用该入口。不要把专用转发入口当作 JavaScript 聚合执行器，也不要因缺少同名直接接口就忽略目录中可用的工具。
 - `message` 是唯一任务胶囊：写清目标、范围、允许操作、交付格式和必要背景，不复制整段对话，不附加 V1/V2 契约、sidecar、checks 或其他尾行协议。
 - 主代理按任务依赖和文件范围选择模式：同步任务使用 sync_ 前缀，独立旁路使用 async_ 前缀；未标注按同步处理，同一活动批次不得混合。异步任务明确文件归属，主代理不读写子代理独占范围。
@@ -154,7 +154,7 @@ pub(crate) const ROOT_AGENT_MULTI_AGENT_MODE_HINT: &str = "Only enabled Codey ro
 explicitly set `agent_type`. Never use default, explorer, worker or external roles. \
 Use codey_quick_scan for focused lookup, codey_deep_research for broad research, \
 codey_visual_analysis for visual inspection, codey_worker for implementation, \
-codey_comments for comments only, codey_visual_worker for visual implementation. \
+codey_copywriter for scoped writing and copy editing, codey_visual_worker for visual implementation. \
 If no enabled role fits, the root does the work. Delegate independent work early; \
 keep inseparable work local. Set fork_turns=\"none\"; supply a self-contained task, \
 known facts, allowed paths, exclusions and stopping evidence. Quick scans return within \
@@ -274,12 +274,14 @@ developer_instructions = """
 image_generation = false
 "#####;
 
-pub(crate) const COMMENTS_AGENT_CONFIG: &str =
-    include_str!("../../customizations/codex-constraints/agents/codey_comments.toml");
+pub(crate) const COPYWRITER_AGENT_CONFIG: &str =
+    include_str!("../../customizations/codex-constraints/agents/codey_copywriter.toml");
 
-pub(crate) const COMMENTS_ROLE_USAGE_HINT: &str = "\
-`codey_comments` 是代码注释身份，属于非视觉可写角色。符合委派条件的源码注释任务优先使用它，\
-限定文件或差异范围，默认中文；不得借此修改可执行代码。返回后主代理必须检查非注释内容保持不变。";
+pub(crate) const COPYWRITER_ROLE_USAGE_HINT: &str = "\
+`codey_copywriter` 是文案身份，属于非视觉可写角色。符合委派条件的注释、文档、界面与日志文字、设定和叙事任务优先使用它；\
+主代理提供方向、目标读者、文字用途、事实或设定依据、文件范围及不可变项，由子代理具体成稿，默认中文。\
+提示词、技能说明和代理指令仅在明确委派时处理，不得自行改变行为与权限边界。\
+只改授权文字，不改变程序逻辑、占位符、结构化键或解析契约；需要联动代码或测试时交回主代理。返回后主代理检查仅授权文字变化、程序契约保持不变。";
 
 pub(crate) const VISUAL_WORKER_AGENT_CONFIG: &str = r#####"name = "codey_visual_worker"
 
@@ -311,7 +313,7 @@ pub(crate) const SUBAGENT_TASK_BOUNDARY_GUARD: &str = "\
 返回时区分本次实际修改、已清理内容和未完成要求，不能用其他尝试的结果代替本次证据。";
 
 pub(crate) const NO_WRITABLE_SUBAGENT_GUIDANCE: &str = "\
-本次运行没有启用 `codey_worker`、`codey_comments`、`codey_visual_worker` 或 `default`，因此没有可写子代理。所有创建、修改、\
+本次运行没有启用 `codey_worker`、`codey_copywriter`、`codey_visual_worker` 或 `default`，因此没有可写子代理。所有创建、修改、\
 删除、移动文件或其他会改变状态的工作都由主代理直接完成；只读子代理只能承担检索、分析和证据\
 收集。不得把写入任务改派给只读角色，也不得要求它们尝试 `replace`、\
 `apply_patch` 或其他写入工具。";
@@ -322,7 +324,7 @@ pub(crate) fn subagent_source_config(role: &str) -> Option<&'static str> {
         "codey_deep_research" => Some(DEEP_RESEARCH_AGENT_CONFIG),
         "codey_visual_analysis" => Some(VISUAL_ANALYSIS_AGENT_CONFIG),
         "codey_worker" => Some(WORKER_AGENT_CONFIG),
-        "codey_comments" => Some(COMMENTS_AGENT_CONFIG),
+        "codey_copywriter" => Some(COPYWRITER_AGENT_CONFIG),
         "codey_visual_worker" => Some(VISUAL_WORKER_AGENT_CONFIG),
         "default" => Some(DEFAULT_AGENT_CONFIG),
         _ => None,
@@ -710,7 +712,7 @@ mod tests {
     #[test]
     fn multi_agent_mode_hint_uses_role_aware_concurrency_without_spawn_budgets() {
         for role in [
-            "codey_comments",
+            "codey_copywriter",
             "codey_quick_scan",
             "codey_deep_research",
             "codey_visual_analysis",
@@ -777,7 +779,7 @@ mod tests {
             ("codey_deep_research", false),
             ("codey_visual_analysis", false),
             ("codey_worker", true),
-            ("codey_comments", true),
+            ("codey_copywriter", true),
             ("codey_visual_worker", true),
             ("default", true),
         ] {

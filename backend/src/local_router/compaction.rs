@@ -1090,7 +1090,7 @@ mod tests {
             "input":[{"type":"additional_tools","tools":[qualified,
                 {"type":"namespace","name":"other","tools":[spawn.clone()]}]}]
         });
-        let roles = vec!["codey_quick_scan".to_string(), "codey_comments".to_string()];
+        let roles = vec!["codey_quick_scan".to_string(), "codey_copywriter".to_string()];
         assert!(restrict_specialized_agent_roles(&mut body, &roles).unwrap());
         for function in [&body["tools"][0]["tools"][0], &body["input"][0]["tools"][0]] {
             assert_eq!(
@@ -1118,7 +1118,7 @@ mod tests {
         ] {
             let mut body = json!({"tools":[{"type":"function","name":"agents.spawn_agent","parameters":parameters}]});
             assert!(
-                restrict_specialized_agent_roles(&mut body, &["codey_comments".into()]).is_err()
+                restrict_specialized_agent_roles(&mut body, &["codey_copywriter".into()]).is_err()
             );
         }
     }
@@ -1306,7 +1306,7 @@ mod tests {
             let original = body.clone();
             assert!(!prepare_plaintext_agent_arguments(&mut body));
             assert!(
-                !restrict_specialized_agent_roles(&mut body, &["codey_comments".into()]).unwrap()
+                !restrict_specialized_agent_roles(&mut body, &["codey_copywriter".into()]).unwrap()
             );
             assert_eq!(body, original);
         }
@@ -1316,7 +1316,7 @@ mod tests {
             json!({"input":{"type":"tool_search_output","execution":"client","tools":other}});
         let original = body.clone();
         assert!(!prepare_plaintext_agent_arguments(&mut body));
-        assert!(!restrict_specialized_agent_roles(&mut body, &["codey_comments".into()]).unwrap());
+        assert!(!restrict_specialized_agent_roles(&mut body, &["codey_copywriter".into()]).unwrap());
         assert_eq!(body, original);
     }
 
@@ -1335,7 +1335,7 @@ mod tests {
         for input in [item.clone(), json!([item.clone()])] {
             let mut body = json!({"input":input});
             assert!(
-                restrict_specialized_agent_roles(&mut body, &["codey_comments".into()]).unwrap()
+                restrict_specialized_agent_roles(&mut body, &["codey_copywriter".into()]).unwrap()
             );
             let item = if body["input"].is_array() {
                 &body["input"][0]
@@ -1344,7 +1344,7 @@ mod tests {
             };
             assert_eq!(
                 item["tools"][0]["children"][0]["parameters"]["properties"]["agent_type"]["enum"],
-                json!(["codey_comments"])
+                json!(["codey_copywriter"])
             );
             assert!(
                 item["tools"][0]["children"][0]["parameters"]["required"]

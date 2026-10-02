@@ -4,6 +4,22 @@ import test from "node:test";
 
 const root = new URL("../", import.meta.url);
 
+test("copywriter instructions cover writing tasks without widening behavioral authority", async () => {
+  const source = await readFile(new URL("customizations/codex-constraints/agents/codey_copywriter.toml", root), "utf8");
+  for (const required of [
+    'name = "codey_copywriter"',
+    'sandbox_mode = "workspace-write"',
+    "目标读者", "文字用途", "事实或设定依据", "不可变项",
+    "源码注释", "技术文档", "界面文字", "日志与错误消息", "国家设定", "叙事",
+    "区分已有设定与新增创作", "不把创作自由用于技术说明",
+    "保持占位符", "插值表达式", "结构化键", "事件码", "已知解析依赖不变",
+    "交回主代理", "不自行调整解析器、断言或快照",
+    "明确委派时可撰写提示词、技能说明和代理指令",
+    "不自行改变规则", "不派生其他代理", "程序契约保持不变",
+  ]) assert.ok(source.includes(required), required);
+  assert.doesNotMatch(source, /comment-only|只处理手写源码|不得修改字符串/);
+});
+
 test("subagent settings expose the six supported role controls", async () => {
   const [featurePolicySource, modelHookSource, modelOptionsSource, comboboxSource] = await Promise.all([
     readFile(new URL("src/FeaturePolicyCard.tsx", root), "utf8"),
@@ -22,7 +38,7 @@ test("subagent settings expose the six supported role controls", async () => {
     ["codey_deep_research", "深度检索"],
     ["codey_visual_analysis", "视觉分析"],
     ["codey_worker", "代码实施"],
-    ["codey_comments", "代码注释"],
+    ["codey_copywriter", "文案"],
     ["codey_visual_worker", "视觉实施"],
   ]) {
     assert.match(featurePolicySource, new RegExp(`id: "${id}"`));
@@ -33,9 +49,9 @@ test("subagent settings expose the six supported role controls", async () => {
   assert.match(featurePolicySource, /onCheckedChange=\{\(enabled\) => updateRole\(\{ enabled \}\)\}/);
   assert.match(featurePolicySource, /"可写"/);
   assert.match(featurePolicySource, /"只读"/);
-  assert.match(featurePolicySource, /WRITABLE_SUBAGENT_ROLE_IDS\s*=\s*\[[\s\S]*?"codey_comments"/);
-  assert.ok(featurePolicySource.indexOf('id: "codey_worker"') < featurePolicySource.indexOf('id: "codey_comments"'));
-  assert.ok(featurePolicySource.indexOf('id: "codey_comments"') < featurePolicySource.indexOf('id: "codey_visual_worker"'));
+  assert.match(featurePolicySource, /WRITABLE_SUBAGENT_ROLE_IDS\s*=\s*\[[\s\S]*?"codey_copywriter"/);
+  assert.ok(featurePolicySource.indexOf('id: "codey_worker"') < featurePolicySource.indexOf('id: "codey_copywriter"'));
+  assert.ok(featurePolicySource.indexOf('id: "codey_copywriter"') < featurePolicySource.indexOf('id: "codey_visual_worker"'));
   assert.match(featurePolicySource, /roleDisabled/);
   assert.match(featurePolicySource, /enabledReadOnlyRoleNames/);
   assert.match(featurePolicySource, /请先启用至少一个只读角色/);

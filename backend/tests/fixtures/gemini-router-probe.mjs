@@ -28,7 +28,7 @@ const template=fs.readFileSync(new URL('../../resources/gemini-antigravity-base-
 const legacy=fs.readFileSync(new URL('../../resources/codex-0.153.3-base-instructions.md',import.meta.url),'utf8');
 const gpt6=fs.readFileSync(new URL('../../resources/codex-0.155.0-alpha.9-gpt6-base-instructions.md',import.meta.url),'utf8');
 const codingAgent=fs.readFileSync(new URL('../../resources/codex-0.153.3-coding-agent-base-instructions.md',import.meta.url),'utf8');
-const childRole=baseline==='deepseek'?'codey_worker':['coding-agent','catalog'].includes(baseline)?'codey_quick_scan':'codey_comments';
+const childRole=baseline==='deepseek'?'codey_worker':['coding-agent','catalog'].includes(baseline)?'codey_quick_scan':'codey_copywriter';
 const roleInput=JSON.parse(process.env.CODEY_GEMINI_PROBE_ROLE_INPUT ?? JSON.stringify({agent_type:childRole}));
 const childModel=baseline==='deepseek'?'deepseek-flash':'gemini-3.8-flash-high';
 const childEffort=baseline==='deepseek'?'max':'high';

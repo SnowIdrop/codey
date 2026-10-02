@@ -8,7 +8,7 @@
     "codey_deep_research": { "access": "read_only", "visual": false },
     "codey_visual_analysis": { "access": "read_only", "visual": true },
     "codey_worker": { "access": "write", "visual": false },
-    "codey_comments": { "access": "write", "visual": false },
+    "codey_copywriter": { "access": "write", "visual": false },
     "codey_visual_worker": { "access": "write", "visual": true },
     "default": { "access": "write", "visual": true }
   },
@@ -69,7 +69,7 @@
       "priority": 800,
       "effect": "allow",
       "actors": ["child"],
-      "roles": ["codey_comments"],
+      "roles": ["codey_copywriter"],
       "toolClasses": ["read", "write", "command", "network", "collaboration"],
       "explanation": "写入角色可使用声明范围内的读写、网络读取与受沙箱约束的命令能力。"
     },
@@ -104,9 +104,9 @@
       "priority": 50,
       "effect": "deny",
       "actors": ["child"],
-      "roles": ["codey_quick_scan", "codey_deep_research", "codey_visual_analysis", "codey_comments"],
+      "roles": ["codey_quick_scan", "codey_deep_research", "codey_visual_analysis", "codey_copywriter"],
       "toolClasses": ["unknown"],
-      "explanation": "只读和注释角色不得调用未归类工具。"
+      "explanation": "只读和文案角色不得调用未归类工具。"
     }
   ]
 }

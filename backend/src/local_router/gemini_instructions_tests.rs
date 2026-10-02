@@ -770,8 +770,8 @@ async fn gemini_upstream_websocket_fallback_retains_adaptation() {
 #[ignore = "requires native CLI, captured catalog and built Codey gate paths; loopback model traffic only"]
 async fn gemini_native_cli_child_through_actual_router() {
     for (baseline, role, rejected) in [
-        ("legacy", json!({"agent_type":"codey_comments"}), false),
-        ("gpt6", json!({"agent_type":"codey_comments"}), false),
+        ("legacy", json!({"agent_type":"codey_copywriter"}), false),
+        ("gpt6", json!({"agent_type":"codey_copywriter"}), false),
         (
             "coding-agent",
             json!({"agent_type":"codey_quick_scan"}),
@@ -789,7 +789,7 @@ async fn gemini_native_cli_child_through_actual_router() {
         ("gpt6", json!({"agent_type":null}), true),
         (
             "gpt6",
-            json!({"agent_type":"codey_comments","agentRole":"explorer"}),
+            json!({"agent_type":"codey_copywriter","agentRole":"explorer"}),
             true,
         ),
     ] {
@@ -866,7 +866,7 @@ async fn run_native_role_probe(
             if matches!(baseline, "coding-agent" | "catalog") {
                 "codey_quick_scan"
             } else {
-                "codey_comments"
+                "codey_copywriter"
             },
             MODEL,
             "high",
@@ -987,7 +987,7 @@ async fn deepseek_native_cli_preserves_max_reasoning() {
 #[ignore = "requires native CLI, captured catalog and built Codey gate paths; loopback model traffic only"]
 async fn gemini_native_cli_agent_task_delivery_probe() {
     for (baseline, role) in [
-        ("gpt6", "codey_comments"),
+        ("gpt6", "codey_copywriter"),
         ("coding-agent", "codey_quick_scan"),
     ] {
         for (plaintext_messages, payload) in [

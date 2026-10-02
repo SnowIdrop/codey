@@ -2740,12 +2740,12 @@ mod tests {
     }
 
     #[test]
-    fn comments_role_uses_writer_capabilities_and_conflicts_with_other_writers() {
-        for other_role in ["codey_worker", "codey_visual_worker", "codey_comments"] {
+    fn copywriter_role_uses_writer_capabilities_and_conflicts_with_other_writers() {
+        for other_role in ["codey_worker", "codey_visual_worker", "codey_copywriter"] {
             let temp = tempdir().unwrap();
             let rules = rules::load(temp.path()).rules;
             let capsule = prepare_task_capsule(
-                Some(&spawn_input("comments", "codey_comments")),
+                Some(&spawn_input("copywriter", "codey_copywriter")),
                 Some("/repo"),
                 &rules,
             )
@@ -2759,7 +2759,7 @@ mod tests {
                     temp.path(),
                     "runtime-a",
                     "session-a",
-                    Some(&spawn_input("comments", "codey_comments")),
+                    Some(&spawn_input("copywriter", "codey_copywriter")),
                     Some("/repo"),
                     0,
                     10
