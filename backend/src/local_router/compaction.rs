@@ -1090,7 +1090,10 @@ mod tests {
             "input":[{"type":"additional_tools","tools":[qualified,
                 {"type":"namespace","name":"other","tools":[spawn.clone()]}]}]
         });
-        let roles = vec!["codey_quick_scan".to_string(), "codey_copywriter".to_string()];
+        let roles = vec![
+            "codey_quick_scan".to_string(),
+            "codey_copywriter".to_string(),
+        ];
         assert!(restrict_specialized_agent_roles(&mut body, &roles).unwrap());
         for function in [&body["tools"][0]["tools"][0], &body["input"][0]["tools"][0]] {
             assert_eq!(
@@ -1316,7 +1319,9 @@ mod tests {
             json!({"input":{"type":"tool_search_output","execution":"client","tools":other}});
         let original = body.clone();
         assert!(!prepare_plaintext_agent_arguments(&mut body));
-        assert!(!restrict_specialized_agent_roles(&mut body, &["codey_copywriter".into()]).unwrap());
+        assert!(
+            !restrict_specialized_agent_roles(&mut body, &["codey_copywriter".into()]).unwrap()
+        );
         assert_eq!(body, original);
     }
 

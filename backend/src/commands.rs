@@ -62,7 +62,7 @@ pub use runtime::{
 };
 use updates::current_update_platform;
 #[cfg(test)]
-pub(crate) use updates::{UpdateAssetInfo, UpdateCheck};
+pub(crate) use updates::UpdateCheck;
 #[cfg(test)]
 use updates::{UpdateManifest, assess_update_manifest, current_update_arch};
 use webhooks::{

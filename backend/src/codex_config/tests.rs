@@ -959,7 +959,10 @@ fn disabled_subagent_roles_are_omitted_from_runtime_registration_and_policy_inpu
 #[test]
 fn runtime_guidance_keeps_writes_with_root_when_all_writable_roles_are_disabled() {
     let mut configured = crate::config::default_subagent_roles();
-    configured.get_mut(SUBAGENT_ROLE_COPYWRITER).unwrap().enabled = false;
+    configured
+        .get_mut(SUBAGENT_ROLE_COPYWRITER)
+        .unwrap()
+        .enabled = false;
     configured
         .get_mut(crate::config::SUBAGENT_ROLE_WORKER)
         .unwrap()

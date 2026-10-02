@@ -253,8 +253,10 @@ async fn run(ui: NativeUpdateUi) -> Result<()> {
                         }
                     }
                 }
-                let error =
-                    initial_startup_failure_error(&error, cleanup.as_ref().err().map(String::as_str));
+                let error = initial_startup_failure_error(
+                    &error,
+                    cleanup.as_ref().err().map(String::as_str),
+                );
                 show_initial_startup_failure(&error).await;
                 return Err(anyhow::Error::msg(error));
             }
