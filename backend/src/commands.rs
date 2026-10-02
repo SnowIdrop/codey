@@ -60,9 +60,9 @@ pub(crate) use runtime::{cleanup_failed_runtime_start, reap_runtime_child_before
 pub use runtime::{
     launch_codey_runtime, runtime_status, schedule_restart_codey_runtime, stop_codey_runtime,
 };
-use updates::current_update_platform;
 #[cfg(test)]
 pub(crate) use updates::UpdateCheck;
+use updates::current_update_platform;
 #[cfg(test)]
 use updates::{UpdateManifest, assess_update_manifest, current_update_arch};
 use webhooks::{

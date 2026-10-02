@@ -341,12 +341,16 @@ where
         .await
 }
 
+pub(crate) struct UpstreamHttpError<'a> {
+    pub(crate) status: u16,
+    pub(crate) request_id: Option<&'a str>,
+    pub(crate) retry_advice: Option<ResponseRetryAdvice>,
+    pub(crate) body: &'a [u8],
+}
+
 pub(crate) async fn write_upstream_http_error<D>(
     downstream: &mut D,
-    status: u16,
-    upstream_request_id: Option<&str>,
-    retry_advice: Option<ResponseRetryAdvice>,
-    body: &[u8],
+    error: UpstreamHttpError<'_>,
     resolved: &RouteSelection,
     bridge: ProtocolBridge,
     request_kind: ResponsesRequestKind,
@@ -354,6 +358,12 @@ pub(crate) async fn write_upstream_http_error<D>(
 where
     D: ResponsesDownstream + ?Sized,
 {
+    let UpstreamHttpError {
+        status,
+        request_id: upstream_request_id,
+        retry_advice,
+        body,
+    } = error;
     let upstream_request_id = upstream_request_id.map(str::to_string);
     let probe = downstream.request_log_probe().cloned();
     let parsed = serde_json::from_slice::<Value>(body).ok();

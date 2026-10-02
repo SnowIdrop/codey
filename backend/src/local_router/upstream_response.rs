@@ -501,8 +501,8 @@ mod tests {
             .unwrap_or_default();
         let upstream_server = tokio::spawn(async move {
             let (mut stream, _) = upstream_listener.accept().await.unwrap();
-            let mut request = [0_u8; 1024];
-            stream.read(&mut request).await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            assert_eq!(request.method, "GET");
             let headers = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n{retry_header}connection: close\r\n\r\n",
                 body.len()
