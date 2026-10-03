@@ -83,12 +83,59 @@ impl NativeHistoryCache {
 }
 
 #[derive(Default)]
+struct NativeResponseOutput {
+    items: BTreeMap<u64, Value>,
+    count: u64,
+    bytes: usize,
+    budget: RetainedMemoryBudget,
+}
+
+impl NativeResponseOutput {
+    fn observe_item(&mut self, event: &Value) -> Result<()> {
+        let index = event["output_index"]
+            .as_u64()
+            .context("流式输出项缺少有效的 output_index")?;
+        self.count = self
+            .count
+            .max(index.checked_add(1).context("输出项索引超过上限")?);
+        // Added items only establish the expected range: their arguments and
+        // encrypted reasoning may still be incomplete.
+        if event["type"] == "response.output_item.added" {
+            return Ok(());
+        }
+        let item = &event["item"];
+        if !item.is_object() {
+            anyhow::bail!("流式输出项缺少完整的 item");
+        }
+        if let Some(previous) = self.items.get(&index) {
+            if previous != item {
+                anyhow::bail!("流式输出包含冲突的 output_index");
+            }
+            return Ok(());
+        }
+        // Include per-entry overhead and reserve before retaining a JSON clone.
+        let bytes = self
+            .bytes
+            .saturating_add(64)
+            .saturating_add(bounded_json_bytes(
+                item,
+                MAX_REQUEST_BYTES.saturating_sub(self.bytes.saturating_add(64)),
+            )?);
+        self.budget.resize(bytes)?;
+        self.items.insert(index, item.clone());
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
 pub(crate) struct NativeResponsesHistory {
     owner: Option<[u8; 32]>,
     scope: Option<[u8; 32]>,
     cache: Arc<Mutex<NativeHistoryCache>>,
     latest: Option<Arc<AdaptedResponsesHistory>>,
     history: AdaptedResponsesHistory,
+    output: NativeResponseOutput,
     unavailable: Option<String>,
 }
 
@@ -141,9 +188,11 @@ impl NativeResponsesHistory {
 
     pub(crate) fn clear_pending(&mut self) {
         self.history.clear_pending();
+        self.output = NativeResponseOutput::default();
     }
 
     pub(crate) fn prepare(&mut self, owner: [u8; 32], body: &mut Value) {
+        self.output = NativeResponseOutput::default();
         if self.owner != Some(owner) {
             self.history = AdaptedResponsesHistory::default();
             self.latest = None;
@@ -208,7 +257,20 @@ impl NativeResponsesHistory {
     }
 
     pub(crate) fn observe(&mut self, event: &Value) {
-        if self.history.pending_input.is_none() || !responses_event_is_terminal(event) {
+        if self.history.pending_input.is_none() {
+            return;
+        }
+        if matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("response.output_item.added" | "response.output_item.done")
+        ) {
+            if let Err(error) = self.output.observe_item(event) {
+                self.unavailable = Some(error.to_string());
+                self.clear_pending();
+            }
+            return;
+        }
+        if !responses_event_is_terminal(event) {
             return;
         }
         let response = &event["response"];
@@ -221,18 +283,27 @@ impl NativeResponsesHistory {
             .get("id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty() && id.len() <= 1024);
-        if complete
-            && let (Some(id), Some(output)) = (id, response.get("output").and_then(Value::as_array))
-        {
-            // Missing/oversized terminal output makes recovery unavailable;
-            // it must not turn an already delivered generation into a retry.
-            self.unavailable = self
-                .history
-                .remember(id, output)
-                .err()
-                .map(|error| error.to_string());
+        if complete && let Some(id) = id {
+            // Some upstreams omit all or part of the aggregate output after
+            // sending item.done. Only a complete ordered set can replace it.
+            let result = if let Some(output) = response.get("output").and_then(Value::as_array)
+                && output.len() as u64 >= self.output.count
+            {
+                self.history.remember(id, output)
+            } else if self.output.count > 0
+                && self.output.items.keys().copied().eq(0..self.output.count)
+            {
+                let output: Vec<_> = std::mem::take(&mut self.output.items)
+                    .into_values()
+                    .collect();
+                self.history.remember(id, &output)
+            } else {
+                Err(anyhow::anyhow!("流式响应缺少完整输出，无法恢复续接历史"))
+            };
+            // Cache failures must not retry an already delivered generation.
+            self.unavailable = result.err().map(|error| error.to_string());
         }
-        self.history.clear_pending();
+        self.clear_pending();
         if self.history.last.is_some() {
             let history = Arc::new(std::mem::take(&mut self.history));
             if let (Some(scope), Some(owner)) = (self.scope, self.owner) {
@@ -370,13 +441,16 @@ mod tests {
                     let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
                     let first = ws.next().await.unwrap().unwrap();
                     assert!(matches!(first, WebSocketMessage::Text(_)));
-                    ws.send(WebSocketMessage::Text(
-                        completed("resp-first", vec![call(custom, "call-1")])
-                            .to_string()
-                            .into(),
-                    ))
-                    .await
+                    let mut events = responses_event_sequence(
+                        &completed("resp-first", vec![call(custom, "call-1")])["response"],
+                    )
                     .unwrap();
+                    events.last_mut().unwrap()["response"]["output"] = json!([]);
+                    for event in events {
+                        ws.send(WebSocketMessage::Text(event.to_string().into()))
+                            .await
+                            .unwrap();
+                    }
                     ws.close(None).await.unwrap();
                     // Wait until Codey has consumed the upstream Close and
                     // released its socket before the client submits the result.
@@ -427,7 +501,15 @@ mod tests {
                             },
                         );
                         let response = if sse {
-                            format!("data: {event}\n\n")
+                            let mut events = responses_event_sequence(&event["response"]).unwrap();
+                            events.last_mut().unwrap()["response"]
+                                .as_object_mut()
+                                .unwrap()
+                                .remove("output");
+                            events
+                                .iter()
+                                .map(|event| format!("data: {event}\n\n"))
+                                .collect::<String>()
                         } else {
                             event["response"].to_string()
                         };
@@ -669,6 +751,104 @@ mod tests {
         );
         client.close(None).await.unwrap();
         router.stop().await.unwrap();
+    }
+
+    #[test]
+    fn native_history_restores_streamed_output_when_terminal_output_is_incomplete() {
+        for custom in [false, true] {
+            let output = vec![
+                json!({"id":"reasoning-1","type":"reasoning","encrypted_content":"opaque"}),
+                call(custom, "call-1"),
+            ];
+            for terminal_output in [
+                None,
+                Some(vec![]),
+                Some(output[..1].to_vec()),
+                Some(output.clone()),
+            ] {
+                let cache = Arc::new(Mutex::new(NativeHistoryCache::default()));
+                let headers = [("thread-id".into(), "streamed-history".into())];
+                let mut history = NativeResponsesHistory::with_cache(Arc::clone(&cache), &headers);
+                history.prepare([1; 32], &mut json!({"input":"task"}));
+                // Completion order and duplicate notifications must not change
+                // item order or duplicate a tool call in the retained history.
+                for index in [1, 0, 1] {
+                    history.observe(&json!({"type":"response.output_item.done","output_index":index,"item":output[index]}));
+                    history.observe(&json!({"type":"response.output_item.added","output_index":index,"item":{"type":"function_call","arguments":""}}));
+                }
+                let mut terminal = completed("resp-streamed", vec![]);
+                if let Some(output) = terminal_output {
+                    terminal["response"]["output"] = json!(output);
+                } else {
+                    terminal["response"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("output");
+                }
+                history.observe(&terminal);
+                assert!(history.unavailable.is_none(), "{:?}", history.unavailable);
+                assert!(history.output.items.is_empty());
+                assert_eq!(history.output.bytes, 0);
+                drop(history);
+
+                let mut reconnected = NativeResponsesHistory::with_cache(cache, &headers);
+                let mut body = json!({"previous_response_id":"resp-streamed","input":[result(custom, "call-1")]});
+                reconnected.prepare([1; 32], &mut body);
+                assert!(reconnected.restore([1; 32], &mut body).unwrap());
+                assert_eq!(
+                    body["input"],
+                    json!([
+                        {"role":"user","content":"task"}, output[0], output[1], result(custom, "call-1")
+                    ])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_history_never_restores_unfinished_or_discarded_streamed_output() {
+        for reset in ["clear", "prepare", "owner", "failed", "incomplete", "error"] {
+            let mut history = NativeResponsesHistory::default();
+            history.prepare([1; 32], &mut json!({"input":"old task"}));
+            history.observe(&json!({"type":"response.output_item.done","output_index":0,"item":call(false, "old-call")}));
+            let owner = if reset == "owner" { [2; 32] } else { [1; 32] };
+            match reset {
+                "clear" => history.clear_pending(),
+                "prepare" | "owner" => {},
+                "error" => history.observe(&json!({"type":"error"})),
+                kind => history.observe(&json!({"type":format!("response.{kind}"),"response":{"id":"resp-failed","output":[call(false,"old-call")]}})),
+            }
+            history.prepare(owner, &mut json!({"input":"new task"}));
+            assert!(history.output.items.is_empty());
+            history.observe(&completed("resp-new", vec![]));
+            let mut body =
+                json!({"previous_response_id":"resp-new","input":[result(false,"old-call")]});
+            history.prepare(owner, &mut body);
+            assert!(history.restore(owner, &mut body).is_err(), "{reset}");
+        }
+        for events in [
+            vec![
+                json!({"type":"response.output_item.added","output_index":0,"item":call(false,"call-1")}),
+            ],
+            vec![
+                json!({"type":"response.output_item.done","output_index":1,"item":call(false,"call-1")}),
+            ],
+            vec![json!({"type":"response.output_item.done","item":call(false,"call-1")})],
+            vec![
+                json!({"type":"response.output_item.done","output_index":0,"item":call(false,"call-1")}),
+                json!({"type":"response.output_item.done","output_index":0,"item":call(false,"call-2")}),
+            ],
+        ] {
+            let mut history = NativeResponsesHistory::default();
+            history.prepare([1; 32], &mut json!({"input":"task"}));
+            for event in events {
+                history.observe(&event);
+            }
+            history.observe(&completed("resp-unfinished", vec![]));
+            assert!(history.unavailable.is_some());
+            assert!(!history.has_history());
+            assert!(history.output.items.is_empty());
+        }
     }
 
     #[test]
