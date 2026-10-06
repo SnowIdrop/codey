@@ -377,7 +377,10 @@ fn validate_native_tool_history(input: &[Value], restoring: bool) -> Result<()> 
                 else {
                     continue;
                 };
-                if !calls.remove(&(call_kind, id)) {
+                // A yielded exec call can emit an initial result and later
+                // notifications with the same call_id. Retain its provenance
+                // for every output without changing or dropping any fragments.
+                if !calls.contains(&(call_kind, id)) {
                     anyhow::bail!(
                         "工具结果缺少对应的完整调用历史（{kind} call_id={id}{}），请重新发送完整上下文",
                         tool_name_label(item)
@@ -910,6 +913,73 @@ mod tests {
             history.prepare(key, &mut next);
             assert!(history.restore(key, &mut next).unwrap());
             assert_eq!(next["input"].as_array().unwrap().len(), 4);
+        }
+    }
+
+    #[test]
+    fn native_history_preserves_incremental_results_for_one_call() {
+        for custom in [false, true] {
+            let key = [1; 32];
+            let mut invocation = call(custom, "call-1");
+            invocation["name"] = json!("exec");
+            let mut outputs = vec![result(custom, "call-1")];
+            outputs[0]["output"] = json!("Script running with cell ID 58");
+            for sample in 1..=3 {
+                let mut output = result(custom, "call-1");
+                output["name"] = json!("exec");
+                output["output"] = json!(format!("sample {sample}"));
+                outputs.push(output);
+                if sample == 1 {
+                    outputs.push(call(custom, "call-2"));
+                    outputs.push(result(custom, "call-2"));
+                }
+            }
+            let mut input = vec![invocation.clone()];
+            input.extend(outputs.clone());
+            let mut complete = json!({"input":input});
+            let original = complete.clone();
+            let mut history = NativeResponsesHistory::default();
+            history.prepare(key, &mut complete);
+            assert!(!history.restore(key, &mut complete).unwrap());
+            assert_eq!(complete, original);
+
+            history.prepare(key, &mut json!({"input":"task"}));
+            history.observe(&completed("resp-call", vec![invocation.clone()]));
+            let mut next = json!({"previous_response_id":"resp-call","input":outputs});
+            history.prepare(key, &mut next);
+            assert!(history.restore(key, &mut next).unwrap());
+            let mut expected = vec![json!({"role":"user","content":"task"}), invocation];
+            expected.extend(outputs);
+            assert_eq!(next["input"], json!(expected));
+
+            // Later notifications may arrive after another model response.
+            history.observe(&completed("resp-samples", vec![]));
+            let late = result(custom, "call-1");
+            let mut next = json!({"previous_response_id":"resp-samples","input":[late.clone()]});
+            history.prepare(key, &mut next);
+            assert!(history.restore(key, &mut next).unwrap());
+            expected.push(late);
+            assert_eq!(next["input"], json!(expected));
+        }
+    }
+
+    #[test]
+    fn native_history_rejects_missing_mismatched_and_reused_calls() {
+        for custom in [false, true] {
+            for restoring in [false, true] {
+                for input in [
+                    vec![result(custom, "call-1"), call(custom, "call-1")],
+                    vec![call(custom, "call-1"), result(!custom, "call-1")],
+                    vec![call(custom, "call-1"), result(custom, "call-2")],
+                    vec![
+                        call(custom, "call-1"),
+                        result(custom, "call-1"),
+                        call(custom, "call-1"),
+                    ],
+                ] {
+                    assert!(validate_native_tool_history(&input, restoring).is_err());
+                }
+            }
         }
     }
 
