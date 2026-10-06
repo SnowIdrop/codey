@@ -172,11 +172,16 @@ fn fastctx_namespace_aliases_pass_attested_child_hooks_without_broadening_permis
             child.tool_name = Some(tool.into());
             let output = handle_hook_for_runtime_at(&child, root, runtime_id, 12).unwrap();
             assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+            let expected_reason = if role == "codey_quick_scan" {
+                "不具备写入权限"
+            } else {
+                "deny-unknown-child-tool"
+            };
             assert!(
                 output["hookSpecificOutput"]["permissionDecisionReason"]
                     .as_str()
                     .unwrap()
-                    .contains("deny-unknown-child-tool"),
+                    .contains(expected_reason),
                 "{role}: {tool}: {output}"
             );
         }

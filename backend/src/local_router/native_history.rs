@@ -1167,11 +1167,20 @@ mod tests {
             "type":"response.completed",
             "response":{"id":"resp-hollow","status":"completed","output":[]}
         }));
+        assert!(
+            history
+                .unavailable
+                .as_deref()
+                .unwrap()
+                .contains("流式响应缺少完整输出")
+        );
+        assert!(!history.has_history());
         let mut next =
             json!({"previous_response_id":"resp-hollow","input":[result(false, "call-1")]});
+        let original = next.clone();
         history.prepare(key, &mut next);
-        let error = history.restore(key, &mut next).unwrap_err().to_string();
-        assert!(error.contains("流式响应缺少完整输出"), "{error}");
+        assert!(history.restore(key, &mut next).is_err());
+        assert_eq!(next, original);
     }
 
     #[test]
