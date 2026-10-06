@@ -455,6 +455,7 @@ dependencies = [
  "fs2",
  "libc",
  "libloading",
+ "reqwest",
  "semver",
  "serde",
  "serde_json",

@@ -2498,9 +2498,9 @@ impl RouterServer {
         let Some(response) = upstream_response else {
             return write_upstream_http_error(
                 downstream,
-                UpstreamHttpError {
+                UpstreamHttpErrorResponse {
                     status: upstream_status,
-                    request_id: upstream_request_id.as_deref(),
+                    upstream_request_id: upstream_request_id.as_deref(),
                     retry_advice,
                     body: preloaded_error_body.as_deref().unwrap_or_default(),
                 },
@@ -2525,9 +2525,9 @@ impl RouterServer {
                     Ok(Ok(body)) => {
                         write_upstream_http_error(
                             downstream,
-                            UpstreamHttpError {
+                            UpstreamHttpErrorResponse {
                                 status: upstream_status,
-                                request_id: upstream_request_id.as_deref(),
+                                upstream_request_id: upstream_request_id.as_deref(),
                                 retry_advice,
                                 body: &body,
                             },

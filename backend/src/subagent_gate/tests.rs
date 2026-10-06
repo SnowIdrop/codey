@@ -371,6 +371,7 @@ fn wait_snapshot_never_settles_unreported_ledger_siblings() {
     write_test_runtime_policy(root);
     for task in ["reader_a", "reader_b"] {
         let mut spawn = input("PreToolUse", session_id);
+        spawn.cwd = Some(format!("/repo-{task}"));
         spawn.turn_id = Some("root-turn".to_string());
         spawn.tool_name = Some("agents.spawn_agent".to_string());
         spawn.tool_input = Some(json!({
@@ -1700,6 +1701,7 @@ fn bound_root_turn_can_finish_batch_dispatch_while_other_turns_fail_closed() {
     write_test_runtime_policy(root);
     let spawn_input = |task: &str, turn: &str| {
         let mut spawn = input("PreToolUse", "turn-bound-session");
+        spawn.cwd = Some(format!("/repo-{task}"));
         spawn.turn_id = Some(turn.to_string());
         spawn.tool_name = Some("agents.spawn_agent".to_string());
         spawn.tool_input = Some(json!({
@@ -2236,6 +2238,7 @@ fn missing_id_stop_settles_only_a_unique_active_ledger_candidate() {
 
     let spawn_agent = |session_id: &str, task_id: &str, now_ms: u64| {
         let mut spawn = input("PreToolUse", session_id);
+        spawn.cwd = Some(format!("/repo-{task_id}"));
         spawn.turn_id = Some("root-turn-a".to_string());
         spawn.tool_name = Some("agents.spawn_agent".to_string());
         spawn.tool_input = Some(json!({
@@ -2370,6 +2373,7 @@ fn synchronous_batches_block_local_work_while_verified_async_batches_allow_it() 
                        contract: Value,
                        now_ms: u64| {
         let mut spawn = input("PreToolUse", session_id);
+        spawn.cwd = Some(format!("/repo-{task_id}"));
         spawn.turn_id = Some(root_turn.to_string());
         spawn.tool_name = Some("agents.spawn_agent".to_string());
         spawn.tool_input = Some(json!({
@@ -2462,8 +2466,9 @@ fn synchronous_batches_block_local_work_while_verified_async_batches_allow_it() 
                     base + 30,
                 )
                 .unwrap()
-            ),
-            Some("deny".to_string()),
+            )
+            .as_deref(),
+            Some("deny"),
             "{tool_name}"
         );
     }
@@ -2472,8 +2477,9 @@ fn synchronous_batches_block_local_work_while_verified_async_batches_allow_it() 
         "sql": "WITH columns AS (SELECT * FROM information_schema.columns) SELECT * FROM columns;"
     }));
     assert_eq!(
-        permission(&handle_hook_for_runtime_at(&sql_read, root, runtime_id, base + 30).unwrap()),
-        Some("deny".to_string())
+        permission(&handle_hook_for_runtime_at(&sql_read, root, runtime_id, base + 30).unwrap())
+            .as_deref(),
+        Some("deny")
     );
     for tool_name in [
         "mcp__codey_fastctx__replace",
@@ -2539,6 +2545,7 @@ fn synchronous_batches_block_local_work_while_verified_async_batches_allow_it() 
     assert!(reason.contains("仍有 1 个子代理"));
     assert!(reason.contains("同步批次须等全部代理结束，期间不得补位"));
     assert!(reason.contains("不得恢复非协作本地工作"));
+    assert!(!reason.contains("数据库 schema/只读 SQL"));
     assert!(
         !agent_marker_path(
             &session_state_dir(root, read_session),
@@ -2564,8 +2571,9 @@ fn synchronous_batches_block_local_work_while_verified_async_batches_allow_it() 
                 base + 41,
             )
             .unwrap()
-        ),
-        Some("deny".to_string())
+        )
+        .as_deref(),
+        Some("deny")
     );
 
     remove_active_marker(root, runtime_id, read_session, "agent-reader-b").unwrap();
@@ -2923,7 +2931,7 @@ fn mixed_full_list_settles_only_the_terminal_ledger_marker() {
     let spawn = |task_id: &str, agent_id: &str, now_ms: u64| {
         let mut request = input("PreToolUse", session_id);
         request.turn_id = Some("root-turn-a".to_string());
-        request.cwd = Some("/repo".to_string());
+        request.cwd = Some(format!("/repo-{task_id}"));
         request.tool_name = Some("agents.spawn_agent".to_string());
         request.tool_input = Some(json!({
             "task_name": task_id,

@@ -2678,7 +2678,7 @@ default_subagent_reasoning_effort = "low"
 #[test]
 fn subagent_optimization_keeps_a_standalone_explicit_lower_concurrency() {
     let result = patch_config_with_fastctx_mode(
-        "[agents]\nmax_concurrent_threads_per_session = 2\n",
+        "[agents]\nmax_concurrent_threads_per_session = 1\n",
         RouterPatchOptions {
             config_path: Path::new("/tmp/codey-codex/config.toml"),
             model_catalog_path: relative_model_catalog_path(),
@@ -2695,7 +2695,7 @@ fn subagent_optimization_keeps_a_standalone_explicit_lower_concurrency() {
 
     assert_eq!(
         document["agents"]["max_concurrent_threads_per_session"].as_integer(),
-        Some(2)
+        Some(1)
     );
 }
 
