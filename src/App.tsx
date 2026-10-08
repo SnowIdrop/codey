@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "@heroui/react";
 import {
+  IconBrandGithub,
   IconCheck,
   IconCircleArrowUp,
   IconDeviceFloppy as Save,
@@ -1396,20 +1397,32 @@ export function App({
       </div>
 
       {embedded && (
-        <div className="config-header-feedback justify-self-center">
+        <div className="flex items-center gap-3 justify-self-center max-[760px]:gap-2">
+          <div className="config-header-feedback">
+            <Button
+              aria-describedby="codey-feedback-qr-description"
+              aria-label="问题反馈群，鼠标悬停或键盘聚焦查看二维码"
+              className="h-8! whitespace-nowrap px-3.5 text-xs max-[760px]:w-8! max-[760px]:px-0!"
+              variant="brand-outline"
+            >
+              <IconMessageCircleQuestion aria-hidden="true" />
+              <span className="max-[760px]:hidden">问题反馈群</span>
+            </Button>
+            <div className="feedback-qr-popover" role="tooltip">
+              <img src={feedbackGroupQrUrl} alt="问题反馈群二维码" />
+              <span id="codey-feedback-qr-description">扫码加入问题反馈群</span>
+            </div>
+          </div>
           <Button
-            aria-describedby="codey-feedback-qr-description"
-            aria-label="问题反馈群，鼠标悬停或键盘聚焦查看二维码"
-            className="h-8! whitespace-nowrap px-3.5 text-xs max-[760px]:w-8! max-[760px]:px-0!"
+            aria-label="打开 Codey GitHub 仓库"
+            className="h-8! w-8! min-w-8! px-0!"
+            onClick={() => window.open("https://github.com/SuperGness/codey", "_blank", "noopener,noreferrer")}
+            size="icon-sm"
+            title="GitHub 仓库"
             variant="brand-outline"
           >
-            <IconMessageCircleQuestion aria-hidden="true" />
-            <span className="max-[760px]:hidden">问题反馈群</span>
+            <IconBrandGithub aria-hidden="true" />
           </Button>
-          <div className="feedback-qr-popover" role="tooltip">
-            <img src={feedbackGroupQrUrl} alt="问题反馈群二维码" />
-            <span id="codey-feedback-qr-description">扫码加入问题反馈群</span>
-          </div>
         </div>
       )}
 
