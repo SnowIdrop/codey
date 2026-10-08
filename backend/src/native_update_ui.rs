@@ -473,14 +473,11 @@ async fn show_dialog_with_extra(
     _title: String,
     _description: String,
     kind: DialogKind,
-    _primary_label: String,
+    primary_label: String,
     _secondary_label: Option<String>,
     _extra_label: Option<String>,
 ) -> Result<DialogResult, String> {
-    Ok(match kind {
-        DialogKind::Confirm | DialogKind::RestoreContext => DialogResult::Secondary,
-        DialogKind::Failure => DialogResult::Primary,
-    })
+    Ok(dialog_result_for_label(kind, None, &primary_label, None))
 }
 
 #[cfg(target_os = "macos")]
