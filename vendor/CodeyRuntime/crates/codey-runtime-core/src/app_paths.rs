@@ -1748,7 +1748,7 @@ mod tests {
     fn unpacked_package_read_errors_preserve_both_paths_and_size_limit() {
         let temp = tempfile::tempdir().unwrap();
         let archive = temp.path().join("app.asar");
-        let unpacked = temp.path().join("app.asar.unpacked/package.json");
+        let unpacked = temp.path().join("app.asar.unpacked").join("package.json");
         let entry = serde_json::json!({ "size": 1, "unpacked": true });
         std::fs::write(&archive, test_asar(entry, &[])).unwrap();
         let missing = asar_app_package(&archive).unwrap_err();
