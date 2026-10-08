@@ -31,6 +31,7 @@ use crate::config::{DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT};
 use crate::fs_util::timestamp_millis;
 use crate::local_router::{self, RuntimeRouterEndpoint};
 
+mod context_budget;
 mod fastctx;
 mod fs_io;
 mod repair;
@@ -114,6 +115,8 @@ struct RuntimeConfigLease {
     runtime_hooks_applied: bool,
     #[serde(default)]
     original_hooks_file_exists: bool,
+    #[serde(default)]
+    context_budget: Option<context_budget::ContextBudgetLease>,
 }
 
 fn lease_default_true() -> bool {
@@ -538,6 +541,12 @@ fn apply_isolated_runtime_router_config(
     )? {
         effective_document["model_catalog_json"] = value(path.to_string_lossy().into_owned());
     }
+    let context_budget = context_budget::prepare(
+        home,
+        &persistent,
+        &mut effective_document,
+        local_router.and(model_contexts),
+    )?;
     let runtime_config_overrides = build_isolated_runtime_overrides(
         &effective_document,
         root_instructions.as_deref(),
@@ -577,6 +586,7 @@ fn apply_isolated_runtime_router_config(
         runtime_agent_hashes,
         runtime_hooks_applied: updated_hooks.is_some(),
         original_hooks_file_exists: original_hooks.is_some(),
+        context_budget,
     };
     if let Err(error) = write_lease(marker, &state) {
         let _ = fs::remove_dir_all(&backup_dir);
@@ -591,6 +601,14 @@ fn apply_isolated_runtime_router_config(
             "Codex 配置在 Codey 保存隔离约束快照后发生变化；取消启动时清理租约失败，恢复备份已保留"
         })?;
         bail!("Codex 配置在 Codey 保存隔离约束快照后发生变化；已取消本次启动");
+    }
+
+    if let Some(budget) = &state.context_budget
+        && let Err(error) = budget.apply(home, original_config.as_deref().unwrap_or_default())
+    {
+        rollback_isolated_runtime_config(home, marker, &state)
+            .context("应用上下文配置失败，恢复租约也失败")?;
+        return Err(error);
     }
 
     if let Some(updated_hooks) = updated_hooks.as_deref()
@@ -1029,6 +1047,9 @@ fn rollback_isolated_runtime_config(
     marker: &Path,
     state: &RuntimeConfigLease,
 ) -> Result<()> {
+    if let Some(budget) = &state.context_budget {
+        budget.restore(home)?;
+    }
     restore_runtime_hooks_file(home, state)?;
     crate::subagent_gate::clear_runtime_subagent_policy(home)?;
     remove_optional(marker)
@@ -1239,11 +1260,7 @@ fn restore_runtime_config_at(
         Err(error) => return Err(error.into()),
     };
     let repair_router_config = repair_router_config || state.local_router_applied;
-    // Every lease written since the isolated-runtime design carries only
-    // process-local state (hooks.json, policy files). The pre-isolation
-    // AGENTS.md / agents/default.toml restore path was removed on 2026-09-06;
-    // a lease from such an old release is treated the same way and its marker
-    // is released so the next launch can proceed.
+    // 预算和 Hook 的恢复均保留用户在运行期间做出的修改。
     rollback_isolated_runtime_config(home, marker, &state)?;
     if repair_router_config {
         let _ = repair_persistent_codey_runtime_config(home)?;

@@ -1454,6 +1454,85 @@ fn runtime_context_overlay_uses_user_catalog_and_reset_restores_its_path() {
 }
 
 #[test]
+fn context_budget_startup_applies_and_recovers_global_conflicts() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let original = "model_catalog_json='catalog.json'\nmodel_context_window=372000\nmodel_auto_compact_token_limit=300000\n";
+    fs::write(home.join("config.toml"), original).unwrap();
+    let mut catalog = codey_runtime_core::model_suffix::bundled_model_catalog().unwrap();
+    for model in catalog["models"].as_array_mut().unwrap() {
+        model["base_instructions"] = serde_json::json!("Test instructions");
+    }
+    fs::write(
+        home.join("catalog.json"),
+        serde_json::to_vec(&catalog).unwrap(),
+    )
+    .unwrap();
+    let policies = BTreeMap::from([(
+        "gpt-5.6-sol".into(),
+        crate::config::ModelContextConfig {
+            context_window_tokens: 1_000_000,
+            auto_compact_token_limit: Some(800_000),
+            reserve_output_tokens: None,
+        },
+    )]);
+    let marker = temp.path().join("state/lease.json");
+    let backups = temp.path().join("state/backups");
+    let applied = apply_isolated_runtime_router_config(
+        &home,
+        RouterApplyOptions {
+            local_router: Some(test_runtime_router_endpoint()),
+            use_official_catalog: true,
+            model_contexts: Some(&policies),
+            stream_max_retries: 5,
+            default_model: None,
+            fastctx_command: None,
+            subagent_optimization: false,
+            subagent_model: DEFAULT_SUBAGENT_MODEL,
+            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+            subagent_roles: None,
+            marker: &marker,
+            backup_root: &backups,
+        },
+    )
+    .unwrap();
+    let config = read_codex_config_document(&home.join("config.toml")).unwrap();
+    assert!(!config.contains_key("model_context_window"));
+    assert!(!config.contains_key("model_auto_compact_token_limit"));
+    let argument = applied
+        .runtime_config_overrides
+        .iter()
+        .find(|entry| entry.starts_with("model_catalog_json="))
+        .unwrap();
+    let path = parse_document(argument).unwrap()["model_catalog_json"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let projected: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    let model = projected["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["slug"] == "gpt-5.6-sol")
+        .unwrap();
+    assert_eq!(model["context_window"], 1_000_000);
+    assert_eq!(model["auto_compact_token_limit"], 800_000);
+    assert!(restore_runtime_config_at(&home, &marker, false).unwrap());
+    let restored = read_codex_config_document(&home.join("config.toml")).unwrap();
+    assert_eq!(restored["model_context_window"].as_integer(), Some(372000));
+    assert_eq!(
+        restored["model_auto_compact_token_limit"].as_integer(),
+        Some(300000)
+    );
+    assert_eq!(
+        restored["model_catalog_json"].as_str(),
+        Some("catalog.json")
+    );
+    assert!(!marker.exists());
+}
+
+#[test]
 fn isolated_runtime_skips_retry_overrides_for_builtin_providers() {
     // Codex 禁止在 `model_providers` 下覆盖内置 Provider，路由关闭时必须跳过
     // 这条覆盖，否则 app-server 在加载配置阶段就会退出。
