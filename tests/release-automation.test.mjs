@@ -7,6 +7,7 @@ import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 import { analyzeNoteBatch, analyzeNotePatches, assertSameAssets, callback, collectNotePatches, generateNotes, identity, main, selectNoteCandidates, signature, updateReleaseNotes, validateBuild, validateNotes, validateRelease } from "../scripts/release-automation.mjs";
+import { formatNoteResults } from "../scripts/release-note-batches.mjs";
 
 const environment = {
   RELEASE_BUILD_ID: "build_test-123", RELEASE_ATTEMPT: "2", GITHUB_RUN_ID: "456", RELEASE_ACTION: "build",
@@ -143,7 +144,7 @@ test("multi-batch results use one injected global selector with all candidates",
   });
   assert.equal(candidates.length, 2);
   assert.equal(result.evidence[0].file, "beta.js");
-  assert.equal(result.notes, "- 更新 beta.js");
+  assert.equal(result.notes, "**体验优化**\n- 更新 beta.js");
 });
 
 test("global AI selection retries invalid candidate references without accepting new text", async () => {
@@ -158,7 +159,7 @@ test("global AI selection retries invalid candidate references without accepting
     return { stdout: JSON.stringify({ selected: ["c0"] }) };
   });
   assert.equal(calls, 2);
-  assert.deepEqual(result, { notes: "- 增加启动提示", evidence: candidates, notes_status: "generated" });
+  assert.deepEqual(result, { ...formatNoteResults(candidates), notes_status: "generated" });
 });
 
 test("global AI selection preserves valid candidates beyond the suggested size without retrying", async () => {
@@ -172,7 +173,7 @@ test("global AI selection preserves valid candidates beyond the suggested size w
   });
   assert.equal(calls, 1);
   assert.deepEqual(result.evidence, candidates);
-  assert.equal(result.notes, candidates.map(candidate => `- ${candidate.note}`).join("\n"));
+  assert.equal(result.notes, `**体验优化**\n${candidates.map(candidate => `- ${candidate.note}`).join("\n")}`);
 });
 
 test("batch evidence cannot cite changes from another batch", async () => {
@@ -234,7 +235,7 @@ test("Copilot returns only notes and references while the script preserves exact
     return { stdout: JSON.stringify({ entries: [{ note: "调整路径处理", ref }] }) };
   });
   assert.equal(calls, 1);
-  assert.equal(result.notes, "- 调整路径处理");
+  assert.equal(result.notes, "**体验优化**\n- 调整路径处理");
   assert.equal(result.evidence[0].file, patches[0].file);
   assert.equal(result.evidence[0].excerpt, patches[0].diff.slice(0, -1));
 });
@@ -265,9 +266,45 @@ for (const [name, notes] of [
       return { stdout: JSON.stringify({ entries: notes.map(note => ({ note, ref })) }) };
     });
     assert.equal(calls, 1);
-    assert.equal(result.notes, notes.map(note => `- ${note}`).join("\n"));
+    assert.equal(result.notes, `**体验优化**\n${notes.map(note => `- ${note}`).join("\n")}`);
   });
 }
+
+test("categorized AI entries produce concise section format with evidence in matching order", async () => {
+  const patches = [{ file: "app.js", diff: "+const changed = true;\n" }];
+  let calls = 0;
+  const result = await analyzeNoteBatch(patches, build, 0, 1, async (_command, args) => {
+    calls += 1;
+    assert.match(args[1], /新增功能、体验优化、问题修复/);
+    assert.match(args[1], /省去背景、过程和实现细节/);
+    assert.match(args[1], /这些是篇幅建议/);
+    const ref = args[1].match(/\[evidence:(b\d+p\d+l\d+)\]/)[1];
+    return { stdout: JSON.stringify({ entries: [
+      { category: "问题修复", note: "修复启动失败", ref },
+      { category: "新增功能", note: "支持查看更新日志", ref },
+      { category: "体验优化", note: "简化更新提示", ref },
+    ] }) };
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.notes, "**新增功能**\n- 支持查看更新日志\n\n**体验优化**\n- 简化更新提示\n\n**问题修复**\n- 修复启动失败");
+  assert.deepEqual(result.evidence.map(item => item.category), ["新增功能", "体验优化", "问题修复"]);
+  assert.equal(result.notes_status, "generated");
+  assert.throws(() => validateNotes({ ...result, evidence: result.evidence.map(item => ({ ...item, category: "问题修复" })) }, patches), /分类或证据格式不一致/);
+});
+
+test("global selection retains categories and omits empty sections after choosing candidates", async () => {
+  const candidates = [
+    { category: "新增功能", note: "支持快捷更新", file: "app.js", excerpt: "+const changed = true;" },
+    { category: "问题修复", note: "修复启动失败", file: "app.js", excerpt: "+const changed = true;" },
+    { category: "体验优化", note: "简化更新提示", file: "app.js", excerpt: "+const changed = true;" },
+  ];
+  const result = await selectNoteCandidates(candidates, build, async (_command, args) => {
+    assert.match(args[1], /"category":"新增功能"/);
+    return { stdout: JSON.stringify({ selected: ["c1", "c0"] }) };
+  });
+  assert.equal(result.notes, "**新增功能**\n- 支持快捷更新\n\n**问题修复**\n- 修复启动失败");
+  assert.deepEqual(result.evidence, [candidates[0], candidates[1]]);
+});
 
 test("invalid JSON never appears in the correction prompt and repeated invalid references still fail", async () => {
   const patches = [{ file: "retry.js", diff: "+const retries = 3;\n" }];

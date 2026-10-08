@@ -422,9 +422,36 @@ impl LifecycleRequest {
         }) {
             return Err(failure("plugin_turn_state_unauthorized"));
         }
-        headers.remove("cookie");
-        headers.remove("x-codex-turn-state");
-        headers.insert("cookie", state.cookie.clone());
+        let borrowed_cookie = state
+            .cookie
+            .to_str()
+            .map_err(|_| failure("plugin_turn_state_invalid_cookie"))?;
+        let mut cookies = headers
+            .get("cookie")
+            .map(|value| {
+                value
+                    .to_str()
+                    .map_err(|_| failure("plugin_turn_state_invalid_cookie"))
+            })
+            .transpose()?
+            .unwrap_or_default()
+            .split(';')
+            .map(str::trim)
+            .filter(|part| {
+                part.split_once('=')
+                    .is_none_or(|(name, _)| !matches!(name.trim(), "__cflb" | "__oailb"))
+            })
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        cookies.extend(
+            borrowed_cookie
+                .split(';')
+                .map(|part| part.trim().to_owned()),
+        );
+        let merged_cookie = reqwest::header::HeaderValue::from_str(&cookies.join("; "))
+            .map_err(|_| failure("plugin_turn_state_invalid_cookie"))?;
+        headers.insert("cookie", merged_cookie);
         headers.insert("x-codex-turn-state", state.turn_state.clone());
         if let Some(entry) = self.entries.iter().find(|entry| entry.plugin.id == *owner) {
             entry.plugin.log("turn_state_applied");
