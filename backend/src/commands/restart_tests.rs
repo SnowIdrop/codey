@@ -193,7 +193,7 @@ fn unknown_official_auth_does_not_force_openai_auth_for_third_party_launches() {
         crate::config::LaunchOfficialAccountStatus::Unknown
     );
     assert!(!next.router_requires_openai_auth());
-    assert_eq!(next.profiles, vec![official, relay]);
+    assert_eq!(next.profiles, previous.profiles);
     assert_eq!(next.active_profile_id, "relay");
 }
 

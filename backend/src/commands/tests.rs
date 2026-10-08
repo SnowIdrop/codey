@@ -660,12 +660,14 @@ fn route_name_limit_matches_the_renderer_and_legacy_names_stay_saveable() {
 
     let mut at_limit = legacy.clone();
     at_limit.name = "名".repeat(15);
+    at_limit.short_name = "旧".to_string();
     let merged = merge_profile_secrets(vec![at_limit.clone()], &previous).unwrap();
     assert_eq!(merged[0].name, at_limit.name);
 
     // 改名以后超过上限会被拒绝,直接调用后端接口也无法写进界面存不下的名称。
     let mut renamed = legacy.clone();
     renamed.name = "名".repeat(16);
+    renamed.short_name = "旧".to_string();
     let error = merge_profile_secrets(vec![renamed], &previous).unwrap_err();
     assert!(error.contains("最多 15 个字符"), "{error}");
 }
@@ -922,6 +924,7 @@ fn saving_a_route_keeps_the_official_account_id_when_the_form_omits_it() {
     let mut incoming = saved.clone();
     incoming.official_account_id = None;
     incoming.name = "主力".to_string();
+    incoming.short_name = "主".to_string();
     let previous = CodeyConfig {
         profiles: vec![saved],
         ..CodeyConfig::default()

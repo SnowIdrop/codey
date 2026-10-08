@@ -3122,7 +3122,7 @@ mod tests {
         assert!(profile.official_account);
         assert_eq!(profile.auth_mode, AUTH_MODE_OFFICIAL_ACCOUNT);
         assert_eq!(profile.upstream_protocol, UPSTREAM_PROTOCOL_OFFICIAL);
-        assert!(profile.short_name.is_empty());
+        assert_eq!(profile.short_name, "Op");
         assert_eq!(profile.display_short_name(), "Op");
         assert!(profile.validate().is_ok());
         assert_eq!(loaded.clone().normalize(), loaded);
