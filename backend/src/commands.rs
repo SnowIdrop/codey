@@ -1189,7 +1189,9 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         "codex_extensions" => extensions::invoke(state, &args).await,
         "repair_plugin_marketplace" => repair_plugin_marketplace().await,
         "prepare_computer_use" => prepare_computer_use().await,
-        "list_codey_plugins"
+        "get_codey_plugin_host_info"
+        | "validate_codey_plugin_config"
+        | "list_codey_plugins"
         | "get_codey_plugin_config_file"
         | "select_codey_plugin_package"
         | "inspect_codey_plugin"

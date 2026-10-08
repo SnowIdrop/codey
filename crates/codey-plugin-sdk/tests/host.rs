@@ -174,6 +174,13 @@ fn uninstall_loaded_plugin(root: &Path, remove_data: bool) {
 
 #[tokio::test]
 async fn complete_native_plugin_lifecycle() {
+    // 预检查不能初始化管理器、创建目录或加载插件；后续安装仍须显式初始化。
+    assert!(host::list().is_err());
+    let info = host::host_info();
+    assert_eq!(info.platform, consts::OS);
+    assert_eq!(info.arch, consts::ARCH);
+    assert!(codey_plugin_sdk::config::validate(INITIAL_CONFIG).valid);
+    assert!(host::list().is_err());
     if let Some(root) = std::env::var_os("CODEY_TEST_TRANSPORT_STARTUP_ROOT") {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = calls.clone();

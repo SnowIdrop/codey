@@ -576,6 +576,9 @@ if (import.meta.env.DEV) {
         };
       }
 
+      if (command === "get_codey_plugin_host_info" || command === "validate_codey_plugin_config") {
+        throw new Error("预览环境不提供真实宿主查询或配置预检查，请连接 Codey bridge。");
+      }
       if (command === "list_codey_plugins") {
         const pluginPreview = new URLSearchParams(window.location.search).get("plugins");
         if (pluginPreview === "error") throw new Error("预览：插件列表暂时不可用，请稍后刷新。");
