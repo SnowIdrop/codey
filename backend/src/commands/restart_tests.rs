@@ -932,6 +932,19 @@ fn restart_sensitive_config_changes_are_detected() {
         &enabled_subagent,
         &changed_task_role
     ));
+    for enabled in [false, true] {
+        changed_task_role
+            .subagent_roles
+            .get_mut(crate::config::SUBAGENT_ROLE_QUICK_SCAN)
+            .unwrap()
+            .enabled = enabled;
+        assert!(!config_requires_restart(
+            &enabled_subagents,
+            &enabled_models,
+            &RuntimeSubagentConfig::from_config(&changed_task_role),
+            &changed_task_role
+        ));
+    }
 
     let mut two_routes = applied;
     let mut second_route = crate::config::ProviderProfile::new("Route B");

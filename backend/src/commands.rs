@@ -2464,6 +2464,7 @@ enum SubagentHotReloadStatus {
     Unchanged,
     Applied,
     Repaired,
+    PendingRestart,
     Superseded,
     Failed,
 }
@@ -2476,6 +2477,14 @@ pub(super) struct SubagentHotReloadOutcome {
 }
 
 impl SubagentHotReloadOutcome {
+    fn pending_restart(reason: impl Into<String>) -> Self {
+        Self {
+            status: SubagentHotReloadStatus::PendingRestart,
+            error: Some(reason.into()),
+            ..Self::default()
+        }
+    }
+
     fn unchanged() -> Self {
         Self {
             status: SubagentHotReloadStatus::Unchanged,
@@ -2523,7 +2532,10 @@ impl SubagentHotReloadOutcome {
     }
 
     pub(super) fn requires_restart(&self) -> bool {
-        self.status == SubagentHotReloadStatus::Failed
+        matches!(
+            self.status,
+            SubagentHotReloadStatus::Failed | SubagentHotReloadStatus::PendingRestart
+        )
     }
 
     pub(super) fn health(&self) -> &'static str {
@@ -2532,6 +2544,7 @@ impl SubagentHotReloadOutcome {
             SubagentHotReloadStatus::Unchanged => "healthy",
             SubagentHotReloadStatus::Applied => "applied",
             SubagentHotReloadStatus::Repaired => "repaired",
+            SubagentHotReloadStatus::PendingRestart => "pending_restart",
             SubagentHotReloadStatus::Superseded => "superseded",
             SubagentHotReloadStatus::Failed => "restart_required",
         }
@@ -2605,12 +2618,11 @@ pub(super) async fn hot_reload_runtime_subagent_config(
         Ok(config) => config,
         Err(error) => return SubagentHotReloadOutcome::failed(format!("{error:#}")),
     };
-    let result = tokio::task::spawn_blocking(move || {
-        reconcile_runtime_subagent_roles(&runtime_config).map_err(|error| format!("{error:#}"))
-    })
-    .await
-    .map_err(|error| format!("子代理运行时文件更新任务异常退出：{error}"))
-    .and_then(std::convert::identity);
+    let result =
+        tokio::task::spawn_blocking(move || reconcile_runtime_subagent_roles(&runtime_config))
+            .await
+            .map_err(|error| anyhow::anyhow!("子代理运行时文件更新任务异常退出：{error}"))
+            .and_then(std::convert::identity);
     match result {
         Ok(report) => {
             if !report.repaired && !applied_config_changed {
@@ -2646,6 +2658,9 @@ pub(super) async fn hot_reload_runtime_subagent_config(
             )
         }
         Err(error) => {
+            if error.is::<crate::codex_config::SubagentRoleRegistrationChanged>() {
+                return SubagentHotReloadOutcome::pending_restart(error.to_string());
+            }
             let error = format!("{error:#}");
             error_log::record_failure(
                 "patch_verification_failed",

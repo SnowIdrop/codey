@@ -211,11 +211,25 @@ fn repair_at(home: &Path, marker: &Path, runtime_active: bool) -> RepairResult<C
         let lease = lease.as_ref().expect("active role lease");
         // Saved settings can have pending edits. Preserve the settings currently
         // attested by this lease rather than applying the next launch's settings.
+        let applied_roles = SUBAGENT_ROLE_IDS
+            .into_iter()
+            .map(|role| {
+                let selection = lease.subagent_roles.get(role).cloned().unwrap_or_else(|| {
+                    let mut disabled = SubagentRoleConfig::new(
+                        &lease.subagent_model,
+                        &lease.subagent_reasoning_effort,
+                    );
+                    disabled.enabled = false;
+                    disabled
+                });
+                (role.to_string(), selection)
+            })
+            .collect();
         let applied = CodeyConfig {
             subagent_optimization: true,
             subagent_model: lease.subagent_model.clone(),
             subagent_reasoning_effort: lease.subagent_reasoning_effort.clone(),
-            subagent_roles: lease.subagent_roles.clone(),
+            subagent_roles: applied_roles,
             ..CodeyConfig::default()
         };
         roles_repaired = reconcile_runtime_subagent_roles_at(&applied, marker)
@@ -695,6 +709,11 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         let original = "# retain user model\nmodel='user-model'\n";
         fs::write(home.join("config.toml"), original).unwrap();
+        let mut configured = crate::config::default_subagent_roles();
+        configured
+            .get_mut(crate::config::SUBAGENT_ROLE_WORKER)
+            .unwrap()
+            .enabled = false;
         apply_isolated_runtime_router_config(
             &home,
             RouterApplyOptions {
@@ -707,7 +726,7 @@ mod tests {
                 subagent_optimization: true,
                 subagent_model: DEFAULT_SUBAGENT_MODEL,
                 subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
-                subagent_roles: None,
+                subagent_roles: Some(&configured),
                 marker: &marker,
                 backup_root: &temp.path().join("backups"),
             },
@@ -734,6 +753,18 @@ mod tests {
         assert_eq!(
             updated_lease["subagentRoles"],
             original_lease["subagentRoles"]
+        );
+        assert!(
+            updated_lease["subagentRoles"]
+                .get(crate::config::SUBAGENT_ROLE_WORKER)
+                .is_none()
+        );
+        let (policy, _) = crate::subagent_gate::runtime_subagent_policy_paths(&home);
+        let policy: serde_json::Value = serde_json::from_slice(&fs::read(policy).unwrap()).unwrap();
+        assert!(
+            policy["roles"]
+                .get(crate::config::SUBAGENT_ROLE_WORKER)
+                .is_none()
         );
         assert!(!repair_at(&home, &marker, true).unwrap().repaired);
     }

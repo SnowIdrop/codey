@@ -208,6 +208,34 @@ fn child_tools_require_turn_context_model_attestation_and_cache_success() {
     .unwrap()
     .unwrap();
     assert!(unverified.contains("CODEY_SUBAGENT_RUNTIME_UNVERIFIED"));
+
+    let mut disabled = roles.clone();
+    disabled.remove(role);
+    commit_runtime_subagent_policy(home, &disabled, &hashes).unwrap();
+    assert!(
+        runtime_role_admission_denial(&state_root, role)
+            .unwrap()
+            .unwrap()
+            .contains("CODEY_SUBAGENT_ROLE_DISABLED")
+    );
+    assert_eq!(
+        runtime_subagent_attestation_denial(&good, &state_root, runtime_id).unwrap(),
+        None
+    );
+    assert!(
+        runtime_subagent_attestation_denial(
+            &child_input(pending_agent, &pending_transcript),
+            &state_root,
+            runtime_id
+        )
+        .unwrap()
+        .is_some()
+    );
+    commit_runtime_subagent_policy(home, &roles, &hashes).unwrap();
+    assert_eq!(
+        runtime_role_admission_denial(&state_root, role).unwrap(),
+        None
+    );
 }
 
 #[test]

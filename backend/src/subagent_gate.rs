@@ -1115,8 +1115,14 @@ fn runtime_role_admission_denial(state_root: &Path, role: &str) -> Result<Option
     if policy.roles.contains_key(role) {
         Ok(None)
     } else if crate::config::SUBAGENT_ROLE_IDS.contains(&role) {
+        let available = policy
+            .roles
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("、");
         Ok(Some(format!(
-            "CODEY_SUBAGENT_ROLE_DISABLED: Codey 子代理角色 `{role}` 已关闭；请在设置中开启后重试，或改用已启用角色。未创建调度账本记录。"
+            "CODEY_SUBAGENT_ROLE_DISABLED: Codey 子代理角色 `{role}` 已关闭；当前可用角色：{available}。请改用已启用角色。未创建调度账本记录。"
         )))
     } else {
         Ok(Some(format!(
