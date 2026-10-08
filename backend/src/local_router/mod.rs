@@ -232,6 +232,9 @@ mod tail_tests;
 mod tests;
 
 #[cfg(test)]
+mod compaction_tests;
+
+#[cfg(test)]
 mod safety_tests;
 
 #[cfg(test)]

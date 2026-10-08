@@ -621,8 +621,12 @@ fn provider_secret_merge_preserves_user_remote_compaction_setting() {
 
     let mut disabled = saved.clone();
     disabled.supports_remote_compaction = false;
+    disabled.remote_compaction_protocol = crate::config::RemoteCompactionProtocol::CompactEndpoint;
+    disabled.api_key.clear();
     let merged = merge_profile_secrets(vec![disabled], &previous).unwrap();
     assert!(!merged[0].supports_remote_compaction);
+    assert_eq!(merged[0].remote_compaction_protocol, crate::config::RemoteCompactionProtocol::CompactEndpoint);
+    assert_eq!(merged[0].api_key, "saved-secret");
 
     let mut previous_disabled_profile = saved;
     previous_disabled_profile.supports_remote_compaction = false;

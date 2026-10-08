@@ -834,6 +834,7 @@ impl RouterSnapshot {
                     && config.route_supports_websockets_this_launch(profile),
                 supports_remote_compaction: config
                     .route_supports_remote_compaction_this_launch(profile),
+                remote_compaction_protocol: profile.remote_compaction_protocol,
                 models: HashSet::new(),
                 websocket_config: [0; 32],
                 context_config: [0; 32],
@@ -1163,6 +1164,7 @@ pub(crate) struct RouteTarget {
     pub(crate) plugin_transport: Option<plugin_transport::Target>,
     pub(crate) supports_websockets: bool,
     pub(crate) supports_remote_compaction: bool,
+    pub(crate) remote_compaction_protocol: crate::config::RemoteCompactionProtocol,
     pub(crate) models: HashSet<String>,
     pub(crate) websocket_config: [u8; 32],
     pub(crate) context_config: [u8; 32],

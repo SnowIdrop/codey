@@ -346,6 +346,12 @@ impl NativeResponsesHistory {
                 // Missing/oversized terminal output makes recovery unavailable;
                 // it must not turn an already delivered generation into a retry.
                 let output = terminal_output.map_or(&[][..], Vec::as_slice);
+                if self.history.pending_input.as_ref().is_some_and(|input| {
+                    input.iter().any(|item| item["type"] == "compaction_trigger")
+                }) {
+                    // 显式压缩的 output 是完整的新窗口，不能再拼接旧历史与触发项。
+                    self.history.pending_input = Some(Vec::new());
+                }
                 self.unavailable = self
                     .history
                     .remember(id, output)
@@ -770,11 +776,23 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_compaction_restores_history_before_switching_to_http() {
+        assert_websocket_compaction_history(crate::config::RemoteCompactionProtocol::Responses).await;
+    }
+
+    #[tokio::test]
+    async fn websocket_compaction_compatibility_restores_and_replaces_the_history_window() {
+        assert_websocket_compaction_history(crate::config::RemoteCompactionProtocol::CompactEndpoint)
+            .await;
+    }
+
+    async fn assert_websocket_compaction_history(protocol: crate::config::RemoteCompactionProtocol) {
+        let compat = protocol == crate::config::RemoteCompactionProtocol::CompactEndpoint;
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let (mut config, provider, model) =
             router_config(format!("http://{}/v1", listener.local_addr().unwrap()));
         config.profiles[0].supports_websockets = true;
         config.profiles[0].supports_remote_compaction = true;
+        config.profiles[0].remote_compaction_protocol = protocol;
         let upstream = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -785,21 +803,56 @@ mod tests {
                 ))
                 .await
                 .unwrap();
+            let window = json!([
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"retained task"}]},
+                {"type":"compaction","encrypted_content":"opaque"}
+            ]);
+            for round in 0..2 {
+                let (mut http, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut http).await.unwrap();
+                assert_eq!(request.method, "POST");
+                assert_eq!(
+                    request.path,
+                    if compat {
+                        "/v1/responses/compact"
+                    } else {
+                        "/v1/responses"
+                    }
+                );
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert!(body.get("previous_response_id").is_none(), "{body}");
+                let mut expected = if round == 0 {
+                    json!([{"role":"user","content":"original task"}])
+                } else {
+                    window.clone()
+                };
+                if !compat {
+                    expected
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"type":"compaction_trigger"}));
+                }
+                assert_eq!(body["input"], expected);
+                let response = if compat {
+                    json!({"id":"resp-compact","object":"response.compaction","output":window})
+                } else {
+                    completed("resp-compact", window.as_array().unwrap().clone())["response"].clone()
+                };
+                write_json_response(&mut http, 200, &response).await.unwrap();
+            }
             let (mut http, _) = listener.accept().await.unwrap();
             let request = read_http_request(&mut http).await.unwrap();
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.path, "/v1/responses");
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             assert!(body.get("previous_response_id").is_none(), "{body}");
-            assert_eq!(
-                body["input"],
-                json!([{"role":"user","content":"original task"},{"type":"compaction_trigger"}])
-            );
+            let mut expected = window.as_array().unwrap().clone();
+            expected.push(json!({"role":"user","content":"continue after compression"}));
+            assert_eq!(body["input"], json!(expected));
             write_json_response(
                 &mut http,
                 200,
-                &completed(
-                    "resp-compact",
-                    vec![json!({"type":"compaction","encrypted_content":"opaque"})],
-                )["response"],
+                &completed("resp-continued", vec![])["response"],
             )
             .await
             .unwrap();
@@ -816,13 +869,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(terminal(&mut client).await["response"]["id"], "resp-first");
-        client.send(WebSocketMessage::Text(json!({"type":"response.create","model":model,"previous_response_id":"resp-first","input":[{"type":"compaction_trigger"}]}).to_string().into())).await.unwrap();
-        assert_eq!(
-            terminal(&mut client).await["response"]["id"],
-            "resp-compact"
-        );
+        for previous in ["resp-first", "resp-compact"] {
+            client
+                .send(WebSocketMessage::Text(
+                    json!({
+                        "type":"response.create","model":model,
+                        "previous_response_id":previous,
+                        "input":[{"type":"compaction_trigger"}]
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(terminal(&mut client).await["response"]["id"], "resp-compact");
+        }
+        client
+            .send(WebSocketMessage::Text(
+                json!({
+                    "type":"response.create","model":model,
+                    "previous_response_id":"resp-compact",
+                    "input":[{"role":"user","content":"continue after compression"}]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let continuation = terminal(&mut client).await;
+        assert_eq!(continuation["type"], "response.completed", "{continuation}");
+        assert_eq!(continuation["response"]["id"], "resp-continued");
         upstream.await.unwrap();
-        client.send(WebSocketMessage::Text(json!({"type":"response.create","model":model,"previous_response_id":"resp-missing","input":[{"type":"compaction_trigger"}]}).to_string().into())).await.unwrap();
+        client
+            .send(WebSocketMessage::Text(
+                json!({
+                    "type":"response.create","model":model,
+                    "previous_response_id":"resp-missing",
+                    "input":[{"type":"compaction_trigger"}]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
         let failure = terminal(&mut client).await;
         assert_eq!(failure["response"]["error"]["code"], "invalid_prompt");
         assert_eq!(
@@ -1343,6 +1432,41 @@ mod tests {
                 result(false, "call-1")
             ])
         );
+    }
+
+    #[test]
+    fn streamed_anonymous_output_preserves_distinct_positions_without_duplicates() {
+        let message = json!({
+            "type":"message","role":"assistant",
+            "content":[{"type":"output_text","text":"same message"}]
+        });
+        for terminal_count in 0..=2 {
+            let mut history = NativeResponsesHistory::default();
+            let key = [1; 32];
+            history.prepare(key, &mut json!({"input":"task"}));
+            for index in 0..2 {
+                history.observe(&json!({
+                    "type":"response.output_item.done","output_index":index,
+                    "item":message
+                }));
+            }
+            history.observe(&completed(
+                "resp-anonymous",
+                vec![message.clone(); terminal_count],
+            ));
+            let mut next = json!({"previous_response_id":"resp-anonymous","input":"next"});
+            history.prepare(key, &mut next);
+            history.restore(key, &mut next).unwrap();
+            assert_eq!(
+                next["input"],
+                json!([
+                    {"role":"user","content":"task"},
+                    message, message,
+                    {"role":"user","content":"next"}
+                ]),
+                "terminal_count={terminal_count}"
+            );
+        }
     }
 
     #[test]

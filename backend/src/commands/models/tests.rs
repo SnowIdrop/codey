@@ -2020,6 +2020,23 @@ fn native_web_search_models_hot_reload_but_capability_switch_requires_restart() 
 }
 
 #[test]
+fn remote_compaction_protocol_selection_hot_reloads_without_changing_provider_identity() {
+    use crate::config::RemoteCompactionProtocol;
+    let mut route = ProviderProfile::new("Relay");
+    route.base_url = "https://relay.example/v1".into();
+    route.api_key = "key".into();
+    route.supports_remote_compaction = true;
+    let applied = CodeyConfig { profiles: vec![route], ..CodeyConfig::default() };
+    let mut current = applied.clone();
+    current.profiles[0].remote_compaction_protocol = RemoteCompactionProtocol::CompactEndpoint;
+    assert!(!remote_compaction_transport_requires_restart(&applied, &current));
+    assert!(!provider_route_requires_restart(&applied, &current));
+    assert!(runtime_supports_current_routes_for_hot_reload(&applied, &current));
+    let pinned = config_with_launch_pinned_transport(&applied, &current);
+    assert_eq!(pinned.profiles[0].remote_compaction_protocol, RemoteCompactionProtocol::CompactEndpoint);
+}
+
+#[test]
 fn remote_compaction_identity_changes_require_restart_and_stop_hot_reload() {
     let mut route = crate::config::ProviderProfile::new("Responses Route");
     route.id = "route-a".into();

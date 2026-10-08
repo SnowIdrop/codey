@@ -396,6 +396,7 @@ fn profile_from_provider(
         official_account: provider.official,
         official_account_id: None,
         supports_remote_compaction: provider.supports_remote_compaction,
+        remote_compaction_protocol: crate::config::RemoteCompactionProtocol::default(),
         supports_websockets: provider.official,
         supports_native_web_search: provider.official,
         supports_auto_review: provider.official,

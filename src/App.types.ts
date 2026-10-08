@@ -27,6 +27,7 @@ export type Profile = {
   /** 该线路来自哪个已保存的官方账号；多条官方线路靠它区分。 */
   officialAccountId?: string;
   supportsRemoteCompaction?: boolean;
+  remoteCompactionProtocol?: "responses" | "compactEndpoint";
   supportsWebsockets?: boolean;
   supportsNativeWebSearch?: boolean;
   supportsAutoReview?: boolean;
@@ -206,6 +207,12 @@ export type OfficialAccountsResult = {
 
 export type RuntimeStatus = {
   running: boolean;
+  remoteCompaction?: {
+    configured: boolean;
+    active: boolean | null;
+    restartRequired: boolean;
+    blockingRoutes: Array<{ routeId: string; routeName: string; reason: string }>;
+  };
   appVersion?: string;
   availableUpdate?: UpdateCheck;
   codexAppVersion?: string;

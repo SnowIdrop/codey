@@ -1675,6 +1675,23 @@ impl RouterServer {
             }
         }
         let bridge = ProtocolBridge::from_upstream_protocol(resolved.protocol);
+        if let Some(probe) = downstream.request_log_probe() {
+            probe.resolve_route(
+                &resolved.provider_id,
+                &resolved.route.route_name,
+                resolved
+                    .route
+                    .official_auth
+                    .as_ref()
+                    .map(|auth| auth.account_id.as_str()),
+                &resolved.requested_model,
+                &resolved.upstream_model,
+                &resolved.route.upstream_authority,
+                bridge.upstream_protocol().label(),
+                bridge.label(),
+                subagent_request,
+            );
+        }
         if compacting && !resolved.route.supports_remote_compaction {
             return downstream
                 .write_error(
@@ -1706,23 +1723,6 @@ impl RouterServer {
                     )
                     .await;
             }
-        }
-        if let Some(probe) = downstream.request_log_probe() {
-            probe.resolve_route(
-                &resolved.provider_id,
-                &resolved.route.route_name,
-                resolved
-                    .route
-                    .official_auth
-                    .as_ref()
-                    .map(|auth| auth.account_id.as_str()),
-                &resolved.requested_model,
-                &resolved.upstream_model,
-                &resolved.route.upstream_authority,
-                bridge.upstream_protocol().label(),
-                bridge.label(),
-                subagent_request,
-            );
         }
         downstream.select_route(&resolved.route);
         if bridge != ProtocolBridge::NativeResponses
@@ -1813,9 +1813,14 @@ impl RouterServer {
                 .insert("stream".to_string(), Value::Bool(true));
             body_mutated = true;
         }
-        let upstream_url = match request_kind {
-            ResponsesRequestKind::Create => &resolved.route.upstream_url,
-            ResponsesRequestKind::Compact => &resolved.route.upstream_compact_url,
+        let compact_endpoint_compat = compacting
+            && request_kind == ResponsesRequestKind::Create
+            && !resolved.route.official_account
+            && resolved.route.remote_compaction_protocol
+                == crate::config::RemoteCompactionProtocol::CompactEndpoint;
+        let upstream_url = match (request_kind, compact_endpoint_compat) {
+            (ResponsesRequestKind::Compact, _) | (_, true) => &resolved.route.upstream_compact_url,
+            _ => &resolved.route.upstream_url,
         };
         let upstream_url = match upstream_url {
             Ok(upstream_url) => upstream_url.as_str(),
@@ -2125,7 +2130,29 @@ impl RouterServer {
             body_mutated = true;
             encoded_body = None;
         }
-        let xai_response_fix = if bridge == ProtocolBridge::NativeResponses
+        if compact_endpoint_compat {
+            if let Err(error) = adapt_compaction_trigger_to_compact(&mut upstream_body) {
+                return downstream
+                    .write_error(
+                        400,
+                        "unsupported_compaction_payload",
+                        error.to_string(),
+                        Some(&resolved.route),
+                    )
+                    .await;
+            }
+            body_mutated = true;
+            encoded_body = None;
+            headers.insert(
+                reqwest::header::ACCEPT,
+                HeaderValue::from_static("application/json"),
+            );
+            if let Some(probe) = downstream.request_log_probe() {
+                probe.mark_fallback("compaction_compact_endpoint");
+            }
+        }
+        let xai_response_fix = if !compacting
+            && bridge == ProtocolBridge::NativeResponses
             && !resolved.route.official_account
             && native_upstream_needs_xai_compat(upstream_url, &resolved.upstream_model)
         {
@@ -2452,7 +2479,13 @@ impl RouterServer {
                 write_validated_compaction(
                     downstream,
                     response,
-                    request_kind == ResponsesRequestKind::Create,
+                    if compact_endpoint_compat {
+                        CompactionResponseFormat::CompactToResponses
+                    } else if request_kind == ResponsesRequestKind::Create {
+                        CompactionResponseFormat::Responses
+                    } else {
+                        CompactionResponseFormat::Compact
+                    },
                     stream_requested,
                     &resolved.route,
                 )

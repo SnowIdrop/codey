@@ -1039,9 +1039,11 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
         // Compaction and an active lifecycle plugin both skip that attempt, so
         // stage before every HTTP restore. A second call after a failed
         // handshake only restages the same turn.
-        let restored = self
-            .native_history
-            .restore_for_http(key, body, route.official_account);
+        let restored = self.native_history.restore_for_http(
+            key,
+            body,
+            route.official_account || route.supports_remote_compaction,
+        );
         if restored.is_ok() {
             self.upstream.take();
         }

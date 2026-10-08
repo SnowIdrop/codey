@@ -1638,6 +1638,7 @@ export function App({
             <ModelSection
               active={active}
               config={config}
+              runtimeStatus={status}
               currentProvider={provider ?? null}
               officialAccountAvailable={status.officialAccountAvailable === true}
               popupContainer={popupContainer}

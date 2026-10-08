@@ -10,6 +10,22 @@ use uuid::Uuid;
 pub use crate::notifications::WebhookConfig;
 use crate::{local_router, model_catalog, model_id};
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoteCompactionProtocol {
+    #[default]
+    Responses,
+    CompactEndpoint,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RemoteCompactionBlocker {
+    pub(crate) route_id: String,
+    pub(crate) route_name: String,
+    pub(crate) reason: &'static str,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderProfile {
@@ -56,6 +72,9 @@ pub struct ProviderProfile {
     /// compaction when it was explicitly enabled by the source configuration.
     #[serde(default)]
     pub supports_remote_compaction: bool,
+    /// 上游压缩协议；旧配置保持原生 Responses 行为，兼容端点由用户明确选择。
+    #[serde(default)]
+    pub remote_compaction_protocol: RemoteCompactionProtocol,
     /// Whether this route supports the Responses WebSocket transport.
     /// Official ChatGPT-account routes normalize to enabled; third-party
     /// routes remain disabled unless the user explicitly opts in.
@@ -220,6 +239,7 @@ impl ProviderProfile {
             official_account: false,
             official_account_id: None,
             supports_remote_compaction: false,
+            remote_compaction_protocol: RemoteCompactionProtocol::default(),
             supports_websockets: false,
             supports_native_web_search: false,
             supports_auto_review: false,
@@ -305,6 +325,7 @@ impl ProviderProfile {
             self.official_account = true;
             self.api_key.clear();
             self.supports_remote_compaction = true;
+            self.remote_compaction_protocol = RemoteCompactionProtocol::Responses;
             self.supports_websockets = true;
             self.supports_native_web_search = true;
             self.supports_auto_review = true;
@@ -1776,23 +1797,46 @@ impl CodeyConfig {
     /// the whole runtime even when an official account route is also present.
     pub(crate) fn runtime_supports_remote_compaction(&self) -> bool {
         let mut has_runtime_route = false;
-        for profile in &self.profiles {
-            if !profile.enabled || profile.provider_id().trim().is_empty() {
-                continue;
-            }
-            if profile.official_account {
-                if !self.official_route_usable(profile) {
-                    continue;
-                }
-            } else if profile.normalized_base_url().is_empty() {
-                continue;
-            }
+        for profile in self.remote_compaction_runtime_profiles() {
             has_runtime_route = true;
             if !self.route_supports_remote_compaction_this_launch(profile) {
                 return false;
             }
         }
         has_runtime_route
+    }
+
+    fn remote_compaction_runtime_profiles(&self) -> impl Iterator<Item = &ProviderProfile> {
+        self.profiles.iter().filter(|profile| {
+            profile.enabled
+                && !profile.provider_id().trim().is_empty()
+                && if profile.official_account {
+                    self.official_route_usable(profile)
+                } else {
+                    !profile.normalized_base_url().is_empty()
+                }
+        })
+    }
+
+    pub(crate) fn remote_compaction_blockers(&self) -> Vec<RemoteCompactionBlocker> {
+        self.remote_compaction_runtime_profiles()
+            .filter(|profile| !self.route_supports_remote_compaction_this_launch(profile))
+            .map(|profile| RemoteCompactionBlocker {
+                route_id: profile.id.clone(),
+                route_name: if profile.name.trim().is_empty() {
+                    profile.display_short_name()
+                } else {
+                    profile.name.clone()
+                },
+                reason: if profile.plugin_route_spec.as_ref().is_some_and(|s| s.transport.is_some()) {
+                    "插件传输不支持原生压缩"
+                } else if profile.upstream_protocol != UPSTREAM_PROTOCOL_OPENAI_RESPONSES {
+                    "上游协议不支持原生压缩"
+                } else {
+                    "未开启远程压缩"
+                },
+            })
+            .collect()
     }
 
     pub fn manual_third_party_models(&self) -> &[String] {
@@ -3734,6 +3778,98 @@ mod tests {
         unsupported.normalize();
         config.profiles.push(unsupported);
         assert!(!config.runtime_supports_remote_compaction());
+    }
+
+    #[test]
+    fn remote_compaction_protocol_migrates_and_normalizes_official_routes() {
+        let mut legacy = serde_json::to_value(ProviderProfile::new("Relay")).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("remoteCompactionProtocol");
+        let mut profile: ProviderProfile = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            profile.remote_compaction_protocol,
+            RemoteCompactionProtocol::Responses
+        );
+        profile.remote_compaction_protocol = RemoteCompactionProtocol::CompactEndpoint;
+        let serialized = serde_json::to_value(&profile).unwrap();
+        assert_eq!(serialized["remoteCompactionProtocol"], "compactEndpoint");
+        let decoded: ProviderProfile = serde_json::from_value(serialized).unwrap();
+        assert_eq!(
+            decoded.remote_compaction_protocol,
+            RemoteCompactionProtocol::CompactEndpoint
+        );
+        profile.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        profile.normalize();
+        assert_eq!(
+            profile.remote_compaction_protocol,
+            RemoteCompactionProtocol::Responses
+        );
+    }
+
+    #[test]
+    fn remote_compaction_blockers_match_runtime_eligibility() {
+        let mut capable = ProviderProfile::new("Responses");
+        capable.id = "capable".into();
+        capable.base_url = "https://relay.example/v1".into();
+        capable.supports_remote_compaction = true;
+        let mut disabled = capable.clone();
+        disabled.id = "disabled".into();
+        disabled.enabled = false;
+        disabled.supports_remote_compaction = false;
+        let mut unavailable = ProviderProfile::new("Unavailable official");
+        unavailable.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        unavailable.normalize();
+        let mut config = CodeyConfig {
+            profiles: vec![
+                capable.clone(),
+                disabled,
+                unavailable,
+                ProviderProfile::new("Empty URL"),
+            ],
+            ..CodeyConfig::default()
+        };
+        assert!(config.runtime_supports_remote_compaction());
+        assert!(config.remote_compaction_blockers().is_empty());
+
+        let mut switched_off = capable.clone();
+        switched_off.id = "off".into();
+        switched_off.name.clear();
+        switched_off.short_name = "备".into();
+        switched_off.supports_remote_compaction = false;
+        let mut adapted = capable.clone();
+        adapted.id = "chat".into();
+        adapted.upstream_protocol = UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+        let mut plugin = capable;
+        plugin.id = "plugin".into();
+        plugin.plugin_route_spec = Some(crate::codey_plugins::PluginRouteSpec {
+            name: "Plugin".into(),
+            base_url: "https://unused.invalid".into(),
+            upstream_protocol: UPSTREAM_PROTOCOL_OPENAI_RESPONSES.into(),
+            models: vec![],
+            model_reasoning_efforts: BTreeMap::new(),
+            headers: BTreeMap::new(),
+            short_name: String::new(),
+            transport: Some(codey_plugin_sdk::transport::TransportOptions {
+                account_email: "user@example.com".into(),
+                models: BTreeMap::new(),
+                image_generation: false,
+                image_edit: false,
+            }),
+        });
+        config.profiles.extend([switched_off, adapted, plugin]);
+        assert!(!config.runtime_supports_remote_compaction());
+        let blockers = config.remote_compaction_blockers();
+        assert_eq!(blockers.len(), 3);
+        assert_eq!(blockers[0].route_id, "off");
+        assert_eq!(blockers[0].route_name, "备");
+        assert_eq!(blockers[0].reason, "未开启远程压缩");
+        assert_eq!(blockers[1].reason, "上游协议不支持原生压缩");
+        assert_eq!(blockers[2].reason, "插件传输不支持原生压缩");
+        config.profiles.clear();
+        assert!(!config.runtime_supports_remote_compaction());
+        assert!(config.remote_compaction_blockers().is_empty());
     }
 
     #[test]

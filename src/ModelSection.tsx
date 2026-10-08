@@ -20,7 +20,7 @@ import {
   IconTrash as Trash,
 } from "@tabler/icons-react";
 
-import type { Confirmation, Config, ModelContextConfig, ModelState, OfficialAccount, OfficialAccountsResult, Profile, ProviderStatus } from "./App.types";
+import type { Confirmation, Config, ModelContextConfig, ModelState, OfficialAccount, OfficialAccountsResult, Profile, ProviderStatus, RuntimeStatus } from "./App.types";
 import { OfficialAccountsPanel } from "./OfficialAccountsPanel";
 import { SettingsPageHeader } from "./SettingsPageHeader";
 import { ModelCombobox } from "./components/ModelCombobox";
@@ -62,9 +62,11 @@ import { validateOutboundApiUrl, validateOutboundProxyUrl } from "./urlValidatio
 import { invoke } from "./api";
 import { listOfficialAccounts, rememberOfficialAccounts } from "./officialAccountsRequests";
 import { readHostTheme } from "./overlayTheme";
+import { remoteCompactionStatusText } from "./remoteCompactionStatus";
 
 type ModelSectionProps = {
   config: Config;
+  runtimeStatus: RuntimeStatus;
   currentProvider: ProviderStatus["provider"] | null;
   officialAccountAvailable: boolean;
   popupContainer: HTMLElement | null;
@@ -134,6 +136,7 @@ function createRoute(): Profile {
     clearApiKey: false,
     officialAccount: false,
     supportsRemoteCompaction: false,
+    remoteCompactionProtocol: "responses",
     supportsWebsockets: false,
     supportsNativeWebSearch: false,
   };
@@ -212,6 +215,7 @@ const REQUIRED_FIELD_MARKER = <span aria-hidden="true" className="text-[var(--co
 
 function ModelSectionComponent({
   config,
+  runtimeStatus,
   currentProvider,
   officialAccountAvailable,
   popupContainer,
@@ -266,6 +270,8 @@ function ModelSectionComponent({
   const [officialDialogScope, setOfficialDialogScope] =
     useState<OfficialRouteDialogScope | null>(null);
   const routeConfigReadOnly = !config.localRouterEnabled;
+  const compactionStatus = remoteCompactionStatusText(runtimeStatus);
+  const compactionBlockers = runtimeStatus.remoteCompaction?.blockingRoutes ?? [];
 
   useEffect(() => {
     if (!routeConfigReadOnly) return;
@@ -760,6 +766,22 @@ function ModelSectionComponent({
       />
 
       <div className="route-content">
+        {(config.localRouterEnabled || runtimeStatus.remoteCompaction?.active != null) && (
+          <div className="rounded-lg border border-default p-3 text-xs text-muted space-y-1.5" aria-label="远程压缩状态">
+            <strong className="text-foreground">{compactionStatus.title}</strong>
+            <p>{compactionStatus.detail}</p>
+            {config.localRouterEnabled && compactionBlockers.length > 0 && (
+              <details>
+                <summary className="cursor-pointer">{compactionBlockers.length} 条线路阻止已保存配置使用远程压缩</summary>
+                <ul className="mt-1.5 space-y-1">
+                  {compactionBlockers.map((route) => (
+                    <li key={route.routeId}>{route.routeName}：{route.reason}</li>
+                  ))}
+                </ul>
+              </details>
+            )}
+          </div>
+        )}
         <div className={`route-manager${routeConfigReadOnly ? " route-manager-current" : ""}`}>
           <div className="route-catalog-pane">
             {!routeConfigReadOnly && (
@@ -1559,7 +1581,7 @@ function ModelSectionComponent({
                       <div className="route-option-header">
                         <div className="route-option-title-group">
                           <strong className="route-option-title">原生远程压缩</strong>
-                          <Tooltip content="仅在上游实现 OpenAI Responses 原生压缩协议时开启；所有启用线路都支持时 Codex 才会使用，能力变更需重启。">
+                          <Tooltip content="仅在上游明确支持时开启，并选择服务商支持的压缩接口；所有启用线路都支持时 Codex 才会使用，能力变更需重启。">
                             <span className="route-option-info-trigger" aria-label="原生远程压缩详细说明">
                               <IconInfoCircle size={13} />
                             </span>
@@ -1600,6 +1622,30 @@ function ModelSectionComponent({
                       <small className="route-field-hint">
                         优先长连接，失败转流式 HTTP
                       </small>
+                      {routeDraft.supportsRemoteCompaction && (
+                        <div className="route-field mt-2">
+                          <span id="route-compaction-protocol-label">压缩接口</span>
+                          <Select
+                            aria-labelledby="route-compaction-protocol-label"
+                            value={routeDraft.remoteCompactionProtocol ?? "responses"}
+                            disabled={isBusy}
+                            onChange={(value) => {
+                              if (value === "responses" || value === "compactEndpoint") {
+                                updateRouteDraft({ remoteCompactionProtocol: value });
+                              }
+                            }}
+                            optionList={[
+                              { label: "原生 Responses（默认）", value: "responses" },
+                              { label: "独立压缩接口（兼容）", value: "compactEndpoint" },
+                            ]}
+                          />
+                          <small className="route-field-hint">
+                            {routeDraft.remoteCompactionProtocol === "compactEndpoint"
+                              ? "将新式压缩请求转换到 /responses/compact；上游须返回加密压缩结果。接口选择保存后生效。"
+                              : "按 Codex 原始压缩协议发送；若服务商仅支持 /responses/compact，请选择兼容接口。"}
+                          </small>
+                        </div>
+                      )}
                     </div>
                     <div className="route-option-item">
                       <div className="route-option-header">

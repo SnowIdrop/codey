@@ -682,9 +682,12 @@ impl AdaptedResponsesHistory {
             if !complete {
                 continue;
             }
-            if merged
-                .iter()
-                .any(|existing| same_history_item(existing, &item))
+            // 匿名输出也可能同时出现在流式事件和终态中；仅按位置去重，
+            // 保留不同位置上内容相同的合法消息。
+            if merged.get(index) == Some(&item)
+                || merged
+                    .iter()
+                    .any(|existing| same_history_item(existing, &item))
             {
                 continue;
             }
