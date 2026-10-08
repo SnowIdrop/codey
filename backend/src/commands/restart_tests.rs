@@ -356,9 +356,9 @@ fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
         catalog["model_metadata"][0],
         json!({
             "model": "source-provider/gpt-5.6-sol",
-            "display_name": "[默认] gpt-5.6-sol",
+            "display_name": "[默认配置] gpt-5.6-sol",
             "route_name": "默认配置",
-            "route_prefix": "默认",
+            "route_prefix": "默认配置",
             "provider_id": "codey_router",
             "source_model": "gpt-5.6-sol",
             "official_account": false,
@@ -373,9 +373,9 @@ fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
         catalog["model_metadata"][5],
         json!({
             "model": "source-provider/provider-fast-coder",
-            "display_name": "[默认] provider-fast-coder",
+            "display_name": "[默认配置] provider-fast-coder",
             "route_name": "默认配置",
-            "route_prefix": "默认",
+            "route_prefix": "默认配置",
             "provider_id": "codey_router",
             "source_model": "provider-fast-coder",
             "official_account": false,
@@ -509,7 +509,7 @@ fn renderer_model_catalog_routes_official_account_models_through_the_codey_route
 }
 
 #[test]
-fn renderer_catalog_uses_current_config_only_for_hot_reloadable_routes() {
+fn renderer_catalog_uses_saved_config_only_without_an_applied_runtime() {
     let applied = CodeyConfig::default();
     let mut current = applied.clone();
     let mut third_party = crate::config::ProviderProfile::new("第三方线路");
@@ -519,13 +519,17 @@ fn renderer_catalog_uses_current_config_only_for_hot_reloadable_routes() {
 
     assert!(std::ptr::eq(
         model_catalog_config_for_runtime(&current, Some(&applied), None),
-        &current
+        &applied
     ));
 
     current.profiles.last_mut().unwrap().official_account = true;
     assert!(std::ptr::eq(
         model_catalog_config_for_runtime(&current, Some(&applied), None),
         &applied
+    ));
+    assert!(std::ptr::eq(
+        model_catalog_config_for_runtime(&current, None, None),
+        &current
     ));
 }
 
@@ -575,19 +579,19 @@ fn renderer_catalog_keeps_hot_reloaded_routes_when_websockets_are_pending_restar
     }
     assert!(std::ptr::eq(
         model_catalog_config_for_runtime(&delivered, Some(&startup), Some(&startup)),
-        &delivered,
+        &startup,
     ));
 }
 
 #[test]
-fn renderer_catalog_uses_current_config_for_model_only_changes() {
+fn renderer_catalog_waits_for_commit_even_for_model_only_changes() {
     let applied = CodeyConfig::default();
     let mut current = applied.clone();
     current.default_model = "provider-default".into();
 
     assert!(std::ptr::eq(
         model_catalog_config_for_runtime(&current, Some(&applied), None),
-        &current
+        &applied
     ));
 }
 
@@ -609,7 +613,7 @@ fn model_hot_reload_ignores_empty_declarations_and_delivers_reasoning_changes() 
         ));
         assert!(std::ptr::eq(
             model_catalog_config_for_runtime(saved, Some(baseline), None),
-            saved,
+            baseline,
         ));
         assert!(!provider_route_restart_required_for_runtime(
             baseline, saved
@@ -633,7 +637,7 @@ fn model_hot_reload_ignores_empty_declarations_and_delivers_reasoning_changes() 
         ));
         assert!(std::ptr::eq(
             model_catalog_config_for_runtime(saved, Some(baseline), None),
-            saved,
+            baseline,
         ));
         assert!(!provider_route_restart_required_for_runtime(
             baseline, saved
@@ -759,7 +763,7 @@ fn model_hot_reload_keeps_startup_capabilities_pending_without_blocking_other_ro
             .selected_models_by_provider
             .insert("other".into(), vec!["other-b".into()]);
         assert!(std::ptr::eq(
-            model_catalog_config_for_runtime(&current, Some(&applied), None),
+            model_catalog_config_for_runtime(&current, Some(&applied), Some(&current)),
             &current,
         ));
         // Publishing the picker updates only the model baseline. The app-server

@@ -2627,5 +2627,8 @@ mod gpu_launch_argument_tests;
 #[cfg(test)]
 mod subagent_model_tests;
 
+#[cfg(test)]
+mod model_delivery_test_support;
+
 #[cfg(all(test, unix))]
 mod tests;

@@ -1,5 +1,5 @@
 name: Build desktop packages
-run-name: Desktop packages · ${{ github.ref_name }} · ${{ github.event_name == 'push' && github.ref_type == 'tag' && 'all' || inputs.platform || 'windows' }}
+run-name: "${{ inputs.build_id && format('Codey build {0} #{1}', inputs.build_id, inputs.attempt) || format('Desktop packages · {0} · {1}', github.ref_name, github.event_name == 'push' && github.ref_type == 'tag' && 'all' || inputs.platform || 'windows') }}"
 
 on:
   workflow_dispatch:
@@ -16,6 +16,20 @@ on:
         description: Run full JavaScript/Rust tests, rustfmt and Clippy
         type: boolean
         default: false
+      build_id:
+        type: string
+      attempt:
+        type: string
+      source_sha:
+        type: string
+      version:
+        type: string
+      base_sha:
+        type: string
+      base_tag:
+        type: string
+      artifact_run_id:
+        type: string
   push:
     branches:
       - build/windows
@@ -25,15 +39,94 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: codey-release-automation
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_BUILD_DIR: target
   RUSTFLAGS: -D warnings
+  RELEASE_BUILD_ID: ${{ inputs.build_id }}
+  RELEASE_ATTEMPT: ${{ inputs.attempt }}
+  RELEASE_SOURCE_SHA: ${{ inputs.source_sha }}
+  RELEASE_VERSION: ${{ inputs.version }}
+  RELEASE_BASE_SHA: ${{ inputs.base_sha }}
+  RELEASE_BASE_TAG: ${{ inputs.base_tag }}
+  RELEASE_ACTION: build
+  RELEASE_ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id }}
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      claimed: ${{ steps.claim.outputs.claimed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha || github.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Claim platform build
+        id: claim
+        if: inputs.build_id != ''
+        env:
+          CODEY_RELEASE_ADMIN_URL: ${{ vars.CODEY_RELEASE_ADMIN_URL }}
+          RELEASE_ADMIN_CALLBACK_SECRET: ${{ secrets.RELEASE_ADMIN_CALLBACK_SECRET }}
+        run: node scripts/release-automation.mjs claim
+      - name: Save claimed build
+        if: inputs.build_id != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-build-context
+          path: .release-build.json
+          include-hidden-files: true
+          if-no-files-found: error
+
+  notes:
+    if: inputs.build_id != ''
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      copilot-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out release analysis tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tools
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-build-context
+      - name: Install Copilot CLI
+        continue-on-error: true
+        run: npm install --global @github/copilot@1.0.91
+      - name: Generate evidence-backed release notes
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ github.token }}
+        run: node .release-tools/scripts/release-automation.mjs notes
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes-evidence
+          path: release-notes.json
+          if-no-files-found: error
+
   macos:
+    if: inputs.artifact_run_id == '' && (inputs.build_id != '' || github.event_name == 'push' && github.ref_type == 'tag' || inputs.platform == 'macos' || inputs.platform == 'all')
+    needs: prepare
     name: macOS ${{ matrix.arch }} unsigned
-    if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.platform == 'macos' || inputs.platform == 'all'
     runs-on: ${{ matrix.runner }}
     env:
       CARGO_PROFILE_RELEASE_LTO: thin
@@ -48,6 +141,9 @@ jobs:
     steps:
       - name: Checkout Codey
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha || github.ref }}
+          persist-credentials: false
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -71,6 +167,16 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Download claimed platform build
+        if: inputs.build_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: release-build-context
+
+      - name: Inject validated platform release version
+        if: inputs.build_id != ''
+        run: node scripts/release-automation.mjs prepare-version
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -129,7 +235,7 @@ jobs:
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
             VERSION="${GITHUB_REF_NAME#v}"
             VERSION="${VERSION#V}"
-          else
+          elif [[ -z "$RELEASE_BUILD_ID" ]]; then
             VERSION="${VERSION}-${GITHUB_RUN_NUMBER}"
           fi
           VERSION="${VERSION//\//-}"
@@ -147,6 +253,8 @@ jobs:
           if-no-files-found: error
 
   macos-check:
+    if: inputs.build_id != '' || github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
+    needs: prepare
     name: macOS ${{ matrix.arch }} checks
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -159,6 +267,9 @@ jobs:
     steps:
       - name: Checkout Codey
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha || github.ref }}
+          persist-credentials: false
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -196,29 +307,31 @@ jobs:
         run: pnpm run check
 
       - name: JavaScript tests
-        if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
+        if: inputs.build_id != '' || github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
         run: pnpm run test:js
 
       - name: Build embedded frontend assets
         run: pnpm run vite:build
 
       - name: Rust format
-        if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
+        if: inputs.build_id != '' || github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
         run: cargo fmt --all -- --check
 
       - name: Rust tests
-        if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
+        if: inputs.build_id != '' || github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
         run: cargo test --workspace --locked
         env:
           CODEY_SKIP_OVERLAY_BUILD: "1"
 
       - name: Rust clippy
-        if: github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
+        if: inputs.build_id != '' || github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
         env:
           CODEY_SKIP_OVERLAY_BUILD: "1"
 
   windows:
+    if: inputs.artifact_run_id == '' && (inputs.build_id != '' || github.event_name == 'push' || inputs.platform == 'windows' || inputs.platform == 'all')
+    needs: prepare
     name: Windows x64
     runs-on: windows-latest
     # 测试和 clippy 在 ci.yml 的 Windows 任务里跑。这里只编 release 并打安装包。
@@ -231,6 +344,9 @@ jobs:
     steps:
       - name: Checkout Codey
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha || github.ref }}
+          persist-credentials: false
 
       - name: Keep Windows Defender off the Cargo directories
         shell: pwsh
@@ -267,6 +383,16 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Download claimed platform build
+        if: inputs.build_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: release-build-context
+
+      - name: Inject validated platform release version
+        if: inputs.build_id != ''
+        run: node scripts/release-automation.mjs prepare-version
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -329,7 +455,7 @@ jobs:
           $version = node -p "require('./package.json').version"
           if ($env:GITHUB_REF_TYPE -eq "tag") {
             $version = $env:GITHUB_REF_NAME.TrimStart("v", "V")
-          } else {
+          } elseif (-not $env:RELEASE_BUILD_ID) {
             $version = "$version-$env:GITHUB_RUN_NUMBER"
           }
           $version = $version -replace '[\\/]', '-'
@@ -363,7 +489,10 @@ jobs:
             throw "Unable to read the workspace version from Cargo.toml."
           }
           $cargoVersion = $cargoMatch.Matches[0].Groups[1].Value
-          $manifestVersion = $version -replace '-\d+$', ''
+          $manifestVersion = $version
+          if (-not $env:RELEASE_BUILD_ID -and $env:GITHUB_REF_TYPE -ne "tag") {
+            $manifestVersion = $version -replace '-\d+$', ''
+          }
           if ($cargoVersion -ne $manifestVersion) {
             throw "Cargo.toml version $cargoVersion does not match packaged version $manifestVersion. Bump the workspace version before releasing."
           }
@@ -388,6 +517,8 @@ jobs:
           if-no-files-found: error
 
   windows-check:
+    if: inputs.build_id != '' || github.event_name == 'push' && github.ref_type == 'tag' || inputs.run_checks
+    needs: prepare
     name: Windows checks
     runs-on: windows-latest
     # 打包任务只出安装包。标签发布不触发 ci.yml，所以 Windows 测试放在这里，并作为发布前置。
@@ -395,6 +526,9 @@ jobs:
     steps:
       - name: Checkout Codey
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha || github.ref }}
+          persist-credentials: false
 
       - name: Keep Windows Defender off the Cargo directories
         shell: pwsh
@@ -462,7 +596,7 @@ jobs:
 
   publish:
     name: Attach packages to GitHub Release
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && inputs.build_id == ''
     permissions:
       contents: write
     needs:
@@ -578,3 +712,82 @@ jobs:
             upload_object "releases/${TAG}/${FILE_NAME}" "$ASSET" "$CONTENT_TYPE" "public, max-age=31536000, immutable"
           done
           upload_object "releases/${TAG}/latest.json" "release-assets/latest.json" "application/json" "no-cache, no-store, max-age=0"
+
+  managed-publish:
+    if: >-
+      always() && inputs.build_id != '' && needs.prepare.result == 'success' &&
+      needs.notes.result == 'success' && needs.macos-check.result == 'success' &&
+      needs.windows-check.result == 'success' &&
+      (needs.macos.result == 'success' || (inputs.artifact_run_id != '' && needs.macos.result == 'skipped')) &&
+      (needs.windows.result == 'success' || (inputs.artifact_run_id != '' && needs.windows.result == 'skipped'))
+    needs:
+      - prepare
+      - notes
+      - macos
+      - macos-check
+      - windows
+      - windows-check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CODEY_RELEASE_ADMIN_URL: ${{ vars.CODEY_RELEASE_ADMIN_URL }}
+      RELEASE_ADMIN_CALLBACK_SECRET: ${{ secrets.RELEASE_ADMIN_CALLBACK_SECRET }}
+      CLOUDFLARE_R2_BUCKET: ${{ vars.CLOUDFLARE_R2_BUCKET }}
+      CLOUDFLARE_R2_PUBLIC_BASE_URL: ${{ vars.CLOUDFLARE_R2_PUBLIC_BASE_URL }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-build-context
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes-evidence
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: codey-*
+          path: release-assets
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.artifact_run_id || github.run_id }}
+      - name: Record immutable artifacts for upload retries
+        run: node scripts/release-automation.mjs artifacts-ready
+      - name: Publish managed draft and verified R2 artifacts
+        run: node scripts/release-automation.mjs publish
+
+  report-failure:
+    if: always() && inputs.build_id != '' && needs.prepare.outputs.claimed == 'true' && needs.managed-publish.result != 'success'
+    needs:
+      - prepare
+      - notes
+      - macos
+      - macos-check
+      - windows
+      - windows-check
+      - managed-publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Report failed build without hiding job failures
+        continue-on-error: true
+        env:
+          CODEY_RELEASE_ADMIN_URL: ${{ vars.CODEY_RELEASE_ADMIN_URL }}
+          RELEASE_ADMIN_CALLBACK_SECRET: ${{ secrets.RELEASE_ADMIN_CALLBACK_SECRET }}
+          RELEASE_ERROR: 构建、检查或产物验收失败，请查看本次 GitHub Actions 日志
+        run: node scripts/release-automation.mjs failed

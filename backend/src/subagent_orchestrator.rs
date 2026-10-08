@@ -2339,7 +2339,7 @@ pub(crate) fn authorize_child_tool_with_context(
             )),
             Some(_) => None,
         },
-        ToolClass::Write => match bound_reservation {
+        ToolClass::Write | ToolClass::Unknown => match bound_reservation {
             None => Some(format!(
                 "{UNBOUND_ATTEMPT_ERROR_CODE}: Codey 能力/资源门禁：当前 child 未绑定有效 attempt，禁止执行写入工具。不要重试写入或等待门禁自行恢复；请立即把该错误码返回主代理，由主代理使用全新的 task_name 重新派生或直接接管。"
             )),

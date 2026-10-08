@@ -506,14 +506,43 @@ function ConfirmationDialogComponent({
   const isUpdate =
     confirmation?.action === "download-update" ||
     confirmation?.action === "install-update";
+  const noteLines = isUpdate
+    ? confirmation?.releaseNotes?.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) ?? []
+    : [];
   return (
     <Dialog open={Boolean(confirmation)} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="confirmation-dialog" container={container}>
-        <DialogHeader>
+      <DialogContent
+        className={isUpdate
+          ? "confirmation-dialog update-confirmation-dialog sm:w-[560px] max-h-[calc(100dvh-32px)]"
+          : "confirmation-dialog"}
+        container={container}
+      >
+        <DialogHeader className={isUpdate ? "shrink-0" : undefined}>
           <DialogTitle>{confirmation?.title}</DialogTitle>
-          <DialogDescription>{confirmation?.description}</DialogDescription>
+          <DialogDescription className={isUpdate ? "whitespace-pre-wrap [overflow-wrap:anywhere]" : undefined}>
+            {confirmation?.description}
+          </DialogDescription>
         </DialogHeader>
-        <DialogFooter>
+        {noteLines.length > 0 && (
+          <section className="mt-4 flex min-h-0 flex-col gap-2">
+            <h3 className="m-0 shrink-0 text-xs font-medium text-foreground">更新日志</h3>
+            <div
+              className="update-release-notes min-h-0 max-h-[min(360px,45dvh)] overflow-y-auto overscroll-contain rounded-lg border border-default p-4 text-sm leading-7 text-muted [overflow-wrap:anywhere]"
+              role="region"
+              aria-label="更新日志内容"
+              tabIndex={0}
+            >
+              <ul className="m-0 list-disc space-y-2 pl-4">
+                {noteLines.map((line, index) => (
+                  <li key={index} className="pl-1 whitespace-pre-wrap">
+                    {line.replace(/^[-*•]\s+/, "")}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </section>
+        )}
+        <DialogFooter className={isUpdate ? "shrink-0" : undefined}>
           <Button variant="outline" onClick={onClose}>
             {isUpdate ? "稍后" : "取消"}
           </Button>

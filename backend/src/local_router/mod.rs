@@ -177,6 +177,7 @@ mod plugin_transport;
 mod request_log_tap;
 mod request_meta;
 mod resource_budget;
+mod response_failure;
 mod responses;
 mod server;
 mod sse;
@@ -205,6 +206,7 @@ pub(crate) use native_history::*;
 pub(crate) use request_log_tap::*;
 pub(crate) use request_meta::*;
 pub(crate) use resource_budget::*;
+pub(crate) use response_failure::*;
 pub(crate) use server::*;
 pub(crate) use sse::*;
 pub(crate) use sse_anthropic::*;
@@ -239,3 +241,6 @@ mod header_tests;
 
 #[cfg(test)]
 mod lifecycle_tests;
+
+#[cfg(test)]
+mod retry_contract_tests;
