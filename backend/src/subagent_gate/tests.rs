@@ -887,8 +887,8 @@ fn interrupt_revokes_queued_writer_before_acknowledgement() {
             ["permissionDecision"],
         "deny"
     );
-    let mut replacement = input("PreToolUse", session_id);
-    replacement.turn_id = Some("root-turn-a".into());
+    let mut replacement = input("PreToolUse", "replacement-session");
+    replacement.turn_id = Some("replacement-turn".into());
     replacement.cwd = spawn.cwd.clone();
     replacement.tool_name = Some("agents.spawn_agent".into());
     replacement.tool_input = Some(json!({
@@ -896,7 +896,20 @@ fn interrupt_revokes_queued_writer_before_acknowledgement() {
         "message": "Apply the bounded change after the old attempt settles."
     }));
     assert_eq!(
-        handle_hook_for_runtime_at(&replacement, root, runtime_id, 34).unwrap()["hookSpecificOutput"]
+        handle_hook_for_runtime_at(&replacement, root, runtime_id, 34).unwrap(),
+        json!({})
+    );
+    replacement.hook_event_name = "PostToolUse".into();
+    replacement.tool_response = Some(json!({"agent_id":"replacement-agent"}));
+    handle_hook_for_runtime_at(&replacement, root, runtime_id, 34).unwrap();
+    let mut replacement_write = input("PreToolUse", "replacement-session");
+    replacement_write.agent_id = Some("replacement-agent".into());
+    replacement_write.agent_type = Some("codey_worker".into());
+    replacement_write.tool_name = Some("apply_patch".into());
+    replacement_write.tool_input = write.tool_input.clone();
+    attest_test_child(&replacement_write, root, runtime_id);
+    assert_eq!(
+        handle_hook_for_runtime_at(&replacement_write, root, runtime_id, 34).unwrap()["hookSpecificOutput"]
             ["permissionDecision"],
         "deny"
     );
@@ -934,18 +947,16 @@ fn interrupt_revokes_queued_writer_before_acknowledgement() {
         json!({})
     );
     assert_eq!(
-        handle_hook_for_runtime_at(&replacement, root, runtime_id, 44).unwrap(),
+        handle_hook_for_runtime_at(&replacement_write, root, runtime_id, 44).unwrap(),
         json!({})
     );
-    replacement.hook_event_name = "PostToolUse".into();
-    replacement.tool_response = Some(json!({"agent_id": "replacement-thread"}));
-    handle_hook_for_runtime_at(&replacement, root, runtime_id, 45).unwrap();
     // A replacement attempt cannot restore the old attempt's write permission.
     assert_eq!(
         handle_hook_for_runtime_at(&write, root, runtime_id, 46).unwrap()["hookSpecificOutput"]["permissionDecision"],
         "deny"
     );
-    write.agent_id = Some("replacement-thread".into());
+    write.agent_id = Some("replacement-agent".into());
+    write.session_id = "replacement-session".into();
     attest_test_child(&write, root, runtime_id);
     assert_eq!(
         handle_hook_for_runtime_at(&write, root, runtime_id, 47).unwrap(),
@@ -2526,7 +2537,7 @@ fn partial_wait_updates_keep_root_blocked_until_every_subagent_stops() {
     assert!(first_reason.contains("仍有 2 个子代理"));
     assert!(first_reason.contains("first result"));
     assert!(first_reason.contains("可继续使用 agents.wait_agent"));
-    assert!(first_reason.contains("检查剩余并发额度与工作区占用"));
+    assert!(first_reason.contains("检查剩余并发额度"));
     assert!(first_reason.contains("不得自动重派已结束或已放弃的旧任务"));
     assert!(first_reason.contains("不得恢复非协作本地工作"));
 
@@ -2752,7 +2763,7 @@ fn mixed_full_list_settles_only_the_terminal_ledger_marker() {
         blocked["reason"]
             .as_str()
             .unwrap()
-            .contains("检查剩余并发额度与工作区占用")
+            .contains("检查剩余并发额度")
     );
     assert_eq!(
         active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),

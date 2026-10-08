@@ -31,6 +31,10 @@ fn legacy_ledger(root: &Path, version: u32, writable: bool) -> PathBuf {
     let mut ledger: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     ledger["schema_version"] = json!(version);
     ledger["reservations"]["task_a"]["write_capable"] = json!(writable);
+    ledger["reservations"]["task_a"]
+        .as_object_mut()
+        .unwrap()
+        .remove("workspace_write_claimed");
     // v14 fields removed by v15 must not prevent migration of live attempts.
     ledger["batch_number"] = json!(1);
     ledger["reservations"]["task_a"]["acceptance"] = json!([]);
@@ -40,7 +44,7 @@ fn legacy_ledger(root: &Path, version: u32, writable: bool) -> PathBuf {
 
 #[test]
 fn supported_legacy_ledgers_preserve_active_identity_and_workspace_reservation() {
-    for version in [14, 15] {
+    for version in [14, 15, 16] {
         let temp = tempdir().unwrap();
         let path = legacy_ledger(temp.path(), version, true);
         let before: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -50,6 +54,10 @@ fn supported_legacy_ledgers_preserve_active_identity_and_workspace_reservation()
         );
         let after: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(after["schema_version"], json!(LEDGER_SCHEMA_VERSION));
+        assert_eq!(
+            after["reservations"]["task_a"]["workspace_write_claimed"],
+            json!(true)
+        );
         for field in [
             "attempt_id",
             "fencing_token",
@@ -70,15 +78,36 @@ fn supported_legacy_ledgers_preserve_active_identity_and_workspace_reservation()
                 .is_none()
         );
         let second = json!({"task_name":"task_b","agent_type":"codey_worker","message":"Work"});
+        assert_eq!(
+            pre_spawn(temp.path(), "runtime", "other", Some(&second), 0, 21).unwrap(),
+            None
+        );
+        post_spawn(
+            temp.path(),
+            "runtime",
+            "other",
+            Some(&second),
+            Some(&json!({"agent_id":"agent-b"})),
+            21,
+        )
+        .unwrap();
+        let attempt = || ChildToolContext {
+            agent_id: "agent-b",
+            agent_type: None,
+            transcript_path: None,
+            tool_name: "apply_patch",
+            tool_input: None,
+        };
         assert!(
-            pre_spawn(temp.path(), "runtime", "other", Some(&second), 0, 21)
+            authorize_child_tool_with_context(temp.path(), "runtime", "other", attempt(), 22)
                 .unwrap()
                 .unwrap()
                 .contains("CODEY_SUBAGENT_WORKSPACE_BUSY")
         );
         subagent_stopped(temp.path(), "runtime", "session", "agent-a", 22).unwrap();
         assert_eq!(
-            pre_spawn(temp.path(), "runtime", "other", Some(&second), 0, 23).unwrap(),
+            authorize_child_tool_with_context(temp.path(), "runtime", "other", attempt(), 23)
+                .unwrap(),
             None
         );
     }
@@ -109,6 +138,52 @@ fn migration_never_expands_legacy_permissions() {
     )
     .unwrap();
     assert!(denied.is_some());
+}
+
+#[test]
+fn v17_migration_preserves_both_unclaimed_readers_and_workspace_writers() {
+    for writable in [false, true] {
+        let temp = tempdir().unwrap();
+        let path = legacy_ledger(temp.path(), 17, true);
+        let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let reservation = value["reservations"]["task_a"].as_object_mut().unwrap();
+        reservation.insert("workspace_write_claimed".into(), json!(writable));
+        reservation.remove("file_write_claims");
+        reservation.remove("unbounded_write_claimed");
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        active_reservation_count(temp.path(), "runtime", "session", 20).unwrap();
+        let after: SessionLedger = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            after.reservations["task_a"].workspace_write_claimed,
+            writable
+        );
+        assert!(!after.reservations["task_a"].unbounded_write_claimed);
+        assert!(after.reservations["task_a"].file_write_claims.is_empty());
+        assert_eq!(after.schema_version, LEDGER_SCHEMA_VERSION);
+    }
+}
+
+#[test]
+fn v18_missing_or_invalid_file_claims_are_rejected_without_overwriting_the_ledger() {
+    for invalid in [
+        None,
+        Some(json!(["relative.rs"])),
+        Some(json!(["/root/../file"])),
+    ] {
+        let temp = tempdir().unwrap();
+        let path = legacy_ledger(temp.path(), LEDGER_SCHEMA_VERSION, true);
+        let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let reservation = value["reservations"]["task_a"].as_object_mut().unwrap();
+        if let Some(invalid) = invalid {
+            reservation.insert("file_write_claims".into(), invalid);
+        } else {
+            reservation.remove("file_write_claims");
+        }
+        let bytes = serde_json::to_vec(&value).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        assert!(active_reservation_count(temp.path(), "runtime", "session", 20).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
 }
 
 #[test]

@@ -605,7 +605,7 @@ fn user_prompt_submit_output(
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": format!(
-                "Codey 检测到本轮用户输入到达时仍有 {active} 个子代理未确认终态。当前用户输入优先于旧任务描述：先调用一次不带筛选的 agents.list_agents 对账；若用户明确取消或缩小了某个子任务，只中断仍非终态且被明确取消的 target。应用新输入后，如仍有计划内未派发的独立任务，检查剩余并发额度与工作区占用；存在空余槽位时调用 agents.spawn_agent 补位，否则继续 wait/list。普通状态询问或补充信息不得被解释为取消全部代理；所有活动 attempt 结算前不得恢复非协作本地工作。{compatibility}"
+                "Codey 检测到本轮用户输入到达时仍有 {active} 个子代理未确认终态。当前用户输入优先于旧任务描述：先调用一次不带筛选的 agents.list_agents 对账；若用户明确取消或缩小了某个子任务，只中断仍非终态且被明确取消的 target。应用新输入后，如仍有计划内未派发的独立任务，检查剩余并发额度；存在空余槽位时调用 agents.spawn_agent 补位，否则继续 wait/list。普通状态询问或补充信息不得被解释为取消全部代理；所有活动 attempt 结算前不得恢复非协作本地工作。{compatibility}"
             )
         }
     }))
@@ -955,7 +955,7 @@ fn pre_tool_use_output(
             return Ok(pre_tool_reason_denial(&reason));
         }
         if let Some(agent_id) = child_agent_id {
-            if let Some(reason) = crate::subagent_orchestrator::authorize_child_tool_with_context(
+            if let Some(reason) = crate::subagent_orchestrator::authorize_child_tool_with_workspace(
                 state_root,
                 runtime_id,
                 &input.session_id,
@@ -966,6 +966,7 @@ fn pre_tool_use_output(
                     tool_name,
                     tool_input: input.tool_input.as_ref(),
                 },
+                nonempty(input.cwd.as_deref()),
                 now_ms,
             )? {
                 return Ok(pre_tool_reason_denial(&reason));
@@ -1688,7 +1689,7 @@ fn post_wait_continuation(
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动标记尚未核销。保留下方内容；可继续使用 agents.wait_agent 或不带筛选的 agents.list_agents 对账。只有当前调用仍携带并匹配本批首个根派生调用的 turn_id 时，才可使用 agents.spawn_agent、agents.send_message、agents.followup_task 或 agents.interrupt_agent 协调；缺少该绑定时按匿名主体 fail-closed。completed、errored、shutdown、not_found、FINAL_ANSWER 和 task_complete 都视为终态；任一 attempt 终态或被根成功中断并 fence 后，如仍有计划内未派发的独立任务，检查剩余并发额度与工作区占用，存在空余槽位时立即用新 task_name 调用 agents.spawn_agent 补位；否则只对仍活动的 running、pending_init 或 interrupted 代理继续等待。后来仍显示已 fence target 为活动的上游快照不得触发再次等待。不得自动重派已结束或已放弃的旧任务；不得仅因运行时长、状态未变化或缺少新消息中断或回收子代理。工具明确未注册时不要重复调用；使用当前可用的 list_agents 或 agent_status 核对，收到工具不可用回执后，若 30 秒内仍无可用状态回复且没有子代理工具正在执行，下一次根调用才会触发恢复，不得把失联任务当作成功。{local_read_guidance}{task_body_recovery}{compatibility}\n\n本次 wait_agent 已返回内容：\n{returned_update}"
+            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动标记尚未核销。保留下方内容；可继续使用 agents.wait_agent 或不带筛选的 agents.list_agents 对账。只有当前调用仍携带并匹配本批首个根派生调用的 turn_id 时，才可使用 agents.spawn_agent、agents.send_message、agents.followup_task 或 agents.interrupt_agent 协调；缺少该绑定时按匿名主体 fail-closed。completed、errored、shutdown、not_found、FINAL_ANSWER 和 task_complete 都视为终态；任一 attempt 终态或被根成功中断并 fence 后，如仍有计划内未派发的独立任务，检查剩余并发额度，存在空余槽位时立即用新 task_name 调用 agents.spawn_agent 补位；否则只对仍活动的 running、pending_init 或 interrupted 代理继续等待。后来仍显示已 fence target 为活动的上游快照不得触发再次等待。不得自动重派已结束或已放弃的旧任务；不得仅因运行时长、状态未变化或缺少新消息中断或回收子代理。工具明确未注册时不要重复调用；使用当前可用的 list_agents 或 agent_status 核对，收到工具不可用回执后，若 30 秒内仍无可用状态回复且没有子代理工具正在执行，下一次根调用才会触发恢复，不得把失联任务当作成功。{local_read_guidance}{task_body_recovery}{compatibility}\n\n本次 wait_agent 已返回内容：\n{returned_update}"
         ),
     })
 }
@@ -1706,7 +1707,7 @@ fn post_list_continuation(
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：agents.list_agents 核对后仍有 {active} 个子代理尚未确认进入终态。任一 attempt 已终态或被成功中断并 fence 后，如仍有计划内未派发的独立任务，可信根代理应检查剩余并发额度与工作区占用，存在空余槽位时立即用新 task_name 调用 agents.spawn_agent 补位；否则只对仍活动的 running、pending_init 或 interrupted 代理继续等待、转向或停止。completed、errored、shutdown 和 not_found 不再阻塞。不得仅因运行时长、状态未变化或缺少新消息中断子代理；只有用户明确取消或有证据确认任务无法继续时才中断一次。中断获得结构化成功回执后，确认遗留工具和写入任务已停止再接管，不再等待该 target 的上游状态变化，只有中断失败或目标无法匹配时才继续对账。每次等待保持有界并继续核对，不得自动重派已结束或已放弃的旧任务。若 pending_init 实际已僵死，门禁会在持续 10 分钟无法进展后释放遗留状态。{local_read_guidance}{compatibility}\n\n本次 list_agents 已返回内容：\n{returned_update}"
+            "Codey 子代理汇合门禁：agents.list_agents 核对后仍有 {active} 个子代理尚未确认进入终态。任一 attempt 已终态或被成功中断并 fence 后，如仍有计划内未派发的独立任务，可信根代理应检查剩余并发额度，存在空余槽位时立即用新 task_name 调用 agents.spawn_agent 补位；否则只对仍活动的 running、pending_init 或 interrupted 代理继续等待、转向或停止。completed、errored、shutdown 和 not_found 不再阻塞。不得仅因运行时长、状态未变化或缺少新消息中断子代理；只有用户明确取消或有证据确认任务无法继续时才中断一次。中断获得结构化成功回执后，确认遗留工具和写入任务已停止再接管，不再等待该 target 的上游状态变化，只有中断失败或目标无法匹配时才继续对账。每次等待保持有界并继续核对，不得自动重派已结束或已放弃的旧任务。若 pending_init 实际已僵死，门禁会在持续 10 分钟无法进展后释放遗留状态。{local_read_guidance}{compatibility}\n\n本次 list_agents 已返回内容：\n{returned_update}"
         ),
     })
 }

@@ -53,6 +53,7 @@ tokio = { workspace = true, features = ["io-std", "io-util", "net", "signal", "s
 tokio-tungstenite.workspace = true
 toml_edit.workspace = true
 uuid.workspace = true
+unicode-normalization = "0.1"
 webpki-roots = "0.26"
 zstd = "0.13"
 

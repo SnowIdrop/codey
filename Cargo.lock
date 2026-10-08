@@ -411,6 +411,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "toml_edit",
+ "unicode-normalization",
  "uuid",
  "webpki-roots 0.26.11",
  "windows 0.58.0",

@@ -24,13 +24,17 @@ mod identity;
 mod migration_tests;
 #[cfg(test)]
 mod scheduling_tests;
+mod write_scope;
+#[cfg(test)]
+mod write_scope_tests;
 
 use contract::*;
 use identity::*;
+use write_scope::{MAX_WRITE_PATHS, WriteScope};
 
 pub(crate) const POST_TOOL_HOOK_MATCHER: &str = "*";
 
-const LEDGER_SCHEMA_VERSION: u32 = 16;
+const LEDGER_SCHEMA_VERSION: u32 = 18;
 // v14 already carries attempt identity and runtime fencing. Older formats lack
 // the evidence needed to preserve active work safely.
 const MIN_LEDGER_SCHEMA_VERSION: u32 = 14;
@@ -103,6 +107,13 @@ struct Reservation {
     // Decode the retired permission flag once, without broadening old attempts.
     #[serde(default, rename = "write_capable", skip_serializing)]
     legacy_write_capable: Option<bool>,
+    // Missing flags belong to older ledgers that reserved writing at spawn.
+    #[serde(default = "legacy_workspace_write_claim")]
+    workspace_write_claimed: bool,
+    #[serde(default = "legacy_workspace_write_claim")]
+    unbounded_write_claimed: bool,
+    #[serde(default = "missing_file_write_claims")]
+    file_write_claims: BTreeSet<String>,
     workspace_root: Option<String>,
     state: ReservationState,
     #[serde(default)]
@@ -144,6 +155,14 @@ const fn default_fencing_token() -> u64 {
     1
 }
 
+const fn legacy_workspace_write_claim() -> bool {
+    true
+}
+
+fn missing_file_write_claims() -> BTreeSet<String> {
+    BTreeSet::from(["__missing_file_write_claims__".to_owned()])
+}
+
 const fn default_runtime_generation() -> u64 {
     1
 }
@@ -153,7 +172,8 @@ struct LedgerStore {
     ledger_path: PathBuf,
 }
 
-/// Serializes only admission across sessions, never an agent's execution.
+/// Atomically checks and records write claims across sessions. The file lock
+/// lasts for the check; the persisted claim lasts until attempt settlement.
 struct AdmissionGuard(File);
 
 impl AdmissionGuard {
@@ -173,11 +193,11 @@ impl AdmissionGuard {
                 Err(error) if crate::fs_util::file_lock_is_contended(&error) => {
                     anyhow::ensure!(
                         started.elapsed() < Duration::from_millis(LEDGER_LOCK_TIMEOUT_MILLIS),
-                        "CODEY_SUBAGENT_ADMISSION_BUSY: 其他会话正在登记子代理，请稍后重试"
+                        "CODEY_SUBAGENT_ADMISSION_BUSY: 其他会话正在登记写入占用，请稍后重试"
                     );
                     thread::sleep(Duration::from_millis(LEDGER_LOCK_RETRY_MILLIS));
                 }
-                Err(error) => return Err(error).context("获取子代理跨会话派发锁失败"),
+                Err(error) => return Err(error).context("获取子代理跨会话写入登记锁失败"),
             }
         }
     }
@@ -360,6 +380,10 @@ impl LedgerStore {
         ledger.revision = ledger.revision.saturating_add(1);
         ledger.updated_at_ms = now_ms;
         let bytes = serde_json::to_vec(ledger).context("序列化 Codey 子代理编排账本失败")?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= MAX_LEDGER_BYTES,
+            "子代理账本超过容量限制，保留原有记录"
+        );
         crate::fs_util::atomic_write_private(&self.ledger_path, &bytes).with_context(|| {
             format!(
                 "原子替换 Codey 子代理编排账本失败：{}",
@@ -681,6 +705,26 @@ fn validate_ledger(ledger: &mut SessionLedger) -> Result<bool> {
     );
     let mut changed = false;
     for reservation in ledger.reservations.values_mut() {
+        if ledger.schema_version < 17 && !reservation.workspace_write_claimed {
+            reservation.workspace_write_claimed = true;
+            changed = true;
+        }
+        if ledger.schema_version < 18 {
+            // Earlier formats cannot attest narrow scopes. Preserve exclusion
+            // even if an unexpected field was present in their JSON.
+            reservation.unbounded_write_claimed = !reservation.file_write_claims.is_empty()
+                && reservation.file_write_claims != missing_file_write_claims();
+            reservation.file_write_claims.clear();
+            changed = true;
+        }
+        anyhow::ensure!(
+            reservation.file_write_claims.len() <= MAX_WRITE_PATHS
+                && reservation
+                    .file_write_claims
+                    .iter()
+                    .all(|path| write_scope::valid_path_key(path)),
+            "子代理账本的文件写入范围无效"
+        );
         anyhow::ensure!(
             ledger.schema_version >= 16 || reservation.legacy_write_capable.is_some(),
             "旧版子代理账本缺少权限元数据，无法安全迁移"
@@ -864,9 +908,6 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
         now_ms,
     } = context;
     let loaded_rules = rules::load_logged(state_root);
-    // Lock order: admission first, then this session's ledger. Other lifecycle
-    // operations only need their session lock; snapshots remain atomic reads.
-    let admission = AdmissionGuard::acquire(state_root)?;
     let store = LedgerStore::open(state_root, session_id)?;
     let mut ledger = store
         .load(runtime_id, session_id, now_ms)?
@@ -884,14 +925,6 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
     }
     if let Some(reason) = ledger_capacity_denial(&ledger) {
         return Ok(Some(reason));
-    }
-    if let Some(conflict) = resource_conflict(&prepared, &ledger) {
-        return Ok(Some(conflict));
-    }
-    if let Some(conflict) =
-        resource_conflict_in_other_sessions(state_root, runtime_id, &store.ledger_path, &prepared)?
-    {
-        return Ok(Some(conflict));
     }
     if let Some(reason) = concurrency_denial(&ledger, active_agents) {
         return Ok(Some(reason));
@@ -921,6 +954,9 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
             origin_runtime_id_hash,
             role: prepared.role,
             legacy_write_capable: None,
+            workspace_write_claimed: false,
+            unbounded_write_claimed: false,
+            file_write_claims: BTreeSet::new(),
             workspace_root: prepared.workspace_root,
             state: ReservationState::Pending,
             outcome: ExecutionOutcome::Unknown,
@@ -944,7 +980,6 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
         },
     );
     store.save(&mut ledger, now_ms)?;
-    drop(admission);
     let mut event = SubagentTraceEvent::new(
         now_ms,
         &trace,
@@ -2134,11 +2169,23 @@ pub(crate) struct ChildToolContext<'a> {
     pub(crate) tool_input: Option<&'a Value>,
 }
 
+#[cfg(test)]
 pub(crate) fn authorize_child_tool_with_context(
     state_root: &Path,
     runtime_id: &str,
     session_id: &str,
     context: ChildToolContext<'_>,
+    now_ms: u64,
+) -> Result<Option<String>> {
+    authorize_child_tool_with_workspace(state_root, runtime_id, session_id, context, None, now_ms)
+}
+
+pub(crate) fn authorize_child_tool_with_workspace(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    context: ChildToolContext<'_>,
+    tool_workspace: Option<&str>,
     now_ms: u64,
 ) -> Result<Option<String>> {
     let ChildToolContext {
@@ -2150,6 +2197,14 @@ pub(crate) fn authorize_child_tool_with_context(
     } = context;
     let loaded_rules = rules::load_logged(state_root);
     let tool_class = rules::classify_tool(tool_name);
+    let needs_write_claim = tool_requires_workspace_write(tool_name);
+    // Always acquire the cross-session lock before the session lock. Reads and
+    // lifecycle updates use only the latter and never wait for a write claim.
+    let _admission = if needs_write_claim {
+        Some(AdmissionGuard::acquire(state_root)?)
+    } else {
+        None
+    };
     let store = LedgerStore::open(state_root, session_id)?;
     let mut ledger = store.load(runtime_id, session_id, now_ms)?;
     let agent_hash = hash_component(agent_id);
@@ -2431,7 +2486,67 @@ pub(crate) fn authorize_child_tool_with_context(
             decision.rule_id, decision.priority, decision.explanation
         )));
     }
+    if needs_write_claim
+        && let (Some(current), Some(task_id)) = (ledger.as_mut(), bound_task.as_deref())
+        && let Some(reservation) = current.reservations.get(task_id)
+    {
+        let scope = write_scope::write_scope(
+            tool_name,
+            tool_input,
+            reservation.workspace_root.as_deref(),
+            tool_workspace,
+        );
+        if let Some(reason) = resource_conflict(&scope, task_id, current) {
+            return Ok(Some(reason));
+        }
+        if let Some(reason) =
+            resource_conflict_in_other_sessions(state_root, runtime_id, &store.ledger_path, &scope)?
+        {
+            return Ok(Some(reason));
+        }
+        let reservation = current.reservations.get_mut(task_id).unwrap();
+        let mut changed = false;
+        match scope {
+            WriteScope::None => {}
+            WriteScope::Workspace(_) => {
+                changed = !reservation.workspace_write_claimed;
+                reservation.workspace_write_claimed = true;
+            }
+            WriteScope::Unbounded => {
+                changed = !reservation.unbounded_write_claimed;
+                reservation.unbounded_write_claimed = true;
+            }
+            WriteScope::Paths(paths) => {
+                let union = reservation
+                    .file_write_claims
+                    .union(&paths)
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                if union.len() > MAX_WRITE_PATHS {
+                    return Ok(Some("CODEY_SUBAGENT_WRITE_SCOPE_LIMIT: 本次编辑会超过文件占用记录上限，工具未执行；请结算当前子任务后再安排剩余修改。".to_owned()));
+                }
+                changed = reservation.file_write_claims != union;
+                reservation.file_write_claims = union;
+            }
+        }
+        if changed {
+            store.save(current, now_ms)?;
+        }
+    }
     Ok(None)
+}
+
+fn tool_requires_workspace_write(tool_name: &str) -> bool {
+    match rules::classify_tool(tool_name) {
+        ToolClass::Write | ToolClass::Command | ToolClass::Unknown => true,
+        // UI automation can edit files or invoke commands. Only the known
+        // inspection APIs are exempt; tool names are normalized by namespace.
+        ToolClass::Visual => !matches!(
+            rules::normalize_tool_name(tool_name).as_str(),
+            "view_image" | "screenshot"
+        ),
+        _ => false,
+    }
 }
 
 pub(crate) fn settle_turn(
@@ -2507,13 +2622,11 @@ fn reservation_trace(reservation: &Reservation) -> TraceContext {
     }
 }
 
-fn resource_conflict(prepared: &PreparedContract, ledger: &SessionLedger) -> Option<String> {
-    for existing in ledger
-        .reservations
-        .values()
-        .filter(|reservation| !reservation.spawn_failed && reservation.state.is_active())
-    {
-        if let Some(conflict) = reservation_resource_conflict(prepared, existing) {
+fn resource_conflict(scope: &WriteScope, task_id: &str, ledger: &SessionLedger) -> Option<String> {
+    for existing in ledger.reservations.values().filter(|reservation| {
+        !reservation.spawn_failed && reservation.state.is_active() && reservation.task_id != task_id
+    }) {
+        if let Some(conflict) = reservation_resource_conflict(scope, existing) {
             return Some(conflict);
         }
     }
@@ -2524,7 +2637,7 @@ fn resource_conflict_in_other_sessions(
     state_root: &Path,
     runtime_id: &str,
     current_ledger_path: &Path,
-    prepared: &PreparedContract,
+    scope: &WriteScope,
 ) -> Result<Option<String>> {
     let runtime_id_hash = hash_component(runtime_id);
     for entry in fs::read_dir(state_root)? {
@@ -2571,7 +2684,7 @@ fn resource_conflict_in_other_sessions(
             .values()
             .filter(|reservation| !reservation.spawn_failed && reservation.state.is_active())
         {
-            if let Some(conflict) = reservation_resource_conflict(prepared, existing) {
+            if let Some(conflict) = reservation_resource_conflict(scope, existing) {
                 return Ok(Some(conflict));
             }
         }
@@ -2579,24 +2692,55 @@ fn resource_conflict_in_other_sessions(
     Ok(None)
 }
 
-fn reservation_resource_conflict(
-    prepared: &PreparedContract,
-    existing: &Reservation,
-) -> Option<String> {
-    let overlaps = match (&prepared.workspace_root, &existing.workspace_root) {
-        (Some(left), Some(right)) => paths_overlap(left, right),
-        _ => true,
+fn reservation_resource_conflict(scope: &WriteScope, existing: &Reservation) -> Option<String> {
+    if matches!(scope, WriteScope::None)
+        || !existing.workspace_write_claimed
+            && !existing.unbounded_write_claimed
+            && existing.file_write_claims.is_empty()
+    {
+        return None;
+    }
+    let overlaps = if existing.unbounded_write_claimed {
+        true
+    } else {
+        let workspace_overlap = |path: &str| {
+            existing.workspace_write_claimed
+                && existing
+                    .workspace_root
+                    .as_deref()
+                    .is_none_or(|root| paths_overlap(path, root))
+        };
+        match scope {
+            WriteScope::None => false,
+            WriteScope::Unbounded | WriteScope::Workspace(None) => true,
+            WriteScope::Workspace(Some(root)) => {
+                workspace_overlap(root)
+                    || existing
+                        .file_write_claims
+                        .iter()
+                        .any(|path| paths_overlap(root, path))
+            }
+            WriteScope::Paths(paths) => paths.iter().any(|path| {
+                workspace_overlap(path)
+                    || existing
+                        .file_write_claims
+                        .iter()
+                        .any(|claimed| paths_overlap(path, claimed))
+            }),
+        }
     };
     overlaps.then(|| {
         format!(
-            "CODEY_SUBAGENT_WORKSPACE_BUSY: 任务 `{}` 与活动任务 `{}` 的工作区重叠；请串行执行，或使用原生执行器提供的独立工作区。",
-            prepared.capsule.id, existing.task_id
+            "CODEY_SUBAGENT_WORKSPACE_BUSY: 活动任务 `{}` 已占用本次编辑涉及的文件或工作区，本次工具未执行。可继续读取或处理不冲突的文件；不要反复重试或换工具绕过，由主代理在占用释放后安排剩余修改，并重新读取相关文件。",
+            existing.task_id
         )
     })
 }
 
 fn paths_overlap(left: &str, right: &str) -> bool {
-    path_is_within(left, right) || path_is_within(right, left)
+    let left = write_scope::comparison_key(left);
+    let right = write_scope::comparison_key(right);
+    path_is_within(&left, &right) || path_is_within(&right, &left)
 }
 
 fn path_is_within(path: &str, parent: &str) -> bool {
@@ -2812,7 +2956,7 @@ mod tests {
     }
 
     #[test]
-    fn analysis_roles_use_a_workspace_wide_conflict_lock() {
+    fn analysis_roles_do_not_reserve_writing_at_spawn() {
         let temp = tempdir().unwrap();
         assert_eq!(
             pre_spawn_with_workspace(
@@ -2827,7 +2971,7 @@ mod tests {
             .unwrap(),
             None
         );
-        let denial = pre_spawn_with_workspace(
+        let admission = pre_spawn_with_workspace(
             temp.path(),
             "runtime-a",
             "session-a",
@@ -2836,9 +2980,8 @@ mod tests {
             1,
             11,
         )
-        .unwrap()
         .unwrap();
-        assert!(denial.contains("CODEY_SUBAGENT_WORKSPACE_BUSY"));
+        assert_eq!(admission, None);
         assert_eq!(
             pre_spawn_with_workspace(
                 temp.path(),
