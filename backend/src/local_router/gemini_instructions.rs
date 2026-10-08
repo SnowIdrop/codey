@@ -9,10 +9,13 @@ const LEGACY_BASE_INSTRUCTIONS: &str =
 // whitespace are normalized before comparison, so the exact-match contract is unchanged.
 const GPT6_BASE_INSTRUCTIONS: &str =
     include_str!("../../resources/codex-0.155.0-alpha.9-gpt6-base-instructions.md");
+// CLI 0.160.1 parent and child rollout metadata match the official GPT-6 catalog.
+const GPT6_01601_BASE_INSTRUCTIONS: &str =
+    include_str!("../../resources/codex-0.160.1-gpt6-base-instructions.md");
 const CODING_AGENT_BASE_INSTRUCTIONS: &str =
     include_str!("../../resources/codex-0.153.3-coding-agent-base-instructions.md");
 const TEMPLATE_VERSION: &str =
-    "antigravity-v1/codex-0.153.3+codex-0.153.3-coding-agent+codex-0.155.0-alpha.9";
+    "antigravity-v1/codex-0.153.3+codex-0.153.3-coding-agent+codex-0.155.0-alpha.9+codex-0.160.1";
 pub(crate) const GEMINI_INSTRUCTIONS_ERROR: &str = "gemini_base_instructions_unrecognized";
 pub(crate) const GEMINI_CHAT_TAIL_ERROR: &str = "gemini_chat_tail_unsupported";
 
@@ -139,6 +142,7 @@ pub(crate) fn adapt_gemini_base_instructions(
     let normalized = instructions.map(|text| text.replace("\r\n", "\n"));
     let legacy = LEGACY_BASE_INSTRUCTIONS.replace("\r\n", "\n");
     let gpt6 = GPT6_BASE_INSTRUCTIONS.replace("\r\n", "\n");
+    let gpt6_01601 = GPT6_01601_BASE_INSTRUCTIONS.replace("\r\n", "\n");
     let coding_agent = CODING_AGENT_BASE_INSTRUCTIONS.replace("\r\n", "\n");
     let gemini = GEMINI_BASE_INSTRUCTIONS.replace("\r\n", "\n");
     let matched_baseline = normalized.as_deref().map(str::trim).and_then(|text| {
@@ -146,6 +150,7 @@ pub(crate) fn adapt_gemini_base_instructions(
             ("antigravity-v1", gemini.as_str()),
             ("codex-0.153.3", legacy.as_str()),
             ("codex-0.155.0-alpha.9-gpt6", gpt6.as_str()),
+            ("codex-0.160.1-gpt6", gpt6_01601.as_str()),
             ("codex-0.153.3-coding-agent", coding_agent.as_str()),
         ]
         .into_iter()
