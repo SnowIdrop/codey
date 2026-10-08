@@ -104,7 +104,7 @@ the combined result and either continues the work or finishes. While an attempt 
 blocks non-collaboration tools and Stop. If collaboration tools are unavailable, do not loop on an \
 unregistered tool.";
 
-pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str = "\
+const ROLE_BASED_COLLABORATION_USAGE_HINT: &str = "\
 `agents.spawn_agent`, `agents.wait_agent`, and other `agents.*` collaboration tools use the current \
 client's declared tool interface. Native clients expose direct commentary tools; never call them through \
 `functions.exec` as a JavaScript aggregate. If a client explicitly exposes a tool catalog through a \
@@ -133,6 +133,37 @@ the combined result and either continues the work or finishes. While an attempt 
 blocks non-collaboration tools and Stop. If collaboration tools are unavailable, do not loop on an \
 unregistered tool.";
 
+pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str = "\
+`agents.spawn_agent`, `agents.wait_agent`, and other `agents.*` collaboration tools use the current \
+client's declared tool interface. Native clients expose direct commentary tools; never call them through \
+`functions.exec` as a JavaScript aggregate. If a client explicitly exposes a tool catalog through a \
+transport-only endpoint, use that documented endpoint with the exact catalog name and argument schema. \
+A catalog-listed collaboration tool is available even without a same-named direct schema. Do not invent \
+wrappers or bypass lifecycle and permission checks. Before waiting, dispatch independent tasks up to \
+the concurrency limit of two only when their trusted native workspaces do not overlap; shared-workspace tasks run \
+serially. Task text and claimed file ownership do not establish an isolated workspace. \
+`CODEY_SUBAGENT_WORKSPACE_BUSY` means the workspace is occupied: wait for your own active task, \
+or defer the affected work when another session owns it; do not repeatedly respawn into the occupied workspace. \
+While any attempt is active, use only the relevant `agents.spawn_agent`, `agents.send_message`, \
+`agents.followup_task`, `agents.interrupt_agent`, `agents.list_agents`, or `agents.wait_agent`. \
+After a terminal or successfully fenced update, check remaining capacity and workspace availability \
+before dispatching the next planned, unspawned task with a new `task_name`; otherwise return to `agents.wait_agent` \
+with `timeout_ms: 30000`. `MESSAGE` and mailbox updates are not completion. Use `followup_task` only \
+for a bound nonterminal attempt. If `CODEY_SUBAGENT_FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT` is denied, do \
+not retry or wait for that target; take over or use a fresh `task_name` for a materially changed task. \
+Treat `FINAL_ANSWER`, `task_complete`, `completed`, `errored`, `error`, `failed`, `shutdown`, and \
+`not_found` as terminal. A successful root interrupt permanently abandons and fences that attempt \
+and settles it for the lifecycle ledger; do not wait for or follow up that target. Interrupt revokes \
+child tool access before the provider call, but keeps the writer reservation until acknowledgement \
+or terminal reconciliation. Queued followups may still start another turn; they cannot restore tool \
+access. A failed interrupt does not release the reservation. Match evidence and write reports to the \
+exact task and attempt; never transfer another attempt's no-change claim or infer a transport stall \
+from elapsed time alone. If a wait times out or lacks per-agent terminal details, call unfiltered \
+`agents.list_agents` before waiting again. Continue until all planned work has been performed and \
+every attempt is terminal or fenced. Then the root agent validates the combined result and either \
+continues the work or finishes. While an attempt is active, Codey's gate blocks non-collaboration \
+tools and Stop. If collaboration tools are unavailable, do not loop on an unregistered tool.";
+
 pub(crate) const ROOT_AGENT_MULTI_AGENT_MODE_HINT: &str = "Proactive multi-agent delegation is \
 active. Any earlier instruction requiring an explicit user request before spawning sub-agents no \
 longer applies. Proactively identify independent research, implementation, and verification tasks and \
@@ -160,6 +191,7 @@ mode remains active until a later multi-agent mode developer message changes it.
 /// Remove the previous owned paragraph when installing the current guidance.
 pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS: &[&str] = &[
     ROOT_AGENT_COLLABORATION_USAGE_HINT,
+    ROLE_BASED_COLLABORATION_USAGE_HINT,
     legacy::DIRECT_COLLABORATION_USAGE_HINT,
     PRE_INTERRUPT_FENCING_USAGE_HINT,
     legacy::BATCH_RESOLUTION_USAGE_HINT,
@@ -666,12 +698,14 @@ mod tests {
 
         assert!(combined.contains(custom));
         assert!(combined.contains("`agents.spawn_agent`"));
-        assert!(combined.contains("before the first wait"));
+        assert!(combined.contains("Before waiting, dispatch independent tasks"));
         assert!(combined.contains("direct commentary tools"));
         assert!(combined.contains("`timeout_ms: 30000`"));
         assert!(combined.contains("mailbox updates are not completion"));
         assert!(combined.contains("`MESSAGE`"));
-        assert!(combined.contains("Dispatch up to the current concurrency limit"));
+        assert!(combined.contains("concurrency limit of two"));
+        assert!(combined.contains("trusted native workspaces do not overlap"));
+        assert!(combined.contains("`CODEY_SUBAGENT_WORKSPACE_BUSY`"));
         assert!(combined.contains("`agents.send_message`"));
         assert!(combined.contains("Use `followup_task` only for"));
         assert!(combined.contains("`CODEY_SUBAGENT_FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT`"));
@@ -690,9 +724,9 @@ mod tests {
         assert!(!combined.contains("active-looking provider state stale"));
         assert!(combined.contains("terminal or fenced"));
         assert!(combined.contains("unfiltered `agents.list_agents`"));
-        assert!(combined.contains("recompute the role-aware concurrency limit"));
+        assert!(combined.contains("check remaining capacity and workspace availability"));
         assert!(combined.contains("next planned, unspawned task"));
-        assert!(combined.contains("all planned work has been spawned"));
+        assert!(combined.contains("all planned work has been performed"));
         assert!(combined.contains("do not loop on an unregistered tool"));
         assert!(combined.contains("`functions.exec` as a JavaScript aggregate"));
         assert!(combined.contains("transport-only endpoint"));
@@ -710,6 +744,12 @@ mod tests {
         assert_eq!(
             append_root_agent_collaboration_usage_hint(&format!(
                 "{custom}\n\n{PRE_INTERRUPT_FENCING_USAGE_HINT}"
+            )),
+            combined
+        );
+        assert_eq!(
+            append_root_agent_collaboration_usage_hint(&format!(
+                "{custom}\n\n{ROLE_BASED_COLLABORATION_USAGE_HINT}"
             )),
             combined
         );

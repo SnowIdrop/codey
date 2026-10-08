@@ -13,25 +13,30 @@ use serde_json::Value;
 use crate::subagent::api::{TokenUsage, TraceContext};
 use crate::subagent::lifecycle::{ExecutionOutcome, ExecutionPhase as ReservationState};
 use crate::subagent::protocol::{AgentState, InterruptAcknowledgement};
-use crate::subagent::rules::{self, RoleAccess, RuleActor, RuleContext, RuleEffect, ToolClass};
+use crate::subagent::rules::{self, RuleActor, RuleContext, RuleEffect, ToolClass};
 use crate::subagent::telemetry::{
     self, ExecutionStatus, SubagentTraceEvent, TraceEventKind, TraceRecorder,
 };
 
 mod contract;
 mod identity;
+#[cfg(test)]
+mod migration_tests;
+#[cfg(test)]
+mod scheduling_tests;
 
 use contract::*;
 use identity::*;
 
 pub(crate) const POST_TOOL_HOOK_MATCHER: &str = "*";
 
-const LEDGER_SCHEMA_VERSION: u32 = 15;
-// Only ledgers written by the previous two releases (both already at the
-// current schema) are accepted; older schema upgrades were removed.
-const MIN_LEDGER_SCHEMA_VERSION: u32 = LEDGER_SCHEMA_VERSION;
+const LEDGER_SCHEMA_VERSION: u32 = 16;
+// v14 already carries attempt identity and runtime fencing. Older formats lack
+// the evidence needed to preserve active work safely.
+const MIN_LEDGER_SCHEMA_VERSION: u32 = 14;
 const LEDGER_FILE: &str = "orchestrator-ledger-v1.json";
 const LEDGER_LOCK_FILE: &str = "orchestrator-ledger-v1.lock";
+const ADMISSION_LOCK_FILE: &str = "orchestrator-admission.lock";
 const CONCURRENCY_LIMIT: usize = 2;
 const MAX_RESERVATIONS_PER_LEDGER: usize = 1_024;
 const DUPLICATE_TASK_ID_ERROR_CODE: &str = "CODEY_SUBAGENT_DUPLICATE_TASK_ID";
@@ -95,7 +100,9 @@ struct Reservation {
     #[serde(default)]
     origin_runtime_id_hash: String,
     role: String,
-    write_capable: bool,
+    // Decode the retired permission flag once, without broadening old attempts.
+    #[serde(default, rename = "write_capable", skip_serializing)]
+    legacy_write_capable: Option<bool>,
     workspace_root: Option<String>,
     state: ReservationState,
     #[serde(default)]
@@ -144,6 +151,42 @@ const fn default_runtime_generation() -> u64 {
 struct LedgerStore {
     lock: File,
     ledger_path: PathBuf,
+}
+
+/// Serializes only admission across sessions, never an agent's execution.
+struct AdmissionGuard(File);
+
+impl AdmissionGuard {
+    fn acquire(state_root: &Path) -> Result<Self> {
+        fs::create_dir_all(state_root)?;
+        let path = state_root.join(ADMISSION_LOCK_FILE);
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let started = Instant::now();
+        loop {
+            match lock.try_lock_exclusive() {
+                Ok(()) => return Ok(Self(lock)),
+                Err(error) if crate::fs_util::file_lock_is_contended(&error) => {
+                    anyhow::ensure!(
+                        started.elapsed() < Duration::from_millis(LEDGER_LOCK_TIMEOUT_MILLIS),
+                        "CODEY_SUBAGENT_ADMISSION_BUSY: 其他会话正在登记子代理，请稍后重试"
+                    );
+                    thread::sleep(Duration::from_millis(LEDGER_LOCK_RETRY_MILLIS));
+                }
+                Err(error) => return Err(error).context("获取子代理跨会话派发锁失败"),
+            }
+        }
+    }
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
 }
 
 impl LedgerStore {
@@ -216,11 +259,6 @@ impl LedgerStore {
                 self.ledger_path.display()
             )
         })?;
-        anyhow::ensure!(
-            (MIN_LEDGER_SCHEMA_VERSION..=LEDGER_SCHEMA_VERSION).contains(&ledger.schema_version),
-            "Codey 子代理编排账本版本不受支持：{}",
-            ledger.schema_version
-        );
         let mut changed = validate_ledger(&mut ledger)?;
         let session_id_hash = hash_component(session_id);
         anyhow::ensure!(
@@ -633,10 +671,27 @@ impl SessionLedger {
 }
 
 /// Repairs derivable fields (issued task ids, next fencing token) and rejects
-/// ledgers that violate the identity, capacity or generation invariants. Only
-/// the current schema version is accepted, so there is no migration step.
+/// ledgers that violate the identity, capacity or generation invariants.
+/// Migration keeps active reservations, identities and capabilities intact.
 fn validate_ledger(ledger: &mut SessionLedger) -> Result<bool> {
+    anyhow::ensure!(
+        (MIN_LEDGER_SCHEMA_VERSION..=LEDGER_SCHEMA_VERSION).contains(&ledger.schema_version),
+        "Codey 子代理编排账本版本不受支持：{}；请先用原版本结算活动子代理，再重试升级",
+        ledger.schema_version
+    );
     let mut changed = false;
+    for reservation in ledger.reservations.values_mut() {
+        anyhow::ensure!(
+            ledger.schema_version >= 16 || reservation.legacy_write_capable.is_some(),
+            "旧版子代理账本缺少权限元数据，无法安全迁移"
+        );
+        if reservation.legacy_write_capable == Some(false) {
+            reservation
+                .capabilities
+                .retain(|capability| capability != "workspace.write");
+        }
+        changed |= reservation.legacy_write_capable.take().is_some();
+    }
     let before = ledger.issued_task_ids.len();
     ledger
         .issued_task_ids
@@ -809,6 +864,9 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
         now_ms,
     } = context;
     let loaded_rules = rules::load_logged(state_root);
+    // Lock order: admission first, then this session's ledger. Other lifecycle
+    // operations only need their session lock; snapshots remain atomic reads.
+    let admission = AdmissionGuard::acquire(state_root)?;
     let store = LedgerStore::open(state_root, session_id)?;
     let mut ledger = store
         .load(runtime_id, session_id, now_ms)?
@@ -862,7 +920,7 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
             runtime_generation,
             origin_runtime_id_hash,
             role: prepared.role,
-            write_capable: prepared.policy.access == RoleAccess::Write,
+            legacy_write_capable: None,
             workspace_root: prepared.workspace_root,
             state: ReservationState::Pending,
             outcome: ExecutionOutcome::Unknown,
@@ -886,6 +944,7 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
         },
     );
     store.save(&mut ledger, now_ms)?;
+    drop(admission);
     let mut event = SubagentTraceEvent::new(
         now_ms,
         &trace,
@@ -1777,65 +1836,6 @@ pub(crate) fn active_reservation_projection(
     Ok(Some((active.len(), identities)))
 }
 
-/// Proves that every active attempt is a bound, local-read-only child and that
-/// the lifecycle marker identities exactly match the ledger projection. This
-/// deliberately accepts only `files.read`: read-only roles that can execute
-/// commands or use other capabilities keep the normal global root barrier.
-pub(crate) fn verified_local_read_only_active_count(
-    state_root: &Path,
-    runtime_id: &str,
-    session_id: &str,
-    active_marker_hashes: &BTreeSet<String>,
-    now_ms: u64,
-) -> Result<Option<usize>> {
-    if active_marker_hashes.is_empty() {
-        return Ok(None);
-    }
-    let loaded_rules = rules::load_logged(state_root);
-    let store = LedgerStore::open(state_root, session_id)?;
-    let Some(ledger) = store.load(runtime_id, session_id, now_ms)? else {
-        return Ok(None);
-    };
-    let active = ledger
-        .reservations
-        .values()
-        .filter(|reservation| reservation.state.is_active())
-        .collect::<Vec<_>>();
-    if active.is_empty() || active.len() != active_marker_hashes.len() {
-        return Ok(None);
-    }
-
-    let mut bound_agent_hashes = BTreeSet::new();
-    for reservation in &active {
-        let role_is_read_only = loaded_rules
-            .rules
-            .role_policy(&reservation.role)
-            .is_some_and(|policy| policy.access == RoleAccess::ReadOnly);
-        let files_read_only = matches!(
-            reservation.capabilities.as_slice(),
-            [capability] if capability == "files.read"
-        );
-        let Some(agent_id_hash) = reservation.agent_id_hash.as_ref() else {
-            return Ok(None);
-        };
-        if reservation.spawn_failed
-            || reservation.fenced_at_ms.is_some()
-            || reservation.started_at_ms.is_none()
-            || reservation.outcome != ExecutionOutcome::Unknown
-            || !role_is_read_only
-            || reservation.write_capable
-            || !files_read_only
-            || !bound_agent_hashes.insert(agent_id_hash.clone())
-        {
-            return Ok(None);
-        }
-    }
-    if &bound_agent_hashes != active_marker_hashes {
-        return Ok(None);
-    }
-    Ok(Some(active.len()))
-}
-
 /// Atomically fences every still-active reservation before the gate discards
 /// legacy marker files. This keeps the ledger as the authoritative source of
 /// truth and prevents a Stop recovery loop from resurrecting stale work.
@@ -2149,17 +2149,7 @@ pub(crate) fn authorize_child_tool_with_context(
         tool_input,
     } = context;
     let loaded_rules = rules::load_logged(state_root);
-    let mut tool_class = rules::classify_tool(tool_name);
-    if tool_class == ToolClass::Unknown
-        && crate::subagent_gate::cached_read_only_tool(
-            state_root,
-            tool_name,
-            tool_input,
-            loaded_rules.rules.revision,
-        )
-    {
-        tool_class = ToolClass::Read;
-    }
+    let tool_class = rules::classify_tool(tool_name);
     let store = LedgerStore::open(state_root, session_id)?;
     let mut ledger = store.load(runtime_id, session_id, now_ms)?;
     let agent_hash = hash_component(agent_id);
@@ -2500,11 +2490,10 @@ fn reservation_declares_visual(reservation: &Reservation) -> bool {
 }
 
 fn reservation_declares_write(reservation: &Reservation) -> bool {
-    reservation.write_capable
-        && reservation
-            .capabilities
-            .iter()
-            .any(|capability| capability == "workspace.write")
+    reservation
+        .capabilities
+        .iter()
+        .any(|capability| capability == "workspace.write")
 }
 
 fn reservation_trace(reservation: &Reservation) -> TraceContext {
@@ -2594,16 +2583,13 @@ fn reservation_resource_conflict(
     prepared: &PreparedContract,
     existing: &Reservation,
 ) -> Option<String> {
-    if prepared.policy.access != RoleAccess::Write && !existing.write_capable {
-        return None;
-    }
     let overlaps = match (&prepared.workspace_root, &existing.workspace_root) {
         (Some(left), Some(right)) => paths_overlap(left, right),
         _ => true,
     };
     overlaps.then(|| {
         format!(
-            "Codey 能力/资源冲突门禁：任务 `{}` 与活动任务 `{}` 共享工作区且至少一方可写；请串行执行。",
+            "CODEY_SUBAGENT_WORKSPACE_BUSY: 任务 `{}` 与活动任务 `{}` 的工作区重叠；请串行执行，或使用原生执行器提供的独立工作区。",
             prepared.capsule.id, existing.task_id
         )
     })
@@ -2852,7 +2838,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(denial.contains("资源冲突"));
+        assert!(denial.contains("CODEY_SUBAGENT_WORKSPACE_BUSY"));
         assert_eq!(
             pre_spawn_with_workspace(
                 temp.path(),
