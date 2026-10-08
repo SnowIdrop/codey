@@ -1502,6 +1502,152 @@ async fn official_opaque_continuation_uses_http_with_complete_history() {
 }
 
 #[tokio::test]
+async fn previous_response_not_found_allows_client_full_request_retry() {
+    for sse_wrapped in [false, true] {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let (no_replay_tx, no_replay_rx) = tokio::sync::oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _first = socket.next().await.unwrap().unwrap();
+            socket
+                .send(WebSocketMessage::Text(
+                    json!({
+                        "type":"response.completed",
+                        "response":{"id":"resp-first","status":"completed","output":[]}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            let WebSocketMessage::Text(text) = socket.next().await.unwrap().unwrap() else {
+                panic!("expected continuation");
+            };
+            let request: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(request["previous_response_id"], "resp-first");
+            let error = json!({"type":"error","status":400,"error":{
+                "type":"invalid_request_error","code":"previous_response_not_found",
+                "message":"Previous response was not found. Retrying the full request."
+            }});
+            let frame = if sse_wrapped {
+                format!("data: {error}\n\n")
+            } else {
+                error.to_string()
+            };
+            socket
+                .send(WebSocketMessage::Text(frame.into()))
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), upstream.accept())
+                    .await
+                    .is_err()
+            );
+            no_replay_tx.send(()).unwrap();
+
+            let (stream, _) = tokio::time::timeout(Duration::from_secs(5), upstream.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut retry_socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let WebSocketMessage::Text(text) = retry_socket.next().await.unwrap().unwrap() else {
+                panic!("expected full request retry");
+            };
+            let request: Value = serde_json::from_str(&text).unwrap();
+            assert!(request.get("previous_response_id").is_none());
+            assert_eq!(
+                request["input"],
+                json!([
+                    {"role":"user","content":"first"}, {"role":"user","content":"next"}
+                ])
+            );
+            retry_socket
+                .send(WebSocketMessage::Text(
+                    json!({
+                        "type":"response.completed",
+                        "response":{"id":"resp-retry","status":"completed","output":[]}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+        let (mut config, provider, model) = router_config(format!("http://{address}/v1"));
+        config.profiles[0].supports_websockets = true;
+        let router = LocalRouter::start(&config).await.unwrap();
+        let mut client = connect_router_websocket(&router.endpoint()).await;
+        let alias = model_alias(&provider, &model);
+        let first = send_router_websocket_request(&mut client, &alias, "first").await;
+        assert_eq!(first.last().unwrap()["response"]["id"], "resp-first");
+        client
+            .send(WebSocketMessage::Text(
+                json!({
+                    "type":"response.create", "model":alias,
+                    "previous_response_id":"resp-first", "input":"next"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let WebSocketMessage::Text(text) =
+            tokio::time::timeout(Duration::from_secs(5), client.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("expected recovery error");
+        };
+        let event: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(event["type"], "error", "{event}");
+        assert_eq!(event["error"]["code"], "previous_response_not_found");
+        assert_eq!(event["error"]["type"], "invalid_request_error");
+        assert!(
+            event["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Responses WebSocket")
+        );
+        no_replay_rx.await.unwrap();
+        client.close(None).await.unwrap();
+        client = connect_router_websocket(&router.endpoint()).await;
+
+        client
+            .send(WebSocketMessage::Text(
+                json!({
+                    "type":"response.create", "model":alias, "input":[
+                        {"role":"user","content":"first"}, {"role":"user","content":"next"}
+                    ]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let WebSocketMessage::Text(text) =
+            tokio::time::timeout(Duration::from_secs(5), client.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("expected successful retry");
+        };
+        let event: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(event["type"], "response.completed", "{event}");
+        assert_eq!(event["response"]["id"], "resp-retry");
+        upstream_task.await.unwrap();
+        client.close(None).await.unwrap();
+        router.stop().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn persisted_context_rejection_is_not_replayed_without_a_new_client_request() {
     let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let address = upstream.local_addr().unwrap();
