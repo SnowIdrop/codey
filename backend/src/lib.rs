@@ -30,7 +30,6 @@ mod model_list;
 mod native_update_ui;
 mod notifications;
 mod official_accounts;
-mod overlay_recovery;
 mod pending_approval;
 mod pet_slim_patch;
 mod plugin_log_terminal;
@@ -83,10 +82,6 @@ pub fn run_plugin_log_terminal_if_requested() -> Result<bool> {
 
 pub fn run_codex_cli_wrapper_if_requested() -> Result<bool> {
     codex_startup_patch::run_cli_wrapper_if_requested()
-}
-
-pub fn run_overlay_recovery_if_requested() -> Result<bool> {
-    overlay_recovery::run_if_requested()
 }
 
 pub fn run_node_options_repair_if_requested() -> Result<bool> {

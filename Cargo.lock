@@ -438,13 +438,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "codey-plugin-header-demo"
-version = "0.1.0"
-dependencies = [
- "codey-plugin-sdk",
-]
-
-[[package]]
 name = "codey-plugin-sdk"
 version = "0.1.0"
 dependencies = [

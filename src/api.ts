@@ -30,7 +30,6 @@ export const CODEY_API_COMMANDS = [
   "clear_route_request_logs",
   "restart_codey",
   "clear_diagnostic_storage",
-  "repair_codex_overlays",
   "test_notification_channel",
   "start_wechat_claw_login",
   "poll_wechat_claw_login",

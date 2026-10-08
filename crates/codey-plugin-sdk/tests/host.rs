@@ -4,6 +4,8 @@
 #[allow(dead_code)]
 #[path = "../../../backend/src/fs_util.rs"]
 mod fs_util;
+// Backend request handlers use additional host APIs outside this standalone test.
+#[allow(dead_code)]
 #[path = "../../../backend/src/codey_plugins/mod.rs"]
 mod host;
 

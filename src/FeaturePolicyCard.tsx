@@ -1,4 +1,4 @@
-import { memo, useState, type CSSProperties } from "react";
+import { memo, type CSSProperties } from "react";
 import {
   IconAdjustments,
   IconCode,
@@ -29,8 +29,6 @@ import {
   type SubagentModelOption,
 } from "./subagentModels";
 import { SettingsPageHeader } from "./SettingsPageHeader";
-import { invoke } from "./api";
-import { errorText } from "./appUtils";
 import type { DiagnosticStorageTarget } from "./diagnosticStorage";
 import { NotificationChannelsCard } from "./notifications/NotificationChannelsCard";
 import type { NotificationChannel } from "./notifications/types";
@@ -423,20 +421,6 @@ function FeaturePolicyCardComponent({
   onChannelChange,
   onRequestRemoveChannel,
 }: FeaturePolicyCardProps) {
-  const [repairingOverlay, setRepairingOverlay] = useState(false);
-  const [overlayRepairMessage, setOverlayRepairMessage] = useState("");
-  async function repairOverlay() {
-    setRepairingOverlay(true);
-    setOverlayRepairMessage("请松开鼠标，等待浮窗恢复完成。");
-    try {
-      const result = await invoke<{ message: string }>("repair_codex_overlays");
-      setOverlayRepairMessage(result.message);
-    } catch (error) {
-      setOverlayRepairMessage(errorText(error));
-    } finally {
-      setRepairingOverlay(false);
-    }
-  }
   const configuredGpuLaunchModeIndex = GPU_LAUNCH_MODES.findIndex(
     ({ value }) => value === config.gpuLaunchMode,
   );
@@ -557,26 +541,6 @@ function FeaturePolicyCardComponent({
                 </small>
               </div>
             </div>
-
-            {isWindowsClient && (
-              <div className="feature-card">
-                <div className="feature-card-header">
-                  <strong>浮窗点击与拖动恢复</strong>
-                  <Button
-                    className="feature-action-btn"
-                    size="xs"
-                    disabled={isBusy || repairingOverlay}
-                    onClick={() => void repairOverlay()}
-                  >
-                    {repairingOverlay ? "正在恢复…" : "立即恢复"}
-                  </Button>
-                </div>
-                <div className="feature-card-body">
-                  <small>适用于 Windows 商店版。只保留需要恢复的一个宠物或语音浮窗；恢复时请松开鼠标，浮窗可能短暂闪烁。</small>
-                  <small role="status">{overlayRepairMessage}</small>
-                </div>
-              </div>
-            )}
 
             <div
               className={`feature-card ${fastContextToolsEnabled ? "active" : ""}`}
