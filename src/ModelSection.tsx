@@ -54,6 +54,8 @@ import { globalDefaultForRoute, routeProviderId, sortRoutesByEnabled } from "./m
 import { maskEmail, maskUrl } from "./sensitiveText";
 import {
   MAX_ROUTE_SHORT_NAME_CHARACTERS,
+  fallbackRouteShortName,
+  prefixedRouteName,
   validateThirdPartyRouteShortName,
 } from "./routeShortNames";
 import { validateOutboundApiUrl, validateOutboundProxyUrl } from "./urlValidation";
@@ -115,19 +117,12 @@ type RouteModelGroup = {
   official: boolean;
 };
 
-function newRouteName(profiles: Profile[]) {
-  let index = profiles.length + 1;
-  const names = new Set(profiles.map((profile) => profile.name));
-  while (names.has(`新线路 ${index}`)) index += 1;
-  return `新线路 ${index}`;
-}
-
-function createRoute(profiles: Profile[]): Profile {
+function createRoute(): Profile {
   const id = `route-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   return {
     id,
     enabled: true,
-    name: newRouteName(profiles),
+    name: "",
     shortName: "",
     baseUrl: "",
     apiKey: "",
@@ -191,9 +186,7 @@ function validateRouteDraft(route: Profile, profiles: readonly Profile[]): Route
     };
   }
   const errors: RouteDraftErrors = {
-    name: !route.name.trim()
-      ? "请输入线路名称"
-      : Array.from(route.name.trim()).length > MAX_ROUTE_NAME_CHARACTERS
+    name: Array.from(route.name.trim()).length > MAX_ROUTE_NAME_CHARACTERS
         ? `线路名最多 ${MAX_ROUTE_NAME_CHARACTERS} 个字符`
         : "",
     shortName: validateThirdPartyRouteShortName(route.shortName, profiles, route.id),
@@ -214,6 +207,8 @@ const routeProtocolOptions: Array<{
   { label: "OpenAI Chat Completions", value: "openaiChatCompletions" },
   { label: "Anthropic Messages", value: "anthropicMessages" },
 ];
+
+const REQUIRED_FIELD_MARKER = <span aria-hidden="true" className="text-[var(--codey-red,#d70015)]">*</span>;
 
 function ModelSectionComponent({
   config,
@@ -354,11 +349,10 @@ function ModelSectionComponent({
     if (matchingProfile?.enabled === false) return null;
     return {
       id: matchingProfile?.id || currentProvider.id,
-      name:
-        currentProvider.name.trim() ||
-        matchingProfile?.name.trim() ||
-        currentProvider.id,
-      shortName: matchingProfile?.shortName || (official ? "官" : ""),
+      name: matchingProfile
+        ? matchingProfile.name.trim()
+        : currentProvider.name.trim() || currentProvider.id,
+      shortName: matchingProfile?.shortName || "",
       baseUrl: currentProvider.baseUrl || matchingProfile?.baseUrl || "",
       apiKey: "",
       upstreamProtocol:
@@ -485,7 +479,7 @@ function ModelSectionComponent({
   );
 
   const openNewRouteDialog = () => {
-    setRouteDraft(createRoute(config.profiles));
+    setRouteDraft(createRoute());
     setRouteValidationAttempted(false);
     setRouteApiKeyVisible(false);
     setRouteHeadersText(JSON.stringify({}, null, 2));
@@ -499,7 +493,7 @@ function ModelSectionComponent({
     officialScope: OfficialRouteDialogScope | null = null,
   ) => {
     const official = profile.authMode === "officialAccount";
-    setRouteDraft({ ...profile });
+    setRouteDraft({ ...profile, shortName: profile.shortName || fallbackRouteShortName(profile.name) });
     setRouteValidationAttempted(false);
     setRouteApiKeyVisible(false);
     setRouteHeadersText(headersTextFromMap(profile.modelRequestHeaders));
@@ -508,8 +502,8 @@ function ModelSectionComponent({
     setOfficialRouteDraft(
       official && officialScope === "settings"
         ? {
-            routeName: routeAccount?.routeName ?? "",
-            routeShortName: routeAccount?.routeShortName ?? "",
+            routeName: routeAccount?.routeName ?? profile.name,
+            routeShortName: routeAccount?.routeShortName || profile.shortName || fallbackRouteShortName(profile.name),
             baseUrl: routeAccount?.baseUrl ?? "",
             upstreamProxy: profile.upstreamProxy ?? "",
           }
@@ -900,7 +894,7 @@ function ModelSectionComponent({
                                 />
                               </span>
                             )}
-                            <strong id={`provider-model-${profile.id}`} title={profile.name}>{profile.name || "未命名线路"}</strong>
+                            <strong id={`provider-model-${profile.id}`} title={profile.name}>{prefixedRouteName(profile)}</strong>
                             <div className="route-item-badges">
                               {pendingRouteToggle?.id === profile.id && <Badge variant="secondary">保存中…</Badge>}
                               {disabled ? <Badge variant="destructive">已禁用</Badge> : (
@@ -1244,7 +1238,45 @@ function ModelSectionComponent({
                   <>
                     <div className="route-editor-row route-editor-row-names">
                       <label className="route-field">
-                        <span>线路名</span>
+                        <span>短名称 {REQUIRED_FIELD_MARKER}</span>
+                        <Input
+                          id="official-route-short-name-input"
+                          aria-label="短名称"
+                          required
+                          aria-required="true"
+                          error={Boolean(
+                            officialRouteDraftErrors?.shortName &&
+                            (routeValidationAttempted ||
+                              (officialRouteDraft?.routeShortName.length ?? 0) > 0),
+                          )}
+                          aria-errormessage={
+                            officialRouteDraftErrors?.shortName &&
+                            (routeValidationAttempted ||
+                              (officialRouteDraft?.routeShortName.length ?? 0) > 0)
+                              ? "official-route-short-name-error"
+                              : undefined
+                          }
+                          value={officialRouteDraft?.routeShortName ?? ""}
+                          disabled={isBusy || !draftOfficialAccount}
+                          placeholder="如：官1、主"
+                          maxLength={MAX_ROUTE_SHORT_NAME_CHARACTERS}
+                          onChange={(event) =>
+                            updateOfficialRouteDraft({ routeShortName: event.target.value })}
+                        />
+                        {officialRouteDraftErrors?.shortName &&
+                        (routeValidationAttempted ||
+                          (officialRouteDraft?.routeShortName.length ?? 0) > 0) ? (
+                          <small
+                            id="official-route-short-name-error"
+                            className="text-[var(--codey-red,#d70015)]"
+                            role="alert"
+                          >
+                            {officialRouteDraftErrors.shortName}
+                          </small>
+                        ) : null}
+                      </label>
+                      <label className="route-field">
+                        <span>线路名（可选）</span>
                         <Input
                           id="official-route-name-input"
                           aria-label="线路名"
@@ -1263,7 +1295,7 @@ function ModelSectionComponent({
                           }
                           value={officialRouteDraft?.routeName ?? ""}
                           disabled={isBusy || !draftOfficialAccount}
-                          placeholder={routeDraft.name || "OpenAI 官方直登"}
+                          placeholder="留空仅显示短名称"
                           onChange={(event) =>
                             updateOfficialRouteDraft({ routeName: event.target.value })}
                         />
@@ -1280,42 +1312,6 @@ function ModelSectionComponent({
                         ) : !draftOfficialAccount ? (
                           <small className="route-field-hint">
                             未找到该线路对应的官方账号记录。
-                          </small>
-                        ) : null}
-                      </label>
-                      <label className="route-field">
-                        <span>短名称</span>
-                        <Input
-                          id="official-route-short-name-input"
-                          aria-label="短名称"
-                          error={Boolean(
-                            officialRouteDraftErrors?.shortName &&
-                            (routeValidationAttempted ||
-                              (officialRouteDraft?.routeShortName.length ?? 0) > 0),
-                          )}
-                          aria-errormessage={
-                            officialRouteDraftErrors?.shortName &&
-                            (routeValidationAttempted ||
-                              (officialRouteDraft?.routeShortName.length ?? 0) > 0)
-                              ? "official-route-short-name-error"
-                              : undefined
-                          }
-                          value={officialRouteDraft?.routeShortName ?? ""}
-                          disabled={isBusy || !draftOfficialAccount}
-                          placeholder="官"
-                          maxLength={MAX_ROUTE_SHORT_NAME_CHARACTERS}
-                          onChange={(event) =>
-                            updateOfficialRouteDraft({ routeShortName: event.target.value })}
-                        />
-                        {officialRouteDraftErrors?.shortName &&
-                        (routeValidationAttempted ||
-                          (officialRouteDraft?.routeShortName.length ?? 0) > 0) ? (
-                          <small
-                            id="official-route-short-name-error"
-                            className="text-[var(--codey-red,#d70015)]"
-                            role="alert"
-                          >
-                            {officialRouteDraftErrors.shortName}
                           </small>
                         ) : null}
                       </label>
@@ -1462,38 +1458,12 @@ function ModelSectionComponent({
               <div className="route-editor-form">
                 <div className="route-editor-row route-editor-row-names">
                   <label className="route-field">
-                    <span>线路名</span>
-                    <Input
-                      id="route-name-input"
-                      aria-label="线路名"
-                      maxLength={MAX_ROUTE_NAME_CHARACTERS}
-                      aria-invalid={Boolean(
-                        routeDraftErrors?.name &&
-                        (routeValidationAttempted || routeDraft.name.length > 0),
-                      )}
-                      aria-describedby={
-                        routeDraftErrors?.name &&
-                        (routeValidationAttempted || routeDraft.name.length > 0)
-                          ? "route-name-error"
-                          : undefined
-                      }
-                      value={routeDraft.name}
-                      disabled={isBusy}
-                      placeholder="如：主线路、备用中转"
-                      onChange={(event) => updateRouteDraft({ name: event.target.value })}
-                    />
-                    {routeDraftErrors?.name &&
-                    (routeValidationAttempted || routeDraft.name.length > 0) ? (
-                      <small id="route-name-error" className="text-[var(--codey-red,#d70015)]" role="alert">
-                        {routeDraftErrors.name}
-                      </small>
-                    ) : null}
-                  </label>
-                  <label className="route-field">
-                    <span>短名称</span>
+                    <span>短名称 {REQUIRED_FIELD_MARKER}</span>
                     <Input
                       id="route-short-name-input"
                       aria-label="短名称"
+                      required
+                      aria-required="true"
                       error={Boolean(
                         routeDraftErrors?.shortName &&
                         (routeValidationAttempted || routeDraft.shortName.length > 0),
@@ -1522,13 +1492,42 @@ function ModelSectionComponent({
                       </small>
                     ) : null}
                   </label>
+                  <label className="route-field">
+                    <span>线路名（可选）</span>
+                    <Input
+                      id="route-name-input"
+                      aria-label="线路名"
+                      maxLength={MAX_ROUTE_NAME_CHARACTERS}
+                      aria-invalid={Boolean(
+                        routeDraftErrors?.name &&
+                        (routeValidationAttempted || routeDraft.name.length > 0),
+                      )}
+                      aria-describedby={
+                        routeDraftErrors?.name &&
+                        (routeValidationAttempted || routeDraft.name.length > 0)
+                          ? "route-name-error"
+                          : undefined
+                      }
+                      value={routeDraft.name}
+                      disabled={isBusy}
+                      placeholder="留空仅显示短名称"
+                      onChange={(event) => updateRouteDraft({ name: event.target.value })}
+                    />
+                    {routeDraftErrors?.name &&
+                    (routeValidationAttempted || routeDraft.name.length > 0) ? (
+                      <small id="route-name-error" className="text-[var(--codey-red,#d70015)]" role="alert">
+                        {routeDraftErrors.name}
+                      </small>
+                    ) : null}
+                  </label>
                 </div>
 
                 <div className="route-field">
-                  <span id="route-protocol-label">上游协议</span>
+                  <span id="route-protocol-label">上游协议 {REQUIRED_FIELD_MARKER}</span>
                   <Select
                     aria-label="上游协议"
                     aria-labelledby="route-protocol-label"
+                    aria-required={true}
                     value={routeDraft.upstreamProtocol}
                     disabled={isBusy}
                     onChange={(value) => {
@@ -1629,10 +1628,12 @@ function ModelSectionComponent({
                 )}
 
                 <label className="route-field">
-                  <span>URL</span>
+                  <span>URL {REQUIRED_FIELD_MARKER}</span>
                   <Input
                     id="route-url-input"
                     aria-label="URL"
+                    required
+                    aria-required="true"
                     aria-invalid={Boolean(
                       routeDraftErrors?.baseUrl &&
                       (routeValidationAttempted || routeDraft.baseUrl.trim()),
@@ -1661,10 +1662,12 @@ function ModelSectionComponent({
                 </label>
 
                 <label className="route-field">
-                  <span>Key</span>
+                  <span>Key {REQUIRED_FIELD_MARKER}</span>
                   <PasswordInput
                     id="route-key-input"
                     aria-label="Key"
+                    required={!routeDraft.apiKeyConfigured}
+                    aria-required={!routeDraft.apiKeyConfigured}
                     aria-invalid={Boolean(
                       routeValidationAttempted && routeDraftErrors?.apiKey,
                     )}

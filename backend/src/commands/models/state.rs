@@ -415,15 +415,7 @@ pub(crate) fn renderer_route_model_catalog(
             .unwrap_or_default()
         };
         let route_name = profile.name.trim();
-        let route_name = if route_name.is_empty() {
-            provider_id.as_str()
-        } else {
-            route_name
-        };
-        let route_prefix = match profile.short_name.trim() {
-            "" if profile.official_account => OFFICIAL_ROUTE_SHORT_NAME.to_string(),
-            short_name => short_name.to_string(),
-        };
+        let route_prefix = profile.display_short_name();
         let mut official_models = state
             .official_models
             .iter()

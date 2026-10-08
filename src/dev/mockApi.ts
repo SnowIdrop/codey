@@ -13,6 +13,8 @@ import {
   uniqueModelIds,
 } from "../modelIds";
 import { routeModelAlias } from "../modelRoutes";
+import { fallbackRouteShortName, validateThirdPartyRouteShortName } from "../routeShortNames";
+import { MAX_ROUTE_NAME_CHARACTERS, validateOfficialRouteSettings } from "../officialRouteSettings";
 import { previewOfficialModels, previewUpstreamModels } from "../previewModels";
 import {
   previewCrashpadPendingStats,
@@ -41,14 +43,7 @@ if (import.meta.env.DEV) {
       wecom: "https://webhook.example.invalid/wecom/preview-only?key=preview",
       ntfy: "https://ntfy.example.invalid",
     } as const;
-    // 官方线路按存储账号逐条派生；账号没有自定义名称时，使用按添加顺序生成的
-    // 默认线路名和短名称，例如第一个账号是「官方账号1」和「官1」。
     const previewOfficialRouteName = (index: number) => `官方账号${index}`;
-    const previewOfficialRouteShortName = (index: number) => {
-      if (index <= 9) return `官${index}`;
-      const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-      return `官${letters[Math.min(index - 10, letters.length - 1)] ?? "Z"}`;
-    };
     const previewAccountRouteIndex = (account: OfficialAccount) => {
       const value = (account.routeName ?? account.routeShortName ?? "").trim();
       const digits = value.startsWith("官方账号")
@@ -62,17 +57,24 @@ if (import.meta.env.DEV) {
     // 与后端保持一致：还没有名称的账号补上当前最小编号，已有名称保持不动。
     const previewEnsureGeneratedRouteSettings = () => {
       const used = new Set<number>();
+      const usedShortNames = new Set(previewOfficialAccounts.map((account) => account.routeShortName?.trim()).filter(Boolean));
       for (const account of previewOfficialAccounts) {
         const index = previewAccountRouteIndex(account);
         if (index !== null) used.add(index);
       }
       for (const account of [...previewOfficialAccounts].sort((left, right) => left.addedAt - right.addedAt)) {
-        if (account.routeName && account.routeShortName) continue;
+        if (account.routeName !== undefined && account.routeShortName?.trim()) continue;
         let index = 1;
         while (used.has(index)) index += 1;
         used.add(index);
         account.routeName ??= previewOfficialRouteName(index);
-        account.routeShortName ??= previewOfficialRouteShortName(index);
+        if (!account.routeShortName?.trim()) {
+          let shortName = fallbackRouteShortName(account.routeName) || `官${index}`;
+          let suffix = 1;
+          while (usedShortNames.has(shortName)) shortName = `官${suffix++}`;
+          account.routeShortName = shortName;
+          usedShortNames.add(shortName);
+        }
       }
     };
     let previewConfig: Config = {
@@ -277,7 +279,7 @@ if (import.meta.env.DEV) {
           id: previewOfficialProviderId(account),
           enabled: true,
           name: account.routeName ?? previewOfficialRouteName(index),
-          shortName: account.routeShortName ?? previewOfficialRouteShortName(index),
+          shortName: account.routeShortName || fallbackRouteShortName(account.routeName ?? previewOfficialRouteName(index)),
           baseUrl: account.baseUrl ?? "",
           apiKey: "",
           upstreamProtocol: "official",
@@ -870,15 +872,22 @@ if (import.meta.env.DEV) {
       if (command === "save_official_account_route_settings") {
         const account = previewOfficialAccounts.find((item) => item.id === args.accountId);
         if (!account) return { status: "failed", message: "找不到官方账号" };
+        const errors = validateOfficialRouteSettings({
+          routeName: String(args.routeName ?? ""),
+          routeShortName: String(args.routeShortName ?? ""),
+          baseUrl: String(args.baseUrl ?? ""),
+          upstreamProxy: String(args.upstreamProxy ?? ""),
+        }, previewConfig.profiles, previewOfficialAccounts, account.id);
+        const error = Object.values(errors).find(Boolean);
+        if (error) return { status: "failed", message: error };
         const routeOverride = (value: unknown) => {
           const text = String(value ?? "").trim();
           return text ? text : undefined;
         };
-        account.routeName = routeOverride(args.routeName);
+        account.routeName = String(args.routeName ?? "").trim();
         account.routeShortName = routeOverride(args.routeShortName);
         account.upstreamProxy = routeOverride(args.upstreamProxy);
         account.baseUrl = routeOverride(args.baseUrl);
-        // 清空设置后后端会立刻补回生成的默认名称，预览保持一致。
         previewDeriveOfficialProfiles();
         return {
           status: "ok",
@@ -1064,6 +1073,15 @@ if (import.meta.env.DEV) {
       }
       if (command === "save_codey_config") {
         const incoming = args.config as Config;
+        for (const profile of incoming.profiles) {
+          const error = profile.authMode === "officialAccount"
+            ? ""
+            : validateThirdPartyRouteShortName(profile.shortName, incoming.profiles, profile.id);
+          if (error) return { status: "failed", message: error };
+          if (Array.from(profile.name.trim()).length > MAX_ROUTE_NAME_CHARACTERS) {
+            return { status: "failed", message: `线路名最多 ${MAX_ROUTE_NAME_CHARACTERS} 个字符` };
+          }
+        }
         previewConfig = {
           ...incoming,
           profiles: incoming.profiles.map((profile) => ({
@@ -1410,6 +1428,20 @@ if (import.meta.env.DEV) {
         if (!targetProfile || targetProfile.authMode !== "officialAccount" || models.length === 0) {
           return { status: "failed", message: "官方线路至少需要保留一个模型" };
         }
+        if (args.accountId) {
+          const accountId = String(args.accountId).trim();
+          if (!previewOfficialAccounts.some((account) => account.id === accountId)) {
+            return { status: "failed", message: "找不到官方账号" };
+          }
+          const errors = validateOfficialRouteSettings({
+            routeName: String(args.routeName ?? ""),
+            routeShortName: String(args.routeShortName ?? ""),
+            baseUrl: String(args.baseUrl ?? ""),
+            upstreamProxy: String(args.upstreamProxy ?? ""),
+          }, previewConfig.profiles, previewOfficialAccounts, accountId);
+          const error = Object.values(errors).find(Boolean);
+          if (error) return { status: "failed", message: error };
+        }
         const providerId = routeProviderId(targetProfile);
         const availableModels = previewOfficialModels.map((model) => model.slug);
         previewConfig.modelContextByProvider = { ...previewConfig.modelContextByProvider,
@@ -1468,7 +1500,7 @@ if (import.meta.env.DEV) {
             const text = String(value ?? "").trim();
             return text ? text : undefined;
           };
-          account.routeName = routeOverride(args.routeName);
+          account.routeName = String(args.routeName ?? "").trim();
           account.routeShortName = routeOverride(args.routeShortName);
           account.upstreamProxy = routeOverride(args.upstreamProxy);
           if ("baseUrl" in args) account.baseUrl = routeOverride(args.baseUrl);

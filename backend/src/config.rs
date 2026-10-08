@@ -90,21 +90,6 @@ pub fn default_official_route_name(index: usize) -> String {
     format!("{OFFICIAL_ROUTE_NAME_PREFIX}{index}")
 }
 
-/// 官方账号默认短名称与线路名同号，例如「官1」。短名称最长两个字符，
-/// 编号越过 9 之后依次使用「官A」这类字母编号。
-pub fn default_official_route_short_name(index: usize) -> String {
-    let prefix = OFFICIAL_ROUTE_SHORT_NAME;
-    if index <= 9 {
-        return format!("{prefix}{index}");
-    }
-    let letter = OFFICIAL_ROUTE_SHORT_NAME_LETTERS
-        .chars()
-        .nth(index - 10)
-        .or_else(|| OFFICIAL_ROUTE_SHORT_NAME_LETTERS.chars().last())
-        .unwrap_or('Z');
-    format!("{prefix}{letter}")
-}
-
 /// Stable profile id of the derived official route that belongs to one stored
 /// account. The id doubles as the route-scoped provider id, so several
 /// accounts can be selected side by side in one conversation.
@@ -134,16 +119,13 @@ pub fn is_official_profile_id(provider_id: &str) -> bool {
 }
 
 fn default_route_short_name(name: &str) -> String {
-    name.trim()
-        .chars()
-        .take(MAX_ROUTE_SHORT_NAME_CHARS)
-        .collect()
+    name.trim().chars().take(2).collect()
 }
 
 /// Keeps one official account's preferred short name when it is still free and
 /// otherwise numbers the following accounts so route-scoped model ids stay
 /// readable.
-fn unique_official_route_short_name(preferred: &str, used: &BTreeSet<String>) -> String {
+pub(crate) fn unique_official_route_short_name(preferred: &str, used: &BTreeSet<String>) -> String {
     let preferred = preferred.trim();
     if !preferred.is_empty() && !used.contains(preferred) {
         return preferred.to_string();
@@ -222,7 +204,7 @@ impl ProviderProfile {
         Self {
             id: Uuid::new_v4().to_string(),
             enabled: true,
-            short_name: default_route_short_name(&name),
+            short_name: String::new(),
             name,
             base_url: String::new(),
             api_key: String::new(),
@@ -257,6 +239,15 @@ impl ProviderProfile {
             .unwrap_or(self.id.as_str())
     }
 
+    pub(crate) fn display_short_name(&self) -> String {
+        let short_name = self.short_name.trim();
+        if short_name.is_empty() {
+            default_route_short_name(&self.name)
+        } else {
+            short_name.to_string()
+        }
+    }
+
     pub(crate) fn runtime_wire_api(&self) -> Result<&'static str, String> {
         match self.upstream_protocol.as_str() {
             UPSTREAM_PROTOCOL_OFFICIAL
@@ -279,7 +270,6 @@ impl ProviderProfile {
     }
 
     /// 旧配置没有认证类型，仅为无 API Key 的官方端点恢复账号线路。
-    /// 这类线路的短名称使用官方默认值，不参与按线路名生成短名称的迁移。
     fn resolves_to_official_account_route(&self) -> bool {
         self.official_account
             || self.auth_mode.trim() == AUTH_MODE_OFFICIAL_ACCOUNT
@@ -292,9 +282,6 @@ impl ProviderProfile {
     pub(crate) fn normalize(&mut self) {
         self.id = self.id.trim().to_string();
         self.name = self.name.trim().to_string();
-        if self.name.is_empty() {
-            self.name = "未命名线路".to_string();
-        }
         self.short_name = self.short_name.trim().to_string();
         self.base_url = self.base_url.trim().trim_end_matches('/').to_string();
         self.api_key = self.api_key.trim().to_string();
@@ -316,9 +303,6 @@ impl ProviderProfile {
         self.auth_mode = normalize_auth_mode(&self.auth_mode, self.official_account);
         if self.auth_mode == AUTH_MODE_OFFICIAL_ACCOUNT {
             self.official_account = true;
-            if self.short_name.is_empty() {
-                self.short_name = OFFICIAL_ROUTE_SHORT_NAME.to_string();
-            }
             self.api_key.clear();
             self.supports_remote_compaction = true;
             self.supports_websockets = true;
@@ -363,10 +347,15 @@ impl ProviderProfile {
                 local_router::ROUTER_PROVIDER_ID
             ));
         }
-        let name = self.name.trim();
-        if name.is_empty() {
-            return Err("线路名称不能为空".to_string());
+        let short_name = self.display_short_name();
+        if short_name.is_empty() {
+            return Err("请输入短名称".to_string());
         }
+        let name = if self.name.trim().is_empty() {
+            short_name.as_str()
+        } else {
+            self.name.trim()
+        };
         local_router::prepare_upstream_headers(
             self,
             local_router::UpstreamProtocol::from_profile(
@@ -389,9 +378,6 @@ impl ProviderProfile {
             )?;
         }
         let short_name = self.short_name.trim();
-        if short_name.is_empty() {
-            return Err(format!("线路「{name}」缺少短名称"));
-        }
         if short_name.chars().count() > MAX_ROUTE_SHORT_NAME_CHARS {
             return Err(format!(
                 "线路「{name}」的短名称最多 {MAX_ROUTE_SHORT_NAME_CHARS} 个字符"
@@ -996,20 +982,27 @@ impl CodeyConfig {
         self.route_request_log.normalize();
         self.profiles
             .retain(|profile| !profile.id.trim().is_empty());
+        for profile in &mut self.profiles {
+            profile.normalize();
+        }
         let mut used_short_names = self
             .profiles
             .iter()
-            .filter(|profile| !profile.short_name.trim().is_empty())
-            .map(|profile| profile.short_name.trim().to_string())
+            .map(|profile| profile.short_name.clone())
+            .filter(|short_name| !short_name.is_empty())
             .collect::<BTreeSet<_>>();
         for profile in &mut self.profiles {
-            if !profile.resolves_to_official_account_route() && profile.short_name.trim().is_empty()
-            {
-                profile.short_name =
-                    unique_default_route_short_name(&profile.name, &used_short_names);
+            if profile.short_name.is_empty() && !profile.is_unconfigured_default() {
+                profile.short_name = if profile.official_account {
+                    unique_official_route_short_name(
+                        &profile.display_short_name(),
+                        &used_short_names,
+                    )
+                } else {
+                    unique_default_route_short_name(&profile.name, &used_short_names)
+                };
                 used_short_names.insert(profile.short_name.clone());
             }
-            profile.normalize();
         }
         if self.profiles.is_empty() {
             let profile = ProviderProfile::new("默认配置");
@@ -1144,7 +1137,7 @@ impl CodeyConfig {
                     .unwrap_or(true);
                 official_profile.normalize();
                 official_profile.short_name = unique_official_route_short_name(
-                    &official_profile.short_name,
+                    &official_profile.display_short_name(),
                     &used_short_names,
                 );
                 used_short_names.insert(official_profile.short_name.clone());
@@ -2374,7 +2367,7 @@ pub(crate) fn validate_provider_profiles(profiles: &[ProviderProfile]) -> Result
         // Official and third-party routes share one namespace because the
         // short name prefixes every route-scoped model name.
         let short_name = profile.short_name.trim();
-        if !short_names.insert(short_name.to_string()) {
+        if !short_name.is_empty() && !short_names.insert(short_name.to_string()) {
             return Err(format!("多条线路使用了相同的短名称：{short_name}"));
         }
     }
@@ -3129,7 +3122,8 @@ mod tests {
         assert!(profile.official_account);
         assert_eq!(profile.auth_mode, AUTH_MODE_OFFICIAL_ACCOUNT);
         assert_eq!(profile.upstream_protocol, UPSTREAM_PROTOCOL_OFFICIAL);
-        assert_eq!(profile.short_name, OFFICIAL_ROUTE_SHORT_NAME);
+        assert!(profile.short_name.is_empty());
+        assert_eq!(profile.display_short_name(), "Op");
         assert!(profile.validate().is_ok());
         assert_eq!(loaded.clone().normalize(), loaded);
 
@@ -3277,7 +3271,7 @@ mod tests {
     }
 
     #[test]
-    fn third_party_short_names_are_required_limited_and_migrated() {
+    fn legacy_short_names_are_migrated_and_custom_names_stay_limited() {
         let mut route = ProviderProfile::new("中转线路");
         route.id = "relay".into();
         route.base_url = "https://relay.example/v1".into();
@@ -3285,7 +3279,8 @@ mod tests {
 
         route.short_name.clear();
         route.normalize();
-        assert_eq!(route.validate().unwrap_err(), "线路「中转线路」缺少短名称");
+        assert!(route.validate().is_ok());
+        assert_eq!(route.display_short_name(), "中转");
 
         route.short_name = "中转线路".into();
         assert!(route.validate().is_ok());
@@ -3303,12 +3298,13 @@ mod tests {
             ..CodeyConfig::default()
         }
         .normalize();
-        assert_eq!(migrated.profiles[0].short_name, "中转线路");
+        assert_eq!(migrated.profiles[0].short_name, "中转");
+        assert_eq!(migrated.profiles[0].display_short_name(), "中转");
         assert!(migrated.profiles[0].validate().is_ok());
     }
 
     #[test]
-    fn legacy_short_name_migration_keeps_route_prefixes_unique() {
+    fn legacy_empty_short_names_receive_unique_defaults() {
         let mut first = ProviderProfile::new("线路 A");
         first.id = "route-a".into();
         first.short_name.clear();
@@ -3328,8 +3324,10 @@ mod tests {
         }
         .normalize();
 
-        assert_eq!(migrated.profiles[0].short_name, "线路 A");
-        assert_eq!(migrated.profiles[1].short_name, "线路 B");
+        assert_eq!(migrated.profiles[0].short_name, "线路");
+        assert_eq!(migrated.profiles[1].short_name, "线1");
+        assert_eq!(migrated.profiles[0].display_short_name(), "线路");
+        assert_eq!(migrated.profiles[1].display_short_name(), "线1");
         assert!(validate_provider_profiles(&migrated.profiles).is_ok());
     }
 
@@ -3353,7 +3351,33 @@ mod tests {
     }
 
     #[test]
-    fn official_routes_keep_a_custom_short_name_and_fall_back_to_the_official_one() {
+    fn short_name_only_routes_preserve_blank_names_through_serialization() {
+        for official in [false, true] {
+            let mut route = ProviderProfile::new("");
+            route.id = "route-id".into();
+            route.short_name = "主".into();
+            route.base_url = "https://relay.example/v1".into();
+            route.api_key = "relay-key".into();
+            if official {
+                route.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+            }
+            route.normalize();
+            assert!(route.validate().is_ok());
+            let config = CodeyConfig {
+                active_profile_id: route.id.clone(),
+                profiles: vec![route],
+                ..CodeyConfig::default()
+            }.normalize();
+            let saved = serde_json::to_string(&config).unwrap();
+            let reloaded = serde_json::from_str::<CodeyConfig>(&saved).unwrap().normalize();
+            assert_eq!(reloaded.profiles[0].name, "");
+            assert_eq!(reloaded.profiles[0].short_name, "主");
+            assert_eq!(reloaded.profiles[0].provider_id(), "route-id");
+        }
+    }
+
+    #[test]
+    fn official_routes_keep_a_custom_short_name_and_fall_back_to_the_name() {
         let mut route = ProviderProfile::new("Official");
         route.short_name = "自定".into();
         route.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
@@ -3364,7 +3388,12 @@ mod tests {
 
         route.short_name.clear();
         route.normalize();
-        assert_eq!(route.short_name, OFFICIAL_ROUTE_SHORT_NAME);
+        assert!(route.short_name.is_empty());
+        assert_eq!(route.display_short_name(), "Of");
+        route.name = "Plus".into();
+        assert_eq!(route.display_short_name(), "Pl");
+        route.name = "😀备用".into();
+        assert_eq!(route.display_short_name(), "😀备");
         assert!(route.validate().is_ok());
 
         route.short_name = "官方线路".into();
@@ -3377,22 +3406,14 @@ mod tests {
     #[test]
     fn generated_official_account_names_follow_the_add_order() {
         assert_eq!(default_official_route_name(1), "官方账号1");
-        assert_eq!(default_official_route_short_name(1), "官1");
-        assert_eq!(default_official_route_short_name(2), "官2");
-        assert_eq!(default_official_route_short_name(9), "官9");
-        // 默认短名称保持两个字符，编号超过 9 之后改用字母。
-        assert_eq!(default_official_route_short_name(10), "官A");
-        for index in 1..=300 {
-            let short_name = default_official_route_short_name(index);
-            assert!(short_name.chars().count() <= MAX_ROUTE_SHORT_NAME_CHARS);
-        }
+        assert_eq!(default_official_route_name(10), "官方账号10");
 
         let mut route = ProviderProfile::new(default_official_route_name(1));
-        route.short_name = default_official_route_short_name(1);
         route.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
         route.normalize();
         assert_eq!(route.name, "官方账号1");
-        assert_eq!(route.short_name, "官1");
+        assert!(route.short_name.is_empty());
+        assert_eq!(route.display_short_name(), "官方");
         assert!(route.validate().is_ok());
     }
 
@@ -4053,7 +4074,8 @@ mod tests {
             config.profiles[1].official_account_id.as_deref(),
             Some("acct-two")
         );
-        assert_ne!(config.profiles[0].short_name, config.profiles[1].short_name);
+        assert_eq!(config.profiles[0].display_short_name(), "主力");
+        assert_eq!(config.profiles[1].display_short_name(), "备用");
         assert!(config.qualifies_official_model_ids());
 
         // 同一段对话里两条官方线路的模型必须能区分，模型名带上线路前缀。

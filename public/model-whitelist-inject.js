@@ -470,9 +470,9 @@
         ) {
           sourceModel = sourceModel.slice(selectorPrefix.length).replace(/#\d+$/, "").trim();
         }
-        const routeName = metadataText(metadata, "route_name")
-          || displayNameParts(metadataText(metadata, "display_name")).routeName
-          || providerId;
+        const routeName = typeof metadata.route_name === "string"
+          ? metadata.route_name.trim()
+          : displayNameParts(metadataText(metadata, "display_name")).routeName || providerId;
         return [model, {
           selectorModel: model,
           providerId,
@@ -693,11 +693,15 @@
     const route = sourceCatalog.routeMetadata[canonicalModelName];
     const metadataDisplayName = metadataText(metadata, "display_name");
     const displayParts = displayNameParts(metadataDisplayName);
-    const routeName = metadataText(metadata, "route_name")
-      || route?.routeName
-      || displayParts.routeName
-      || cleanText(route?.providerId)
-      || "";
+    const routeName = typeof metadata?.route_name === "string"
+      ? metadata.route_name.trim()
+      : route?.routeName ?? (displayParts.routeName || cleanText(route?.providerId) || "");
+    const routePrefix = metadataText(metadata, "route_prefix")
+      || /^\[([^\[\]]+)\]/.exec(metadataDisplayName)?.[1]?.trim()
+      || sourceCatalog.routePrefixByProviderKey?.get(modelKey(
+        metadataText(metadata, "route_provider_id") || route?.routeProviderId || route?.providerId,
+      ))
+      || Array.from(routeName).slice(0, 2).join("");
     const sourceModel = metadataText(metadata, "source_model") || route?.sourceModel || "";
     const modelLabel = metadataText(metadata, "model_display_name")
       || sourceModel
@@ -714,6 +718,7 @@
       || canonicalModelName;
     return {
       routeName,
+      routeLabel: routeName ? (routePrefix ? `[${routePrefix}] ${routeName}` : routeName) : routePrefix,
       modelName: modelLabel,
       displayName,
       providerId: cleanText(route?.providerId) || metadataText(metadata, "provider_id"),
@@ -1251,7 +1256,7 @@
     for (const modelName of catalog.models) {
       const presentation = modelPresentation(modelName);
       const displayName = cleanText(presentation.displayName);
-      if (!displayName || !presentation.routeName || !presentation.modelName) continue;
+      if (!displayName || !presentation.routeLabel || !presentation.modelName) continue;
       for (const menuLabel of [displayName, cleanText(modelName)]) {
         if (menuLabel) byMenuLabel.set(menuLabel, { modelName, presentation, menuLabel });
       }
@@ -1280,7 +1285,7 @@
         }
         const existingModel = item.dataset?.codeyRouteModel || "";
         const existingPresentation = existingModel ? modelPresentation(existingModel) : null;
-        const existingPresentationStillMatches = existingPresentation?.routeName
+        const existingPresentationStillMatches = existingPresentation?.routeLabel
           && catalog.modelNamesByKey.has(modelKey(existingModel))
           && [existingPresentation.displayName, existingPresentation.modelName]
             .map(cleanText)
@@ -1288,7 +1293,7 @@
         const matched = existingPresentationStillMatches
           ? { modelName: existingModel, presentation: existingPresentation, menuLabel: itemText }
           : byMenuLabel.get(itemText);
-        if (!matched?.presentation?.routeName || !matched.presentation.modelName) {
+        if (!matched?.presentation?.routeLabel || !matched.presentation.modelName) {
           const supersededModel = (
             existingModel && !catalog.modelNamesByKey.has(modelKey(existingModel))
               ? existingModel
@@ -1308,14 +1313,14 @@
         item.classList?.add?.("codey-model-route-item");
         item.setAttribute?.(
           "aria-label",
-          `${matched.presentation.routeName} / ${matched.presentation.modelName}`,
+          `${matched.presentation.routeName || matched.presentation.routeLabel} / ${matched.presentation.modelName}`,
         );
         replaceTextOnce(
           item,
           matched.menuLabel,
           matched.presentation.modelName,
         );
-        enhancedItems.push({ item, routeName: matched.presentation.routeName });
+        enhancedItems.push({ item, routeName: matched.presentation.routeLabel });
         itemParents.add(item.parentElement || container);
       }
       const itemsByParent = new Map();

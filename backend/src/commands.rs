@@ -2117,6 +2117,14 @@ fn merge_profile_secrets(
             profile.plugin_owner_id = None;
             profile.plugin_route_spec = None;
         }
+        if profile.short_name.trim().is_empty()
+            && !profile.is_unconfigured_default()
+            && !previous_profile.is_some_and(|saved| {
+                saved.short_name.trim().is_empty() && saved.name.trim() == profile.name.trim()
+            })
+        {
+            return Err("请输入短名称".to_string());
+        }
         profile.normalize();
         // 线路名上限与渲染层一致。旧配置里已经超限的名称只要这次没有改动就
         // 放行，用户仍能保存其他设置或删除这条线路，不会被历史数据卡住。

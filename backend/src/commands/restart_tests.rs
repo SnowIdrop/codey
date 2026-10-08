@@ -274,6 +274,28 @@ fn full_config_save_restores_route_secrets_and_source_owned_identity() {
 }
 
 #[test]
+fn full_config_save_requires_short_names_and_preserves_blank_long_names() {
+    let mut saved = crate::config::ProviderProfile::new("主线路");
+    saved.id = "route-profile".into();
+    saved.short_name = "主".into();
+    saved.base_url = "https://relay.example/v1".into();
+    saved.api_key = "saved-secret".into();
+    let previous = CodeyConfig {
+        active_profile_id: saved.id.clone(),
+        profiles: vec![saved.clone()],
+        ..CodeyConfig::default()
+    }.normalize();
+    let mut draft = saved;
+    draft.name.clear();
+    let merged = merge_profile_secrets(vec![draft.clone()], &previous).unwrap();
+    assert_eq!(merged[0].name, "");
+    assert_eq!(merged[0].short_name, "主");
+    assert_eq!(merged[0].provider_id(), "route-profile");
+    draft.short_name = " ".into();
+    assert_eq!(merge_profile_secrets(vec![draft], &previous).unwrap_err(), "请输入短名称");
+}
+
+#[test]
 fn every_available_route_model_can_be_selected_for_subagents() {
     let state = model_catalog::ModelSelectionState {
         third_party_models: vec!["provider-coder".into()],
@@ -356,9 +378,9 @@ fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
         catalog["model_metadata"][0],
         json!({
             "model": "source-provider/gpt-5.6-sol",
-            "display_name": "[默认配置] gpt-5.6-sol",
+            "display_name": "[默认] gpt-5.6-sol",
             "route_name": "默认配置",
-            "route_prefix": "默认配置",
+            "route_prefix": "默认",
             "provider_id": "codey_router",
             "source_model": "gpt-5.6-sol",
             "official_account": false,
@@ -373,9 +395,9 @@ fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
         catalog["model_metadata"][5],
         json!({
             "model": "source-provider/provider-fast-coder",
-            "display_name": "[默认配置] provider-fast-coder",
+            "display_name": "[默认] provider-fast-coder",
             "route_name": "默认配置",
-            "route_prefix": "默认配置",
+            "route_prefix": "默认",
             "provider_id": "codey_router",
             "source_model": "provider-fast-coder",
             "official_account": false,
@@ -493,9 +515,9 @@ fn renderer_model_catalog_routes_official_account_models_through_the_codey_route
         catalog["model_metadata"][0],
         json!({
             "model": "gpt-5.6-sol",
-            "display_name": "[官] gpt-5.6-sol",
+            "display_name": "[默认] gpt-5.6-sol",
             "route_name": "默认配置",
-            "route_prefix": "官",
+            "route_prefix": "默认",
             "provider_id": crate::local_router::ROUTER_PROVIDER_ID,
             "source_model": "gpt-5.6-sol",
             "official_account": true,

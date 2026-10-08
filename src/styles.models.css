@@ -625,7 +625,7 @@
 }
 
 .route-editor-row-names {
-  grid-template-columns: 1fr 130px;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 7fr);
 }
 
 .route-editor-span-all {

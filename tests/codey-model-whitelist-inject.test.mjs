@@ -3036,12 +3036,12 @@ test("model picker menu groups models under route headings without changing mode
 
   runtime.patch.enhanceModelMenus();
 
-  assert.equal(menu.children[0].textContent, "官方线路");
+  assert.equal(menu.children[0].textContent, "[官] 官方线路");
   assert.equal(menu.children[1], officialItem);
   assert.equal(officialItem.textContent, "gpt-5.6-sol");
   assert.equal(officialItem.dataset.codeyRouteModel, "gpt-5.6-sol");
   assert.equal(officialItem.getAttribute("aria-label"), "官方线路 / gpt-5.6-sol");
-  assert.equal(menu.children[2].textContent, "中转线路");
+  assert.equal(menu.children[2].textContent, "[中转] 中转线路");
   assert.equal(menu.children[3], relayItem);
   assert.equal(relayItem.textContent, "gpt-5.6-sol");
   assert.equal(relayItem.dataset.codeyRouteModel, "relay/gpt-5.6-sol");
@@ -3068,6 +3068,68 @@ test("model picker menu groups models under route headings without changing mode
     model: "gpt-5.6-sol",
     responsesapiClientMetadata: { codey_route: "relay" },
   });
+  runtime.patch.dispose();
+});
+
+test("model picker headings use name fallbacks and update when a short name changes", async () => {
+  const body = new FakeElementCore("body", { connected: true });
+  const menu = body.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menu" },
+  }));
+  const officialItem = menu.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menuitemradio" },
+  }));
+  officialItem.textContent = "gpt-6-luna";
+  const relayItem = menu.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menuitemradio" },
+  }));
+  relayItem.textContent = "relay/gpt-6-luna";
+  const catalog = {
+    status: "ok",
+    models: ["gpt-6-luna", "relay/gpt-6-luna"],
+    default_model: "gpt-6-luna",
+    model_metadata: [
+      {
+        model: "gpt-6-luna",
+        route_name: "Plus",
+        provider_id: "openai",
+        source_model: "gpt-6-luna",
+      },
+      {
+        model: "relay/gpt-6-luna",
+        route_name: "😀备用",
+        provider_id: "relay",
+        source_model: "gpt-6-luna",
+      },
+    ],
+  };
+  const runtime = await loadPatch(catalog, [statsigClient()], { documentBody: body });
+  runtime.patch.enhanceModelMenus();
+  const headings = () => menu.children
+    .filter((child) => child.dataset.codeyRouteHeading)
+    .map((heading) => heading.textContent);
+  assert.deepEqual(headings(), ["[Pl] Plus", "[😀备] 😀备用"]);
+
+  await runtime.patch.setCatalog({
+    ...catalog,
+    model_metadata: catalog.model_metadata.map((metadata) => ({
+      ...metadata,
+      route_prefix: metadata.provider_id === "relay" ? "晚" : "Pl",
+    })),
+  });
+  runtime.patch.enhanceModelMenus();
+  assert.deepEqual(headings(), ["[Pl] Plus", "[晚] 😀备用"]);
+  await runtime.patch.setCatalog({
+    ...catalog,
+    model_metadata: catalog.model_metadata.map((metadata) => ({
+      ...metadata,
+      route_name: "",
+      route_prefix: metadata.provider_id === "relay" ? "晚" : "Pl",
+    })),
+  });
+  runtime.patch.enhanceModelMenus();
+  assert.deepEqual(headings(), ["Pl", "晚"]);
+  assert.equal(relayItem.dataset.codeyRouteModel, "relay/gpt-6-luna");
   runtime.patch.dispose();
 });
 
@@ -3198,7 +3260,7 @@ test("an open model picker hides a route row removed by a hot catalog update", a
   assert.deepEqual(
     menu.children.filter((child) => child.dataset.codeyRouteHeading)
       .map((heading) => heading.textContent),
-    ["OpenAI 官方直登"],
+    ["[官] OpenAI 官方直登"],
   );
 
   // A virtualized native row can be reused for a current model later. The

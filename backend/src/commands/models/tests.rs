@@ -1503,10 +1503,10 @@ fn renderer_catalog_routes_every_model_through_the_codey_router_carrier() {
         .unwrap();
     assert_eq!(
         official_metadata["display_name"].as_str(),
-        Some("[官] gpt-5.6-sol")
+        Some("[官方] gpt-5.6-sol")
     );
     assert_eq!(official_metadata["route_name"].as_str(), Some("官方线路"));
-    assert_eq!(official_metadata["route_prefix"].as_str(), Some("官"));
+    assert_eq!(official_metadata["route_prefix"].as_str(), Some("官方"));
     assert_eq!(
         official_metadata["provider_id"].as_str(),
         Some(local_router::ROUTER_PROVIDER_ID)
@@ -1531,6 +1531,16 @@ fn renderer_catalog_routes_every_model_through_the_codey_router_carrier() {
         .find(|entry| entry["model"].as_str() == Some("relay/gpt-5.6-sol"))
         .unwrap();
     assert_eq!(relay_metadata["official_account"], false);
+
+    for profile in &mut config.profiles {
+        profile.name.clear();
+    }
+    let short_name_only_catalog = renderer_model_catalog_value(&config.normalize(), &model_state);
+    assert_eq!(short_name_only_catalog["models"], catalog["models"]);
+    for metadata in short_name_only_catalog["model_metadata"].as_array().unwrap() {
+        assert_eq!(metadata["route_name"], "");
+        assert!(!metadata["route_prefix"].as_str().unwrap().is_empty());
+    }
 }
 
 #[test]
