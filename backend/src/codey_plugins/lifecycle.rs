@@ -268,8 +268,8 @@ pub struct LifecycleRequest {
     upstream_url: Option<reqwest::Url>,
     // No Debug/serialization: the selected credential stays private to this request.
     selected_api_key: Option<(String, reqwest::header::HeaderValue)>,
-    selected_turn_state: Option<(String, crate::codey_plugins::turn_state::State)>,
-    turn_state_request: Option<(String, crate::codey_plugins::turn_state::Request)>,
+    selected_turn_state: Option<(String, super::turn_state::State)>,
+    turn_state_request: Option<(String, super::turn_state::Request)>,
 }
 
 impl LifecycleRequest {
@@ -384,7 +384,7 @@ impl LifecycleRequest {
         }
         let request = request.clone();
         plugin.log("turn_state_requested");
-        let mut future = Box::pin(crate::codey_plugins::turn_state::mint(client, &request));
+        let mut future = Box::pin(super::turn_state::mint(client, &request));
         loop {
             tokio::select! {
                 result = &mut future => {
@@ -503,9 +503,9 @@ impl LifecycleRequest {
                     let authorized = transport == Some((true, true))
                         && self.metadata.get("requestKind").and_then(Value::as_str)
                             == Some("responses")
-                        && upstream_url.as_ref().is_some_and(|url| {
-                            url.as_str() == crate::codey_plugins::turn_state::ENDPOINT
-                        })
+                        && upstream_url
+                            .as_ref()
+                            .is_some_and(|url| url.as_str() == super::turn_state::ENDPOINT)
                         && self
                             .metadata
                             .get("officialAccountEmail")
@@ -656,7 +656,7 @@ fn selected_headers(
 
 enum ParsedAction {
     Continue(Vec<HeaderPatch>, Option<String>),
-    BorrowTurnState(crate::codey_plugins::turn_state::Request),
+    BorrowTurnState(super::turn_state::Request),
     Retry(Vec<HeaderPatch>),
     Wait(String, Duration),
     Abort(LifecycleError),
@@ -717,13 +717,11 @@ fn parse_action(
             {
                 return Err(failure("plugin_turn_state_invalid_action"));
             }
-            Ok(ParsedAction::BorrowTurnState(
-                crate::codey_plugins::turn_state::Request {
-                    source_account_email,
-                    model,
-                    timeout: Duration::from_millis(timeout_ms),
-                },
-            ))
+            Ok(ParsedAction::BorrowTurnState(super::turn_state::Request {
+                source_account_email,
+                model,
+                timeout: Duration::from_millis(timeout_ms),
+            }))
         }
         Action::Retry { headers: patches } => parse_header_action(patches, stage, headers, true),
         Action::Wait {
