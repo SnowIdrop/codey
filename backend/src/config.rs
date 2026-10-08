@@ -3367,9 +3367,12 @@ mod tests {
                 active_profile_id: route.id.clone(),
                 profiles: vec![route],
                 ..CodeyConfig::default()
-            }.normalize();
+            }
+            .normalize();
             let saved = serde_json::to_string(&config).unwrap();
-            let reloaded = serde_json::from_str::<CodeyConfig>(&saved).unwrap().normalize();
+            let reloaded = serde_json::from_str::<CodeyConfig>(&saved)
+                .unwrap()
+                .normalize();
             assert_eq!(reloaded.profiles[0].name, "");
             assert_eq!(reloaded.profiles[0].short_name, "主");
             assert_eq!(reloaded.profiles[0].provider_id(), "route-id");

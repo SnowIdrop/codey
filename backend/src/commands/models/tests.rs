@@ -1537,7 +1537,10 @@ fn renderer_catalog_routes_every_model_through_the_codey_router_carrier() {
     }
     let short_name_only_catalog = renderer_model_catalog_value(&config.normalize(), &model_state);
     assert_eq!(short_name_only_catalog["models"], catalog["models"]);
-    for metadata in short_name_only_catalog["model_metadata"].as_array().unwrap() {
+    for metadata in short_name_only_catalog["model_metadata"]
+        .as_array()
+        .unwrap()
+    {
         assert_eq!(metadata["route_name"], "");
         assert!(!metadata["route_prefix"].as_str().unwrap().is_empty());
     }

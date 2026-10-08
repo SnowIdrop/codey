@@ -284,7 +284,8 @@ fn full_config_save_requires_short_names_and_preserves_blank_long_names() {
         active_profile_id: saved.id.clone(),
         profiles: vec![saved.clone()],
         ..CodeyConfig::default()
-    }.normalize();
+    }
+    .normalize();
     let mut draft = saved;
     draft.name.clear();
     let merged = merge_profile_secrets(vec![draft.clone()], &previous).unwrap();
@@ -292,7 +293,10 @@ fn full_config_save_requires_short_names_and_preserves_blank_long_names() {
     assert_eq!(merged[0].short_name, "主");
     assert_eq!(merged[0].provider_id(), "route-profile");
     draft.short_name = " ".into();
-    assert_eq!(merge_profile_secrets(vec![draft], &previous).unwrap_err(), "请输入短名称");
+    assert_eq!(
+        merge_profile_secrets(vec![draft], &previous).unwrap_err(),
+        "请输入短名称"
+    );
 }
 
 #[test]

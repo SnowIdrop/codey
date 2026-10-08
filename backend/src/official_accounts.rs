@@ -775,7 +775,8 @@ impl OfficialAccountStore {
         let _guard = self.lock_writes()?;
         let records = self.list()?;
         let missing = |value: Option<&str>| trimmed_setting(value).is_none();
-        let mut used_short_names = records.iter()
+        let mut used_short_names = records
+            .iter()
             .filter_map(|record| trimmed_setting(record.route_short_name.as_deref()))
             .map(ToString::to_string)
             .collect::<BTreeSet<_>>();
@@ -802,11 +803,16 @@ impl OfficialAccountStore {
                 updated.route_name = Some(default_official_route_name(index));
             }
             if needs_short_name {
-                let short_name = updated.route_name.as_deref().unwrap_or_default()
-                    .trim().chars().take(2).collect::<String>();
-                let short_name = crate::config::unique_official_route_short_name(
-                    &short_name, &used_short_names,
-                );
+                let short_name = updated
+                    .route_name
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .chars()
+                    .take(2)
+                    .collect::<String>();
+                let short_name =
+                    crate::config::unique_official_route_short_name(&short_name, &used_short_names);
                 used_short_names.insert(short_name.clone());
                 updated.route_short_name = Some(short_name);
             }
@@ -2301,9 +2307,21 @@ mod tests {
         assert_eq!(
             generated,
             vec![
-                ("acct_1".to_string(), "官方账号1".to_string(), "官方".to_string()),
-                ("acct_2".to_string(), "官方账号2".to_string(), "官1".to_string()),
-                ("acct_3".to_string(), "官方账号3".to_string(), "官2".to_string()),
+                (
+                    "acct_1".to_string(),
+                    "官方账号1".to_string(),
+                    "官方".to_string()
+                ),
+                (
+                    "acct_2".to_string(),
+                    "官方账号2".to_string(),
+                    "官1".to_string()
+                ),
+                (
+                    "acct_3".to_string(),
+                    "官方账号3".to_string(),
+                    "官2".to_string()
+                ),
             ]
         );
 
@@ -2371,11 +2389,18 @@ mod tests {
         }
 
         store.ensure_generated_route_settings().unwrap();
-        let short_names = store.list().unwrap().into_iter()
+        let short_names = store
+            .list()
+            .unwrap()
+            .into_iter()
             .map(|record| record.route_short_name.unwrap())
             .collect::<BTreeSet<_>>();
         assert_eq!(short_names.len(), 11);
-        assert!(short_names.iter().all(|name| !name.is_empty() && name.chars().count() <= 4));
+        assert!(
+            short_names
+                .iter()
+                .all(|name| !name.is_empty() && name.chars().count() <= 4)
+        );
 
         store.ensure_generated_route_settings().unwrap();
         let names = store

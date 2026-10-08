@@ -1136,9 +1136,9 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         }
         "clear_route_request_logs" => clear_route_request_logs(state).await,
         "restart_codey" => schedule_restart_codey_runtime(state).await,
-        "clear_diagnostic_storage"
-        | "repair_codex_config"
-        | "repair_main_process_injection" => diagnostics::invoke(state, command, &args).await,
+        "clear_diagnostic_storage" | "repair_codex_config" | "repair_main_process_injection" => {
+            diagnostics::invoke(state, command, &args).await
+        }
         "test_notification_channel" => {
             match argument::<NotificationChannelConfig>(&args, "channel") {
                 Ok(channel) => test_notification_channel(state, channel).await,
