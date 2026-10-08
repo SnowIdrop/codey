@@ -509,23 +509,6 @@ pub(crate) struct WebSocketResponsesDownstream {
     pub(crate) idle_registry: Arc<Mutex<IdleDownstreamRegistry>>,
 }
 
-/// Streaming items are retained for a later replay, so only items a replayed
-/// request can carry are worth keeping. Reasoning kept only as a summary is
-/// replayable; reasoning with nothing at all is not.
-fn replayable_streamed_item(item: &Value) -> bool {
-    match item.get("type").and_then(Value::as_str) {
-        Some("reasoning") => {
-            item.get("encrypted_content")
-                .and_then(Value::as_str)
-                .is_some_and(|content| !content.is_empty())
-                || reasoning_item_has_text(item)
-                || summary_replay_text(item).is_some()
-        }
-        Some("item_reference" | "compaction") => false,
-        _ => true,
-    }
-}
-
 /// Tool calls announce their payload in a separate event, so an item whose
 /// payload has not arrived yet is not replayable.
 fn streamed_item_arguments(item: &Value) -> Option<&str> {
@@ -567,12 +550,14 @@ fn same_history_item(left: &Value, right: &Value) -> bool {
 pub(crate) struct AdaptedResponsesHistory {
     pub(crate) last: Option<(String, Vec<Value>)>,
     pub(crate) pending_input: Option<Vec<Value>>,
+    pub(crate) requires_native_http: bool,
     /// Items the upstream streamed for the current turn. Streaming upstreams
     /// announce tool calls through output-item events and may omit them from
     /// the terminal `response.output`, so the terminal array alone cannot be
     /// trusted to describe the turn. Each entry carries whether the payload
     /// has arrived.
     pending_output: Vec<(usize, Value, bool)>,
+    pending_output_overflowed: bool,
     last_bytes: usize,
     budget: RetainedMemoryBudget,
 }
@@ -583,6 +568,7 @@ impl AdaptedResponsesHistory {
     pub(crate) fn clear_pending(&mut self) {
         self.pending_input = None;
         self.pending_output.clear();
+        self.pending_output_overflowed = false;
         self.budget
             .resize(self.last_bytes)
             .expect("releasing retained history budget cannot fail");
@@ -606,10 +592,7 @@ impl AdaptedResponsesHistory {
             .map(|index| index as usize);
         match kind {
             "response.output_item.added" | "response.output_item.done" => {
-                let Some(item) = event
-                    .get("item")
-                    .filter(|item| item.is_object() && replayable_streamed_item(item))
-                else {
+                let Some(item) = event.get("item").filter(|item| item.is_object()) else {
                     return;
                 };
                 // A skeleton announced by `added` still needs its arguments.
@@ -662,6 +645,7 @@ impl AdaptedResponsesHistory {
             return;
         }
         if self.pending_output.len() >= STREAMED_OUTPUT_ITEM_LIMIT {
+            self.pending_output_overflowed = true;
             return;
         }
         self.pending_output.push((index, item, complete));
@@ -737,6 +721,8 @@ impl AdaptedResponsesHistory {
         previous_history: Option<&Self>,
     ) -> Result<bool> {
         self.pending_input = None;
+        self.pending_output.clear();
+        self.pending_output_overflowed = false;
         self.budget.resize(self.last_bytes)?;
         // Count without allocating a second encoded request. Reserve before
         // cloning history into pending state and the expanded request body.
@@ -788,6 +774,9 @@ impl AdaptedResponsesHistory {
         };
         let mut context = previous.cloned().unwrap_or_default();
         context.extend(input);
+        self.requires_native_http = previous_history
+            .is_some_and(|history| history.requires_native_http)
+            || context.iter().any(native_item_requires_http);
         if !expand || previous_response_id.is_none() {
             self.pending_input = Some(context);
             return Ok(false);
@@ -800,10 +789,14 @@ impl AdaptedResponsesHistory {
 
     pub(crate) fn remember(&mut self, response_id: &str, output: &[Value]) -> Result<()> {
         if self.pending_input.is_none() {
-            self.pending_output.clear();
+            self.clear_pending();
             return Ok(());
         }
+        if self.pending_output_overflowed {
+            anyhow::bail!("流式输出条目超过会话历史上限，无法确认完整上下文，请重新发送完整输入");
+        }
         let output = self.take_streamed_output(output);
+        self.requires_native_http |= output.iter().any(native_item_requires_http);
         let bytes = bounded_json_bytes(
             self.pending_input
                 .as_ref()

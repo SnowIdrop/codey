@@ -1307,6 +1307,235 @@ async fn declared_responses_route_reuses_upstream_websocket() {
 }
 
 #[tokio::test]
+async fn official_web_search_uses_http_before_upstream_websocket_send() {
+    let auth_home = tempfile::tempdir().unwrap();
+    let auth_path = auth_home.path().join("auth.json");
+    std::fs::write(
+        &auth_path,
+        r#"{"auth_mode":"chatgpt","tokens":{"access_token":"test-access","account_id":"test-account"}}"#,
+    )
+    .unwrap();
+    for tool_type in [
+        "web_search",
+        "web_search_preview",
+        "web_search_2025_08_26",
+        "web_search_preview_2025_03_11",
+    ] {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            assert_eq!(request.method, "POST");
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let event = json!({
+                "type":"response.completed",
+                "response":{
+                    "id":"resp-search",
+                    "status":"completed",
+                    "model":body["model"],
+                    "output":[]
+                }
+            });
+            let sse = format!("data: {event}\n\n");
+            write_static_response(&mut stream, "text/event-stream", sse.as_bytes())
+                .await
+                .unwrap();
+            (request.path, body)
+        });
+        let (mut config, provider_id, model) = router_config(format!("http://{address}/v1"));
+        config.profiles[0].supports_websockets = true;
+        let router = LocalRouter::start(&config).await.unwrap();
+        let mut snapshot = RouterSnapshot::from_config(&config);
+        let route = Arc::make_mut(snapshot.routes.get_mut(&provider_id).unwrap());
+        route.official_account = true;
+        route.official_auth = Some(OfficialRouteAuth {
+            account_id: "test-account".into(),
+            email: None,
+            path: auth_path.clone(),
+            accepts_incoming_authorization: false,
+        });
+        *router.snapshot.write().unwrap() = Arc::new(snapshot);
+        let mut socket = connect_router_websocket(&router.endpoint()).await;
+        let tools = json!([
+            {"type":"function","name":"local_tool","parameters":{"type":"object"}},
+            {"type":tool_type,"search_context_size":"high"}
+        ]);
+        socket
+            .send(WebSocketMessage::Text(
+                json!({
+                    "type":"response.create",
+                    "model":model_alias(&provider_id, &model),
+                    "input":"search the web",
+                    "tools":tools,
+                    "tool_choice":"auto"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let WebSocketMessage::Text(text) = message else {
+            panic!("expected response.completed");
+        };
+        let event: Value = serde_json::from_str(text.as_str()).unwrap();
+        assert_eq!(event["type"], "response.completed", "{event}");
+        let (path, body) = upstream_task.await.unwrap();
+        assert_eq!(path, "/v1/responses");
+        assert_eq!(body["model"], model);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["tools"], tools);
+        assert_eq!(body["tool_choice"], "auto");
+        assert!(body.get("type").is_none());
+        assert!(router.websocket_backoffs.lock().unwrap().entries.is_empty());
+        socket.close(None).await.unwrap();
+        router.stop().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn official_opaque_continuation_uses_http_with_complete_history() {
+    for output in [
+        json!({"type":"web_search_call","status":"completed","action":{"type":"search","query":"test"}}),
+        json!({"type":"reasoning","encrypted_content":"encrypted-reasoning","summary":[]}),
+        json!({"type":"compaction","encrypted_content":"encrypted-compaction"}),
+    ] {
+        let auth_home = tempfile::tempdir().unwrap();
+        let auth_path = auth_home.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"test-access","account_id":"test-account"}}"#,
+        )
+        .unwrap();
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let expected_output = output.clone();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _request = websocket.next().await.unwrap().unwrap();
+            websocket
+                .send(WebSocketMessage::Text(
+                    json!({
+                        "type":"response.completed",
+                        "response":{"id":"resp-opaque","status":"completed","output":[output]}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let (mut http, _) = tokio::time::timeout(Duration::from_secs(5), upstream.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let request = read_http_request(&mut http).await.unwrap();
+            assert_eq!(request.method, "POST");
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let event = json!({"type":"response.completed","response":{
+                "id":"resp-http","status":"completed","output":[]
+            }});
+            write_static_response(
+                &mut http,
+                "text/event-stream",
+                format!("data: {event}\n\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+            body
+        });
+        let (mut config, provider, model) = router_config(format!("http://{address}/v1"));
+        config.profiles[0].supports_websockets = true;
+        let router = LocalRouter::start(&config).await.unwrap();
+        let mut snapshot = RouterSnapshot::from_config(&config);
+        let route = Arc::make_mut(snapshot.routes.get_mut(&provider).unwrap());
+        route.official_account = true;
+        route.official_auth = Some(OfficialRouteAuth {
+            account_id: "test-account".into(),
+            email: None,
+            path: auth_path,
+            accepts_incoming_authorization: false,
+        });
+        *router.snapshot.write().unwrap() = Arc::new(snapshot);
+        let mut client = connect_router_websocket(&router.endpoint()).await;
+        let alias = model_alias(&provider, &model);
+        let first = send_router_websocket_request(&mut client, &alias, "first task").await;
+        assert_eq!(first.last().unwrap()["response"]["id"], "resp-opaque");
+        client
+            .send(WebSocketMessage::Text(
+                json!({
+                    "type":"response.create", "model":alias,
+                    "previous_response_id":"resp-opaque", "input":"next task"
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(5), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let WebSocketMessage::Text(text) = message else {
+            panic!("expected terminal event")
+        };
+        let event: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(event["type"], "response.completed", "{event}");
+        let body = upstream_task.await.unwrap();
+        assert!(body.get("previous_response_id").is_none());
+        assert_eq!(
+            body["input"],
+            json!([
+                {"role":"user","content":"first task"}, expected_output,
+                {"role":"user","content":"next task"}
+            ])
+        );
+        client.close(None).await.unwrap();
+        router.stop().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn persisted_context_rejection_is_not_replayed_without_a_new_client_request() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (stream, _) = upstream.accept().await.unwrap();
+        let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let _request = websocket.next().await.unwrap().unwrap();
+        websocket.send(WebSocketMessage::Text(json!({"type":"error","error":{
+            "type":"invalid_request_error", "code":"unsupported_persisted_item_context",
+            "message":"Persisted response contains hosted-tool, compaction, or unverifiable hidden reasoning state that Rustponses cannot replay."
+        }}).to_string().into())).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), upstream.accept())
+                .await
+                .is_err()
+        );
+    });
+    let (mut config, provider, model) = router_config(format!("http://{address}/v1"));
+    config.profiles[0].supports_websockets = true;
+    let router = LocalRouter::start(&config).await.unwrap();
+    let mut client = connect_router_websocket(&router.endpoint()).await;
+    let events =
+        send_router_websocket_request(&mut client, &model_alias(&provider, &model), "task").await;
+    let error = &events.last().unwrap()["response"]["error"];
+    assert_eq!(
+        error["codey"]["originalCode"],
+        "unsupported_persisted_item_context"
+    );
+    upstream_task.await.unwrap();
+    client.close(None).await.unwrap();
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn websocket_service_tier_survives_forwarding_and_connection_reuse() {
     let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let upstream_address = upstream.local_addr().unwrap();

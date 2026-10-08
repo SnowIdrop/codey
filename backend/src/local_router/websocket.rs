@@ -339,16 +339,27 @@ impl WebSocketResponsesDownstream {
         discard_opaque_reasoning: bool,
         probe: Option<&RouteRequestLogProbe>,
     ) -> Result<UpstreamWebSocketAttempt> {
-        if !route.supports_websockets {
-            self.native_history.prepare(
-                native_history_key(
-                    route,
-                    UpstreamWebSocketAuthIdentity::from_headers(headers),
-                    body,
-                ),
-                body,
-            );
-            self.upstream.take();
+        let auth_identity = UpstreamWebSocketAuthIdentity::from_headers(headers);
+        let official_web_search = route.official_account
+            && body
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| {
+                    tools.iter().any(|tool| {
+                        matches!(
+                            tool.get("type").and_then(Value::as_str),
+                            Some(
+                                "web_search"
+                                    | "web_search_preview"
+                                    | "web_search_2025_08_26"
+                                    | "web_search_preview_2025_03_11"
+                            )
+                        )
+                    })
+                });
+        if !route.supports_websockets || official_web_search {
+            self.native_history
+                .prepare_for_route(route, auth_identity, body);
             return Ok(UpstreamWebSocketAttempt::UseHttp);
         }
         let upstream_url = route
@@ -356,7 +367,6 @@ impl WebSocketResponsesDownstream {
             .as_ref()
             .map_err(|error| anyhow::anyhow!(error.clone()))?;
         let now = Instant::now();
-        let auth_identity = UpstreamWebSocketAuthIdentity::from_headers(headers);
         let backoff_key =
             UpstreamWebSocketBackoffKey::for_route(route, upstream_url, auth_identity);
         let previous_response_id = responses_previous_response_id(body);
@@ -386,8 +396,12 @@ impl WebSocketResponsesDownstream {
             .filter(|_| cached_matches)
             .map_or(auth_identity, |cached| cached.auth_identity);
         // !cached_matches 时 effective_auth 就是请求头身份，prepare 与 restore 共用同一把钥匙。
-        let history_key = native_history_key(route, effective_auth, body);
-        self.native_history.prepare(history_key, body);
+        let history_key = self
+            .native_history
+            .prepare_for_route(route, effective_auth, body);
+        if route.official_account && self.native_history.requires_http() {
+            return Ok(UpstreamWebSocketAttempt::UseHttp);
+        }
         if !cached_matches {
             // A response ID belongs to its original upstream socket. Reconnect
             // with full history only before sending this new request.
@@ -1016,7 +1030,7 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
         headers: &HeaderMap,
         body: &mut Value,
     ) -> Result<bool> {
-        let key = native_history_key(
+        let key = self.native_history.prepare_for_route(
             route,
             UpstreamWebSocketAuthIdentity::from_headers(headers),
             body,
@@ -1025,8 +1039,13 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
         // Compaction and an active lifecycle plugin both skip that attempt, so
         // stage before every HTTP restore. A second call after a failed
         // handshake only restages the same turn.
-        self.native_history.prepare(key, body);
-        self.native_history.restore(key, body)
+        let restored = self
+            .native_history
+            .restore_for_http(key, body, route.official_account);
+        if restored.is_ok() {
+            self.upstream.take();
+        }
+        restored
     }
 
     fn remember_adapted_response(&mut self, response_id: &str, output: &[Value]) -> Result<()> {
@@ -1413,16 +1432,50 @@ mod http_fallback_history_tests {
     use super::*;
 
     #[tokio::test]
+    async fn search_http_selection_preserves_other_websocket_requests() {
+        let (config, provider_id, model) = router_config("http://127.0.0.1:9/v1".into());
+        let snapshot = RouterSnapshot::from_config(&config);
+        let mut route = snapshot.routes[&provider_id].as_ref().clone();
+        route.supports_websockets = true;
+        route.upstream_websocket_url = Err("websocket selected".into());
+        let (socket, _peer) = local_websocket_pair().await;
+        let mut downstream = WebSocketResponsesDownstream::new(socket);
+        for (official_account, tools) in [
+            (true, json!([])),
+            (true, json!([{"type":"function","name":"web_search"}])),
+            (true, json!([{"type":"tool_search"}])),
+            (false, json!([{"type":"web_search"}])),
+            (false, json!([{"type":"web_search_preview"}])),
+        ] {
+            route.official_account = official_account;
+            let mut body = json!({"model":model,"input":"hello","tools":tools});
+            let error = downstream
+                .proxy_upstream_websocket(&route, &HeaderMap::new(), &mut body, false, None)
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), "websocket selected");
+        }
+    }
+
+    #[tokio::test]
     async fn http_fallback_stages_history_when_the_websocket_attempt_is_skipped() {
         let (config, provider_id, model) = router_config("http://127.0.0.1:9/v1".into());
         let snapshot = RouterSnapshot::from_config(&config);
-        let route = snapshot.routes[&provider_id].as_ref();
+        let mut route = snapshot.routes[&provider_id].as_ref().clone();
+        route.official_account = true;
+        route.supports_websockets = true;
+        let route = &route;
         let (socket, mut peer) = local_websocket_pair().await;
         let mut downstream = WebSocketResponsesDownstream::new(socket);
         let mut headers = HeaderMap::new();
         headers.insert(
             HeaderName::from_static("session-id"),
             HeaderValue::from_static("lifecycle-session"),
+        );
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer old-token"));
+        headers.insert(
+            HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER),
+            HeaderValue::from_static("same-account"),
         );
         downstream.native_history = NativeResponsesHistory::with_cache(
             Arc::new(Mutex::new(NativeHistoryCache::default())),
@@ -1451,18 +1504,31 @@ mod http_fallback_history_tests {
         };
 
         downstream.clear_stream_id();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer refreshed-token"),
+        );
         let mut second = json!({
             "model": model,
             "stream": true,
             "previous_response_id": "resp-first",
-            "input": "follow up"
+            "input": "follow up",
+            "tools": [{"type":"web_search"}]
         });
+        assert_eq!(
+            downstream
+                .proxy_upstream_websocket(route, &headers, &mut second, false, None)
+                .await
+                .unwrap(),
+            UpstreamWebSocketAttempt::UseHttp
+        );
         assert!(
             downstream
                 .prepare_native_http_fallback(route, &headers, &mut second)
                 .unwrap()
         );
         assert!(second.get("previous_response_id").is_none());
+        assert_eq!(second["tools"], json!([{"type":"web_search"}]));
         assert_eq!(
             second["input"],
             json!([
