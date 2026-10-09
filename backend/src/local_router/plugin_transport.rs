@@ -394,10 +394,17 @@ mod tests {
             // 虚拟时间跳跃时，后台回调可能尚未完成；让路由器的期限先到期。
             .with_invoke_timeout(UPSTREAM_READ_IDLE_TIMEOUT + Duration::from_secs(1));
             with_test_transport("test.transport", plugin, async {
-                let response = send(&target(), Operation::Responses, &headers(), Bytes::new()).await;
-                let mut prepared = prepare_upstream_response(response, "plugin test", None).await.unwrap();
+                let response =
+                    send(&target(), Operation::Responses, &headers(), Bytes::new()).await;
+                let mut prepared = prepare_upstream_response(response, "plugin test", None)
+                    .await
+                    .unwrap();
                 tokio::time::pause();
-                let duration = if total_deadline { Duration::from_secs(1) } else { UPSTREAM_READ_IDLE_TIMEOUT };
+                let duration = if total_deadline {
+                    Duration::from_secs(1)
+                } else {
+                    UPSTREAM_READ_IDLE_TIMEOUT
+                };
                 if total_deadline {
                     prepared.deadline = tokio::time::Instant::now() + duration;
                 }
@@ -411,13 +418,17 @@ mod tests {
                     if total_deadline {
                         assert!(error.is::<UpstreamResponseDeadline>());
                     } else {
-                        assert!(error.is::<UpstreamReadIdleTimeout>(), "unexpected error: {error:#}");
+                        assert!(
+                            error.is::<UpstreamReadIdleTimeout>(),
+                            "unexpected error: {error:#}"
+                        );
                     }
                 }
                 tokio::time::resume();
                 drop(prepared);
                 wait_cancel(&cancelled).await;
-            }).await;
+            })
+            .await;
         }
     }
     #[tokio::test]
