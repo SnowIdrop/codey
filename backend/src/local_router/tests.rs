@@ -8857,11 +8857,11 @@ async fn responses_route_normalizes_tool_schemas_and_passes_web_search_natively(
     assert_eq!(body["tools"][0]["type"], "web_search");
     let union = &body["tools"][1]["parameters"];
     assert_eq!(union["type"], "object");
-    let branches = union["anyOf"].as_array().unwrap();
-    assert_eq!(branches.len(), 2);
-    assert!(branches.iter().all(|branch| branch["type"] == "object"));
-    assert_eq!(branches[1]["oneOf"].as_array().unwrap().len(), 1);
-    assert_eq!(branches[1]["oneOf"][0]["type"], "object");
+    for keyword in ["anyOf", "oneOf", "allOf"] {
+        assert!(union.get(keyword).is_none(), "{keyword}");
+    }
+    assert_eq!(union["properties"]["mode"]["type"], "string");
+    assert!(union.get("required").is_none());
     assert_eq!(
         body["tools"][2]["parameters"],
         json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]})
