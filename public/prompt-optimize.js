@@ -351,18 +351,18 @@
     );
   };
 
-  const findAccessInsertionTarget = () => {
-    if (!inputElement?.parentElement) return null;
-    const inputRect = inputElement.getBoundingClientRect();
+  const findAccessInsertionTarget = (input = inputElement) => {
+    if (!input?.parentElement) return null;
+    const inputRect = input.getBoundingClientRect();
     const seen = new Set();
     let bestControl = null;
     let bestScore = Number.NEGATIVE_INFINITY;
-    let scope = inputElement.parentElement;
+    let scope = input.parentElement;
     let depth = 0;
     while (scope && depth < 8) {
       for (const control of scope.querySelectorAll?.(composerControlSelector) ||
         []) {
-        if (inputElement.contains?.(control)) continue;
+        if (input.contains?.(control)) continue;
         if (seen.has(control) || !isVisibleControl(control)) continue;
         seen.add(control);
         const score = accessControlScore(control, inputRect);
@@ -376,7 +376,7 @@
       depth += 1;
     }
     if (!bestControl) return null;
-    if (!hasComposerActionContext(inputElement)) return null;
+    if (!hasComposerActionContext(input)) return null;
 
     let anchor = bestControl;
     let host = bestControl.parentElement;
@@ -874,6 +874,11 @@
   loadConfig();
 
   window.__codeyPromptOptimize = {
+    composerContext: () => {
+      const input = findComposerInput();
+      if (!input) return null;
+      return { sessionId: findComposerConversationId(input), target: findAccessInsertionTarget(input) };
+    },
     snapshot: () => ({
       ready: ready,
       enabled: enabled,

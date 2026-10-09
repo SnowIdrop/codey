@@ -1285,3 +1285,17 @@ fn manual_model_selection_rejects_official_models_in_the_other_model_input() {
 
     assert!(error.contains("已在官方模型列表中"));
 }
+
+#[test]
+fn conversation_git_toggle_requires_restart_but_model_change_is_live() {
+    let applied = CodeyConfig::default();
+    let mut current = applied.clone();
+    current.conversation_git.enabled = true;
+    current.conversation_git.model = "model".into();
+    assert!(config_requires_restart_with_route_status(false, &applied,
+        &RuntimeModelConfig::from_config(&applied), &RuntimeSubagentConfig::from_config(&applied), &current));
+    let enabled = current.clone();
+    current.conversation_git.model = "another-model".into();
+    assert!(!config_requires_restart_with_route_status(false, &enabled,
+        &RuntimeModelConfig::from_config(&enabled), &RuntimeSubagentConfig::from_config(&enabled), &current));
+}

@@ -919,8 +919,17 @@
   border-bottom: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.05);
 }
 
+.route-auxiliary-header:last-child {
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
 [data-theme="dark"] .route-auxiliary-header {
   border-bottom-color: rgba(255, 255, 255, 0.05);
+}
+
+[data-theme="dark"] .route-auxiliary-header:last-child {
+  border-bottom: none;
 }
 
 .route-auxiliary-title-wrap {
@@ -948,6 +957,12 @@
   font-size: 11.5px;
   line-height: 1.5;
   color: var(--mac-text-secondary);
+}
+
+.route-auxiliary-action {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
 }
 
 .route-auxiliary-grid {

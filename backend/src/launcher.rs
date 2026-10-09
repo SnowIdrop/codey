@@ -934,6 +934,7 @@ async fn prepare_codex_startup_state(
     let runtime_model_contexts = config.runtime_enabled_model_contexts();
     let remote_compaction_models = config.runtime_remote_compaction_model_aliases();
     let fast_context_tools = config.fast_context_tools;
+    let conversation_git = config.conversation_git.enabled;
     let mut runtime_subagent_config = config.clone();
     runtime_subagent_config.active_profile_id = current_profile.id.clone();
     subagent_policy::reconcile_with_model_state(&mut runtime_subagent_config, Some(&model_state));
@@ -956,6 +957,7 @@ async fn prepare_codex_startup_state(
                 model_contexts: Some(&runtime_model_contexts),
                 default_model: runtime_default_model.as_deref(),
                 fast_context_tools,
+                conversation_git,
                 subagent_optimization,
                 subagent_model: &subagent_model,
                 subagent_reasoning_effort: &subagent_reasoning_effort,
@@ -1733,6 +1735,7 @@ async fn prepare_native_runtime_state(
 ) -> Result<PreparedProviderState> {
     let runtime_config_home = home.to_path_buf();
     let fast_context_tools = config.fast_context_tools;
+    let conversation_git = config.conversation_git.enabled;
     let subagent_optimization = config.subagent_optimization;
     let stream_max_retries = config.stream_max_retries;
     let native_subagent_config = config.clone();
@@ -1750,6 +1753,7 @@ async fn prepare_native_runtime_state(
                 model_contexts: None,
                 default_model: None,
                 fast_context_tools,
+                conversation_git,
                 subagent_optimization,
                 subagent_model: &native_subagent_config.subagent_model,
                 subagent_reasoning_effort: &native_subagent_config.subagent_reasoning_effort,

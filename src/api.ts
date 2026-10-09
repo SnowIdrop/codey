@@ -61,6 +61,9 @@ export const CODEY_API_COMMANDS = [
   "clear_codey_plugin_logs",
   "invoke_codey_plugin",
   "codex_extensions",
+  "conversation_git_status",
+  "conversation_git_preview",
+  "conversation_git_execute",
 ] as const;
 
 export type CodeyApiCommand = (typeof CODEY_API_COMMANDS)[number];

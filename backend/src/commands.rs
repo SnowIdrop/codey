@@ -17,6 +17,7 @@ mod native_plugins;
 mod official_accounts;
 mod plugins;
 mod prompt_optimization;
+mod conversation_git;
 mod runtime;
 mod updates;
 mod webhooks;
@@ -1168,6 +1169,9 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             Ok(text) => optimize_prompt_command(state, text).await,
             Err(error) => Err(error),
         },
+        "conversation_git_status" | "conversation_git_preview" | "conversation_git_execute" => {
+            conversation_git::invoke(state, command, &args).await
+        }
         "test_prompt_optimization" => {
             match optional_argument::<PromptOptimizationConfig>(&args, "config") {
                 Ok(draft) => test_prompt_optimization_command(state, draft).await,
@@ -1816,6 +1820,8 @@ async fn save_codey_config_locked(
         .merge_redacted_secrets(&previous.prompt_optimization);
     config_input.prompt_optimization.validate()?;
     config.prompt_optimization = config_input.prompt_optimization;
+    config_input.conversation_git.validate()?;
+    config.conversation_git = config_input.conversation_git;
     config.codex_app_path = config_input.codex_app_path;
     config.user_scripts = config_input.user_scripts;
     config.disable_trace_log_writes = config_input.disable_trace_log_writes;
@@ -3034,6 +3040,7 @@ pub(super) fn config_requires_restart_with_route_status(
         || applied.slim_codex_pet != current.slim_codex_pet
         || applied.gpu_launch_mode != current.gpu_launch_mode
         || applied.fast_context_tools != current.fast_context_tools
+        || applied.conversation_git.enabled != current.conversation_git.enabled
         || applied.subagent_optimization != current.subagent_optimization
         || !applied
             .misc_model

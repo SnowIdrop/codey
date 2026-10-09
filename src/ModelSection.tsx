@@ -10,6 +10,7 @@ import {
   IconEye,
   IconEyeOff,
   IconFileText,
+  IconGitCommit,
   IconGripVertical,
   IconHelpCircle,
   IconInfoCircle,
@@ -689,6 +690,22 @@ function ModelSectionComponent({
     </div>
   );
 
+  const conversationGitTooltip = (
+    <div className="flex flex-col gap-1 text-xs leading-relaxed max-w-[360px]">
+      <div className="font-semibold text-foreground">
+        指定分析本对话文件改动并生成 Git 提交信息的模型
+      </div>
+      <div className="text-muted">
+        在对话工具栏中点击 Git 提交时，使用此模型分析限定文件的完整 diff 并生成提交说明。保存后生效；推荐使用具备良好推理能力的代码模型。
+      </div>
+      {!config.localRouterEnabled && (
+        <div className="text-muted italic">
+          本地路由已关闭，无法通过本地路由分发模型请求。
+        </div>
+      )}
+    </div>
+  );
+
   return (
     <section className="route-section" aria-labelledby="route-title">
       <SettingsPageHeader
@@ -1183,6 +1200,55 @@ function ModelSectionComponent({
               </div>
             </div>
           </div>
+        </div>
+
+        <div className="route-auxiliary-bar">
+          <div className="route-auxiliary-header">
+            <div className="route-auxiliary-title-row">
+              <IconGitCommit size={15} className="route-auxiliary-icon" aria-hidden="true" />
+              <span className="route-auxiliary-title">对话 Git 提交增强</span>
+            </div>
+            <div className="route-auxiliary-action">
+              <Switch
+                aria-label="对话 Git 提交增强"
+                checked={config.conversationGit?.enabled === true}
+                disabled={isBusy || !onConfigChange || (!config.localRouterEnabled && !config.conversationGit?.enabled)}
+                onCheckedChange={(enabled) => onConfigChange?.({
+                  ...config,
+                  conversationGit: { model: config.conversationGit?.model || config.defaultModel, enabled },
+                })}
+              />
+            </div>
+          </div>
+
+          {config.conversationGit?.enabled && (
+            <div className="route-auxiliary-grid">
+              <div className="route-auxiliary-misc">
+                <Tooltip content={conversationGitTooltip} position="top">
+                  <span className="route-auxiliary-label cursor-help">
+                    <IconCpu size={14} className="route-auxiliary-icon" aria-hidden="true" />
+                    <strong>提交分析模型</strong>
+                    <IconInfoCircle size={13} className="route-auxiliary-help" aria-hidden="true" />
+                  </span>
+                </Tooltip>
+                <div className="route-auxiliary-combobox">
+                  <ModelCombobox
+                    aria-label="Git 提交分析模型"
+                    value={config.conversationGit.model}
+                    placeholder={
+                      subagentModelOptions.length === 0
+                        ? "所有线路均暂无模型"
+                        : "请选择提交分析模型"
+                    }
+                    disabled={isBusy || !config.localRouterEnabled}
+                    options={subagentModelOptions}
+                    preferredProviderId={preferredProviderId}
+                    onChange={(model) => onConfigChange?.({ ...config, conversationGit: { enabled: true, model } })}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="readonly-note">

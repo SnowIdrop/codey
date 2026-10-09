@@ -676,6 +676,7 @@ fn isolated_runtime_restores_live_disk_provider_to_resume_shim() {
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
+            conversation_git: false,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
@@ -836,6 +837,7 @@ fn local_router_accepts_a_codey_owned_resume_shim() {
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
+            conversation_git: false,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
@@ -888,6 +890,7 @@ fn isolated_runtime_config_creates_empty_codex_config_when_missing() {
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
+            conversation_git: false,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
@@ -1576,6 +1579,7 @@ fn native_runtime_forwards_user_catalog_with_the_same_resolved_path() {
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
+            conversation_git: false,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: None,
@@ -1621,6 +1625,7 @@ fn native_isolated_runtime_does_not_create_a_missing_codex_config() {
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
+            conversation_git: false,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: None,
@@ -1682,6 +1687,7 @@ fn runtime_context_overlay_uses_user_catalog_and_reset_restores_its_path() {
             &home,
             RouterApplyOptions {
                 remote_compaction_models: None,
+                conversation_git: false,
                 local_router: router.then(test_runtime_router_endpoint),
                 use_official_catalog: router,
                 model_contexts: Some(contexts),
@@ -1760,6 +1766,7 @@ fn context_budget_startup_applies_and_recovers_global_conflicts() {
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
+            conversation_git: false,
             local_router: Some(test_runtime_router_endpoint()),
             use_official_catalog: true,
             model_contexts: Some(&policies),
@@ -1832,6 +1839,7 @@ fn isolated_runtime_skips_retry_overrides_for_builtin_providers() {
             &home,
             RouterApplyOptions {
                 remote_compaction_models: None,
+                conversation_git: false,
                 model_contexts: None,
                 stream_max_retries: 7,
                 local_router: None,
@@ -1879,6 +1887,7 @@ fn isolated_runtime_keeps_retry_overrides_for_custom_providers() {
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
+            conversation_git: false,
             model_contexts: None,
             stream_max_retries: 7,
             local_router: None,
@@ -1936,6 +1945,7 @@ fn isolated_runtime_preserves_computer_use_without_adding_an_mcp() {
                 &home,
                 RouterApplyOptions {
                     remote_compaction_models: None,
+                    conversation_git: false,
                     model_contexts: None,
                     stream_max_retries: 5,
                     local_router,
@@ -1989,6 +1999,7 @@ wire_api = "responses"
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
+            conversation_git: false,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: None,
@@ -3330,6 +3341,7 @@ experimental_bearer_token = "upstream-secret-token"
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
+            conversation_git: false,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
@@ -3416,6 +3428,7 @@ fn official_login_uses_the_websocket_router_without_overriding_builtin_openai() 
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
+            conversation_git: false,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
@@ -3454,6 +3467,7 @@ fn builtin_catalog_roles_keep_the_selected_routes_compaction_mode() {
         &home,
         RouterApplyOptions {
             remote_compaction_models: Some(&[DEFAULT_SUBAGENT_MODEL.to_string()]),
+            conversation_git: false,
             local_router: Some(test_runtime_router_endpoint()),
             stream_max_retries: 5,
             use_official_catalog: false,
@@ -3507,6 +3521,7 @@ wire_api = "responses"
         &home,
         RouterApplyOptions {
             remote_compaction_models: None,
+            conversation_git: false,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
@@ -4178,4 +4193,41 @@ fn unrelated_provider_ids_and_missing_configs_stay_untouched() {
 
     assert!(repair_reserved_provider_ids(&home).unwrap().is_empty());
     assert_eq!(fs::read(home.join("config.toml")).unwrap(), original);
+}
+
+#[test]
+fn conversation_git_installs_only_trusted_edit_hooks_without_other_enhancements() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let marker = temp.path().join("state/lease.json");
+    let backup = temp.path().join("state/backups");
+    let applied = apply_isolated_runtime_router_config(&home, RouterApplyOptions {
+        remote_compaction_models: None,
+        conversation_git: true,
+        local_router: None,
+        use_official_catalog: false,
+        model_contexts: None,
+        stream_max_retries: 5,
+        default_model: None,
+        fastctx_command: None,
+        subagent_optimization: false,
+        subagent_model: DEFAULT_SUBAGENT_MODEL,
+        subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+        subagent_roles: None,
+        marker: &marker,
+        backup_root: &backup,
+    }).unwrap();
+    assert!(applied.runtime_config_overrides.iter().any(|entry| entry == "features.hooks=true"));
+    let hooks: serde_json::Value = serde_json::from_slice(&fs::read(home.join("hooks.json")).unwrap()).unwrap();
+    for event in ["PreToolUse", "PostToolUse"] {
+        let handlers = hooks["hooks"][event].as_array().unwrap();
+        assert_eq!(handlers.len(), 1);
+        assert!(handlers[0]["hooks"][0]["command"].as_str().unwrap().contains(crate::conversation_git::tracking::HOOK_ARGUMENT));
+        assert_eq!(handlers[0]["hooks"][0]["timeout"], crate::conversation_git::tracking::HOOK_TIMEOUT_SECONDS);
+    }
+    assert_eq!(hooks["hooks"].as_object().unwrap().len(), 2);
+    assert!(applied.runtime_config_overrides.iter().any(|entry| entry.starts_with("hooks.state=")));
+    assert!(restore_runtime_config_at(&home, &marker, true).unwrap());
+    assert!(!home.join("hooks.json").exists());
 }

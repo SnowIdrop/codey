@@ -41,6 +41,7 @@ http-body = "1"
 hyper-util = { version = "0.1", features = ["client-proxy", "client-proxy-system"], default-features = false }
 memchr = "2"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+regex = "1"
 reqwest = { workspace = true, features = ["socks"] }
 rusqlite = { workspace = true, features = ["hooks"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
