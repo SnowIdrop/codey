@@ -51,6 +51,13 @@ use crate::route_request_log::{
 };
 
 pub(crate) const ROUTER_PROVIDER_ID: &str = "codey_router";
+pub(crate) const REMOTE_COMPACTION_PROVIDER_ID: &str = "codey_router_remote";
+pub(crate) const ROUTER_PROVIDER_IDS: [&str; 2] =
+    [ROUTER_PROVIDER_ID, REMOTE_COMPACTION_PROVIDER_ID];
+
+pub(crate) fn is_router_provider(id: &str) -> bool {
+    ROUTER_PROVIDER_IDS.contains(&id)
+}
 pub(crate) const ROUTER_AUTH_HEADER: &str = "x-codey-router-token";
 const TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 const ROUTE_METADATA_KEY: &str = "codey_route";

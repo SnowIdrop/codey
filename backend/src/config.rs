@@ -362,10 +362,10 @@ impl ProviderProfile {
         if self.id.trim().is_empty() {
             return Err("线路 ID 不能为空".to_string());
         }
-        if self.provider_id() == local_router::ROUTER_PROVIDER_ID {
+        if local_router::is_router_provider(self.provider_id()) {
             return Err(format!(
                 "线路不能使用 Codey 内部 Provider ID「{}」",
-                local_router::ROUTER_PROVIDER_ID
+                self.provider_id()
             ));
         }
         let short_name = self.display_short_name();
@@ -1619,8 +1619,15 @@ impl CodeyConfig {
         self.local_router_enabled && self.usable_official_routes().count() > 1
     }
 
-    pub(crate) fn runtime_gateway_provider_id(&self) -> &'static str {
-        local_router::ROUTER_PROVIDER_ID
+    pub(crate) fn runtime_gateway_provider_id_for_profile(
+        &self,
+        profile: &ProviderProfile,
+    ) -> &'static str {
+        if self.route_supports_remote_compaction_this_launch(profile) {
+            local_router::REMOTE_COMPACTION_PROVIDER_ID
+        } else {
+            local_router::ROUTER_PROVIDER_ID
+        }
     }
 
     /// Whether a route can use upstream Responses WebSocket this launch.
@@ -1791,19 +1798,49 @@ impl CodeyConfig {
             && profile.upstream_protocol == UPSTREAM_PROTOCOL_OPENAI_RESPONSES
     }
 
-    /// Advertise the OpenAI provider identity only when every runtime route
-    /// supports native compaction. Codex derives this capability from the
-    /// shared provider, so one adapted Chat/Anthropic route must disable it for
-    /// the whole runtime even when an official account route is also present.
+    /// 这里只汇总可用能力；会话通过独立 Provider 选择压缩方式。
     pub(crate) fn runtime_supports_remote_compaction(&self) -> bool {
-        let mut has_runtime_route = false;
-        for profile in self.remote_compaction_runtime_profiles() {
-            has_runtime_route = true;
-            if !self.route_supports_remote_compaction_this_launch(profile) {
-                return false;
-            }
+        self.remote_compaction_runtime_profiles()
+            .any(|profile| self.route_supports_remote_compaction_this_launch(profile))
+    }
+
+    pub(crate) fn remote_compaction_route_capabilities(&self) -> BTreeMap<String, bool> {
+        self.remote_compaction_runtime_profiles()
+            .map(|profile| {
+                (
+                    profile.provider_id().to_string(),
+                    self.route_supports_remote_compaction_this_launch(profile),
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn remote_compaction_mode(&self) -> &'static str {
+        let routes = self.remote_compaction_route_capabilities();
+        if !routes.values().any(|enabled| *enabled) {
+            "local"
+        } else if routes.values().all(|enabled| *enabled) {
+            "remote"
+        } else {
+            "mixed"
         }
-        has_runtime_route
+    }
+
+    pub(crate) fn runtime_remote_compaction_model_aliases(&self) -> Vec<String> {
+        let qualify_official = self.qualifies_official_model_ids();
+        self.remote_compaction_runtime_profiles()
+            .filter(|profile| self.route_supports_remote_compaction_this_launch(profile))
+            .flat_map(|profile| {
+                let models = if profile.official_account {
+                    self.enabled_official_route_models(profile.provider_id())
+                } else {
+                    self.enabled_route_models(profile.provider_id())
+                };
+                models
+                    .into_iter()
+                    .map(move |model| runtime_catalog_model_id(profile, &model, qualify_official))
+            })
+            .collect()
     }
 
     fn remote_compaction_runtime_profiles(&self) -> impl Iterator<Item = &ProviderProfile> {
@@ -1991,7 +2028,9 @@ impl CodeyConfig {
             };
             for upstream_model in models {
                 let alias = local_router::model_alias(provider_id, &upstream_model);
-                let request_provider_id = self.runtime_gateway_provider_id().to_string();
+                let request_provider_id = self
+                    .runtime_gateway_provider_id_for_profile(profile)
+                    .to_string();
                 targets.push(RuntimeModelTarget {
                     route_id: profile.id.clone(),
                     provider_id: provider_id.to_string(),
@@ -3753,34 +3792,6 @@ mod tests {
     }
 
     #[test]
-    fn third_party_remote_compaction_is_advertised_only_when_every_runtime_route_supports_it() {
-        let mut capable = ProviderProfile::new("Responses Route");
-        capable.id = "route-capable".into();
-        capable.base_url = "https://responses.example/v1".into();
-        capable.api_key = "responses-key".into();
-        capable.supports_remote_compaction = true;
-        capable.normalize();
-
-        let mut config = CodeyConfig {
-            active_profile_id: capable.id.clone(),
-            profiles: vec![capable],
-            ..CodeyConfig::default()
-        }
-        .normalize();
-        assert!(config.runtime_supports_remote_compaction());
-
-        let mut unsupported = ProviderProfile::new("Chat Route");
-        unsupported.id = "route-chat".into();
-        unsupported.base_url = "https://chat.example/v1".into();
-        unsupported.api_key = "chat-key".into();
-        unsupported.upstream_protocol = UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
-        unsupported.supports_remote_compaction = true;
-        unsupported.normalize();
-        config.profiles.push(unsupported);
-        assert!(!config.runtime_supports_remote_compaction());
-    }
-
-    #[test]
     fn remote_compaction_protocol_migrates_and_normalizes_official_routes() {
         let mut legacy = serde_json::to_value(ProviderProfile::new("Relay")).unwrap();
         legacy
@@ -3859,7 +3870,8 @@ mod tests {
             }),
         });
         config.profiles.extend([switched_off, adapted, plugin]);
-        assert!(!config.runtime_supports_remote_compaction());
+        assert!(config.runtime_supports_remote_compaction());
+        assert_eq!(config.remote_compaction_mode(), "mixed");
         let blockers = config.remote_compaction_blockers();
         assert_eq!(blockers.len(), 3);
         assert_eq!(blockers[0].route_id, "off");
@@ -3870,6 +3882,51 @@ mod tests {
         config.profiles.clear();
         assert!(!config.runtime_supports_remote_compaction());
         assert!(config.remote_compaction_blockers().is_empty());
+    }
+
+    #[test]
+    fn remote_compaction_uses_separate_providers_for_mixed_routes() {
+        let mut capable = ProviderProfile::new("Responses Route");
+        capable.id = "route-capable".into();
+        capable.base_url = "https://responses.example/v1".into();
+        capable.api_key = "responses-key".into();
+        capable.supports_remote_compaction = true;
+        capable.normalize();
+
+        let mut config = CodeyConfig {
+            active_profile_id: capable.id.clone(),
+            profiles: vec![capable],
+            ..CodeyConfig::default()
+        }
+        .normalize();
+        assert!(config.runtime_supports_remote_compaction());
+
+        let mut unsupported = ProviderProfile::new("Chat Route");
+        unsupported.id = "route-chat".into();
+        unsupported.base_url = "https://chat.example/v1".into();
+        unsupported.api_key = "chat-key".into();
+        unsupported.upstream_protocol = UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+        unsupported.supports_remote_compaction = true;
+        unsupported.normalize();
+        config.profiles.push(unsupported);
+        assert!(config.runtime_supports_remote_compaction());
+        assert_eq!(config.remote_compaction_mode(), "mixed");
+        assert_eq!(
+            config.runtime_gateway_provider_id_for_profile(&config.profiles[0]),
+            local_router::REMOTE_COMPACTION_PROVIDER_ID
+        );
+        assert_eq!(
+            config.runtime_gateway_provider_id_for_profile(&config.profiles[1]),
+            local_router::ROUTER_PROVIDER_ID
+        );
+        config.selected_models_by_provider = BTreeMap::from([
+            ("route-capable".into(), vec!["shared-model".into()]),
+            ("route-chat".into(), vec!["shared-model".into()]),
+        ]);
+        assert_eq!(
+            config.runtime_remote_compaction_model_aliases(),
+            ["route-capable/shared-model"]
+        );
     }
 
     #[test]
@@ -3897,8 +3954,8 @@ mod tests {
         chat.normalize();
         config.profiles.push(chat);
         assert!(
-            !config.runtime_supports_remote_compaction(),
-            "a shared provider must not advertise native compaction to an adapted Chat route"
+            config.runtime_supports_remote_compaction(),
+            "the official account remains eligible when another route uses local compaction"
         );
 
         config.official_account_available_this_launch = false;

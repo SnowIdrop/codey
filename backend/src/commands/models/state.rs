@@ -31,7 +31,18 @@ pub(crate) fn remote_compaction_transport_requires_restart(
     applied: &CodeyConfig,
     current: &CodeyConfig,
 ) -> bool {
-    applied.runtime_supports_remote_compaction() != current.runtime_supports_remote_compaction()
+    let remote_routes = |config: &CodeyConfig| {
+        config
+            .remote_compaction_route_capabilities()
+            .into_iter()
+            .filter_map(|(id, supported)| supported.then_some(id))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    // Adding or removing local-only routes needs no new Provider capability.
+    // The all-remote default is also launch-scoped when using Codex's catalog.
+    remote_routes(applied) != remote_routes(current)
+        || (applied.remote_compaction_mode() == "remote")
+            != (current.remote_compaction_mode() == "remote")
 }
 
 pub(crate) fn native_web_search_capability_requires_restart(
@@ -246,6 +257,7 @@ pub(crate) fn renderer_model_catalog_value(
                 "route_name": entry.route_name,
                 "route_prefix": entry.route_prefix,
                 "provider_id": entry.request_provider_id,
+                "supports_remote_compaction": entry.request_provider_id == local_router::REMOTE_COMPACTION_PROVIDER_ID,
                 "source_model": entry.request_model,
                 "official_account": entry.official_account,
                 "supported_reasoning_efforts": entry.supported_reasoning_efforts,
@@ -470,7 +482,9 @@ pub(crate) fn renderer_route_model_catalog(
             // 单账号时官方模型沿用原生 ID，多账号时按上面生成的线路前缀为准，
             // 请求转发仍统一走本地路由。
             let (request_provider_id, request_model) = (
-                config.runtime_gateway_provider_id().to_string(),
+                config
+                    .runtime_gateway_provider_id_for_profile(profile)
+                    .to_string(),
                 model.clone(),
             );
             let is_default = default_model

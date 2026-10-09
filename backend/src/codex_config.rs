@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -95,6 +95,8 @@ struct RuntimeConfigLease {
     backup_dir: PathBuf,
     #[serde(default = "lease_default_true")]
     local_router_applied: bool,
+    #[serde(default)]
+    remote_compaction_models: HashSet<String>,
     #[serde(default)]
     fastctx_command: Option<PathBuf>,
     #[serde(default)]
@@ -226,6 +228,7 @@ impl Drop for RuntimeConfigLock {
 
 pub(crate) struct RuntimeRouterConfigOptions<'a> {
     pub local_router: Option<&'a RuntimeRouterEndpoint>,
+    pub remote_compaction_models: Option<&'a [String]>,
     pub use_official_catalog: bool,
     pub model_contexts: Option<&'a BTreeMap<String, crate::config::ModelContextConfig>>,
     pub default_model: Option<&'a str>,
@@ -254,6 +257,7 @@ pub(crate) struct FastContextToolsStatus {
 
 struct RouterApplyOptions<'a> {
     local_router: Option<&'a RuntimeRouterEndpoint>,
+    remote_compaction_models: Option<&'a [String]>,
     stream_max_retries: u32,
     use_official_catalog: bool,
     model_contexts: Option<&'a BTreeMap<String, crate::config::ModelContextConfig>>,
@@ -314,6 +318,7 @@ pub(crate) fn apply_runtime_router_config(
         home,
         RouterApplyOptions {
             local_router: options.local_router,
+            remote_compaction_models: options.remote_compaction_models,
             stream_max_retries: options.stream_max_retries,
             use_official_catalog,
             model_contexts: options.model_contexts,
@@ -395,6 +400,7 @@ fn apply_isolated_runtime_router_config(
 ) -> Result<AppliedRuntimeRouterConfig> {
     let RouterApplyOptions {
         local_router,
+        remote_compaction_models,
         stream_max_retries,
         use_official_catalog,
         model_contexts,
@@ -421,13 +427,28 @@ fn apply_isolated_runtime_router_config(
     if local_router.is_some() && user_owned_router_provider_occupies_id(&persistent) {
         anyhow::bail!(
             "Codex config.toml 已占用 Codey 内部 Provider ID「{}」；请先重命名该自定义 Provider",
-            local_router::ROUTER_PROVIDER_ID
+            local_router::ROUTER_PROVIDER_IDS.join("、")
         );
     }
     // Codex resolves this path from the app-server working directory, which is
     // `/` for the packaged macOS app, rather than from CODEX_HOME.
     let model_catalog_path =
         use_official_catalog.then(|| home.join(crate::model_catalog::relative_path()));
+    let remote_compaction_models = local_router.map(|_| {
+        remote_compaction_models
+            .map(|models| {
+                models
+                    .iter()
+                    .map(|model| crate::model_id::key(model))
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                model_catalog_path
+                    .as_deref()
+                    .map(crate::model_catalog::remote_compaction_models_from_catalog)
+                    .unwrap_or_default()
+            })
+    });
     let effective = patch_config_with_fastctx_mode(
         existing,
         RouterPatchOptions {
@@ -502,6 +523,7 @@ fn apply_isolated_runtime_router_config(
             &constraints_dir,
             &registration_roles,
             fastctx_instructions.as_deref(),
+            remote_compaction_models.as_ref(),
         )?;
         (
             Some(root_instructions),
@@ -588,6 +610,7 @@ fn apply_isolated_runtime_router_config(
     let state = RuntimeConfigLease {
         backup_dir: backup_dir.clone(),
         local_router_applied: local_router.is_some(),
+        remote_compaction_models: remote_compaction_models.unwrap_or_default(),
         fastctx_command: fastctx_command.map(Path::to_path_buf),
         subagent_optimization_applied: subagent_optimization,
         subagent_model: subagent_model.to_string(),
@@ -690,6 +713,7 @@ fn apply_isolated_test_runtime_config(
         home,
         RouterApplyOptions {
             local_router: Some(test_runtime_router_endpoint()),
+            remote_compaction_models: None,
             stream_max_retries: 5,
             use_official_catalog,
             model_contexts: None,
@@ -806,8 +830,14 @@ fn prepare_runtime_agent_files(
     constraints_dir: &Path,
     roles: &BTreeMap<String, SubagentRoleConfig>,
     fastctx_instructions: Option<&str>,
+    remote_compaction_models: Option<&HashSet<String>>,
 ) -> Result<Vec<RuntimeAgentRegistration>> {
-    let plans = plan_runtime_agent_files(constraints_dir, roles, fastctx_instructions)?;
+    let plans = plan_runtime_agent_files(
+        constraints_dir,
+        roles,
+        fastctx_instructions,
+        remote_compaction_models,
+    )?;
     let mut registrations = Vec::with_capacity(plans.len());
     for plan in plans {
         if let Some(parent) = plan.registration.config_file.parent() {
@@ -853,6 +883,7 @@ fn plan_runtime_agent_files(
     constraints_dir: &Path,
     roles: &BTreeMap<String, SubagentRoleConfig>,
     fastctx_instructions: Option<&str>,
+    remote_compaction_models: Option<&HashSet<String>>,
 ) -> Result<Vec<RuntimeAgentPlan>> {
     let mut plans = Vec::with_capacity(roles.len());
     for role in SUBAGENT_ROLE_IDS {
@@ -877,8 +908,13 @@ fn plan_runtime_agent_files(
             &subagent_source_config_versions(role).unwrap(),
         )?;
         let runtime_path = runtime_agent_path(constraints_dir, role);
-        let (contents, description) =
-            render_runtime_agent(&source, role, selection, fastctx_instructions)?;
+        let (contents, description) = render_runtime_agent(
+            &source,
+            role,
+            selection,
+            fastctx_instructions,
+            remote_compaction_models,
+        )?;
         let content_sha256 = crate::fs_util::sha256_hex(&contents);
         plans.push(RuntimeAgentPlan {
             registration: RuntimeAgentRegistration {
@@ -908,6 +944,7 @@ fn render_runtime_agent(
     role: &str,
     selection: &SubagentRoleConfig,
     fastctx_instructions: Option<&str>,
+    remote_compaction_models: Option<&HashSet<String>>,
 ) -> Result<(Vec<u8>, String)> {
     let mut document = parse_document(source).context("解析 Codey 子代理约束文件失败")?;
     let model = selection.model.trim();
@@ -950,6 +987,15 @@ fn render_runtime_agent(
     )?;
     document["name"] = value(role);
     document["model"] = value(model);
+    if let Some(models) = remote_compaction_models {
+        // A child selecting another route must not inherit its parent's
+        // compaction mode. Only generated role files receive this override.
+        document["model_provider"] = value(if models.contains(&crate::model_id::key(model)) {
+            local_router::REMOTE_COMPACTION_PROVIDER_ID
+        } else {
+            local_router::ROUTER_PROVIDER_ID
+        });
+    }
     document["model_reasoning_effort"] = value(&reasoning_effort);
     let rendered = document_string(&document)?;
     Ok((rendered.into_bytes(), description))
@@ -1179,6 +1225,15 @@ fn reconcile_runtime_subagent_roles_at(
     config: &CodeyConfig,
     marker: &Path,
 ) -> Result<RuntimeSubagentReconcileReport> {
+    let remote_compaction_models = runtime_agent_remote_compaction_models(config);
+    reconcile_runtime_subagent_roles_with_compaction(config, marker, &remote_compaction_models)
+}
+
+fn reconcile_runtime_subagent_roles_with_compaction(
+    config: &CodeyConfig,
+    marker: &Path,
+    remote_compaction_models: &HashSet<String>,
+) -> Result<RuntimeSubagentReconcileReport> {
     anyhow::ensure!(
         config.subagent_optimization,
         "当前 Codey 配置未启用子代理协作优化"
@@ -1207,10 +1262,16 @@ fn reconcile_runtime_subagent_roles_at(
     )?;
     let constraints_dir = marker.with_file_name(CODEY_CONSTRAINTS_DIR);
     let fastctx_instructions = runtime_fastctx_instructions(&constraints_dir, &state)?;
+    // Router enablement belongs to the running process. Pending settings must
+    // not add provider overrides to a process launched without the router.
+    let remote_compaction_models = state
+        .local_router_applied
+        .then_some(remote_compaction_models);
     let plans = plan_runtime_agent_files(
         &constraints_dir,
         &registration_roles,
         fastctx_instructions.as_deref(),
+        remote_compaction_models,
     )
     .context("预检 Codey 子代理运行时配置失败；未写入运行时配置")?;
     let expected_hashes = runtime_agent_plan_hashes(&plans);
@@ -1220,7 +1281,8 @@ fn reconcile_runtime_subagent_roles_at(
         && state.subagent_roles == runtime_roles
         && !state.runtime_home.as_os_str().is_empty()
         && state.runtime_agent_schema_version == RUNTIME_AGENT_SCHEMA_VERSION
-        && state.runtime_agent_hashes == expected_hashes;
+        && state.runtime_agent_hashes == expected_hashes
+        && remote_compaction_models.is_none_or(|models| state.remote_compaction_models == *models);
     let generated_files_match = runtime_agent_files_match(&plans)?;
     let runtime_policy_matches = crate::subagent_gate::runtime_subagent_policy_matches(
         &runtime_home,
@@ -1241,7 +1303,7 @@ fn reconcile_runtime_subagent_roles_at(
         return Ok(RuntimeSubagentReconcileReport::default());
     }
 
-    refresh_runtime_subagent_roles_at(config, marker)?;
+    refresh_runtime_subagent_roles_at(config, marker, remote_compaction_models)?;
     Ok(RuntimeSubagentReconcileReport {
         repaired: true,
         reasons,
@@ -1340,6 +1402,14 @@ fn restore_runtime_config_at(
     Ok(true)
 }
 
+fn runtime_agent_remote_compaction_models(config: &CodeyConfig) -> HashSet<String> {
+    config
+        .runtime_remote_compaction_model_aliases()
+        .iter()
+        .map(|model| crate::model_id::key(model))
+        .collect()
+}
+
 fn repair_persistent_codey_runtime_config(home: &Path) -> Result<bool> {
     let config_path = home.join("config.toml");
     let manager = ConfigManager::new(&config_path);
@@ -1348,12 +1418,13 @@ fn repair_persistent_codey_runtime_config(home: &Path) -> Result<bool> {
         return Ok(false);
     }
     let mut document = snapshot.document().clone();
-    let codey_router_owned = codey_router_provider_is_codey_owned(&document);
+    let codey_router_owned = local_router::ROUTER_PROVIDER_IDS.iter().any(|id| {
+        document_provider_table(&document, id)
+            .is_some_and(codey_router_provider_table_is_codey_owned)
+    });
     let codey_router_dangling = persistent_codey_router_selection_is_dangling(&document);
     let removed = remove_persistent_codey_runtime_config(&mut document, home);
-    let shimmed = if user_owned_router_provider_occupies_id(&document) {
-        false
-    } else if codey_router_owned || codey_router_dangling {
+    let shimmed = if codey_router_owned || codey_router_dangling {
         ensure_persistent_router_resume_shim(&mut document)?
     } else {
         false
@@ -1561,9 +1632,6 @@ pub(crate) fn prepare_persistent_router_resume_shim_at(home: &Path) -> Result<bo
         return Ok(false);
     }
     let mut document = snapshot.document().clone();
-    if user_owned_router_provider_occupies_id(&document) {
-        return Ok(false);
-    }
     if !ensure_persistent_router_resume_shim(&mut document)? {
         return Ok(false);
     }
@@ -1576,11 +1644,8 @@ pub(crate) fn prepare_persistent_router_resume_shim_at(home: &Path) -> Result<bo
     Ok(true)
 }
 
-/// Persist the live loopback `codey_router` table while the local router is
-/// running. Official authentication stays enabled when available, while the
-/// provider name advertises OpenAI-only capabilities only when every runtime
-/// route supports them. Desktop and config reload resolve that id from disk,
-/// so it must match the process `-c` overlay.
+/// 两个会话 Provider 共用回环服务和鉴权，仅压缩能力不同。
+/// 磁盘表与进程覆盖保持一致，供 Desktop 恢复已保存的会话。
 pub(crate) fn prepare_runtime_router_disk_provider_at(
     home: &Path,
     endpoint: &RuntimeRouterEndpoint,
@@ -1595,11 +1660,16 @@ pub(crate) fn prepare_runtime_router_disk_provider_at(
     if user_owned_router_provider_occupies_id(&document) {
         return Ok(false);
     }
-    let desired = local_router_provider_table(endpoint);
-    if runtime_router_disk_provider_matches(&document, &desired) {
+    let providers = runtime_router_provider_tables(endpoint);
+    if providers
+        .iter()
+        .all(|(id, table)| runtime_router_disk_provider_matches(&document, id, table))
+    {
         return Ok(false);
     }
-    write_persistent_router_shim(&mut document, desired)?;
+    for (id, table) in providers {
+        write_persistent_router_shim(&mut document, id, table)?;
+    }
     manager.replace_document(
         Some(snapshot.revision()),
         document,
@@ -1635,18 +1705,21 @@ fn remove_persistent_codey_runtime_config(doc: &mut DocumentMut, home: &Path) ->
 }
 
 pub(crate) fn user_owned_router_provider_occupies_id(document: &DocumentMut) -> bool {
-    let Some(item) = document_provider_item(document, local_router::ROUTER_PROVIDER_ID) else {
-        return false;
-    };
-    match item.as_table_like() {
-        Some(provider) => !codey_router_provider_table_is_codey_owned(provider),
-        None => true,
-    }
+    local_router::ROUTER_PROVIDER_IDS.iter().any(|id| {
+        document_provider_item(document, id).is_some_and(|item| {
+            item.as_table_like()
+                .is_none_or(|provider| !codey_router_provider_table_is_codey_owned(provider))
+        })
+    })
 }
 
 fn codey_router_provider_is_codey_owned(doc: &DocumentMut) -> bool {
-    document_provider_table(doc, local_router::ROUTER_PROVIDER_ID)
-        .is_some_and(codey_router_provider_table_is_codey_owned)
+    let id = doc
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .filter(|id| local_router::is_router_provider(id))
+        .unwrap_or(local_router::ROUTER_PROVIDER_ID);
+    document_provider_table(doc, id).is_some_and(codey_router_provider_table_is_codey_owned)
 }
 
 fn codey_router_provider_table_is_codey_owned(provider: &dyn TableLike) -> bool {
@@ -1661,24 +1734,37 @@ fn codey_router_provider_table_is_codey_owned(provider: &dyn TableLike) -> bool 
 fn persistent_codey_router_is_selected(doc: &DocumentMut) -> bool {
     doc.get("model_provider")
         .and_then(Item::as_str)
-        .is_some_and(|provider| provider.trim() == local_router::ROUTER_PROVIDER_ID)
+        .is_some_and(|provider| local_router::is_router_provider(provider.trim()))
 }
 
 fn persistent_codey_router_selection_is_dangling(doc: &DocumentMut) -> bool {
     persistent_codey_router_is_selected(doc)
-        && document_provider_table(doc, local_router::ROUTER_PROVIDER_ID).is_none()
+        && doc
+            .get("model_provider")
+            .and_then(Item::as_str)
+            .is_some_and(|id| document_provider_table(doc, id.trim()).is_none())
 }
 
 fn ensure_persistent_router_resume_shim(doc: &mut DocumentMut) -> Result<bool> {
-    if user_owned_router_provider_occupies_id(doc) {
-        return Ok(false);
-    }
     let desired = persistent_router_shim_table(doc);
-    if persistent_router_shim_matches(doc, &desired) {
-        return Ok(false);
+    let occupied = user_owned_router_provider_occupies_id(doc);
+    let mut changed = false;
+    for id in local_router::ROUTER_PROVIDER_IDS {
+        if occupied && document_provider_item(doc, id).is_none() {
+            continue;
+        }
+        if document_provider_item(doc, id).is_some_and(|item| {
+            item.as_table_like()
+                .is_none_or(|table| !codey_router_provider_table_is_codey_owned(table))
+        }) {
+            continue;
+        }
+        if !persistent_router_shim_matches(doc, id, &desired) {
+            write_persistent_router_shim(doc, id, desired.clone())?;
+            changed = true;
+        }
     }
-    write_persistent_router_shim(doc, desired)?;
-    Ok(true)
+    Ok(changed)
 }
 
 fn persistent_router_shim_table(doc: &DocumentMut) -> Table {
@@ -1712,14 +1798,14 @@ fn persistent_non_router_provider_id(doc: &DocumentMut) -> Option<&str> {
     doc.get("model_provider")
         .and_then(Item::as_str)
         .map(str::trim)
-        .filter(|provider| !provider.is_empty() && *provider != local_router::ROUTER_PROVIDER_ID)
+        .filter(|provider| !provider.is_empty() && !local_router::is_router_provider(provider))
 }
 
 fn unique_non_router_provider_table(doc: &DocumentMut) -> Option<&dyn TableLike> {
     let providers = doc.get("model_providers").and_then(Item::as_table_like)?;
     let mut other = None;
     for (key, item) in providers.iter() {
-        if key == local_router::ROUTER_PROVIDER_ID {
+        if local_router::is_router_provider(key) {
             continue;
         }
         let Some(provider) = item.as_table_like() else {
@@ -1733,8 +1819,8 @@ fn unique_non_router_provider_table(doc: &DocumentMut) -> Option<&dyn TableLike>
     other
 }
 
-fn runtime_router_disk_provider_matches(doc: &DocumentMut, desired: &Table) -> bool {
-    let Some(existing) = document_provider_table(doc, local_router::ROUTER_PROVIDER_ID) else {
+fn runtime_router_disk_provider_matches(doc: &DocumentMut, id: &str, desired: &Table) -> bool {
+    let Some(existing) = document_provider_table(doc, id) else {
         return false;
     };
     if !codey_router_provider_table_is_codey_owned(existing) {
@@ -1760,8 +1846,8 @@ fn provider_header_str<'a>(provider: &'a dyn TableLike, key: &str) -> Option<&'a
         .and_then(|headers| table_like_str(headers, key))
 }
 
-fn persistent_router_shim_matches(doc: &DocumentMut, desired: &Table) -> bool {
-    let Some(existing) = document_provider_table(doc, local_router::ROUTER_PROVIDER_ID) else {
+fn persistent_router_shim_matches(doc: &DocumentMut, id: &str, desired: &Table) -> bool {
+    let Some(existing) = document_provider_table(doc, id) else {
         return false;
     };
     if !codey_router_provider_table_is_codey_owned(existing) {
@@ -1791,21 +1877,18 @@ fn provider_has_router_secret(provider: &dyn TableLike) -> bool {
     has_token_header || has_bearer
 }
 
-fn write_persistent_router_shim(doc: &mut DocumentMut, table: Table) -> Result<()> {
+fn write_persistent_router_shim(doc: &mut DocumentMut, id: &str, table: Table) -> Result<()> {
     match doc.get_mut("model_providers") {
         None => {
             let mut providers = Table::new();
-            providers.insert(local_router::ROUTER_PROVIDER_ID, Item::Table(table));
+            providers.insert(id, Item::Table(table));
             doc["model_providers"] = Item::Table(providers);
         }
         Some(item) => {
             if let Some(providers) = item.as_table_mut() {
-                providers.insert(local_router::ROUTER_PROVIDER_ID, Item::Table(table));
+                providers.insert(id, Item::Table(table));
             } else if let Some(providers) = item.as_inline_table_mut() {
-                providers.insert(
-                    local_router::ROUTER_PROVIDER_ID,
-                    Value::InlineTable(table_values_to_inline(&table)),
-                );
+                providers.insert(id, Value::InlineTable(table_values_to_inline(&table)));
             } else {
                 bail!("model_providers 必须是 TOML table");
             }
@@ -2159,11 +2242,16 @@ fn patch_config_with_fastctx_mode(
     let mut doc = parse_document(existing)?;
     if let Some(local_router) = local_router {
         ensure_provider_table(&mut doc)?;
-        doc["model_providers"]
-            .as_table_mut()
-            .expect("model_providers was initialized")[local_router::ROUTER_PROVIDER_ID] =
-            Item::Table(local_router_provider_table(local_router));
-        doc["model_provider"] = value(local_router::ROUTER_PROVIDER_ID);
+        for (id, table) in runtime_router_provider_tables(local_router) {
+            doc["model_providers"]
+                .as_table_mut()
+                .expect("model_providers was initialized")[id] = Item::Table(table);
+        }
+        doc["model_provider"] = value(if local_router.supports_remote_compaction {
+            local_router::REMOTE_COMPACTION_PROVIDER_ID
+        } else {
+            local_router::ROUTER_PROVIDER_ID
+        });
         update_model_catalog_reference(&mut doc, config_path, model_catalog_path);
         set_model_selection(&mut doc, default_model);
     }
@@ -2482,7 +2570,7 @@ fn build_isolated_runtime_overrides(
     // 选中内置 Provider 时不能下发 `model_providers.<id>.*`：Codex 在加载配置
     // 阶段就会以「reserved built-in provider IDs」为由退出，app-server 随之
     // 启动失败，因此这类覆盖必须整条跳过，由 Codex 自身默认值接管。
-    if !RESERVED_BUILTIN_PROVIDER_IDS.contains(&retry_provider_id) {
+    if provider_id.is_none() && !RESERVED_BUILTIN_PROVIDER_IDS.contains(&retry_provider_id) {
         let provider_segment =
             codex_config_override_bare_segment(retry_provider_id, "Codex Provider ID")?;
         push_runtime_override_value(
@@ -2490,17 +2578,6 @@ fn build_isolated_runtime_overrides(
             &format!("model_providers.{provider_segment}.stream_max_retries"),
             &Value::from(stream_max_retries as i64),
         );
-        if provider_id.is_some() {
-            // 压缩期间 Codey 要等上游完整生成并通过校验才写回下游，客户端默认
-            // 的 5 分钟流空闲期限会先判定连接失效；这里按 Codey 的上游预算放宽。
-            push_runtime_override_value(
-                &mut overrides,
-                &format!("model_providers.{provider_segment}.stream_idle_timeout_ms"),
-                &Value::from(
-                    local_router::COMPACTION_CLIENT_STREAM_IDLE_TIMEOUT.as_millis() as i64,
-                ),
-            );
-        }
     }
     push_required_document_override(
         &mut overrides,
@@ -2529,9 +2606,11 @@ fn build_isolated_runtime_overrides(
         "model_catalog_json",
     )?;
 
-    // The only runtime provider is Codey's process-local loopback gateway.
-    // Upstream route tables and credentials never enter Codex's configuration.
-    if let Some(provider_id) = provider_id {
+    // 两种压缩方式共用本地网关，上游凭据不进入 Codex 配置。
+    for provider_id in local_router::ROUTER_PROVIDER_IDS
+        .into_iter()
+        .filter(|_| provider_id.is_some())
+    {
         let provider_segment =
             codex_config_override_bare_segment(provider_id, "Codex Provider ID")?;
         for field in [
@@ -2555,6 +2634,16 @@ fn build_isolated_runtime_overrides(
             &["model_providers", provider_id, "experimental_bearer_token"],
             &format!("model_providers.{provider_segment}.experimental_bearer_token"),
         )?;
+        push_runtime_override_value(
+            &mut overrides,
+            &format!("model_providers.{provider_segment}.stream_max_retries"),
+            &Value::from(stream_max_retries as i64),
+        );
+        push_runtime_override_value(
+            &mut overrides,
+            &format!("model_providers.{provider_segment}.stream_idle_timeout_ms"),
+            &Value::from(local_router::COMPACTION_CLIENT_STREAM_IDLE_TIMEOUT.as_millis() as i64),
+        );
     }
 
     if fastctx_namespace.is_some() {
@@ -2740,8 +2829,10 @@ fn build_isolated_runtime_overrides(
         );
         push_runtime_hook_trust_override(&mut overrides, hook_trust_entries);
     }
-    if let Some(provider_id) = provider_id {
-        validate_runtime_router_overrides(&overrides, provider_id)?;
+    if provider_id.is_some() {
+        for id in local_router::ROUTER_PROVIDER_IDS {
+            validate_runtime_router_overrides(&overrides, id)?;
+        }
     }
     Ok(overrides)
 }
@@ -2821,7 +2912,11 @@ fn validate_runtime_router_overrides(overrides: &[String], provider_id: &str) ->
                 .split_once('=')
                 .is_some_and(|(_, value)| value.trim() == toml_string_literal(provider_id))
     });
-    if !selected_router {
+    if !selected_router
+        && !overrides.iter().any(|entry| {
+            runtime_override_key(entry) == format!("model_providers.{provider_segment}.name")
+        })
+    {
         return Ok(());
     }
 
@@ -3063,15 +3158,7 @@ fn remap_hook_state_entries(
 
 fn local_router_provider_table(endpoint: &RuntimeRouterEndpoint) -> Table {
     let mut provider = Table::new();
-    provider["name"] = value(if endpoint.supports_remote_compaction {
-        // Codex derives remote compaction from this exact name. Authentication
-        // remains an independent provider field so mixed Chat/Responses
-        // runtimes can keep official login without advertising compaction to
-        // routes that cannot carry its Responses V2 trigger.
-        OPENAI_PROVIDER_NAME
-    } else {
-        LOCAL_ROUTER_PROVIDER_NAME
-    });
+    provider["name"] = value(LOCAL_ROUTER_PROVIDER_NAME);
     provider["base_url"] = value(endpoint.base_url.trim_end_matches('/'));
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(endpoint.requires_openai_auth);
@@ -3086,6 +3173,17 @@ fn local_router_provider_table(endpoint: &RuntimeRouterEndpoint) -> Table {
         provider["experimental_bearer_token"] = value(endpoint.token.as_str());
     }
     provider
+}
+
+fn runtime_router_provider_tables(endpoint: &RuntimeRouterEndpoint) -> [(&'static str, Table); 2] {
+    let local = local_router_provider_table(endpoint);
+    let mut remote = local.clone();
+    // Codex 依据这个名称选择原生远程压缩；鉴权与压缩能力相互独立。
+    remote["name"] = value(OPENAI_PROVIDER_NAME);
+    [
+        (local_router::ROUTER_PROVIDER_ID, local),
+        (local_router::REMOTE_COMPACTION_PROVIDER_ID, remote),
+    ]
 }
 
 pub(crate) fn runtime_model_catalog_path(

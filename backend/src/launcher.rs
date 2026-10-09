@@ -308,7 +308,7 @@ fn validate_router_provider(home: &std::path::Path) -> Result<()> {
         // compatible with the live loopback table installed later.
         anyhow::bail!(
             "Codex config.toml 已占用 Codey 内部 Provider ID「{}」；请先重命名该自定义 Provider",
-            ROUTER_PROVIDER_ID
+            crate::local_router::ROUTER_PROVIDER_IDS.join("、")
         );
     }
     Ok(())
@@ -709,6 +709,7 @@ async fn prepare_startup_model_catalog(
         && config.official_account_available_this_launch;
     let (runtime_upstream_models, runtime_selected_models) = config.runtime_catalog_models();
     let runtime_websocket_models = config.runtime_websocket_model_aliases();
+    let runtime_remote_compaction_models = config.runtime_remote_compaction_model_aliases();
     let runtime_native_web_search_models = config.runtime_native_web_search_model_aliases();
     let runtime_image_detail_original_models = config.runtime_image_detail_original_model_aliases();
     let runtime_model_reasoning_efforts = config.runtime_model_reasoning_efforts();
@@ -766,6 +767,7 @@ async fn prepare_startup_model_catalog(
                     websocket_models: Some(&runtime_websocket_models),
                     native_web_search_models: Some(&runtime_native_web_search_models),
                     image_detail_original_models: Some(&runtime_image_detail_original_models),
+                    remote_compaction_models: Some(&runtime_remote_compaction_models),
                 },
                 model_catalog::CatalogOverrides {
                     plugin_contexts: &runtime_plugin_model_contexts,
@@ -779,6 +781,7 @@ async fn prepare_startup_model_catalog(
                     &catalog_home,
                     &runtime_native_web_search_models,
                     &runtime_image_detail_original_models,
+                    &runtime_remote_compaction_models,
                 )
                 .and_then(|available| {
                     if available {
@@ -929,6 +932,7 @@ async fn prepare_codex_startup_state(
     let stream_max_retries = config.stream_max_retries;
     let runtime_default_model = runtime_default_model(config, use_official_catalog, &model_state);
     let runtime_model_contexts = config.runtime_enabled_model_contexts();
+    let remote_compaction_models = config.runtime_remote_compaction_model_aliases();
     let fast_context_tools = config.fast_context_tools;
     let mut runtime_subagent_config = config.clone();
     runtime_subagent_config.active_profile_id = current_profile.id.clone();
@@ -947,6 +951,7 @@ async fn prepare_codex_startup_state(
             &runtime_config_home,
             RuntimeRouterConfigOptions {
                 local_router: Some(&runtime_local_router),
+                remote_compaction_models: Some(&remote_compaction_models),
                 use_official_catalog,
                 model_contexts: Some(&runtime_model_contexts),
                 default_model: runtime_default_model.as_deref(),
@@ -1740,6 +1745,7 @@ async fn prepare_native_runtime_state(
             &runtime_config_home,
             RuntimeRouterConfigOptions {
                 local_router: None,
+                remote_compaction_models: None,
                 use_official_catalog: false,
                 model_contexts: None,
                 default_model: None,

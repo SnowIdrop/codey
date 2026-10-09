@@ -1174,12 +1174,13 @@ fn model_changes_accept_only_the_known_builtin_catalog_fallback() {
         model_catalog::refresh_for_provider(home.path(), false, Some(&models), &models)
             .unwrap_err();
 
-    assert!(model_catalog_fallback(Err(missing_cache), home.path(), &[], &[]).unwrap());
-    assert!(!model_catalog_fallback(Ok(()), home.path(), &[], &[]).unwrap());
+    assert!(model_catalog_fallback(Err(missing_cache), home.path(), &[], &[], &[]).unwrap());
+    assert!(!model_catalog_fallback(Ok(()), home.path(), &[], &[], &[]).unwrap());
     assert_eq!(
         model_catalog_fallback(
             Err(anyhow::anyhow!("模型目录写入失败")),
             home.path(),
+            &[],
             &[],
             &[],
         )
@@ -1509,7 +1510,7 @@ fn renderer_catalog_routes_every_model_through_the_codey_router_carrier() {
     assert_eq!(official_metadata["route_prefix"].as_str(), Some("官方"));
     assert_eq!(
         official_metadata["provider_id"].as_str(),
-        Some(local_router::ROUTER_PROVIDER_ID)
+        Some(local_router::REMOTE_COMPACTION_PROVIDER_ID)
     );
     assert_eq!(
         official_metadata["source_model"].as_str(),
@@ -1531,6 +1532,12 @@ fn renderer_catalog_routes_every_model_through_the_codey_router_carrier() {
         .find(|entry| entry["model"].as_str() == Some("relay/gpt-5.6-sol"))
         .unwrap();
     assert_eq!(relay_metadata["official_account"], false);
+    assert_eq!(official_metadata["supports_remote_compaction"], true);
+    assert_eq!(relay_metadata["supports_remote_compaction"], false);
+    assert_eq!(
+        relay_metadata["provider_id"],
+        local_router::ROUTER_PROVIDER_ID
+    );
 
     for profile in &mut config.profiles {
         profile.name.clear();
@@ -1767,6 +1774,10 @@ fn built_in_router_hot_reloads_added_and_removed_third_party_routes() {
         &applied,
         &after_delete
     ));
+    assert!(!remote_compaction_transport_requires_restart(
+        &applied,
+        &after_delete
+    ));
 
     let mut route_c = crate::config::ProviderProfile::new("Route C");
     route_c.id = "route-c".into();
@@ -1776,6 +1787,9 @@ fn built_in_router_hot_reloads_added_and_removed_third_party_routes() {
     after_add.profiles.push(route_c);
     assert!(provider_route_requires_restart(&applied, &after_add));
     assert!(runtime_supports_current_routes_for_hot_reload(
+        &applied, &after_add
+    ));
+    assert!(!remote_compaction_transport_requires_restart(
         &applied, &after_add
     ));
 }
@@ -2060,6 +2074,22 @@ fn remote_compaction_identity_changes_require_restart_and_stop_hot_reload() {
     ));
     assert!(remote_compaction_transport_requires_restart(
         &enabled, &applied
+    ));
+
+    let mut mixed = enabled.clone();
+    let mut other = mixed.profiles[0].clone();
+    other.id = "route-b".into();
+    other.supports_remote_compaction = false;
+    mixed.profiles.push(other);
+    let mut swapped = mixed.clone();
+    swapped.profiles[0].supports_remote_compaction = false;
+    swapped.profiles[1].supports_remote_compaction = true;
+    assert_eq!(
+        mixed.remote_compaction_mode(),
+        swapped.remote_compaction_mode()
+    );
+    assert!(remote_compaction_transport_requires_restart(
+        &mixed, &swapped
     ));
 }
 

@@ -6,76 +6,78 @@ use crate::codex_config_guidance::{
 const LEGACY_GLOBAL_PROVIDER_ID: &str = "codey_global";
 
 fn assert_resume_shim(document: &DocumentMut, base_url: &str, requires_openai_auth: bool) {
-    let router = document["model_providers"][local_router::ROUTER_PROVIDER_ID]
-        .as_table_like()
-        .expect("codey_router resume shim");
-    assert_eq!(
-        router.get("name").and_then(Item::as_str),
-        Some("Codey Local Router")
-    );
-    assert_eq!(
-        router.get("base_url").and_then(Item::as_str),
-        Some(base_url)
-    );
-    assert_eq!(
-        router.get("wire_api").and_then(Item::as_str),
-        Some("responses")
-    );
-    assert_eq!(
-        router.get("requires_openai_auth").and_then(Item::as_bool),
-        Some(requires_openai_auth)
-    );
-    assert_eq!(
-        router.get("supports_websockets").and_then(Item::as_bool),
-        Some(false)
-    );
-    assert!(
-        router
-            .get("http_headers")
-            .and_then(Item::as_table_like)
-            .is_none_or(|headers| !headers.contains_key(local_router::ROUTER_AUTH_HEADER))
-    );
-    assert!(
-        router
-            .get("experimental_bearer_token")
-            .and_then(Item::as_str)
-            .is_none_or(|token| token.trim().is_empty())
-    );
+    for id in local_router::ROUTER_PROVIDER_IDS {
+        let router = document["model_providers"][id]
+            .as_table_like()
+            .expect("router resume shim");
+        assert_eq!(
+            router.get("name").and_then(Item::as_str),
+            Some("Codey Local Router")
+        );
+        assert_eq!(
+            router.get("base_url").and_then(Item::as_str),
+            Some(base_url)
+        );
+        assert_eq!(
+            router.get("wire_api").and_then(Item::as_str),
+            Some("responses")
+        );
+        assert_eq!(
+            router.get("requires_openai_auth").and_then(Item::as_bool),
+            Some(requires_openai_auth)
+        );
+        assert_eq!(
+            router.get("supports_websockets").and_then(Item::as_bool),
+            Some(false)
+        );
+        assert!(
+            router
+                .get("http_headers")
+                .and_then(Item::as_table_like)
+                .is_none_or(|headers| !headers.contains_key(local_router::ROUTER_AUTH_HEADER))
+        );
+        assert!(router.get("experimental_bearer_token").is_none());
+    }
 }
 
 fn assert_runtime_disk_provider(document: &DocumentMut, base_url: &str, token: &str) {
-    let router = document["model_providers"][local_router::ROUTER_PROVIDER_ID]
-        .as_table_like()
-        .expect("codey_router runtime disk provider");
-    assert_eq!(
-        router.get("name").and_then(Item::as_str),
-        Some("Codey Local Router")
-    );
-    assert_eq!(
-        router.get("base_url").and_then(Item::as_str),
-        Some(base_url)
-    );
-    assert_eq!(
-        router.get("wire_api").and_then(Item::as_str),
-        Some("responses")
-    );
-    assert_eq!(
-        router.get("requires_openai_auth").and_then(Item::as_bool),
-        Some(true)
-    );
-    assert_eq!(
-        router.get("supports_websockets").and_then(Item::as_bool),
-        Some(false)
-    );
-    assert!(router.get("experimental_bearer_token").is_none());
-    assert_eq!(
-        router
-            .get("http_headers")
-            .and_then(Item::as_table_like)
-            .and_then(|headers| headers.get(local_router::ROUTER_AUTH_HEADER))
-            .and_then(Item::as_str),
-        Some(token)
-    );
+    for (id, name) in [
+        (local_router::ROUTER_PROVIDER_ID, LOCAL_ROUTER_PROVIDER_NAME),
+        (
+            local_router::REMOTE_COMPACTION_PROVIDER_ID,
+            OPENAI_PROVIDER_NAME,
+        ),
+    ] {
+        let router = document["model_providers"][id]
+            .as_table_like()
+            .expect("codey_router runtime disk provider");
+        assert_eq!(router.get("name").and_then(Item::as_str), Some(name));
+        assert_eq!(
+            router.get("base_url").and_then(Item::as_str),
+            Some(base_url)
+        );
+        assert_eq!(
+            router.get("wire_api").and_then(Item::as_str),
+            Some("responses")
+        );
+        assert_eq!(
+            router.get("requires_openai_auth").and_then(Item::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            router.get("supports_websockets").and_then(Item::as_bool),
+            Some(false)
+        );
+        assert!(router.get("experimental_bearer_token").is_none());
+        assert_eq!(
+            router
+                .get("http_headers")
+                .and_then(Item::as_table_like)
+                .and_then(|headers| headers.get(local_router::ROUTER_AUTH_HEADER))
+                .and_then(Item::as_str),
+            Some(token)
+        );
+    }
 }
 
 #[test]
@@ -615,27 +617,35 @@ fn runtime_disk_provider_replaces_chatgpt_resume_shim() {
 
 #[test]
 fn runtime_disk_provider_leaves_a_user_owned_codey_router_untouched() {
-    let temp = tempfile::tempdir().unwrap();
-    let home = temp.path().join("codex-home");
-    fs::create_dir_all(&home).unwrap();
-    let original = br#"model_provider = "codey_router"
+    for id in local_router::ROUTER_PROVIDER_IDS {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        let original = format!(
+            r#"model_provider = "{id}"
 
-[model_providers.codey_router]
+[model_providers.{id}]
 name = "User-Owned Router"
 base_url = "https://relay.example/v1"
 wire_api = "responses"
-"#;
-    fs::write(home.join("config.toml"), original).unwrap();
-    let endpoint = crate::local_router::RuntimeRouterEndpoint {
-        base_url: "http://127.0.0.1:43127/v1".into(),
-        token: "launch-only-router-token".into(),
-        supports_websockets: false,
-        supports_remote_compaction: false,
-        requires_openai_auth: false,
-    };
+"#
+        );
+        fs::write(home.join("config.toml"), &original).unwrap();
+        let endpoint = crate::local_router::RuntimeRouterEndpoint {
+            base_url: "http://127.0.0.1:43127/v1".into(),
+            token: "launch-only-router-token".into(),
+            supports_websockets: false,
+            supports_remote_compaction: false,
+            requires_openai_auth: false,
+        };
 
-    assert!(!prepare_runtime_router_disk_provider_at(&home, &endpoint).unwrap());
-    assert_eq!(fs::read(home.join("config.toml")).unwrap(), original);
+        assert!(!prepare_runtime_router_disk_provider_at(&home, &endpoint).unwrap());
+        assert!(!prepare_persistent_router_resume_shim_at(&home).unwrap());
+        assert_eq!(
+            fs::read_to_string(home.join("config.toml")).unwrap(),
+            original
+        );
+    }
 }
 
 #[test]
@@ -665,6 +675,7 @@ fn isolated_runtime_restores_live_disk_provider_to_resume_shim() {
     apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            remote_compaction_models: None,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
@@ -706,6 +717,54 @@ fn isolated_runtime_restores_live_disk_provider_to_resume_shim() {
 }
 
 #[test]
+fn restore_cleans_owned_router_siblings_without_changing_a_user_owned_selection() {
+    for (user_id, owned_id) in [
+        (
+            local_router::ROUTER_PROVIDER_ID,
+            local_router::REMOTE_COMPACTION_PROVIDER_ID,
+        ),
+        (
+            local_router::REMOTE_COMPACTION_PROVIDER_ID,
+            local_router::ROUTER_PROVIDER_ID,
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let original = format!(
+            r#"
+model_provider = "{user_id}"
+model = "user-model"
+[model_providers.{user_id}]
+name = "User-Owned Router"
+base_url = "https://relay.example/v1"
+wire_api = "responses"
+[model_providers.{owned_id}]
+name = "OpenAI"
+base_url = "http://127.0.0.1:43127/v1"
+experimental_bearer_token = "expired-launch-token"
+http_headers = {{ x-codey-router-token = "expired-launch-token" }}
+"#
+        );
+        fs::write(home.join("config.toml"), &original).unwrap();
+        assert!(repair_persistent_codey_runtime_config(home).unwrap());
+        let restored = fs::read_to_string(home.join("config.toml")).unwrap();
+        let document = restored.parse::<DocumentMut>().unwrap();
+        assert_eq!(document["model_provider"].as_str(), Some(user_id));
+        assert_eq!(document["model"].as_str(), Some("user-model"));
+        assert_eq!(
+            document["model_providers"][user_id].to_string(),
+            original.parse::<DocumentMut>().unwrap()["model_providers"][user_id].to_string()
+        );
+        assert_eq!(
+            document["model_providers"][owned_id]["base_url"].as_str(),
+            Some(CHATGPT_CODEX_BASE_URL)
+        );
+        assert!(!restored.contains("expired-launch-token"));
+        assert!(!repair_persistent_codey_runtime_config(home).unwrap());
+    }
+}
+
+#[test]
 fn remote_compaction_runtime_identity_returns_to_a_secret_free_resume_shim() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex-home");
@@ -729,7 +788,7 @@ fn remote_compaction_runtime_identity_returns_to_a_secret_free_resume_shim() {
         .parse::<DocumentMut>()
         .unwrap();
     assert_eq!(
-        live["model_providers"][local_router::ROUTER_PROVIDER_ID]["name"].as_str(),
+        live["model_providers"][local_router::REMOTE_COMPACTION_PROVIDER_ID]["name"].as_str(),
         Some("OpenAI")
     );
 
@@ -776,6 +835,7 @@ fn local_router_accepts_a_codey_owned_resume_shim() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            remote_compaction_models: None,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
@@ -827,6 +887,7 @@ fn isolated_runtime_config_creates_empty_codex_config_when_missing() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            remote_compaction_models: None,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
@@ -956,7 +1017,8 @@ fn disabled_subagent_roles_are_registered_with_safe_defaults_but_omitted_from_po
         registration_roles[crate::config::SUBAGENT_ROLE_WORKER],
         runtime_roles[SUBAGENT_ROLE_DEFAULT]
     );
-    let plans = plan_runtime_agent_files(&constraints_dir, &registration_roles, None).unwrap();
+    let plans =
+        plan_runtime_agent_files(&constraints_dir, &registration_roles, None, None).unwrap();
     assert_eq!(plans.len(), SUBAGENT_ROLE_IDS.len());
 
     let stale_worker_path =
@@ -966,7 +1028,7 @@ fn disabled_subagent_roles_are_registered_with_safe_defaults_but_omitted_from_po
     }
     fs::write(&stale_worker_path, b"stale worker runtime file").unwrap();
     let registrations =
-        prepare_runtime_agent_files(&constraints_dir, &registration_roles, None).unwrap();
+        prepare_runtime_agent_files(&constraints_dir, &registration_roles, None, None).unwrap();
     assert_eq!(registrations.len(), SUBAGENT_ROLE_IDS.len());
     let worker = fs::read_to_string(&stale_worker_path).unwrap();
     assert!(!worker.contains("missing/disabled-model"));
@@ -1305,7 +1367,8 @@ fn runtime_analysis_agents_share_tools_and_keep_task_boundaries() {
     let constraints_dir = temp.path().join("codex-constraints");
     let roles = crate::config::default_subagent_roles();
     let plans =
-        plan_runtime_agent_files(&constraints_dir, &roles, Some(CODEY_FASTCTX_GUIDANCE)).unwrap();
+        plan_runtime_agent_files(&constraints_dir, &roles, Some(CODEY_FASTCTX_GUIDANCE), None)
+            .unwrap();
 
     for plan in &plans {
         let config = parse_document(std::str::from_utf8(&plan.contents).unwrap()).unwrap();
@@ -1342,6 +1405,33 @@ fn runtime_analysis_agents_share_tools_and_keep_task_boundaries() {
 }
 
 #[test]
+fn runtime_agents_select_compaction_from_their_own_model() {
+    let source = subagent_source_config(SUBAGENT_ROLE_DEFAULT).unwrap();
+    let remote_models = HashSet::from(["remote/shared".to_string()]);
+    for (model, expected) in [
+        ("remote/shared", "codey_router_remote"),
+        ("local/shared", "codey_router"),
+        ("shared", "codey_router"),
+    ] {
+        let selection = SubagentRoleConfig::new(model, "high");
+        let (bytes, _) = render_runtime_agent(
+            source,
+            SUBAGENT_ROLE_DEFAULT,
+            &selection,
+            None,
+            Some(&remote_models),
+        )
+        .unwrap();
+        let document = parse_document(std::str::from_utf8(&bytes).unwrap()).unwrap();
+        assert_eq!(document["model_provider"].as_str(), Some(expected));
+    }
+    assert!(
+        !source.contains("model_provider"),
+        "editable templates stay independent of launch routing"
+    );
+}
+
+#[test]
 fn runtime_analysis_templates_upgrade_owned_defaults_and_preserve_custom_sources() {
     for role in [
         "codey_quick_scan",
@@ -1357,7 +1447,7 @@ fn runtime_analysis_templates_upgrade_owned_defaults_and_preserve_custom_sources
         let [current, previous] = subagent_source_config_versions(role).unwrap();
         fs::write(&source_path, previous).unwrap();
         let roles = crate::config::default_subagent_roles();
-        let plans = plan_runtime_agent_files(&constraints_dir, &roles, None).unwrap();
+        let plans = plan_runtime_agent_files(&constraints_dir, &roles, None, None).unwrap();
         assert_eq!(fs::read_to_string(&source_path).unwrap(), previous);
         let plan = plans
             .iter()
@@ -1372,7 +1462,7 @@ fn runtime_analysis_templates_upgrade_owned_defaults_and_preserve_custom_sources
 
         let customized = format!("{previous}\n# User customization\n");
         fs::write(&source_path, &customized).unwrap();
-        plan_runtime_agent_files(&constraints_dir, &roles, None).unwrap();
+        plan_runtime_agent_files(&constraints_dir, &roles, None, None).unwrap();
         assert_eq!(fs::read_to_string(&source_path).unwrap(), customized);
     }
 }
@@ -1485,6 +1575,7 @@ fn native_runtime_forwards_user_catalog_with_the_same_resolved_path() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            remote_compaction_models: None,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: None,
@@ -1529,6 +1620,7 @@ fn native_isolated_runtime_does_not_create_a_missing_codex_config() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            remote_compaction_models: None,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: None,
@@ -1589,6 +1681,7 @@ fn runtime_context_overlay_uses_user_catalog_and_reset_restores_its_path() {
         let applied = apply_isolated_runtime_router_config(
             &home,
             RouterApplyOptions {
+                remote_compaction_models: None,
                 local_router: router.then(test_runtime_router_endpoint),
                 use_official_catalog: router,
                 model_contexts: Some(contexts),
@@ -1666,6 +1759,7 @@ fn context_budget_startup_applies_and_recovers_global_conflicts() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            remote_compaction_models: None,
             local_router: Some(test_runtime_router_endpoint()),
             use_official_catalog: true,
             model_contexts: Some(&policies),
@@ -1737,6 +1831,7 @@ fn isolated_runtime_skips_retry_overrides_for_builtin_providers() {
         let applied = apply_isolated_runtime_router_config(
             &home,
             RouterApplyOptions {
+                remote_compaction_models: None,
                 model_contexts: None,
                 stream_max_retries: 7,
                 local_router: None,
@@ -1783,6 +1878,7 @@ fn isolated_runtime_keeps_retry_overrides_for_custom_providers() {
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            remote_compaction_models: None,
             model_contexts: None,
             stream_max_retries: 7,
             local_router: None,
@@ -1839,6 +1935,7 @@ fn isolated_runtime_preserves_computer_use_without_adding_an_mcp() {
             let applied = apply_isolated_runtime_router_config(
                 &home,
                 RouterApplyOptions {
+                    remote_compaction_models: None,
                     model_contexts: None,
                     stream_max_retries: 5,
                     local_router,
@@ -1891,6 +1988,7 @@ wire_api = "responses"
     apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            remote_compaction_models: None,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: None,
@@ -1998,9 +2096,22 @@ fn runtime_router_separates_openai_identity_from_auth_shape() {
     );
 
     endpoint.supports_remote_compaction = true;
-    let provider = local_router_provider_table(&endpoint);
-    assert_eq!(provider["name"].as_str(), Some("OpenAI"));
-    assert_eq!(provider["requires_openai_auth"].as_bool(), Some(false));
+    let [(local_id, local), (remote_id, remote)] = runtime_router_provider_tables(&endpoint);
+    assert_eq!(local_id, local_router::ROUTER_PROVIDER_ID);
+    assert_eq!(remote_id, local_router::REMOTE_COMPACTION_PROVIDER_ID);
+    assert_eq!(local["name"].as_str(), Some("Codey Local Router"));
+    assert_eq!(remote["name"].as_str(), Some("OpenAI"));
+    for provider in [&local, &remote] {
+        assert_eq!(provider["requires_openai_auth"].as_bool(), Some(false));
+        assert_eq!(
+            provider["experimental_bearer_token"].as_str(),
+            Some("test-router-token")
+        );
+        assert_eq!(
+            provider["base_url"].as_str(),
+            Some("http://127.0.0.1:43127/v1")
+        );
+    }
 }
 
 #[test]
@@ -3218,6 +3329,7 @@ experimental_bearer_token = "upstream-secret-token"
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            remote_compaction_models: None,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
@@ -3303,6 +3415,7 @@ fn official_login_uses_the_websocket_router_without_overriding_builtin_openai() 
     let applied = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            remote_compaction_models: None,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),
@@ -3320,14 +3433,54 @@ fn official_login_uses_the_websocket_router_without_overriding_builtin_openai() 
     .unwrap();
 
     let rendered = applied.runtime_config_overrides.join("\n");
-    assert!(rendered.contains("model_provider=\"codey_router\""));
+    assert!(rendered.contains("model_provider=\"codey_router_remote\""));
     assert!(rendered.contains("model=\"openai/gpt-5.6-sol\""));
-    assert!(rendered.contains("model_providers.codey_router.name=\"OpenAI\""));
+    assert!(rendered.contains("model_providers.codey_router_remote.name=\"OpenAI\""));
+    assert!(rendered.contains("model_providers.codey_router.name=\"Codey Local Router\""));
     assert!(rendered.contains("model_providers.codey_router.requires_openai_auth=true"));
     assert!(rendered.contains("model_providers.codey_router.supports_websockets=true"));
     assert!(rendered.contains("x-codey-router-token"));
     assert!(!rendered.contains("model_providers.codey_router.experimental_bearer_token="));
     assert!(!rendered.contains("openai_base_url="));
+}
+
+#[test]
+fn builtin_catalog_roles_keep_the_selected_routes_compaction_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let marker = temp.path().join("state/lease.json");
+    let backups = temp.path().join("backups");
+    apply_isolated_runtime_router_config(
+        &home,
+        RouterApplyOptions {
+            remote_compaction_models: Some(&[DEFAULT_SUBAGENT_MODEL.to_string()]),
+            local_router: Some(test_runtime_router_endpoint()),
+            stream_max_retries: 5,
+            use_official_catalog: false,
+            model_contexts: None,
+            default_model: None,
+            fastctx_command: None,
+            subagent_optimization: true,
+            subagent_model: DEFAULT_SUBAGENT_MODEL,
+            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+            subagent_roles: None,
+            marker: &marker,
+            backup_root: &backups,
+        },
+    )
+    .unwrap();
+    let path = runtime_agent_path(
+        &marker.with_file_name(CODEY_CONSTRAINTS_DIR),
+        SUBAGENT_ROLE_DEFAULT,
+    );
+    let role = fs::read_to_string(path)
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert_eq!(
+        role["model_provider"].as_str(),
+        Some(local_router::REMOTE_COMPACTION_PROVIDER_ID)
+    );
 }
 
 #[test]
@@ -3353,6 +3506,7 @@ wire_api = "responses"
     let error = apply_isolated_runtime_router_config(
         &home,
         RouterApplyOptions {
+            remote_compaction_models: None,
             model_contexts: None,
             stream_max_retries: 5,
             local_router: Some(&endpoint),

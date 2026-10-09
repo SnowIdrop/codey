@@ -386,6 +386,7 @@ fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
             "route_name": "默认配置",
             "route_prefix": "默认",
             "provider_id": "codey_router",
+            "supports_remote_compaction": false,
             "source_model": "gpt-5.6-sol",
             "official_account": false,
             "route_provider_id": "source-provider",
@@ -403,6 +404,7 @@ fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
             "route_name": "默认配置",
             "route_prefix": "默认",
             "provider_id": "codey_router",
+            "supports_remote_compaction": false,
             "source_model": "provider-fast-coder",
             "official_account": false,
             "route_provider_id": "source-provider",
@@ -513,7 +515,7 @@ fn renderer_model_catalog_routes_official_account_models_through_the_codey_route
     assert_eq!(catalog["default_model"], "gpt-5.6-sol");
     assert_eq!(
         catalog["model_provider"],
-        crate::local_router::ROUTER_PROVIDER_ID
+        crate::local_router::REMOTE_COMPACTION_PROVIDER_ID
     );
     assert_eq!(
         catalog["model_metadata"][0],
@@ -522,7 +524,8 @@ fn renderer_model_catalog_routes_official_account_models_through_the_codey_route
             "display_name": "[默认] gpt-5.6-sol",
             "route_name": "默认配置",
             "route_prefix": "默认",
-            "provider_id": crate::local_router::ROUTER_PROVIDER_ID,
+            "provider_id": crate::local_router::REMOTE_COMPACTION_PROVIDER_ID,
+            "supports_remote_compaction": true,
             "source_model": "gpt-5.6-sol",
             "official_account": true,
             "route_provider_id": "openai",

@@ -36,9 +36,11 @@ fn remote_compaction_status_value(
     json!({
         "configured": configured,
         "active": active,
+        "configuredMode": if config.local_router_enabled { config.remote_compaction_mode() } else { "local" },
+        "activeMode": applied.filter(|applied| applied.local_router_enabled).map(|applied| applied.remote_compaction_mode()),
         "restartRequired": applied.is_some_and(|applied| {
             applied.local_router_enabled != config.local_router_enabled
-                || active.is_some_and(|active| active != configured)
+                || super::models::remote_compaction_transport_requires_restart(applied, config)
         }),
         "blockingRoutes": config.remote_compaction_blockers(),
     })

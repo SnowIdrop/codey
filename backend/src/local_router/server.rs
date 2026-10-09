@@ -208,7 +208,8 @@ impl LocalRouter {
             base_url: format!("http://127.0.0.1:{port}/v1"),
             token,
             supports_websockets: config.runtime_supports_websockets(),
-            supports_remote_compaction: config.runtime_supports_remote_compaction(),
+            // 未携带线路信息的原生会话只在全部线路兼容时默认使用远程压缩。
+            supports_remote_compaction: config.remote_compaction_mode() == "remote",
             requires_openai_auth: config.router_requires_openai_auth(),
         };
         let snapshot = Arc::new(RwLock::new(Arc::new(RouterSnapshot::from_config(config))));

@@ -772,7 +772,7 @@ function ModelSectionComponent({
             <p>{compactionStatus.detail}</p>
             {config.localRouterEnabled && compactionBlockers.length > 0 && (
               <details>
-                <summary className="cursor-pointer">{compactionBlockers.length} 条线路阻止已保存配置使用远程压缩</summary>
+                <summary className="cursor-pointer">已保存配置中有 {compactionBlockers.length} 条线路使用本地压缩</summary>
                 <ul className="mt-1.5 space-y-1">
                   {compactionBlockers.map((route) => (
                     <li key={route.routeId}>{route.routeName}：{route.reason}</li>
@@ -1581,7 +1581,7 @@ function ModelSectionComponent({
                       <div className="route-option-header">
                         <div className="route-option-title-group">
                           <strong className="route-option-title">原生远程压缩</strong>
-                          <Tooltip content="仅在上游明确支持时开启，并选择服务商支持的压缩接口；所有启用线路都支持时 Codex 才会使用，能力变更需重启。">
+                          <Tooltip content="仅在上游明确支持时开启，并选择服务商支持的压缩接口；该线路可独立使用远程压缩，能力变更需重启 Codex。">
                             <span className="route-option-info-trigger" aria-label="原生远程压缩详细说明">
                               <IconInfoCircle size={13} />
                             </span>
@@ -1597,7 +1597,7 @@ function ModelSectionComponent({
                         />
                       </div>
                       <small className="route-field-hint">
-                        仅在上游明确支持时开启；所有启用线路都支持时才会使用
+                        支持的线路独立启用；会话切换压缩方式需重启 Codex 或新建任务
                       </small>
                     </div>
                     <div className="route-option-item">

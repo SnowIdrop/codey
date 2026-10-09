@@ -6,6 +6,77 @@ import { FakeElementCore } from "./helpers/fake-element.mjs";
 
 const MODEL_CONFIG_ID = "107580212";
 
+const mixedCompactionCatalog = {
+  status: "ok", models: ["local/shared", "remote/shared", "gpt-6-astra"],
+  default_model: "local/shared",
+  model_metadata: [
+    { model: "local/shared", source_model: "shared", route_provider_id: "local", provider_id: "codey_router", supports_remote_compaction: false },
+    { model: "remote/shared", source_model: "shared", route_provider_id: "remote", provider_id: "codey_router_remote", supports_remote_compaction: true },
+    { model: "gpt-6-astra", source_model: "gpt-6-astra", route_provider_id: "openai", provider_id: "codey_router_remote", supports_remote_compaction: true, official_account: true },
+  ],
+};
+const compactionRequest = (method, params, id = method) => ({ type: "mcp-request", request: { id, method, params } });
+const compactionReply = (runtime, id, result) => runtime.dispatchWindowEvent("message", {
+  data: { type: "mcp-response", message: { id, result } },
+});
+
+test("mixed routes select compaction independently for new and forked threads", async () => {
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()]);
+  for (const method of ["thread/start", "thread/fork"]) {
+    for (const [model, provider] of [["local/shared", "codey_router"], ["remote/shared", "codey_router_remote"], ["gpt-6-astra", "codey_router_remote"], ["unknown/shared", "codey_router"]]) {
+      const routed = runtime.patch.rewriteOutgoingMessage(compactionRequest(method, { model }));
+      assert.equal(routed.request.params.modelProvider, provider);
+    }
+  }
+  runtime.patch.dispose();
+});
+
+test("a loaded thread blocks a compaction mode change and preserves it for restart", async () => {
+  const storage = memoryStorage();
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()], { storage });
+  runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/start", { model: "local/shared" }));
+  compactionReply(runtime, "thread/start", { modelProvider: "codey_router", thread: { id: "mixed", model: "shared" } });
+  const changed = runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/settings/update", { threadId: "mixed", model: "remote/shared" }));
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(changed), true);
+  assert.equal(JSON.parse(storage.getItem("codey.thread-route-bindings.v1"))[0][1].routeProviderId, "local");
+  const reopened = runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", { threadId: "mixed" }));
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(reopened), true, "a loaded thread cannot change its provider by rejoining");
+  runtime.patch.dispose();
+
+  const restarted = await loadPatch(mixedCompactionCatalog, [statsigClient()], { storage });
+  const resumed = restarted.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", { threadId: "mixed", model: "local/shared" }));
+  assert.equal(restarted.patch.isBlockedOutgoingMessage(resumed), false);
+  assert.equal(resumed.request.params.modelProvider, "codey_router_remote");
+  assert.equal(resumed.request.params.model, "remote/shared");
+  compactionReply(restarted, "thread/resume", { modelProvider: "codey_router_remote", thread: { id: "mixed", model: "shared", modelProvider: "codey_router" } });
+  const sameMode = restarted.patch.rewriteOutgoingMessage(compactionRequest("turn/start", { threadId: "mixed", model: "gpt-6-astra" }));
+  assert.equal(restarted.patch.isBlockedOutgoingMessage(sameMode), false);
+  assert.equal(sameMode.request.params.responsesapiClientMetadata.codey_route, "openai");
+  const local = restarted.patch.rewriteOutgoingMessage(compactionRequest("turn/start", { threadId: "mixed", model: "local/shared" }));
+  assert.equal(restarted.patch.isBlockedOutgoingMessage(local), true);
+  restarted.patch.dispose();
+});
+
+for (const returnedProvider of [undefined, "codey_router"]) {
+  test(`resume must confirm its actual compaction mode (returned provider: ${returnedProvider})`, async () => {
+    const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()]);
+    runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", { threadId: "loaded", model: "remote/shared", modelProvider: "codey_router" }));
+    compactionReply(runtime, "thread/resume", { modelProvider: returnedProvider, thread: { id: "loaded", model: "shared", modelProvider: "codey_router" } });
+    const turn = runtime.patch.rewriteOutgoingMessage(compactionRequest("turn/start", { threadId: "loaded" }));
+    assert.equal(runtime.patch.isBlockedOutgoingMessage(turn), true);
+    runtime.patch.dispose();
+  });
+}
+
+test("a resume response without any provider cannot confirm the requested carrier", async () => {
+  const runtime = await loadPatch(mixedCompactionCatalog, [statsigClient()]);
+  runtime.patch.rewriteOutgoingMessage(compactionRequest("thread/resume", { threadId: "unknown", model: "remote/shared" }));
+  compactionReply(runtime, "thread/resume", { thread: { id: "unknown", model: "shared" } });
+  const turn = runtime.patch.rewriteOutgoingMessage(compactionRequest("turn/start", { threadId: "unknown", model: "remote/shared" }));
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(turn), true);
+  runtime.patch.dispose();
+});
+
 for (const nativeSelectionOnly of [false, true]) {
 test(`Fast stays available across routes and models (native selection: ${nativeSelectionOnly})`, async () => {
   const body = new FakeElementCore("body", { connected: true });
@@ -693,7 +764,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "62");
+  assert.equal(patch.version, "63");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -1077,7 +1148,7 @@ test("a raw model keeps its persisted thread route when multiple routes share th
       type: "mcp-response",
       message: {
         id: "persisted-route-start",
-        result: { thread: { id: "persisted-thread", model: "shared-model" } },
+        result: { modelProvider: "codey_router", thread: { id: "persisted-thread", model: "shared-model" } },
       },
     },
   });
@@ -2096,6 +2167,7 @@ test("an id-less app-server resume records its router migration after request cr
       message: {
         id: "created-after-preflight",
         result: {
+          modelProvider: "codey_router",
           thread: {
             id: "id-less-resume-thread",
             modelProvider: "openai",
@@ -2177,6 +2249,7 @@ test("a legacy custom-carrier thread resumes onto the router and continues on a 
       message: {
         id: "resume-legacy-custom-thread",
         result: {
+          modelProvider: "codey_router",
           thread: {
             id: "legacy-custom-thread",
             model: "gpt-5.6-sol",
@@ -2267,6 +2340,7 @@ test("an external-provider thread resumes onto the router and switches to an off
       message: {
         id: "resume-external-official-thread",
         result: {
+          modelProvider: "codey_router",
           thread: {
             id: "external-official-thread",
             model: "legacy-vendor-model",
@@ -2556,6 +2630,7 @@ test("a prewarmed gateway thread switches models without an invalid turn provide
       message: {
         id: "prewarm-router-draft",
         result: {
+          modelProvider: "codey_router",
           thread: { id: "draft-thread", modelProvider: "codey_router" },
         },
       },
@@ -4573,7 +4648,7 @@ test("native mode can resume from a legacy binding without a model override and 
     "a failed resume must not update the runtime provider");
   runtime.patch.rewriteOutgoingMessage(request);
   runtime.dispatchWindowEvent("message", { data: { type: "mcp-response", message: {
-    id: "resume", result: { thread: { id: "old", modelProvider: "codey_router", model: "vendor/model" } },
+    id: "resume", result: { modelProvider: "native", thread: { id: "old", modelProvider: "codey_router", model: "vendor/model" } },
   } } });
   const continued = runtime.patch.rewriteOutgoingMessage(turn);
   assert.equal(continued, turn, "native app-server now owns the sticky model");

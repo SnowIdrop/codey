@@ -1,9 +1,11 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "62";
+  const patchVersion = "63";
   const nativeSelectionOnly = window.__codeyNativeModelSelectionOnly === true;
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
+  const remoteCompactionProviderId = "codey_router_remote";
+  const routerProviderIds = new Set([localRouterProviderId, remoteCompactionProviderId]);
   const legacyOfficialRouteProviderIds = new Set([
     officialProviderId,
     "local-official",
@@ -11,6 +13,7 @@
   const gatewayProviderIds = new Set([
     officialProviderId,
     localRouterProviderId,
+    remoteCompactionProviderId,
   ]);
   const existingPatch = window.__codeyModelWhitelistPatch;
   if (existingPatch?.version === patchVersion
@@ -58,6 +61,7 @@
   const routeMetadataParam = "responsesapiClientMetadata";
   const routeMetadataKey = "codey_route";
   const persistedThreadRoutesKey = "codey.thread-route-bindings.v1";
+  const persistedRequestedRoutesKey = "codey.thread-requested-routes.v1";
   const persistedDefaultModelHistoryKey = "codey.default-model-history.v1";
   let catalog = {
     loaded: false,
@@ -105,7 +109,11 @@
   // erase a successful runtime migration.
   const threadPersistedProviders = new Map();
   const threadRuntimeProviders = new Map();
+  const unconfirmedThreadProviders = new Set();
   const threadRoutes = new Map();
+  // A blocked mode change is an intent for the next process, not an active
+  // binding. Keep it separate so reopening a loaded thread cannot fake migration.
+  const threadRequestedRoutes = new Map();
   const pendingThreadRequests = new Map();
   const maxTrackedThreadProviders = 2048;
   const maxPendingThreadRequests = 256;
@@ -162,39 +170,42 @@
       maxTrackedThreadProviders,
     );
   };
-  const persistThreadRoutes = () => {
+  const persistThreadRoutes = (routes = threadRoutes, key = persistedThreadRoutesKey) => {
     try {
       window.localStorage?.setItem(
-        persistedThreadRoutesKey,
-        JSON.stringify(Array.from(threadRoutes.entries())),
+        key,
+        JSON.stringify(Array.from(routes.entries())),
       );
     } catch {
       // Routing remains safe for this launch when renderer storage is unavailable.
     }
   };
-  const rememberBoundedThreadRoute = (threadId, route) => {
+  const rememberBoundedThreadRoute = (threadId, route, routes = threadRoutes, key = persistedThreadRoutesKey) => {
     const routeProviderId = requestProviderId(route?.routeProviderId);
     const sourceModel = typeof route?.sourceModel === "string"
       ? route.sourceModel.trim()
       : "";
     if (!threadId || !routeProviderId || !sourceModel) return;
-    const previous = threadRoutes.get(threadId);
+    const previous = routes.get(threadId);
     const changed = !previous
       || modelKey(previous.routeProviderId) !== modelKey(routeProviderId)
       || modelKey(previous.sourceModel) !== modelKey(sourceModel);
     rememberBoundedMap(
-      threadRoutes,
+      routes,
       threadId,
       { routeProviderId, sourceModel },
       maxTrackedThreadProviders,
     );
     // Refresh the in-memory LRU on every turn, but avoid synchronously
     // serializing the entire binding table when the persisted value is unchanged.
-    if (changed) persistThreadRoutes();
+    if (changed) persistThreadRoutes(routes, key);
   };
-  const restoreThreadRoutes = () => {
+  const clearRequestedThreadRoute = (threadId) => {
+    if (threadRequestedRoutes.delete(threadId)) persistThreadRoutes(threadRequestedRoutes, persistedRequestedRoutesKey);
+  };
+  const restoreThreadRoutes = (routes = threadRoutes, key = persistedThreadRoutesKey) => {
     try {
-      const entries = JSON.parse(window.localStorage?.getItem(persistedThreadRoutesKey) || "[]");
+      const entries = JSON.parse(window.localStorage?.getItem(key) || "[]");
       if (!Array.isArray(entries)) return;
       for (const entry of entries.slice(-maxTrackedThreadProviders)) {
         if (!Array.isArray(entry) || entry.length !== 2) continue;
@@ -205,7 +216,7 @@
           ? route.sourceModel.trim()
           : "";
         if (threadId && routeProviderId && sourceModel) {
-          threadRoutes.set(threadId, { routeProviderId, sourceModel });
+          routes.set(threadId, { routeProviderId, sourceModel });
         }
       }
     } catch {
@@ -266,11 +277,12 @@
     route?.officialAccount === true
     || legacyOfficialRouteProviderIds.has(modelKey(route?.routeProviderId))
   );
-  const providersAreCompatible = (method, currentProviderId, targetProviderId) => (
+  const providersAreCompatible = (method, currentProviderId, targetProviderId, threadId) => (
     modelKey(currentProviderId) === modelKey(targetProviderId)
     || (
       method === "thread/resume"
-      && modelKey(targetProviderId) === localRouterProviderId
+      && routerProviderIds.has(modelKey(targetProviderId))
+      && !threadRuntimeProviders.has(threadId)
     )
   );
   const markPatchedProvider = (params, providerId) => {
@@ -321,7 +333,9 @@
     const currentProviderId = providerBoundExistingThreadMethods.has(method)
       ? (threadId ? knownThreadProvider(source) : paramsProviderId(source))
       : "";
-    const routedProviderId = localRouterProviderId;
+    const routedProviderId = route?.supportsRemoteCompaction === true
+      || modelKey(route?.providerId) === remoteCompactionProviderId
+      ? remoteCompactionProviderId : localRouterProviderId;
     const turnSendsUpstreamModel = method === "turn/start" && Boolean(routeProviderId);
     const officialRoute = isOfficialRoute(route);
     let routedModel = model;
@@ -362,16 +376,13 @@
     }
     let blocked = false;
     if (providerBoundExistingThreadMethods.has(method) && routedProviderId) {
-      // `turn/start` has no modelProvider field, so provider migration must
-      // happen during `thread/resume`. Resume may move any persisted provider
-      // onto Codey's runtime router; later turns can then switch routes safely.
-      // A late injection may have missed the resume response. Unknown carriers
-      // must resume too, rather than leaking a route alias to an old upstream.
+      // Only an unloaded thread can adopt a provider during resume. Turn and
+      // settings requests cannot change the running thread's compaction mode.
       if (
         threadId
-        && (!currentProviderId
-          ? method === "turn/start" && routedProviderId === localRouterProviderId
-          : !providersAreCompatible(method, currentProviderId, routedProviderId))
+        && ((method !== "thread/resume" && unconfirmedThreadProviders.has(threadId)) || (!currentProviderId
+          ? method !== "thread/resume"
+          : !providersAreCompatible(method, currentProviderId, routedProviderId, threadId)))
       ) {
         blocked = true;
         markBlockedProviderRequest(next, {
@@ -381,12 +392,17 @@
           targetProviderId: routedProviderId,
           currentProviderId,
           routeName: cleanText(route?.routeName),
-          reason: "provider_migration_required",
+          reason: routerProviderIds.has(modelKey(currentProviderId))
+            ? "compaction_mode_change_required" : "provider_migration_required",
         });
+        if (routeProviderId) rememberBoundedThreadRoute(
+          threadId, route, threadRequestedRoutes, persistedRequestedRoutesKey,
+        );
       }
     }
-    if (!blocked && threadId && routeProviderId) {
+    if (!blocked && threadId && routeProviderId && !threadProviderRequestMethods.has(method)) {
       rememberBoundedThreadRoute(threadId, route);
+      clearRequestedThreadRoute(threadId);
     }
     markPatchedRoute(next, route);
     return markPatchedProvider(next, routedProviderId);
@@ -480,6 +496,7 @@
           sourceModel,
           routeName,
           officialAccount: metadataBoolean(metadata, "official_account"),
+          supportsRemoteCompaction: metadataBoolean(metadata, "supports_remote_compaction"),
         }];
       }).filter(([, route]) => (
         route.providerId && route.routeProviderId && route.sourceModel
@@ -2378,7 +2395,7 @@
         ? model.slice(prefix.length).trim()
         : model;
     })();
-    const providerRoute = providerId && modelKey(providerId) !== localRouterProviderId
+    const providerRoute = providerId && !routerProviderIds.has(modelKey(providerId))
       ? uniqueRouteForProviderModel(providerId, providerModel)
       : null;
     if (providerRoute?.selectorModel) return providerRoute;
@@ -2539,6 +2556,7 @@
       if (source.model === null) {
         const threadId = threadIdFromParams(source);
         if (threadId && threadRoutes.delete(threadId)) persistThreadRoutes();
+        clearRequestedThreadRoute(threadId);
         pendingRouteIntent = null;
         return params;
       }
@@ -2583,6 +2601,9 @@
       : null;
     const threadId = threadIdFromParams(source);
     const userIntentRoute = pendingIntentRouteForRequest();
+    const requestedBinding = threadRequestedRoutes.get(threadId);
+    const requestedThreadRoute = requestedBinding && method !== "thread/start" && method !== "thread/fork"
+      ? routeForHintedRawModel(requestedBinding.routeProviderId, requestedBinding.sourceModel) : null;
     const threadRoute = requestedModel
       ? routeForThreadModel(threadId, requestedModel)
       : null;
@@ -2628,6 +2649,7 @@
       };
     })();
     const route = userIntentRoute
+      || (method !== "thread/settings/update" ? requestedThreadRoute : null)
       || refreshedDefaultRoute
       || metadataRoute
       || previouslyPatchedRoute
@@ -2779,26 +2801,31 @@
     if (pending?.nativeModelUpdate && threadRoutes.delete(pending.threadId)) persistThreadRoutes();
     const result = message.result;
     const resultThread = result?.thread;
-    const fallbackProvider = pending?.method === "thread/start"
-      || pending?.method === "thread/resume"
-      || pending?.method === "thread/fork"
-      ? pending.providerId
-      : pending?.threadId
-        ? threadPersistedProviders.get(pending.threadId)
-        : "";
+    const fallbackProvider = threadPersistedProviders.get(resultThread?.id || pending?.threadId);
     const resultProvider = requestProviderId(result?.modelProvider) || fallbackProvider;
     // Top-level modelProvider reports the live carrier; thread.modelProvider
     // can still describe the persisted rollout after a successful resume.
-    const runtimeProvider = requestProviderId(result?.modelProvider) || ((
-      pending?.method === "thread/start"
-      || pending?.method === "thread/resume"
-      || pending?.method === "thread/fork"
-    ) ? pending.providerId : pending?.threadId
-      ? threadRuntimeProviders.get(pending.threadId)
-      : resultProvider);
+    const reportedRuntimeProvider = requestProviderId(result?.modelProvider);
+    const resultThreadId = resultThread?.id || pending?.threadId;
+    if (reportedRuntimeProvider) unconfirmedThreadProviders.delete(resultThreadId);
+    else if (resultThreadId && threadProviderRequestMethods.has(pending?.method)) {
+      rememberBounded(unconfirmedThreadProviders, resultThreadId, maxTrackedThreadProviders);
+    }
+    const runtimeProvider = reportedRuntimeProvider
+      || threadRuntimeProviders.get(resultThread?.id || pending?.threadId);
     rememberThreadPersistedProvider(resultThread, resultProvider);
     rememberThreadRuntimeProvider(resultThread || pending?.threadId, runtimeProvider);
-    rememberThreadRoute(resultThread, pending?.route);
+    const routeProvider = threadProviderRequestMethods.has(pending?.method)
+      ? reportedRuntimeProvider : runtimeProvider;
+    const confirmedRoute = pending?.route && routeProvider && modelKey(routeProvider) === modelKey(
+      pending.providerId || pending.route.providerId,
+    ) ? pending.route : null;
+    if (pending?.method === "thread/resume" && pending.route && !confirmedRoute) {
+      rememberBoundedThreadRoute(resultThread?.id || pending.threadId,
+        pending.route, threadRequestedRoutes, persistedRequestedRoutesKey);
+    }
+    if (confirmedRoute) clearRequestedThreadRoute(resultThread?.id || pending?.threadId);
+    if (!pending?.route || confirmedRoute) rememberThreadRoute(resultThread, confirmedRoute);
     for (const thread of Array.isArray(result?.data) ? result.data : []) {
       rememberThreadPersistedProvider(thread);
       rememberThreadRoute(thread);
@@ -2806,7 +2833,7 @@
     const directThread = data?.thread;
     rememberThreadPersistedProvider(directThread, resultProvider);
     rememberThreadRuntimeProvider(directThread || pending?.threadId, runtimeProvider);
-    rememberThreadRoute(directThread, pending?.route);
+    if (!pending?.route || confirmedRoute) rememberThreadRoute(directThread, confirmedRoute);
   };
 
   const rememberOutgoingModelListRequest = (detail) => {
@@ -2839,7 +2866,7 @@
     const binding = !Object.hasOwn(params, "model") ? threadRoutes.get(threadId) : null;
     const historicalSource = historicalSourceModel(model);
     const currentProvider = knownThreadProvider(params);
-    const oldCarrier = modelKey(currentProvider) === localRouterProviderId
+    const oldCarrier = routerProviderIds.has(modelKey(currentProvider))
       || (modelKey(currentProvider) === "codey" && modelKey(catalog.nativeProviderId) !== "codey");
     if (!historicalSource && !binding && !oldCarrier) return params;
     const sourceModel = historicalSource || binding?.sourceModel || model;
@@ -2914,11 +2941,10 @@
   const showBlockedProviderNotice = (detail) => {
     const blocked = blockedProviderRequest(detail);
     if (!blocked) return false;
-    const target = blocked.routeName || blocked.targetProviderId || "所选线路";
-    const current = blocked.currentProviderId
-      ? `当前任务仍绑定在 ${blocked.currentProviderId}`
-      : "当前任务的运行时供应商身份尚未确认";
-    const message = blocked.message || `${current}，尚未完成迁入 Codey 统一路由，暂时不能安全发送到「${target}」。请重新打开该任务后重试；恢复完成后即可跨供应商切换。本次消息已在本地拦截，未请求任何上游。`;
+    const target = blocked.routeName || "所选线路";
+    const message = blocked.message || (blocked.reason === "compaction_mode_change_required"
+      ? `切换到 ${target} 需要更换会话的压缩方式。已记住所选线路，请重启 Codex 后恢复任务，或用该线路新建任务。`
+      : `暂时无法确认此任务的线路配置。请重启 Codex 后恢复任务，或用 ${target} 新建任务。`);
     console.warn("[Codey] provider migration required before routed turn", blocked);
     try {
       const noticeId = "codey-provider-mismatch-notice";
@@ -3060,6 +3086,7 @@
   });
   installGroupedModelMenuObserver();
   restoreThreadRoutes();
+  if (!nativeSelectionOnly) restoreThreadRoutes(threadRequestedRoutes, persistedRequestedRoutesKey);
   restoreDefaultModelHistory();
   window.addEventListener?.("focus", handleFocus);
   if (!nativeSelectionOnly) installModelRequestDispatchPatch();
@@ -3139,7 +3166,9 @@
       pendingThreadRequests.clear();
       threadPersistedProviders.clear();
       threadRuntimeProviders.clear();
+      unconfirmedThreadProviders.clear();
       threadRoutes.clear();
+      threadRequestedRoutes.clear();
       pendingRouteIntent = null;
     },
   };

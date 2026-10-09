@@ -26,3 +26,14 @@ test("missing status, stopped Codex and unmanaged compression remain distinct", 
   assert.equal(remoteCompactionStatusText({ running: false, remoteCompaction }).title, "Codex 未运行");
   assert.equal(remoteCompactionStatusText({ running: true, remoteCompaction }).title, "压缩由 Codex 自行管理");
 });
+
+test("mixed routes advertise independent compaction and capability changes require restart", () => {
+  const status = { running: true, remoteCompaction: {
+    configured: true, active: true, configuredMode: "mixed", activeMode: "mixed",
+    restartRequired: true, blockingRoutes: [{ routeName: "Chat", reason: "上游协议不支持原生压缩" }],
+  } };
+  const text = remoteCompactionStatusText(status);
+  assert.equal(text.title, "当前按线路选择压缩方式");
+  assert.match(text.detail, /支持的线路独立使用远程压缩/);
+  assert.match(text.detail, /需重启 Codex/);
+});

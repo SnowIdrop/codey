@@ -210,6 +210,8 @@ export type RuntimeStatus = {
   remoteCompaction?: {
     configured: boolean;
     active: boolean | null;
+    configuredMode?: "local" | "remote" | "mixed";
+    activeMode?: "local" | "remote" | "mixed" | null;
     restartRequired: boolean;
     blockingRoutes: Array<{ routeId: string; routeName: string; reason: string }>;
   };
