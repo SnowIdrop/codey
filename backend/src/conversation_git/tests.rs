@@ -854,6 +854,135 @@ fn historical_cargo_format_tracks_only_prior_owned_files_and_resolves_polls() {
 }
 
 #[test]
+fn wrapped_cargo_all_format_recovers_committed_edits_without_claiming_other_files() {
+    for outcome in [
+        "success",
+        "immediate",
+        "failed",
+        "running",
+        "unsafe",
+        "extra",
+        "tty",
+        "shell",
+        "receipt",
+    ] {
+        let repo = Repo::new();
+        fs::create_dir_all(repo.root.join("backend/src")).unwrap();
+        fs::write(
+            repo.root.join("Cargo.toml"),
+            "[workspace.package]\nedition = '2024'\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.root.join("backend/Cargo.toml"),
+            "[package]\nname = 'codey'\nedition.workspace = true\n",
+        )
+        .unwrap();
+        let path = "backend/src/owned.rs";
+        let own = "fn main(){let value=2;}\n";
+        fs::write(repo.root.join(path), own).unwrap();
+        git(&repo.root, &["add", "--", path], None, None).unwrap();
+        git(
+            &repo.root,
+            &["commit", "-m", "already committed"],
+            None,
+            None,
+        )
+        .unwrap();
+        repo.append_record(
+            SESSION,
+            &repo.native_change(
+                SESSION,
+                path,
+                "@@ -1 +1 @@\n-fn main(){let value=1;}\n+fn main(){let value=2;}\n",
+                1,
+            ),
+        );
+        let other = "backend/src/other.rs";
+        fs::write(repo.root.join(other), own).unwrap();
+        repo.session(OTHER, None);
+        repo.append_record(
+            OTHER,
+            &repo.native_change(
+                OTHER,
+                other,
+                "@@ -1 +1 @@\n-fn main(){let value=1;}\n+fn main(){let value=2;}\n",
+                1,
+            ),
+        );
+        let format_args = match outcome {
+            "unsafe" => json!({"cmd":"cargo fmt --all; true"}),
+            "tty" => json!({"cmd":"cargo fmt --all","tty":true}),
+            "shell" => json!({"cmd":"cargo fmt --all","shell":"/bin/sh"}),
+            _ => json!({"cmd":"cargo fmt --all"}),
+        };
+        let mut code = format!(
+            "text(await tools.exec_command({format_args}));\ntext(await tools.exec_command({}));\ntext(await tools.exec_command({}));\ntext(await tools.exec_command({}));",
+            json!({"cmd":"cargo fmt --all -- --check"}),
+            json!({"cmd":"git diff --check"}),
+            json!({"cmd":"git diff --stat"})
+        );
+        if outcome == "extra" {
+            code.push_str("\ntext(await tools.exec_command({cmd:\"rm owned.rs\"}));");
+        }
+        let envelope =
+            json!({"type":"text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n"});
+        let block = |value: Value| json!({"type":"text","text":value.to_string()});
+        let initial = if outcome == "immediate" {
+            json!({"exit_code":0})
+        } else {
+            json!({"session_id":10})
+        };
+        let mut content = vec![
+            envelope.clone(),
+            block(initial),
+            block(json!({"exit_code":0})),
+            block(json!({"exit_code":0})),
+            block(json!({"exit_code":0})),
+        ];
+        if outcome == "receipt" {
+            content.pop();
+        }
+        repo.history(
+            SESSION,
+            None,
+            "exec",
+            json!(code),
+            json!({"content":content}),
+            2,
+        );
+        if outcome != "running" && outcome != "immediate" {
+            let code = format!(
+                "text(await tools.write_stdin({}));\ntext(await tools.exec_command({}));\ntext(await tools.exec_command({}));",
+                json!({"session_id":10,"chars":""}),
+                json!({"cmd":"cargo fmt --all -- --check"}),
+                json!({"cmd":"git diff --check"})
+            );
+            repo.history(SESSION, None, "exec", json!(code), json!({"content":[envelope,block(json!({"exit_code":if outcome == "failed" {1} else {0}})),block(json!({"exit_code":0})),block(json!({"exit_code":0}))]}), 3);
+        }
+        let formatted = format_rust(&repo.root, "2024", own.as_bytes()).unwrap();
+        fs::write(repo.root.join(path), &formatted).unwrap();
+        fs::write(repo.root.join(other), &formatted).unwrap();
+        let recovered = history::recover(&repo.home, SESSION, &repo.root, &repo.root).unwrap();
+        assert!(!recovered.paths().any(|path| path == other));
+        let before = head_entry(&repo.root, "HEAD", path).unwrap();
+        let after = disk_entry(&repo.root, path).unwrap();
+        assert_eq!(
+            recovered
+                .replay(path, before.as_ref(), after.as_ref())
+                .is_ok(),
+            matches!(outcome, "success" | "immediate"),
+            "{outcome}"
+        );
+        if matches!(outcome, "success" | "immediate") {
+            assert_eq!(status(&repo.home, SESSION).unwrap()["visible"], true);
+            assert_eq!(snapshot(&repo.home, SESSION).unwrap().changes.len(), 1);
+        }
+        assert_eq!(fs::read(repo.root.join(other)).unwrap(), formatted);
+    }
+}
+
+#[test]
 fn committed_other_session_claim_does_not_block_proven_later_history() {
     let repo = Repo::new();
     repo.fastctx(repo.hook(OTHER, "mcp__codey_fastctx__replace", json!({"path":repo.root.join("owned.txt"), "pattern":"old", "replacement":"outside", "literal":true})));

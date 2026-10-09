@@ -574,7 +574,7 @@ fn formatter_calls(name: &str, args: &Value) -> Option<(Vec<Option<Value>>, usiz
         .or_else(|| args["code"].as_str())
         .or_else(|| args["input"].as_str())?
         .trim();
-    if !code.contains("rustfmt ") {
+    if !code.contains("rustfmt ") && !code.contains("cargo fmt ") && !code.contains("write_stdin") {
         return None;
     }
     if code.starts_with("// @exec:") {
@@ -609,11 +609,17 @@ fn formatter_calls(name: &str, args: &Value) -> Option<(Vec<Option<Value>>, usiz
                 field[1].to_string()
             };
             let value = serde_json::from_str::<Value>(&field[2]).ok()?;
+            if key == "__codey_poll" {
+                return None;
+            }
             if object.insert(key, value).is_some() {
                 return None;
             }
         }
-        calls.push((captures[1] == *"exec_command").then_some(Value::Object(object)));
+        if captures[1] == *"write_stdin" {
+            object.insert("__codey_poll".into(), Value::Bool(true));
+        }
+        calls.push(Some(Value::Object(object)));
         code = code[captures.get(0)?.end()..].trim();
         if calls.len() > 8 {
             return None;
@@ -643,25 +649,101 @@ fn cargo_formatter(name: &str, args: &Value) -> bool {
         return false;
     };
     let parts: Vec<_> = command.split(" && ").collect();
-    parts.first() == Some(&"cargo fmt -p codey")
-        && parts.iter().skip(1).all(|part| {
-            *part == "cargo fmt -p codey -- --check" || *part == "echo FORMAT_OK" || {
-                let command = part.split(" 2>&1 | tail -").collect::<Vec<_>>();
-                command.len() <= 2
-                    && command
-                        .get(1)
-                        .is_none_or(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
-                    && (command[0].starts_with("cargo test -p codey")
-                        || command[0].starts_with("cargo clippy -p codey"))
-                    && command[0]
-                        .bytes()
-                        .all(|c| c.is_ascii_alphanumeric() || b" _:-".contains(&c))
+    matches!(
+        parts.first(),
+        Some(&"cargo fmt -p codey" | &"cargo fmt --all")
+    ) && parts.iter().skip(1).all(|part| {
+        *part == "cargo fmt -p codey -- --check" || *part == "echo FORMAT_OK" || {
+            let command = part.split(" 2>&1 | tail -").collect::<Vec<_>>();
+            command.len() <= 2
+                && command
+                    .get(1)
+                    .is_none_or(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+                && (command[0].starts_with("cargo test -p codey")
+                    || command[0].starts_with("cargo clippy -p codey"))
+                && command[0]
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b" _:-".contains(&c))
+        }
+    })
+}
+
+// 固定顺序的原生终端调用可以拆开核对；不接受变量、任意脚本或修改文件的附加命令。
+fn wrapped_cargo_calls(name: &str, args: &Value) -> Option<Vec<(String, Value)>> {
+    if !matches!(name, "exec" | "functions.exec") {
+        return None;
+    }
+    let (calls, offset) = formatter_calls(name, args)?;
+    if offset != 1 {
+        return None;
+    }
+    let mut result = Vec::new();
+    for args in calls {
+        let mut args = args?;
+        let name = if args["__codey_poll"] == true {
+            args.as_object_mut()?.remove("__codey_poll");
+            if args["session_id"].as_u64().is_none()
+                || args["chars"].as_str().is_some_and(|s| !s.is_empty())
+            {
+                return None;
             }
+            "write_stdin"
+        } else {
+            if args["tty"] == true || args.get("shell").is_some_and(|v| !v.is_null()) {
+                return None;
+            }
+            if !cargo_formatter("exec_command", &args)
+                && !matches!(
+                    args["cmd"].as_str(),
+                    Some(
+                        "cargo fmt --all -- --check"
+                            | "cargo fmt -p codey -- --check"
+                            | "git diff --check"
+                            | "git diff --stat"
+                    )
+                )
+            {
+                return None;
+            }
+            "exec_command"
+        };
+        result.push((name.into(), args));
+    }
+    Some(result)
+}
+
+fn wrapped_cargo_receipts(
+    name: &str,
+    args: &Value,
+    response: &Value,
+) -> Option<Vec<(String, Value, Value)>> {
+    let calls = wrapped_cargo_calls(name, args)?;
+    if response["isError"] == true || response.get("error").is_some_and(|v| !v.is_null()) {
+        return None;
+    }
+    let content = response["content"].as_array()?;
+    if content.len() != calls.len() + 1 {
+        return None;
+    }
+    let envelope = content[0]["text"].as_str()?;
+    if !envelope.starts_with("Script completed\n") || !envelope.trim_end().ends_with("Output:") {
+        return None;
+    }
+    calls
+        .into_iter()
+        .zip(&content[1..])
+        .map(|((name, args), block)| {
+            let receipt: Value = serde_json::from_str(block["text"].as_str()?).ok()?;
+            if !receipt.is_object() {
+                return None;
+            }
+            Some((name, args, receipt))
         })
+        .collect()
 }
 
 fn terminal_receipt(response: &Value) -> Option<Value> {
-    if response.get("exit_code").is_some() {
+    if response.get("exit_code").is_some() || response["session_id"].as_u64().is_some() {
         return Some(response.clone());
     }
     let text = tracking::output_text(response)?;
@@ -1061,6 +1143,7 @@ fn read_transcript(home: &Path, raw: &Path) -> Result<Transcript> {
                 || multiple_patches(&name, &args).is_some()
                 || has_formatter(&name, &args)
                 || cargo_formatter(&name, &args)
+                || wrapped_cargo_calls(&name, &args).is_some()
                 || matches!(name.as_str(), "write_stdin" | "functions.write_stdin")
             {
                 ensure!(
@@ -1610,7 +1693,26 @@ pub(super) fn recover(
             }
         }
         let mut running_formats = BTreeMap::new();
-        for (mut name, mut args, response, mut start, end, mut ordinal) in transcript.calls {
+        let calls =
+            transcript
+                .calls
+                .into_iter()
+                .flat_map(|(name, args, response, start, end, ordinal)| {
+                    if let Some(calls) = wrapped_cargo_receipts(&name, &args, &response) {
+                        calls
+                            .into_iter()
+                            .map(|(name, mut args, response)| {
+                                if name == "exec_command" && args.get("workdir").is_none() {
+                                    args["workdir"] = json!(workspace);
+                                }
+                                (name, args, response, start, end, ordinal)
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        vec![(name, args, response, start, end, ordinal)]
+                    }
+                });
+        for (mut name, mut args, response, mut start, end, mut ordinal) in calls {
             if matches!(name.as_str(), "write_stdin" | "functions.write_stdin") {
                 if args["chars"]
                     .as_str()
@@ -1639,7 +1741,10 @@ pub(super) fn recover(
                     running_formats.insert(session, (name, args, start, ordinal));
                     continue;
                 }
-                if receipt["exit_code"] != 0 || response["isError"] == true {
+                if receipt["exit_code"] != 0
+                    || response["isError"] == true
+                    || response.get("error").is_some_and(|v| !v.is_null())
+                {
                     continue;
                 }
                 if args["workdir"]
