@@ -6,7 +6,11 @@
   let ready = false;
   let sessionId = null;
   let generation = 0;
-  let checking = false;
+  const checks = new Map();
+  const statusCache = new Map();
+  const statusCacheTtlMs = 30_000;
+  const statusCacheLimit = 20;
+  const maxChecks = 2;
   let refreshPending = false;
   let busy = false;
   let status = null;
@@ -372,6 +376,7 @@
       const commitAction = async (push) => {
         if (busy) return;
         if (!valid(current, epoch)) { close(); return; }
+        statusCache.clear();
         busy = true;
         cancel.disabled = true;
         commitOnly.disabled = true;
@@ -403,6 +408,10 @@
           busy = false;
           button.disabled = false;
           delete button.dataset.busy;
+          // 提交可能改变整个工作区，丢弃提交前的显示缓存和在途查询结果。
+          statusCache.clear();
+          generation += 1;
+          status = null;
           void refresh();
         }
       };
@@ -431,11 +440,23 @@
     if (panel) { close(); return; }
     void preview();
   });
+  const renderButton = (current = context()) => {
+    const target = current?.target;
+    if (!enabled || !status?.visible || !target) { button.style.display = "none"; return; }
+    const optimizer = document.getElementById("codey-prompt-optimize-button");
+    const anchor = optimizer?.parentElement === target.host && optimizer.style.display !== "none" ? optimizer : target.anchor;
+    if (anchor.nextElementSibling !== button) target.host.insertBefore(button, anchor.nextElementSibling);
+    button.style.display = "inline-flex";
+  };
   const syncContext = () => {
     const current = context();
     if (current?.sessionId !== sessionId) {
       sessionId = current?.sessionId || null; generation += 1; status = null; close(); button.style.display = "none";
+      const cached = statusCache.get(sessionId);
+      if (cached && Date.now() - cached.at < statusCacheTtlMs) status = cached.result;
+      else statusCache.delete(sessionId);
     }
+    renderButton(current);
     return current;
   };
   const refresh = async () => {
@@ -443,32 +464,40 @@
     const current = syncContext();
     if (!enabled || !sessionId || !current?.target) { button.style.display = "none"; return; }
     if (document.hidden) return;
-    if (checking || busy) { refreshPending = true; return; }
+    const active = checks.get(sessionId);
+    // 同一会话合并查询，新会话可使用第二个名额，快速导航只保留最后一次补查。
+    if (active?.epoch === generation) return;
+    if (active || checks.size >= maxChecks || (busy && panel)) { refreshPending = true; return; }
     refreshPending = false;
     const epoch = generation, selected = sessionId;
-    checking = true;
+    checks.set(selected, { epoch });
     try {
       const result = await call("/api/conversation_git_status", { sessionId: selected });
-      if (!valid(selected, epoch)) return;
+      if (!valid(selected, epoch)) {
+        if (context()?.sessionId !== sessionId || (selected === sessionId && epoch !== generation)) refreshPending = true;
+        return;
+      }
       status = result;
-      const target = context()?.target;
-      if (!result?.visible || !target) { button.style.display = "none"; return; }
-      const optimizer = document.getElementById("codey-prompt-optimize-button");
-      const anchor = optimizer?.parentElement === target.host && optimizer.style.display !== "none" ? optimizer : target.anchor;
-      if (anchor.nextElementSibling !== button) target.host.insertBefore(button, anchor.nextElementSibling);
-      button.style.display = "inline-flex";
+      statusCache.delete(selected);
+      if (result?.visible) {
+        statusCache.set(selected, { result, at: Date.now() });
+        if (statusCache.size > statusCacheLimit) statusCache.delete(statusCache.keys().next().value);
+      }
+      renderButton();
     } catch (failure) {
-      if (valid(selected, epoch)) { status = { visible: false, reason: String(failure?.message || failure) }; button.style.display = "none"; }
+      if (valid(selected, epoch)) { statusCache.delete(selected); status = { visible: false, reason: String(failure?.message || failure) }; button.style.display = "none"; }
     } finally {
-      checking = false;
-      if (refreshPending || generation !== epoch || context()?.sessionId !== selected) void refresh();
+      checks.delete(selected);
+      if (context()?.sessionId !== sessionId) refreshPending = true;
+      if (refreshPending) void refresh();
     }
   };
   const schedule = () => {
     // 导航时立即清理旧状态，当前会话优先查询；普通变化合并处理。
+    const previous = sessionId;
     syncContext();
     if (!enabled) return;
-    const delay = status === null ? 0 : 300;
+    const delay = previous !== sessionId || status === null ? 0 : 300;
     if (timer) {
       if (delay >= timerDelay) return;
       clearTimeout(timer);
@@ -480,6 +509,7 @@
     try {
       const config = await call("/settings/get", {});
       enabled = config?.conversationGit?.enabled === true; ready = true;
+      statusCache.clear();
       generation += 1; status = null; close(); button.style.display = "none";
       await refresh();
     } catch { ready = false; enabled = false; button.style.display = "none"; }

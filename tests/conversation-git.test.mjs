@@ -8,7 +8,7 @@ const source = readFileSync(new URL("../public/conversation-git.js", import.meta
 const flush = async () => { for (let i = 0; i < 15; i++) await Promise.resolve(); };
 const deferred = () => { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; };
 
-function harness({ enabled = true, visible = true, optimizer = true, status, preview, execute } = {}) {
+function harness({ enabled = true, visible = true, optimizer = true, status, preview, execute, now = () => Date.now() } = {}) {
   class Element extends FakeElementCore {
     replaceChildren(...children) { [...this.children].forEach((child) => child.remove()); this.append(...children); }
     getBoundingClientRect() { return { left: 100, top: 600 }; }
@@ -56,6 +56,7 @@ function harness({ enabled = true, visible = true, optimizer = true, status, pre
     await flush();
   };
   vm.runInNewContext(source, { window, document,
+    Date: class extends Date { static now() { return now(); } },
     setTimeout: (fn, delay) => { const id = ++timerId; timers.set(id, { fn, delay }); return id; },
     clearTimeout: (id) => timers.delete(id), setInterval: (fn) => intervals.push(fn), console });
   return {
@@ -120,19 +121,105 @@ test("opening an old conversation shows recovered changes without requiring a ne
   assert.equal(env.window.__codeyConversationGit.snapshot().visible, false);
 });
 
-test("checks the latest conversation as soon as an old status request settles", async () => {
+test("lets the current conversation display before an old status request settles", async () => {
   const first = deferred(), latest = deferred();
   const env = harness({ status: ({ sessionId }) => sessionId === "session-a" ? first.promise : latest.promise });
   await env.load();
   await env.navigate("session-b");
-  await env.navigate("session-c");
-  assert.equal(env.calls.filter((call) => call.path.endsWith("_status")).length, 1);
-  first.resolve({ visible: true }); await flush();
   const checks = env.calls.filter((call) => call.path.endsWith("_status"));
-  assert.deepEqual(checks.map((call) => call.payload.sessionId), ["session-a", "session-c"]);
+  assert.deepEqual(checks.map((call) => call.payload.sessionId), ["session-a", "session-b"]);
   assert.equal(env.window.__codeyConversationGit.snapshot().visible, false);
   latest.resolve({ visible: true }); await flush();
   assert.equal(env.window.__codeyConversationGit.snapshot().visible, true);
+  first.resolve({ visible: false }); await flush();
+  assert.equal(env.window.__codeyConversationGit.snapshot().visible, true);
+  assert.equal(env.calls.filter((call) => call.path.endsWith("_status")).length, 2);
+});
+
+test("bounds status queries and checks only the latest queued conversation", async () => {
+  const first = deferred(), second = deferred();
+  const env = harness({ status: ({ sessionId }) => sessionId === "session-a" ? first.promise
+    : sessionId === "session-b" ? second.promise : { visible: true } });
+  await env.load();
+  await env.navigate("session-b");
+  await env.navigate("session-c");
+  await env.navigate("session-d");
+  assert.equal(env.calls.filter((call) => call.path.endsWith("_status")).length, 2);
+  first.resolve({ visible: true }); await flush();
+  assert.deepEqual(env.calls.filter((call) => call.path.endsWith("_status")).map((call) => call.payload.sessionId),
+    ["session-a", "session-b", "session-d"]);
+  assert.equal(env.window.__codeyConversationGit.snapshot().visible, true);
+  second.resolve({ visible: false }); await flush();
+  assert.equal(env.window.__codeyConversationGit.snapshot().visible, true);
+});
+
+test("restores a recently visible conversation immediately and revalidates it", async () => {
+  const pending = deferred();
+  let first = true;
+  const env = harness({ status: ({ sessionId }) => {
+    if (sessionId === "session-a" && !first) return pending.promise;
+    first = false;
+    return { visible: true };
+  } });
+  await env.load();
+  await env.navigate("session-b");
+  env.state.sessionId = "session-a";
+  env.mutate();
+  assert.equal(env.window.__codeyConversationGit.snapshot().visible, true);
+  assert.deepEqual(env.timerDelays(), [0]);
+  await env.runTimers();
+  pending.resolve({ visible: false }); await flush();
+  assert.equal(env.window.__codeyConversationGit.snapshot().visible, false);
+  await env.navigate("session-b");
+  env.state.sessionId = "session-a";
+  env.mutate();
+  assert.equal(env.window.__codeyConversationGit.snapshot().visible, false);
+});
+
+test("expires cached visibility and remounts a confirmed button without another status response", async () => {
+  let now = 0;
+  const env = harness({ now: () => now }); await env.load();
+  const button = env.button();
+  button.remove();
+  env.mutate([{ type: "childList", target: env.host, addedNodes: [], removedNodes: [button, env.optimize] }]);
+  assert.equal(env.button(), button);
+  assert.equal(button.style.display, "inline-flex");
+  await env.navigate("session-b");
+  now = 30_001;
+  env.state.sessionId = "session-a";
+  env.mutate();
+  assert.equal(env.window.__codeyConversationGit.snapshot().visible, false);
+});
+
+test("rechecks the same session after returning while its previous query is pending", async () => {
+  const pending = deferred();
+  let count = 0;
+  const env = harness({ status: ({ sessionId }) => sessionId === "session-a" && ++count === 1
+    ? pending.promise : { visible: true } });
+  await env.load();
+  await env.navigate("session-b");
+  await env.navigate("session-a");
+  pending.resolve({ visible: false }); await flush();
+  assert.equal(env.window.__codeyConversationGit.snapshot().visible, true);
+  assert.deepEqual(env.calls.filter((call) => call.path.endsWith("_status")).map((call) => call.payload.sessionId),
+    ["session-a", "session-b", "session-a"]);
+});
+
+test("invalidates cached visibility and pending status results after committing", async () => {
+  const pending = deferred();
+  let count = 0;
+  const env = harness({ status: () => ++count === 3 ? pending.promise : { visible: count < 3 } });
+  await env.load();
+  await env.navigate("session-b");
+  await env.navigate("session-a");
+  await env.click(env.button());
+  const commitOnly = env.panel().querySelectorAll("button").find((node) => node.textContent === "提交");
+  await env.click(commitOnly);
+  pending.resolve({ visible: true }); await flush();
+  assert.equal(env.window.__codeyConversationGit.snapshot().visible, false);
+  env.state.sessionId = "session-b";
+  env.mutate();
+  assert.equal(env.window.__codeyConversationGit.snapshot().visible, false);
 });
 
 test("navigation promotes a queued background refresh and ignores its own DOM insertion", async () => {
@@ -154,6 +241,8 @@ test("resumes the current conversation check after an old preview finishes", asy
   const env = harness({ preview: () => pending.promise }); await env.load();
   await env.click(env.button());
   await env.navigate("session-b");
+  assert.equal(env.calls.at(-1).payload.sessionId, "session-b");
+  assert.equal(env.window.__codeyConversationGit.snapshot().visible, true);
   pending.resolve({ token: "old", files: [], message: "旧对话", diff: "" }); await flush();
   assert.equal(env.panel(), null);
   assert.equal(env.calls.at(-1).payload.sessionId, "session-b");
