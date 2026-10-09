@@ -601,6 +601,7 @@ jobs:
           merge-multiple: true
 
       - name: Verify the release version
+        id: release-metadata
         shell: bash
         run: |
           set -euo pipefail
@@ -611,11 +612,20 @@ jobs:
             echo "Tag $GITHUB_REF_NAME does not match package.json version $PACKAGE_VERSION." >&2
             exit 1
           }
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from 'node:fs';
+          import { releaseIdentity } from './scripts/release-policy.mjs';
+          const identity = releaseIdentity(process.env.GITHUB_REF_NAME.slice(1));
+          appendFileSync(process.env.GITHUB_OUTPUT, `name=${identity.name}\nprerelease=${identity.prerelease}\ntag=${identity.tag}\n`);
+          NODE
 
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          name: ${{ steps.release-metadata.outputs.name }}
+          tag_name: ${{ steps.release-metadata.outputs.tag }}
+          prerelease: ${{ steps.release-metadata.outputs.prerelease == 'true' }}
           files: release-assets/*
 
       - name: Explain skipped Cloudflare R2 update sync

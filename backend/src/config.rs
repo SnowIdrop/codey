@@ -734,14 +734,49 @@ impl RouteRequestLogConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CodeyUpdatePolicy {
+    Off,
+    #[default]
+    Stable,
+    Experimental,
+}
+
+impl<'de> Deserialize<'de> for CodeyUpdatePolicy {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::Bool(false) => Ok(Self::Off),
+            serde_json::Value::Bool(true) => Ok(Self::Stable),
+            serde_json::Value::String(value) => match value.as_str() {
+                "off" => Ok(Self::Off),
+                "stable" => Ok(Self::Stable),
+                "experimental" => Ok(Self::Experimental),
+                _ => Err(serde::de::Error::custom("Codey 更新策略无效")),
+            },
+            _ => Err(serde::de::Error::custom("Codey 更新策略无效")),
+        }
+    }
+}
+
+impl CodeyUpdatePolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Stable => "stable",
+            Self::Experimental => "experimental",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeyConfig {
     #[serde(default)]
     pub settings_revision: u64,
-    /// 控制启动和运行期间的自动更新检查，包括 Codex 启动失败后的检查。
-    #[serde(default = "default_true")]
-    pub auto_check_codey_updates: bool,
+    #[serde(default, alias = "autoCheckCodeyUpdates")]
+    pub codey_update_policy: CodeyUpdatePolicy,
     /// Controls whether Codey installs and uses its process-local multi-route
     /// gateway. Missing values default to enabled so existing installations
     /// keep their current behavior after upgrading.
@@ -952,7 +987,7 @@ impl Default for CodeyConfig {
         let profile = ProviderProfile::new("默认配置");
         Self {
             settings_revision: 0,
-            auto_check_codey_updates: true,
+            codey_update_policy: CodeyUpdatePolicy::Stable,
             local_router_enabled: true,
             route_request_log: RouteRequestLogConfig::default(),
             stream_max_retries: default_stream_max_retries(),
@@ -4477,12 +4512,12 @@ mod tests {
     }
 
     #[test]
-    fn auto_check_codey_updates_defaults_to_enabled_and_preserves_explicit_value() {
-        assert!(CodeyConfig::default().auto_check_codey_updates);
+    fn codey_update_policy_migrates_legacy_and_preserves_channels() {
+        assert_eq!(CodeyConfig::default().codey_update_policy, CodeyUpdatePolicy::Stable);
         let legacy = serde_json::from_str::<CodeyConfig>(r#"{}"#)
             .unwrap()
             .normalize();
-        assert!(legacy.auto_check_codey_updates);
+        assert_eq!(legacy.codey_update_policy, CodeyUpdatePolicy::Stable);
 
         for enabled in [false, true] {
             let config = serde_json::from_value::<CodeyConfig>(serde_json::json!({
@@ -4490,12 +4525,20 @@ mod tests {
             }))
             .unwrap()
             .normalize();
-            assert_eq!(config.auto_check_codey_updates, enabled);
+            let expected = if enabled { CodeyUpdatePolicy::Stable } else { CodeyUpdatePolicy::Off };
+            assert_eq!(config.codey_update_policy, expected);
             assert_eq!(
-                serde_json::to_value(config).unwrap()["autoCheckCodeyUpdates"],
-                enabled
+                serde_json::to_value(config).unwrap()["codeyUpdatePolicy"],
+                expected.as_str()
             );
         }
+        for policy in ["off", "stable", "experimental"] {
+            let config: CodeyConfig = serde_json::from_value(serde_json::json!({"codeyUpdatePolicy": policy})).unwrap();
+            let serialized = serde_json::to_value(config).unwrap();
+            assert_eq!(serialized["codeyUpdatePolicy"], policy);
+            assert!(serialized.get("autoCheckCodeyUpdates").is_none());
+        }
+        assert!(serde_json::from_value::<CodeyConfig>(serde_json::json!({"codeyUpdatePolicy": "unknown"})).is_err());
     }
 
     #[test]

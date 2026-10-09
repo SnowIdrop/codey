@@ -92,7 +92,7 @@ function modelSectionProps() {
   return {
     config: {
       activeProfileId: "route-a",
-      autoCheckCodeyUpdates: true,
+      codeyUpdatePolicy: "stable",
       codexAppPath: "",
       declaredOfficialModelsByProvider: {},
       defaultModel: "",

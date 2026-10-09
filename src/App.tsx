@@ -298,7 +298,7 @@ export function App({
   } = useAppUpdates({
     embedded,
     configLoaded,
-    autoCheckCodeyUpdates: config?.autoCheckCodeyUpdates !== false,
+    codeyUpdatePolicy: persistedConfigRef.current?.codeyUpdatePolicy ?? "stable",
     isBusy,
     setBusy,
     setNotice,
@@ -424,19 +424,19 @@ export function App({
     }
   }
 
-  function changeAutomaticUpdateChecks(enabled: boolean) {
+  function changeUpdatePolicy(policy: Config["codeyUpdatePolicy"]) {
     if (!config || isBusy) return;
-    if (enabled) {
-      editConfig({ ...config, autoCheckCodeyUpdates: true });
+    if (policy !== "experimental" || config.codeyUpdatePolicy === "experimental") {
+      editConfig({ ...config, codeyUpdatePolicy: policy });
       return;
     }
     setConfirmation({
-      action: "disable-auto-update-check",
-      title: "关闭自动检查 Codey 更新？",
-      description: "关闭后，若 Codex 更新导致 Codey 插件无法启动，需要手动下载最新版插件包。",
-      confirmLabel: "确认关闭",
+      action: "enable-experimental-updates",
+      title: "切换到实验版更新？",
+      description: "实验版尚未经过充分验证，可能出现功能异常、启动失败或数据兼容问题。请先备份重要数据，避免在关键工作环境使用。确认并保存设置后生效；取消会保留原设置。",
+      confirmLabel: "了解风险，使用实验版",
       run: () => {
-        setConfig((current) => current ? { ...current, autoCheckCodeyUpdates: false } : current);
+        setConfig((current) => current ? { ...current, codeyUpdatePolicy: policy } : current);
         setDirty(true);
       },
     });
@@ -1745,8 +1745,8 @@ export function App({
         busy={busy}
         onRepairCodexConfig={askRepairCodexConfig}
         configRepairNotice={configRepairNotice}
-        autoCheckCodeyUpdates={config.autoCheckCodeyUpdates !== false}
-        onAutoCheckCodeyUpdatesChange={changeAutomaticUpdateChecks}
+        codeyUpdatePolicy={config.codeyUpdatePolicy}
+        onCodeyUpdatePolicyChange={changeUpdatePolicy}
       />
     </main>
   );

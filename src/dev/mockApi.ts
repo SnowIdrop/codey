@@ -79,7 +79,7 @@ if (import.meta.env.DEV) {
     };
     let previewConfig: Config = {
       settingsRevision: 0,
-      autoCheckCodeyUpdates: true,
+      codeyUpdatePolicy: "stable",
       localRouterEnabled: true,
       routeRequestLog: {
         enabled: true,

@@ -108,7 +108,7 @@ pub(super) async fn runtime_status_with_options(
         .map(|profile| profile.name.clone())
         .unwrap_or_default();
     let configured_codex_app_path = config.codex_app_path.clone();
-    let auto_check_codey_updates = config.auto_check_codey_updates;
+    let codey_update_policy = config.codey_update_policy;
     let official_account_available = config.official_account_available_this_launch;
     let official_account_status = config.official_account_status_this_launch;
     let runtime_codex_app_path = runtime
@@ -160,7 +160,7 @@ pub(super) async fn runtime_status_with_options(
     let mut status = json!({
         "running": runtime.is_some(),
         "appVersion": env!("CARGO_PKG_VERSION"),
-        "autoCheckCodeyUpdates": auto_check_codey_updates,
+        "codeyUpdatePolicy": codey_update_policy,
         "clientPlatform": current_update_platform(),
         "activeProfileId": active_profile_id,
         "activeProfileName": active_profile_name,
@@ -193,7 +193,9 @@ pub(super) async fn runtime_status_with_options(
         if let Some(error) = startup_error {
             object.insert("startupError".into(), Value::String(error));
         }
-        if let Some(update) = available_update {
+        if let Some(update) = available_update
+            && codey_update_policy != crate::config::CodeyUpdatePolicy::Off
+            && (codey_update_policy == crate::config::CodeyUpdatePolicy::Experimental || !update.latest_version.contains('-')) {
             object.insert(
                 "availableUpdate".into(),
                 serde_json::to_value(update).expect("update metadata must be JSON-serializable"),

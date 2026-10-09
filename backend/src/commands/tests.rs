@@ -1518,7 +1518,7 @@ async fn native_model_cache_without_saved_route_does_not_block_settings_or_reena
 }
 
 #[tokio::test]
-async fn auto_check_codey_updates_save_persists_explicit_and_legacy_values() {
+async fn codey_update_policy_save_persists_explicit_and_legacy_values() {
     let directory = tempfile::tempdir().unwrap();
     let state = Arc::new(AppState {
         store: ConfigStore::new(directory.path().join("config.json")),
@@ -1527,25 +1527,34 @@ async fn auto_check_codey_updates_save_persists_explicit_and_legacy_values() {
 
     for enabled in [false, true] {
         let mut payload = serde_json::to_value(state.config.read().await.clone()).unwrap();
+        payload.as_object_mut().unwrap().remove("codeyUpdatePolicy");
         payload["autoCheckCodeyUpdates"] = json!(enabled);
         let input = codey_config_save_input(&json!({ "config": payload })).unwrap();
         save_codey_config_locked(&state, input).await.unwrap();
-        assert_eq!(state.config.read().await.auto_check_codey_updates, enabled);
+        let expected = if enabled { crate::config::CodeyUpdatePolicy::Stable } else { crate::config::CodeyUpdatePolicy::Off };
+        assert_eq!(state.config.read().await.codey_update_policy, expected);
+    }
+    for policy in [crate::config::CodeyUpdatePolicy::Off, crate::config::CodeyUpdatePolicy::Stable, crate::config::CodeyUpdatePolicy::Experimental] {
+        let mut payload = serde_json::to_value(state.config.read().await.clone()).unwrap();
+        payload["codeyUpdatePolicy"] = json!(policy);
+        let input = codey_config_save_input(&json!({ "config": payload })).unwrap();
+        save_codey_config_locked(&state, input).await.unwrap();
+        assert_eq!(state.config.read().await.codey_update_policy, policy);
         assert_eq!(
-            state.store.load().unwrap().auto_check_codey_updates,
-            enabled
+            state.store.load().unwrap().codey_update_policy,
+            policy
         );
 
         let mut legacy = serde_json::to_value(state.config.read().await.clone()).unwrap();
         legacy
             .as_object_mut()
             .unwrap()
-            .remove("autoCheckCodeyUpdates");
+            .remove("codeyUpdatePolicy");
         legacy["slimCodexPet"] = json!(false);
         let input = codey_config_save_input(&json!({ "config": legacy })).unwrap();
         save_codey_config_locked(&state, input).await.unwrap();
         let saved = state.config.read().await.clone();
-        assert_eq!(saved.auto_check_codey_updates, enabled);
+        assert_eq!(saved.codey_update_policy, policy);
         assert!(!saved.slim_codex_pet);
         assert_eq!(state.store.load().unwrap(), saved);
     }
