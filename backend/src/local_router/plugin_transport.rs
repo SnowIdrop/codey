@@ -390,7 +390,9 @@ mod tests {
                     count.fetch_add(1, Ordering::SeqCst);
                 }
                 Ok(json!({}))
-            });
+            })
+            // 虚拟时间跳跃时，后台回调可能尚未完成；让路由器的期限先到期。
+            .with_invoke_timeout(UPSTREAM_READ_IDLE_TIMEOUT + Duration::from_secs(1));
             with_test_transport("test.transport", plugin, async {
                 let response = send(&target(), Operation::Responses, &headers(), Bytes::new()).await;
                 let mut prepared = prepare_upstream_response(response, "plugin test", None).await.unwrap();
@@ -402,16 +404,14 @@ mod tests {
                 {
                     let read = read_prepared_upstream_chunk(&mut prepared, "plugin test", None);
                     tokio::pin!(read);
-                    tokio::select! {
-                        result = &mut read => panic!("pending response unexpectedly completed: {result:?}"),
-                        _ = tokio::task::yield_now() => {}
-                    }
+                    // 先轮询读取任务，确保空闲超时计时器已创建，再推进时间。
+                    assert!(futures_util::poll!(&mut read).is_pending());
                     tokio::time::advance(duration + Duration::from_millis(1)).await;
                     let error = read.await.unwrap_err();
                     if total_deadline {
                         assert!(error.is::<UpstreamResponseDeadline>());
                     } else {
-                        assert!(error.is::<UpstreamReadIdleTimeout>());
+                        assert!(error.is::<UpstreamReadIdleTimeout>(), "unexpected error: {error:#}");
                     }
                 }
                 tokio::time::resume();
