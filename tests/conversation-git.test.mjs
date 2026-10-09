@@ -8,7 +8,7 @@ const source = readFileSync(new URL("../public/conversation-git.js", import.meta
 const flush = async () => { for (let i = 0; i < 15; i++) await Promise.resolve(); };
 const deferred = () => { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; };
 
-function harness({ enabled = true, visible = true, optimizer = true, preview, execute } = {}) {
+function harness({ enabled = true, visible = true, optimizer = true, status, preview, execute } = {}) {
   class Element extends FakeElementCore {
     replaceChildren(...children) { [...this.children].forEach((child) => child.remove()); this.append(...children); }
     getBoundingClientRect() { return { left: 100, top: 600 }; }
@@ -32,7 +32,7 @@ function harness({ enabled = true, visible = true, optimizer = true, preview, ex
   window.__codexSessionDeleteBridge = async (path, payload) => {
     calls.push({ path, payload });
     if (path === "/settings/get") return { conversationGit: { enabled: state.enabled } };
-    if (path.endsWith("_status")) return { visible: state.visible, reason: "没有文件改动" };
+    if (path.endsWith("_status")) return status ? status(payload) : { visible: state.visible, reason: "没有文件改动" };
     if (path.endsWith("_preview")) return preview ? preview(payload) : {
       token: "preview-token", files: ["owned.txt"], diff: "-old\n+new", message: "fix(conversation-git): 校验当前对话提交范围", branch: "main",
     };
@@ -43,16 +43,30 @@ function harness({ enabled = true, visible = true, optimizer = true, preview, ex
     };
     throw new Error(`unexpected path: ${path}`);
   };
-  const timers = [], intervals = [];
+  const timers = new Map(), intervals = [];
+  let timerId = 0;
   let mutation;
   window.__codeyMutationDispatcher = { subscribe(handler) { mutation = handler; } };
-  vm.runInNewContext(source, { window, document, setTimeout: (fn) => { timers.push(fn); return timers.length; }, setInterval: (fn) => intervals.push(fn), console });
+  const runTimers = async () => {
+    const queued = [...timers.entries()];
+    for (const [id, { fn }] of queued) {
+      if (!timers.delete(id)) continue;
+      fn();
+    }
+    await flush();
+  };
+  vm.runInNewContext(source, { window, document,
+    setTimeout: (fn, delay) => { const id = ++timerId; timers.set(id, { fn, delay }); return id; },
+    clearTimeout: (id) => timers.delete(id), setInterval: (fn) => intervals.push(fn), console });
   return {
     window, document, calls, state, host, optimize,
     button: () => document.getElementById("codey-conversation-git"),
     panel: () => document.getElementById("codey-conversation-git-panel"),
     async tick() { intervals.forEach((fn) => fn()); await flush(); },
-    async navigate(id) { state.sessionId = id; mutation([{ target: host }]); timers.splice(0).forEach((fn) => fn()); await flush(); },
+    async navigate(id) { state.sessionId = id; mutation([{ target: host }]); await runTimers(); },
+    mutate: (mutations = [{ target: host }]) => mutation(mutations),
+    runTimers,
+    timerDelays: () => [...timers.values()].map(({ delay }) => delay),
     async click(node) { node.dispatchEvent({ type: "click", preventDefault() {}, stopPropagation() {} }); await flush(); },
     async load() { await flush(); },
   };
@@ -104,6 +118,46 @@ test("opening an old conversation shows recovered changes without requiring a ne
   env.state.visible = false;
   await env.navigate("conversation-without-changes");
   assert.equal(env.window.__codeyConversationGit.snapshot().visible, false);
+});
+
+test("checks the latest conversation as soon as an old status request settles", async () => {
+  const first = deferred(), latest = deferred();
+  const env = harness({ status: ({ sessionId }) => sessionId === "session-a" ? first.promise : latest.promise });
+  await env.load();
+  await env.navigate("session-b");
+  await env.navigate("session-c");
+  assert.equal(env.calls.filter((call) => call.path.endsWith("_status")).length, 1);
+  first.resolve({ visible: true }); await flush();
+  const checks = env.calls.filter((call) => call.path.endsWith("_status"));
+  assert.deepEqual(checks.map((call) => call.payload.sessionId), ["session-a", "session-c"]);
+  assert.equal(env.window.__codeyConversationGit.snapshot().visible, false);
+  latest.resolve({ visible: true }); await flush();
+  assert.equal(env.window.__codeyConversationGit.snapshot().visible, true);
+});
+
+test("navigation promotes a queued background refresh and ignores its own DOM insertion", async () => {
+  const env = harness(); await env.load();
+  env.mutate();
+  assert.deepEqual(env.timerDelays(), [300]);
+  env.state.sessionId = "session-b";
+  env.mutate();
+  assert.equal(env.window.__codeyConversationGit.snapshot().visible, false);
+  assert.deepEqual(env.timerDelays(), [0]);
+  await env.runTimers();
+  assert.equal(env.calls.at(-1).payload.sessionId, "session-b");
+  env.mutate([{ type: "childList", target: env.host, addedNodes: [env.button()], removedNodes: [] }]);
+  assert.deepEqual(env.timerDelays(), []);
+});
+
+test("resumes the current conversation check after an old preview finishes", async () => {
+  const pending = deferred();
+  const env = harness({ preview: () => pending.promise }); await env.load();
+  await env.click(env.button());
+  await env.navigate("session-b");
+  pending.resolve({ token: "old", files: [], message: "旧对话", diff: "" }); await flush();
+  assert.equal(env.panel(), null);
+  assert.equal(env.calls.at(-1).payload.sessionId, "session-b");
+  assert.equal(env.window.__codeyConversationGit.snapshot().visible, true);
 });
 
 test("previews shared files as partial commits and requires confirmation", async () => {

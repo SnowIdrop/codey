@@ -7,10 +7,12 @@
   let sessionId = null;
   let generation = 0;
   let checking = false;
+  let refreshPending = false;
   let busy = false;
   let status = null;
   let panel = null;
   let timer = 0;
+  let timerDelay = 0;
   const context = () => window.__codeyPromptOptimize?.composerContext?.();
   const call = async (name, payload) => {
     if (typeof window.__codexSessionDeleteBridge !== "function") throw new Error("Codey bridge 尚未就绪");
@@ -420,6 +422,7 @@
       busy = false;
       button.disabled = false;
       delete button.dataset.busy;
+      if (refreshPending) void refresh();
     }
   };
   button.addEventListener("click", (event) => {
@@ -428,13 +431,20 @@
     if (panel) { close(); return; }
     void preview();
   });
-  const refresh = async () => {
+  const syncContext = () => {
     const current = context();
     if (current?.sessionId !== sessionId) {
       sessionId = current?.sessionId || null; generation += 1; status = null; close(); button.style.display = "none";
     }
+    return current;
+  };
+  const refresh = async () => {
+    if (timer) { clearTimeout(timer); timer = 0; }
+    const current = syncContext();
     if (!enabled || !sessionId || !current?.target) { button.style.display = "none"; return; }
-    if (checking || busy || document.hidden) return;
+    if (document.hidden) return;
+    if (checking || busy) { refreshPending = true; return; }
+    refreshPending = false;
     const epoch = generation, selected = sessionId;
     checking = true;
     try {
@@ -449,13 +459,22 @@
       button.style.display = "inline-flex";
     } catch (failure) {
       if (valid(selected, epoch)) { status = { visible: false, reason: String(failure?.message || failure) }; button.style.display = "none"; }
-    } finally { checking = false; }
+    } finally {
+      checking = false;
+      if (refreshPending || generation !== epoch || context()?.sessionId !== selected) void refresh();
+    }
   };
   const schedule = () => {
-    // 导航时同步隐藏旧按钮，再延迟查询，防止旧对话的预览进入新对话。
-    if (context()?.sessionId !== sessionId) { generation += 1; status = null; close(); button.style.display = "none"; }
-    if (!enabled || timer) return;
-    timer = setTimeout(() => { timer = 0; void refresh(); }, 300);
+    // 导航时立即清理旧状态，当前会话优先查询；普通变化合并处理。
+    syncContext();
+    if (!enabled) return;
+    const delay = status === null ? 0 : 300;
+    if (timer) {
+      if (delay >= timerDelay) return;
+      clearTimeout(timer);
+    }
+    timerDelay = delay;
+    timer = setTimeout(() => { timer = 0; void refresh(); }, delay);
   };
   const load = async () => {
     try {
@@ -482,7 +501,12 @@
     if (panel && !busy && !panel.contains(event.target) && !button.contains(event.target)) close();
   });
   const mutationHandler = (mutations) => {
-    if (mutations.some((mutation) => !mutation.target?.closest?.(`#${id}, #${id}-panel`))) schedule();
+    const ownNode = (node) => node?.id === id || node?.id === `${id}-panel` || node?.closest?.(`#${id}, #${id}-panel`);
+    if (mutations.some((mutation) => {
+      if (ownNode(mutation.target)) return false;
+      const nodes = [...(mutation.addedNodes || []), ...(mutation.removedNodes || [])];
+      return !nodes.length || nodes.some((node) => !ownNode(node));
+    })) schedule();
   };
   const options = { childList: true, subtree: true, attributes: true, attributeFilter: ["data-above-composer-conversation-id"] };
   if (window.__codeyMutationDispatcher?.subscribe) window.__codeyMutationDispatcher.subscribe(mutationHandler, options);

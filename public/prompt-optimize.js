@@ -61,6 +61,7 @@
     }
   };
   let scanTimer = 0;
+  let scanTimerDelay = 0;
   let repositionTimer = 0;
   let configLoadTimer = 0;
   let configLoadBackoffMs = 120;
@@ -425,7 +426,7 @@
     if (!isVisible(inputElement)) {
       inputElement = null;
       button.style.display = "none";
-      scheduleScan();
+      scheduleScan(true);
       return;
     }
     const target = findAccessInsertionTarget();
@@ -657,12 +658,18 @@
     updateButtonPosition();
   };
 
-  const scheduleScan = () => {
-    if (!enabled || scanTimer) return;
+  const scheduleScan = (urgent = false) => {
+    if (!enabled) return;
+    const delay = urgent ? 0 : scanDelayMs;
+    if (scanTimer) {
+      if (delay >= scanTimerDelay) return;
+      clearTimeout(scanTimer);
+    }
+    scanTimerDelay = delay;
     scanTimer = setTimeout(() => {
       scanTimer = 0;
       refreshButton();
-    }, scanDelayMs);
+    }, delay);
   };
 
   const scheduleReposition = () => {
@@ -747,7 +754,19 @@
         mutationRequiresComposerScan(mutation)
       );
     });
-    if (hasExternalMutation) scheduleScan();
+    if (hasExternalMutation) {
+      const conversationChanged = mutations.some((mutation) =>
+        mutation.type === "attributes" && mutation.attributeName === "data-above-composer-conversation-id",
+      );
+      const needsMount = !inputElement?.isConnected || !button?.isConnected || button.style.display === "none";
+      const composerChanged = needsMount && mutations.some((mutation) =>
+        nodeTouchesTrackedComposer(mutation.target) ||
+        [...(mutation.addedNodes || []), ...(mutation.removedNodes || [])].some((node) =>
+          nodeTouchesTrackedComposer(node, true) || nodeContainsComposerCandidate(node),
+        ),
+      );
+      scheduleScan(conversationChanged || composerChanged);
+    }
   };
 
   const composerMutationOptions = {
@@ -858,8 +877,8 @@
   });
   window.addEventListener("scroll", scheduleReposition, true);
   window.addEventListener("resize", scheduleReposition);
-  window.addEventListener("hashchange", scheduleScan);
-  window.addEventListener("popstate", scheduleScan);
+  window.addEventListener("hashchange", () => scheduleScan(true));
+  window.addEventListener("popstate", () => scheduleScan(true));
   document.addEventListener(
     "input",
     (event) => {
