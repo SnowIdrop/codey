@@ -1,6 +1,9 @@
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import {
   IconCheck as Check,
+  IconAdjustmentsHorizontal,
+  IconArchive,
+  IconBolt,
   IconChartDonut,
   IconCpu,
   IconEdit as Edit,
@@ -18,6 +21,7 @@ import {
   IconShieldCheck,
   IconSparkles,
   IconTrash as Trash,
+  IconWorld,
 } from "@tabler/icons-react";
 
 import type { Confirmation, Config, ModelContextConfig, ModelState, OfficialAccount, OfficialAccountsResult, Profile, ProviderStatus, RuntimeStatus } from "./App.types";
@@ -62,11 +66,11 @@ import { validateOutboundApiUrl, validateOutboundProxyUrl } from "./urlValidatio
 import { invoke } from "./api";
 import { listOfficialAccounts, rememberOfficialAccounts } from "./officialAccountsRequests";
 import { readHostTheme } from "./overlayTheme";
-import { remoteCompactionStatusText } from "./remoteCompactionStatus";
+import { getRouteCompactionStatus } from "./remoteCompactionStatus";
 
 type ModelSectionProps = {
   config: Config;
-  runtimeStatus: RuntimeStatus;
+  runtimeStatus?: RuntimeStatus;
   currentProvider: ProviderStatus["provider"] | null;
   officialAccountAvailable: boolean;
   popupContainer: HTMLElement | null;
@@ -270,8 +274,6 @@ function ModelSectionComponent({
   const [officialDialogScope, setOfficialDialogScope] =
     useState<OfficialRouteDialogScope | null>(null);
   const routeConfigReadOnly = !config.localRouterEnabled;
-  const compactionStatus = remoteCompactionStatusText(runtimeStatus);
-  const compactionBlockers = runtimeStatus.remoteCompaction?.blockingRoutes ?? [];
 
   useEffect(() => {
     if (!routeConfigReadOnly) return;
@@ -766,22 +768,6 @@ function ModelSectionComponent({
       />
 
       <div className="route-content">
-        {(config.localRouterEnabled || runtimeStatus.remoteCompaction?.active != null) && (
-          <div className="rounded-lg border border-default p-3 text-xs text-muted space-y-1.5" aria-label="远程压缩状态">
-            <strong className="text-foreground">{compactionStatus.title}</strong>
-            <p>{compactionStatus.detail}</p>
-            {config.localRouterEnabled && compactionBlockers.length > 0 && (
-              <details>
-                <summary className="cursor-pointer">已保存配置中有 {compactionBlockers.length} 条线路使用本地压缩</summary>
-                <ul className="mt-1.5 space-y-1">
-                  {compactionBlockers.map((route) => (
-                    <li key={route.routeId}>{route.routeName}：{route.reason}</li>
-                  ))}
-                </ul>
-              </details>
-            )}
-          </div>
-        )}
         <div className={`route-manager${routeConfigReadOnly ? " route-manager-current" : ""}`}>
           <div className="route-catalog-pane">
             {!routeConfigReadOnly && (
@@ -839,6 +825,7 @@ function ModelSectionComponent({
                 const group = modelGroupByProviderId.get(providerId);
                 const isOfficial = profile.authMode === "officialAccount";
                 const disabled = profile.enabled === false;
+                const compaction = getRouteCompactionStatus(profile, runtimeStatus, officialAccountAvailable);
                 const acceptsRouteDrop = draggedProfile && draggedProfile.id !== profile.id
                   && (draggedProfile.enabled === false) === disabled;
                 const officialLoginLabel = officialLoginLabelFor(
@@ -926,6 +913,13 @@ function ModelSectionComponent({
                                     <Badge variant="secondary">待配置模型</Badge>
                                   )}
                                   {(isOfficial || profile.supportsWebsockets) && <Badge variant="brand">WS</Badge>}
+                                  <Tooltip content={compaction.tooltip}>
+                                    <span className="inline-flex">
+                                      <Badge variant={compaction.badgeVariant} title={compaction.tooltip}>
+                                        {compaction.badgeText}
+                                      </Badge>
+                                    </span>
+                                  </Tooltip>
                                 </>
                               )}
                               {disabled && <span className="route-disabled-hint">启用后可使用此线路的模型</span>}
@@ -1118,7 +1112,10 @@ function ModelSectionComponent({
         <div className="route-auxiliary-bar">
           <div className="route-auxiliary-header">
             <div className="route-auxiliary-title-wrap">
-              <span className="route-auxiliary-title">高级路由与重试设置</span>
+              <div className="route-auxiliary-title-row">
+                <IconAdjustmentsHorizontal size={15} className="route-auxiliary-icon" aria-hidden="true" />
+                <span className="route-auxiliary-title">高级路由与重试设置</span>
+              </div>
               <small className="route-auxiliary-subtitle">配置辅助任务专用模型与长会话中断后的自动恢复策略</small>
             </div>
           </div>
@@ -1576,99 +1573,137 @@ function ModelSectionComponent({
                 </div>
 
                 {routeDraft.upstreamProtocol === "openaiResponses" && (
-                  <div className="route-protocol-options route-editor-span-all">
-                    <div className="route-option-item">
-                      <div className="route-option-header">
-                        <div className="route-option-title-group">
-                          <strong className="route-option-title">原生远程压缩</strong>
-                          <Tooltip content="仅在上游明确支持时开启，并选择服务商支持的压缩接口；该线路可独立使用远程压缩，能力变更需重启 Codex。">
-                            <span className="route-option-info-trigger" aria-label="原生远程压缩详细说明">
-                              <IconInfoCircle size={13} />
-                            </span>
-                          </Tooltip>
-                        </div>
-                        <Switch
-                          size="sm"
-                          checked={Boolean(routeDraft.supportsRemoteCompaction)}
-                          disabled={isBusy}
-                          onCheckedChange={(checked) =>
-                            updateRouteDraft({ supportsRemoteCompaction: checked })}
-                          aria-label="原生远程压缩"
-                        />
-                      </div>
-                      <small className="route-field-hint">
-                        支持的线路独立启用；会话切换压缩方式需重启 Codex 或新建任务
-                      </small>
+                  <div className="route-field route-editor-span-all">
+                    <div className="route-protocol-section-header">
+                      <span className="route-protocol-section-title">
+                        <IconAdjustmentsHorizontal size={14} className="text-muted" aria-hidden="true" />
+                        协议特性（OpenAI Responses）
+                      </span>
+                      <span className="route-protocol-section-badge">按需扩展</span>
                     </div>
-                    <div className="route-option-item">
-                      <div className="route-option-header">
-                        <div className="route-option-title-group">
-                          <strong className="route-option-title">WebSocket</strong>
-                          <Tooltip content="优先尝试复用长连接；使用代理或连接失败时转为流式 HTTP。能力变更需重启 Codex，实际速度取决于上游和网络。">
-                            <span className="route-option-info-trigger" aria-label="WebSocket 详细说明">
-                              <IconInfoCircle size={13} />
+                    <div className="route-protocol-options">
+                      <div
+                        className="route-option-item"
+                        data-active={Boolean(routeDraft.supportsRemoteCompaction)}
+                      >
+                        <div className="route-option-header">
+                          <div className="route-option-title-group">
+                            <span className="route-option-icon" aria-hidden="true">
+                              <IconArchive size={15} />
                             </span>
-                          </Tooltip>
-                        </div>
-                        <Switch
-                          size="sm"
-                          checked={Boolean(routeDraft.supportsWebsockets)}
-                          disabled={isBusy}
-                          onCheckedChange={(checked) =>
-                            updateRouteDraft({ supportsWebsockets: checked })}
-                          aria-label="WebSocket"
-                        />
-                      </div>
-                      <small className="route-field-hint">
-                        优先长连接，失败转流式 HTTP
-                      </small>
-                      {routeDraft.supportsRemoteCompaction && (
-                        <div className="route-field mt-2">
-                          <span id="route-compaction-protocol-label">压缩接口</span>
-                          <Select
-                            aria-labelledby="route-compaction-protocol-label"
-                            value={routeDraft.remoteCompactionProtocol ?? "responses"}
+                            <strong className="route-option-title">原生远程压缩</strong>
+                            <Tooltip content="仅在上游明确支持时开启，并选择服务商支持的压缩接口；该线路可独立使用远程压缩，能力变更需重启 Codex。">
+                              <span className="route-option-info-trigger" aria-label="原生远程压缩详细说明">
+                                <IconInfoCircle size={13} />
+                              </span>
+                            </Tooltip>
+                          </div>
+                          <Switch
+                            size="sm"
+                            checked={Boolean(routeDraft.supportsRemoteCompaction)}
                             disabled={isBusy}
-                            onChange={(value) => {
-                              if (value === "responses" || value === "compactEndpoint") {
-                                updateRouteDraft({ remoteCompactionProtocol: value });
-                              }
-                            }}
-                            optionList={[
-                              { label: "原生 Responses（默认）", value: "responses" },
-                              { label: "独立压缩接口（兼容）", value: "compactEndpoint" },
-                            ]}
+                            onCheckedChange={(checked) =>
+                              updateRouteDraft({ supportsRemoteCompaction: checked })}
+                            aria-label="原生远程压缩"
                           />
-                          <small className="route-field-hint">
-                            {routeDraft.remoteCompactionProtocol === "compactEndpoint"
-                              ? "将新式压缩请求转换到 /responses/compact；上游须返回加密压缩结果。接口选择保存后生效。"
-                              : "按 Codex 原始压缩协议发送；若服务商仅支持 /responses/compact，请选择兼容接口。"}
-                          </small>
                         </div>
-                      )}
-                    </div>
-                    <div className="route-option-item">
-                      <div className="route-option-header">
-                        <div className="route-option-title-group">
-                          <strong className="route-option-title">原生网页搜索</strong>
-                          <Tooltip content="仅在上游和所选模型都明确支持时开启。">
-                            <span className="route-option-info-trigger" aria-label="原生网页搜索详细说明">
-                              <IconInfoCircle size={13} />
-                            </span>
-                          </Tooltip>
-                        </div>
-                        <Switch
-                          size="sm"
-                          checked={Boolean(routeDraft.supportsNativeWebSearch)}
-                          disabled={isBusy}
-                          onCheckedChange={(checked) =>
-                            updateRouteDraft({ supportsNativeWebSearch: checked })}
-                          aria-label="原生网页搜索"
-                        />
+                        <p className="route-field-hint">
+                          支持的线路独立启用；会话切换压缩方式需重启 Codex 或新建任务
+                        </p>
+                        {routeDraft.supportsRemoteCompaction && (
+                          <div className="route-option-subpanel">
+                            <div className="route-option-subpanel-title-row">
+                              <span id="route-compaction-protocol-label" className="route-option-subpanel-label">
+                                压缩接口
+                              </span>
+                              <span className="route-option-subpanel-badge">
+                                {routeDraft.remoteCompactionProtocol === "compactEndpoint"
+                                  ? "兼容接口"
+                                  : "原生默认"}
+                              </span>
+                            </div>
+                            <Select
+                              aria-labelledby="route-compaction-protocol-label"
+                              value={routeDraft.remoteCompactionProtocol ?? "responses"}
+                              disabled={isBusy}
+                              onChange={(value) => {
+                                if (value === "responses" || value === "compactEndpoint") {
+                                  updateRouteDraft({ remoteCompactionProtocol: value });
+                                }
+                              }}
+                              optionList={[
+                                { label: "原生 Responses（默认）", value: "responses" },
+                                { label: "独立压缩接口（兼容）", value: "compactEndpoint" },
+                              ]}
+                            />
+                            <p className="route-option-subpanel-hint">
+                              {routeDraft.remoteCompactionProtocol === "compactEndpoint"
+                                ? "将新式压缩请求转换到 /responses/compact；上游须返回加密压缩结果。接口选择保存后生效。"
+                                : "按 Codex 原始压缩协议发送；若服务商仅支持 /responses/compact，请选择兼容接口。"}
+                            </p>
+                          </div>
+                        )}
                       </div>
-                      <small className="route-field-hint">
-                        仅在上游与模型支持时开启
-                      </small>
+
+                      <div
+                        className="route-option-item"
+                        data-active={Boolean(routeDraft.supportsWebsockets)}
+                      >
+                        <div className="route-option-header">
+                          <div className="route-option-title-group">
+                            <span className="route-option-icon" aria-hidden="true">
+                              <IconBolt size={15} />
+                            </span>
+                            <strong className="route-option-title">WebSocket</strong>
+                            <Tooltip content="优先尝试复用长连接；使用代理或连接失败时转为流式 HTTP。能力变更需重启 Codex，实际速度取决于上游和网络。">
+                              <span className="route-option-info-trigger" aria-label="WebSocket 详细说明">
+                                <IconInfoCircle size={13} />
+                              </span>
+                            </Tooltip>
+                          </div>
+                          <Switch
+                            size="sm"
+                            checked={Boolean(routeDraft.supportsWebsockets)}
+                            disabled={isBusy}
+                            onCheckedChange={(checked) =>
+                              updateRouteDraft({ supportsWebsockets: checked })}
+                            aria-label="WebSocket"
+                          />
+                        </div>
+                        <p className="route-field-hint">
+                          优先长连接，失败转流式 HTTP
+                        </p>
+                      </div>
+
+                      <div
+                        className="route-option-item"
+                        data-active={Boolean(routeDraft.supportsNativeWebSearch)}
+                      >
+                        <div className="route-option-header">
+                          <div className="route-option-title-group">
+                            <span className="route-option-icon" aria-hidden="true">
+                              <IconWorld size={15} />
+                            </span>
+                            <strong className="route-option-title">原生网页搜索</strong>
+                            <Tooltip content="仅在上游和所选模型都明确支持时开启。">
+                              <span className="route-option-info-trigger" aria-label="原生网页搜索详细说明">
+                                <IconInfoCircle size={13} />
+                              </span>
+                            </Tooltip>
+                          </div>
+                          <Switch
+                            size="sm"
+                            checked={Boolean(routeDraft.supportsNativeWebSearch)}
+                            disabled={isBusy}
+                            onCheckedChange={(checked) =>
+                              updateRouteDraft({ supportsNativeWebSearch: checked })}
+                            aria-label="原生网页搜索"
+                          />
+                        </div>
+                        <p className="route-field-hint">
+                          仅在上游与模型支持时开启
+                        </p>
+                      </div>
                     </div>
                   </div>
                 )}

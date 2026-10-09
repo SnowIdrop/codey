@@ -137,12 +137,15 @@
 }
 
 @media (max-width: 520px) {
-  .route-protocol-options {
-    grid-template-columns: 1fr;
+  .route-option-item {
+    padding: 9px 12px;
   }
 
-  .route-option-item + .route-option-item {
-    border-left: 0;
-    border-top: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.06);
+  .route-option-item .route-field-hint {
+    padding-left: 0;
+  }
+
+  .route-option-subpanel {
+    margin-left: 0;
   }
 }
