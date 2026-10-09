@@ -23,6 +23,31 @@ fn request_log_catalog_exposes_login_status_independently_of_profiles() {
 }
 
 #[test]
+fn request_log_catalog_preserves_route_display_fields_without_credentials() {
+    let mut third_party = ProviderProfile::new("自建");
+    third_party.short_name = "私".into();
+    third_party.api_key = "private-test-key".into();
+    let mut unnamed = ProviderProfile::new("");
+    unnamed.short_name = "中转".into();
+    let mut official = ProviderProfile::new("官方线路");
+    official.short_name = "官甲".into();
+    official.official_account = true;
+    official.official_account_id = Some("account-a".into());
+    let config = CodeyConfig {
+        profiles: vec![third_party, unnamed, official],
+        ..CodeyConfig::default()
+    };
+    let response = serde_json::to_value(RequestLogCatalog::from_config(&config)).unwrap();
+    assert_eq!(response["profiles"][0]["shortName"], "私");
+    assert_eq!(response["profiles"][1]["shortName"], "中转");
+    assert_eq!(response["profiles"][1]["name"], "");
+    assert_eq!(response["profiles"][2]["shortName"], "官甲");
+    assert_eq!(response["profiles"][2]["officialAccount"], true);
+    assert_eq!(response["profiles"][2]["officialAccountId"], "account-a");
+    assert!(response["profiles"][0].get("apiKey").is_none());
+}
+
+#[test]
 fn image_request_uses_the_model_route_instead_of_a_conversation_binding() {
     let mut chat = ProviderProfile::new("Chat");
     chat.id = "chat".into();

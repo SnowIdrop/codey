@@ -65,6 +65,10 @@ pub(crate) struct RequestLogCatalog {
 pub(crate) struct RequestLogProfile {
     pub(crate) id: String,
     pub(crate) name: String,
+    pub(crate) short_name: String,
+    pub(crate) official_account: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) official_account_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) source_provider_id: Option<String>,
 }
@@ -79,6 +83,9 @@ impl RequestLogCatalog {
                 .map(|profile| RequestLogProfile {
                     id: profile.id.clone(),
                     name: profile.name.clone(),
+                    short_name: profile.display_short_name(),
+                    official_account: profile.official_account,
+                    official_account_id: profile.official_account_id.clone(),
                     source_provider_id: profile.source_provider_id.clone(),
                 })
                 .collect(),
