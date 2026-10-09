@@ -262,7 +262,9 @@ fn history_cache_checks_content_even_when_file_size_and_time_are_preserved() {
     assert_ne!(changed, original);
     assert_eq!(changed.len(), original.len());
     fs::write(&path, changed).unwrap();
-    File::open(&path)
+    File::options()
+        .write(true)
+        .open(&path)
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(modified))
         .unwrap();
