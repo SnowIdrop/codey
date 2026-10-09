@@ -1073,6 +1073,9 @@ impl RouterServer {
                 downstream.write_steering_notifications().await?;
                 continue;
             }
+            if downstream.handle_idle_response_interrupt(&message)? {
+                continue;
+            }
             if matches!(message, WebSocketMessage::Text(_)) {
                 match acquire_connection_permit_within(
                     &self.connection_limit,
@@ -1181,7 +1184,7 @@ impl RouterServer {
                                 400,
                                 "unsupported_websocket_message",
                                 format!(
-                                    "Codey Responses WebSocket 支持 response.create 和 response.steer；{received}"
+                                    "Codey Responses WebSocket 支持 response.create、response.steer 和 response.interrupt；{received}"
                                 ),
                                 None,
                             )

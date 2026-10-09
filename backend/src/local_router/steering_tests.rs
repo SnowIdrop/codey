@@ -255,3 +255,86 @@ async fn invalid_steering_is_a_control_failure_and_keeps_socket_usable() {
     socket.close(None).await.unwrap();
     router.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn websocket_interrupt_is_forwarded_to_upstream() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = upstream.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (stream, _) = upstream.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let WebSocketMessage::Text(create) = socket.next().await.unwrap().unwrap() else {
+            panic!("expected response.create")
+        };
+        let create: Value = serde_json::from_str(&create).unwrap();
+        assert_eq!(create["type"], "response.create");
+        socket
+            .send(WebSocketMessage::Text(
+                json!({
+                    "type":"response.created",
+                    "response":{"id":"resp-interrupt","object":"response","status":"in_progress","output":[]}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let WebSocketMessage::Text(interrupt) = socket.next().await.unwrap().unwrap() else {
+            panic!("expected response.interrupt")
+        };
+        let interrupt: Value = serde_json::from_str(&interrupt).unwrap();
+        assert_eq!(interrupt["type"], "response.interrupt");
+        assert_eq!(interrupt["response_id"], "resp-interrupt");
+        assert_eq!(interrupt["mode"], "discard_partial_items");
+        socket
+            .send(WebSocketMessage::Text(
+                json!({
+                    "type":"response.incomplete",
+                    "response":{"id":"resp-interrupt","object":"response","status":"incomplete","output":[]}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let _ = socket.next().await;
+    });
+
+    let (mut config, provider, model) = router_config(format!("http://{address}/v1"));
+    config.profiles[0].supports_websockets = true;
+    let router = LocalRouter::start(&config).await.unwrap();
+    let mut socket = connect_router_websocket(&router.endpoint()).await;
+    socket
+        .send(WebSocketMessage::Text(
+            json!({
+                "type":"response.create",
+                "model":model_alias(&provider, &model),
+                "input":"interrupt me",
+                "stream_id":"interrupt-lane"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(receive(&mut socket).await["type"], "response.created");
+    socket
+        .send(WebSocketMessage::Text(
+            json!({
+                "type":"response.interrupt",
+                "response_id":"resp-interrupt",
+                "mode":"discard_partial_items"
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(receive(&mut socket).await["type"], "response.incomplete");
+    socket.close(None).await.unwrap();
+    router.stop().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+}

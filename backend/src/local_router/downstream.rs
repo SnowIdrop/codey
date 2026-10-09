@@ -134,6 +134,17 @@ impl std::fmt::Display for DownstreamClosed {
 
 impl std::error::Error for DownstreamClosed {}
 
+#[derive(Debug)]
+pub(crate) struct DownstreamResponseInterrupt;
+
+impl std::fmt::Display for DownstreamResponseInterrupt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("下游请求中断当前 Responses 响应")
+    }
+}
+
+impl std::error::Error for DownstreamResponseInterrupt {}
+
 pub(crate) struct ObservedResponsesDownstream<'a, D>
 where
     D: ResponsesDownstream + ?Sized,
@@ -502,6 +513,8 @@ pub(crate) struct WebSocketResponsesDownstream {
     pub(crate) adapted_history: AdaptedResponsesHistory,
     pub(crate) native_history: NativeResponsesHistory,
     pub(crate) steering: SteeringState,
+    pub(crate) pending_interrupt: Option<Value>,
+    pub(crate) interrupt_forwarding: bool,
     pub(crate) terminal_started: bool,
     pub(crate) pending_messages: VecDeque<(WebSocketMessage, Option<OwnedSemaphorePermit>)>,
     pub(crate) pending_budget_blocked: bool,

@@ -107,6 +107,8 @@ impl WebSocketResponsesDownstream {
             adapted_history: AdaptedResponsesHistory::default(),
             native_history: NativeResponsesHistory::default(),
             steering: SteeringState::default(),
+            pending_interrupt: None,
+            interrupt_forwarding: false,
             terminal_started: false,
             pending_messages: VecDeque::new(),
             pending_budget_blocked: false,
@@ -163,6 +165,30 @@ impl WebSocketResponsesDownstream {
         let event = self.steering.accept(&body, &self.request_body_budget);
         self.write_steering_event(&event).await?;
         Ok(true)
+    }
+
+    fn response_interrupt_from_message(message: &WebSocketMessage) -> Result<Option<Value>> {
+        let WebSocketMessage::Text(text) = message else {
+            return Ok(None);
+        };
+        let Ok(Value::Object(body)) = serde_json::from_str::<Value>(text.as_str()) else {
+            return Ok(None);
+        };
+        if body.get("type").and_then(Value::as_str) != Some("response.interrupt") {
+            return Ok(None);
+        }
+        Ok(Some(Value::Object(body)))
+    }
+
+    fn take_response_interrupt(&mut self) -> Option<Value> {
+        self.pending_interrupt.take()
+    }
+
+    pub(crate) fn handle_idle_response_interrupt(
+        &mut self,
+        message: &WebSocketMessage,
+    ) -> Result<bool> {
+        Ok(Self::response_interrupt_from_message(message)?.is_some())
     }
 
     pub(crate) async fn next_message(&mut self) -> Result<Option<WebSocketMessage>> {
@@ -379,6 +405,22 @@ impl WebSocketResponsesDownstream {
     }
 
     pub(crate) async fn proxy_upstream_websocket(
+        &mut self,
+        route: &RouteTarget,
+        headers: &HeaderMap,
+        body: &mut Value,
+        discard_opaque_reasoning: bool,
+        probe: Option<&RouteRequestLogProbe>,
+    ) -> Result<UpstreamWebSocketAttempt> {
+        self.interrupt_forwarding = true;
+        let result = self
+            .proxy_upstream_websocket_impl(route, headers, body, discard_opaque_reasoning, probe)
+            .await;
+        self.interrupt_forwarding = false;
+        result
+    }
+
+    async fn proxy_upstream_websocket_impl(
         &mut self,
         route: &RouteTarget,
         headers: &HeaderMap,
@@ -603,21 +645,58 @@ impl WebSocketResponsesDownstream {
             if tokio::time::Instant::now() >= response_deadline {
                 return Err(anyhow::Error::new(UpstreamResponseDeadline));
             }
-            let next = match self
-                .wait_for_upstream(tokio::time::timeout_at(
-                    std::cmp::min(
-                        response_deadline,
-                        tokio::time::Instant::now() + UPSTREAM_READ_IDLE_TIMEOUT,
-                    ),
-                    upstream.socket.next(),
-                ))
-                .await?
-            {
-                Ok(next) => next,
-                Err(_) => {
-                    record_upstream_websocket_failure(&self.websocket_backoffs, &backoff_key);
-                    anyhow::bail!("读取 Responses WebSocket 上游事件超时");
-                }
+            let next = loop {
+                let waited = self
+                    .wait_for_upstream(tokio::time::timeout_at(
+                        std::cmp::min(
+                            response_deadline,
+                            tokio::time::Instant::now() + UPSTREAM_READ_IDLE_TIMEOUT,
+                        ),
+                        upstream.socket.next(),
+                    ))
+                    .await;
+                let next = match waited {
+                    Ok(Ok(next)) => next,
+                    Ok(Err(_)) => {
+                        record_upstream_websocket_failure(&self.websocket_backoffs, &backoff_key);
+                        anyhow::bail!("读取 Responses WebSocket 上游事件超时");
+                    }
+                    Err(error)
+                        if error
+                            .downcast_ref::<DownstreamResponseInterrupt>()
+                            .is_some() =>
+                    {
+                        let interrupt = self
+                            .take_response_interrupt()
+                            .context("Responses WebSocket 缺少待发送的中断事件")?;
+                        let message = serde_json::to_string(&interrupt)
+                            .context("序列化 Responses WebSocket 中断事件失败")?;
+                        match tokio::time::timeout(
+                            DOWNSTREAM_WRITE_TIMEOUT,
+                            upstream.socket.send(WebSocketMessage::Text(message.into())),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => continue,
+                            Ok(Err(error)) => {
+                                record_upstream_websocket_failure(
+                                    &self.websocket_backoffs,
+                                    &backoff_key,
+                                );
+                                return Err(error).context("发送 Responses WebSocket 中断事件失败");
+                            }
+                            Err(_) => {
+                                record_upstream_websocket_failure(
+                                    &self.websocket_backoffs,
+                                    &backoff_key,
+                                );
+                                anyhow::bail!("发送 Responses WebSocket 中断事件超时");
+                            }
+                        }
+                    }
+                    Err(error) => return Err(error),
+                };
+                break next;
             };
             let Some(message) = next else {
                 record_upstream_websocket_failure(&self.websocket_backoffs, &backoff_key);
@@ -1050,6 +1129,12 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
                         Some(Ok(message)) => {
                             if self.handle_steering_message(&message).await? {
                                 continue;
+                            }
+                            if let Some(interrupt) = Self::response_interrupt_from_message(&message)? {
+                                if self.interrupt_forwarding {
+                                    self.pending_interrupt = Some(interrupt);
+                                    return Err(DownstreamResponseInterrupt.into());
+                                }
                             }
                             // ponytail: full queues delay control frames; use an explicit
                             // cancellation channel if cancellation must bypass queued requests.
