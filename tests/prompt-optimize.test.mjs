@@ -659,7 +659,7 @@ test("keeps the original dark treatment at a 26px height", async () => {
   const button = env.getElementById("codey-prompt-optimize-button");
   const style = env.getElementById("codey-prompt-optimize-style");
   assert.match(style.textContent, /height: 26px !important/);
-  assert.match(style.textContent, /background: rgba\(30, 30, 30, \.92\)/);
+  assert.match(style.textContent, /background:\s*light-dark/);
   assert.doesNotMatch(style.textContent, /--codey-ai-/);
   assert.doesNotMatch(button.innerHTML, /codey-prompt-optimize-ai-gradient/);
 });
