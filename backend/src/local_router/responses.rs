@@ -1069,6 +1069,10 @@ impl RouterServer {
             let Some(message) = downstream.next_message().await? else {
                 break;
             };
+            if downstream.handle_steering_message(&message).await? {
+                downstream.write_steering_notifications().await?;
+                continue;
+            }
             if matches!(message, WebSocketMessage::Text(_)) {
                 match acquire_connection_permit_within(
                     &self.connection_limit,
@@ -1148,16 +1152,37 @@ impl RouterServer {
                     };
                     let request_body_bytes = Some(text.len() as u64);
                     drop(text);
-                    let message_type = body
-                        .as_object_mut()
-                        .and_then(|body| body.remove("type"))
-                        .and_then(|value| value.as_str().map(str::to_string));
-                    if message_type.as_deref() != Some("response.create") {
+                    if body["type"] == "response.steer" {
+                        let event = downstream.steering.accept(&body, &self.request_body_budget);
+                        downstream.write_steering_event(&event).await?;
+                        downstream.write_steering_notifications().await?;
+                        continue;
+                    }
+                    let message_type = body.as_object_mut().and_then(|body| body.remove("type"));
+                    if message_type.as_ref().and_then(Value::as_str) != Some("response.create") {
+                        // 仅显示有界的协议标识，不把任意字段内容写入错误信息。
+                        let received = match message_type.as_ref() {
+                            None => "缺少 type 字段".to_string(),
+                            Some(Value::String(value))
+                                if !value.is_empty()
+                                    && value.len() <= 64
+                                    && value.bytes().all(|byte| {
+                                        byte.is_ascii_alphanumeric()
+                                            || matches!(byte, b'.' | b'_' | b'-')
+                                    }) =>
+                            {
+                                format!("收到事件类型 {value}")
+                            }
+                            Some(Value::String(_)) => "type 不是有效的事件标识".to_string(),
+                            Some(_) => "type 字段必须为字符串".to_string(),
+                        };
                         downstream
                             .write_error(
                                 400,
                                 "unsupported_websocket_message",
-                                "Codey Responses WebSocket 仅支持 response.create".to_string(),
+                                format!(
+                                    "Codey Responses WebSocket 支持 response.create 和 response.steer；{received}"
+                                ),
                                 None,
                             )
                             .await?;
@@ -1211,6 +1236,34 @@ impl RouterServer {
                         // fallback and never forwards either field over WS.
                         body.remove("stream");
                         body.remove("background");
+                    }
+                    match downstream
+                        .steering
+                        .begin_request(&mut body, &self.request_body_budget)
+                    {
+                        Ok(events) => {
+                            for event in events {
+                                downstream.write_steering_event(&event).await?;
+                            }
+                        }
+                        Err(error) => {
+                            // 这次 create 校验失败，不改变仍在等待工具结果的原响应。
+                            let mut event = ResponsesFailure::new(
+                                400,
+                                "steering_required_input",
+                                error.to_string(),
+                                None,
+                            )
+                            .normalized_event();
+                            downstream.steering.sequence_response_event(&mut event);
+                            downstream
+                                .write_text(encode_responses_websocket_event(
+                                    &event,
+                                    stream_id.as_deref(),
+                                )?)
+                                .await?;
+                            continue;
+                        }
                     }
                     downstream.set_stream_id(stream_id);
                     let request = HttpRequest {
@@ -1272,6 +1325,7 @@ impl RouterServer {
                                 .await?;
                         }
                     }
+                    downstream.write_steering_notifications().await?;
                 }
                 WebSocketMessage::Ping(payload) => downstream.write_pong(payload).await?,
                 WebSocketMessage::Pong(_) => {}

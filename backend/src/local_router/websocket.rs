@@ -106,6 +106,7 @@ impl WebSocketResponsesDownstream {
             stream_id: None,
             adapted_history: AdaptedResponsesHistory::default(),
             native_history: NativeResponsesHistory::default(),
+            steering: SteeringState::default(),
             terminal_started: false,
             pending_messages: VecDeque::new(),
             pending_budget_blocked: false,
@@ -124,7 +125,53 @@ impl WebSocketResponsesDownstream {
         self.terminal_started = false;
     }
 
+    pub(crate) async fn write_steering_event(&mut self, event: &Value) -> Result<()> {
+        let encoded = encode_responses_websocket_event(event, None)?;
+        // 控制事件不经过响应失败归一化，不结束正在生成的响应。
+        self.write_text(encoded).await
+    }
+
+    pub(crate) async fn write_steering_notifications(&mut self) -> Result<()> {
+        for event in self.steering.notifications() {
+            self.write_steering_event(&event).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn handle_steering_message(
+        &mut self,
+        message: &WebSocketMessage,
+    ) -> Result<bool> {
+        let WebSocketMessage::Text(text) = message else {
+            return Ok(false);
+        };
+        #[derive(serde::Deserialize)]
+        struct MessageType {
+            #[serde(rename = "type")]
+            kind: String,
+        }
+        if !serde_json::from_str::<MessageType>(text.as_str())
+            .is_ok_and(|message| message.kind == "response.steer")
+        {
+            return Ok(false);
+        }
+        // 预算不足时沿用普通帧的有界排队，外层取得预算后再处理。
+        let Ok(_permit) = acquire_request_body_budget(&self.request_body_budget, text.len()) else {
+            return Ok(false);
+        };
+        let body: Value = serde_json::from_str(text.as_str())?;
+        let event = self.steering.accept(&body, &self.request_body_budget);
+        self.write_steering_event(&event).await?;
+        Ok(true)
+    }
+
     pub(crate) async fn next_message(&mut self) -> Result<Option<WebSocketMessage>> {
+        self.write_steering_notifications().await?;
+        if let Some(body) = self.steering.take_continuation() {
+            return Ok(Some(WebSocketMessage::Text(
+                serde_json::to_string(&body)?.into(),
+            )));
+        }
         let idle_deadline = tokio::time::Instant::now() + DOWNSTREAM_WEBSOCKET_IDLE_TIMEOUT;
         let mut idle_slot = None;
         loop {
@@ -652,7 +699,13 @@ impl WebSocketResponsesDownstream {
                             // before they are sent to Codex.
                             self.terminal_started |= terminal;
                             self.native_history.observe(&event);
-                            self.write_text(text).await?;
+                            let renumbered = self.steering.sequence_response_event(&mut event);
+                            self.steering.observe(&event);
+                            if renumbered {
+                                self.write_text(serde_json::to_string(&event)?).await?;
+                            } else {
+                                self.write_text(text).await?;
+                            }
                         } else {
                             self.write_event(&event).await?;
                         }
@@ -745,7 +798,10 @@ impl WebSocketResponsesDownstream {
 
 /// 复用连接补 `stream_id` 时 flatten 原对象再追加字段，避免为 delta 事件整树 clone。
 /// 新键写在末尾，与 `Map::insert` 后再 `to_string` 的键序一致。
-fn encode_responses_websocket_event(event: &Value, stream_id: Option<&str>) -> Result<String> {
+pub(crate) fn encode_responses_websocket_event(
+    event: &Value,
+    stream_id: Option<&str>,
+) -> Result<String> {
     match stream_id {
         Some(stream_id) => {
             let object = event
@@ -992,6 +1048,9 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
                         }
                         Some(Err(error)) => return Err(anyhow::Error::new(error).context(DownstreamClosed)),
                         Some(Ok(message)) => {
+                            if self.handle_steering_message(&message).await? {
+                                continue;
+                            }
                             // ponytail: full queues delay control frames; use an explicit
                             // cancellation channel if cancellation must bypass queued requests.
                             // At most one bounded frame may wait for the shared body budget.
@@ -1087,7 +1146,10 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
     }
 
     async fn write_event(&mut self, event: &Value) -> Result<()> {
-        let event = normalized_response_event(event);
+        let mut event = normalized_response_event(event);
+        if self.steering.controls_sent {
+            self.steering.sequence_response_event(event.to_mut());
+        }
         if responses_event_is_terminal(&event) {
             if self.terminal_started {
                 return Ok(());
@@ -1095,6 +1157,7 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
             self.terminal_started = true;
         }
         self.native_history.observe(&event);
+        self.steering.observe(&event);
         let encoded = encode_responses_websocket_event(
             &event,
             self.event_needs_stream_id(&event).then(|| {

@@ -501,6 +501,7 @@ pub(crate) struct WebSocketResponsesDownstream {
     pub(crate) stream_id: Option<String>,
     pub(crate) adapted_history: AdaptedResponsesHistory,
     pub(crate) native_history: NativeResponsesHistory,
+    pub(crate) steering: SteeringState,
     pub(crate) terminal_started: bool,
     pub(crate) pending_messages: VecDeque<(WebSocketMessage, Option<OwnedSemaphorePermit>)>,
     pub(crate) pending_budget_blocked: bool,

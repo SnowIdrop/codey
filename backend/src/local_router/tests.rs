@@ -1214,6 +1214,62 @@ fn router_snapshot_routes_compact_through_each_protocol_endpoint() {
     );
 }
 
+#[tokio::test]
+async fn websocket_rejected_message_reports_type_without_echoing_payload() {
+    let (config, _, _) = router_config("http://127.0.0.1:9/v1".into());
+    let router = LocalRouter::start(&config).await.unwrap();
+    let mut socket = connect_router_websocket(&router.endpoint()).await;
+    for (mut request, expected) in [
+        (
+            json!({"type":"response.cancel"}),
+            "收到事件类型 response.cancel",
+        ),
+        (json!({}), "缺少 type 字段"),
+        (json!({"type":null}), "type 字段必须为字符串"),
+        (
+            json!({"type":{"private":"private-input"}}),
+            "type 字段必须为字符串",
+        ),
+        (
+            json!({"type":"response.steer\nprivate-input"}),
+            "type 不是有效的事件标识",
+        ),
+        (json!({"type":"x".repeat(65)}), "type 不是有效的事件标识"),
+    ] {
+        request["input"] = json!("private-input");
+        socket
+            .send(WebSocketMessage::Text(request.to_string().into()))
+            .await
+            .unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let WebSocketMessage::Text(text) = message else {
+            panic!("expected failure event")
+        };
+        let event: Value = serde_json::from_str(text.as_str()).unwrap();
+        assert_eq!(event["type"], "response.failed");
+        assert_eq!(
+            event["response"]["error"]["codey"]["errorCode"],
+            "unsupported_websocket_message"
+        );
+        assert!(
+            event["response"]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(expected)
+        );
+        assert!(!text.contains("private-input"));
+    }
+    socket.close(None).await.unwrap();
+    router.stop().await.unwrap();
+}
+
+#[path = "steering_tests.rs"]
+mod steering_tests;
+
 #[allow(clippy::result_large_err)]
 #[tokio::test]
 async fn declared_responses_route_reuses_upstream_websocket() {
