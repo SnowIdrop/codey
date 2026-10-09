@@ -437,9 +437,10 @@ impl Repo {
         fs::write(root.join("other.txt"), "other\n").unwrap();
         git(&root, &["add", "--", "owned.txt", "other.txt"], None, None).unwrap();
         git(&root, &["commit", "-m", "initial"], None, None).unwrap();
+        // 使用相对路径，避免 Windows 规范化路径的前缀被 Git 解析为 SSH 地址。
         git(
             &root,
-            &["remote", "add", "origin", remote.to_str().unwrap()],
+            &["remote", "add", "origin", "../remote.git"],
             None,
             None,
         )

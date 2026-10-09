@@ -4352,19 +4352,21 @@ mod tests {
             remote_compaction_models_from_catalog(&path),
             HashSet::from([selected[0].clone()])
         );
-        assert!(prepare_cached_catalog_for_current_capabilities(
-            home.path(),
-            &[],
-            &[],
-            &selected[1..],
-        ).unwrap());
+        assert!(
+            prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[], &selected[1..],)
+                .unwrap()
+        );
         assert_eq!(
             remote_compaction_models_from_catalog(&path),
             HashSet::from([selected[1].clone()])
         );
         let models = read_runtime_catalog_models(home.path()).unwrap();
         assert_eq!(models.len(), 2);
-        assert!(models.iter().all(|model| model["base_instructions"].as_str().is_some()));
+        assert!(
+            models
+                .iter()
+                .all(|model| model["base_instructions"].as_str().is_some())
+        );
     }
 
     #[test]

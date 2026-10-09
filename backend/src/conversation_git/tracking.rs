@@ -161,7 +161,7 @@ fn owner(
         ensure!(
             crate::subagent_orchestrator::trusted_child_workspace(
                 &home.join(crate::subagent_gate::STATE_DIRECTORY),
-                &runtime,
+                runtime,
                 parent,
                 context,
                 workspace

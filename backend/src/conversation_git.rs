@@ -786,13 +786,13 @@ pub(crate) fn save_preview(snapshot: Snapshot, message: String, model: String) -
     let mut public = snapshot.public();
     if let Some((_, ref upstream)) = target {
         public["upstreamBranch"] = json!(upstream.strip_prefix("refs/heads/").unwrap_or(upstream));
-        if let Some(branch) = snapshot.branch.strip_prefix("refs/heads/") {
-            if let Ok(remote) = git_text(
+        if let Some(branch) = snapshot.branch.strip_prefix("refs/heads/")
+            && let Ok(remote) = git_text(
                 &snapshot.root,
                 &["config", "--get", &format!("branch.{branch}.remote")],
-            ) {
-                public["remote"] = json!(remote);
-            }
+            )
+        {
+            public["remote"] = json!(remote);
         }
     }
     let token = uuid::Uuid::new_v4().to_string();

@@ -323,7 +323,9 @@ pub(super) fn path_key(path: &Path) -> Option<String> {
     };
     // Conservatively coordinate differently cased new names on platforms with
     // commonly case-insensitive filesystems, before the file exists.
-    Some(comparison_key(&key))
+    #[cfg(windows)]
+    let key = key.as_str();
+    Some(comparison_key(key))
 }
 
 pub(super) fn comparison_key(path: &str) -> String {

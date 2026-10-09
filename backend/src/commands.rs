@@ -10,6 +10,7 @@ use std::sync::{
 use std::time::Duration;
 
 mod config_repair;
+mod conversation_git;
 mod diagnostics;
 mod extensions;
 mod models;
@@ -17,7 +18,6 @@ mod native_plugins;
 mod official_accounts;
 mod plugins;
 mod prompt_optimization;
-mod conversation_git;
 mod runtime;
 mod updates;
 mod webhooks;
@@ -1631,7 +1631,8 @@ fn codey_config_save_input(args: &Value) -> Result<CodeyConfigSaveInput, String>
     let fields = config_value
         .as_object()
         .ok_or_else(|| "参数 config 无效：必须是 object".to_string())?;
-    let codey_update_policy_present = fields.contains_key("codeyUpdatePolicy") || fields.contains_key("autoCheckCodeyUpdates");
+    let codey_update_policy_present =
+        fields.contains_key("codeyUpdatePolicy") || fields.contains_key("autoCheckCodeyUpdates");
     let local_router_enabled_present = fields.contains_key("localRouterEnabled");
     let model_reasoning_efforts_present = fields.contains_key("modelReasoningEffortsByProvider");
     let model_context_present = fields.contains_key("modelContextByProvider");

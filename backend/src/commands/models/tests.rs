@@ -2040,14 +2040,24 @@ fn remote_compaction_protocol_selection_hot_reloads_without_changing_provider_id
     route.base_url = "https://relay.example/v1".into();
     route.api_key = "key".into();
     route.supports_remote_compaction = true;
-    let applied = CodeyConfig { profiles: vec![route], ..CodeyConfig::default() };
+    let applied = CodeyConfig {
+        profiles: vec![route],
+        ..CodeyConfig::default()
+    };
     let mut current = applied.clone();
     current.profiles[0].remote_compaction_protocol = RemoteCompactionProtocol::CompactEndpoint;
-    assert!(!remote_compaction_transport_requires_restart(&applied, &current));
+    assert!(!remote_compaction_transport_requires_restart(
+        &applied, &current
+    ));
     assert!(!provider_route_requires_restart(&applied, &current));
-    assert!(runtime_supports_current_routes_for_hot_reload(&applied, &current));
+    assert!(runtime_supports_current_routes_for_hot_reload(
+        &applied, &current
+    ));
     let pinned = config_with_launch_pinned_transport(&applied, &current);
-    assert_eq!(pinned.profiles[0].remote_compaction_protocol, RemoteCompactionProtocol::CompactEndpoint);
+    assert_eq!(
+        pinned.profiles[0].remote_compaction_protocol,
+        RemoteCompactionProtocol::CompactEndpoint
+    );
 }
 
 #[test]

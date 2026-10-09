@@ -495,7 +495,10 @@ fn import_session_bundle<R: BufRead>(
     })
 }
 
-pub(crate) fn find_thread(home: &Path, session_id: &str) -> Result<Option<(Map<String, Value>, PathBuf)>> {
+pub(crate) fn find_thread(
+    home: &Path,
+    session_id: &str,
+) -> Result<Option<(Map<String, Value>, PathBuf)>> {
     for db_path in codex_session_db_paths_from_home(home) {
         if !db_path.exists() {
             continue;

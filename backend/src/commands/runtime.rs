@@ -195,7 +195,9 @@ pub(super) async fn runtime_status_with_options(
         }
         if let Some(update) = available_update
             && codey_update_policy != crate::config::CodeyUpdatePolicy::Off
-            && (codey_update_policy == crate::config::CodeyUpdatePolicy::Experimental || !update.latest_version.contains('-')) {
+            && (codey_update_policy == crate::config::CodeyUpdatePolicy::Experimental
+                || !update.latest_version.contains('-'))
+        {
             object.insert(
                 "availableUpdate".into(),
                 serde_json::to_value(update).expect("update metadata must be JSON-serializable"),

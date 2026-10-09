@@ -4202,32 +4202,55 @@ fn conversation_git_installs_only_trusted_edit_hooks_without_other_enhancements(
     fs::create_dir(&home).unwrap();
     let marker = temp.path().join("state/lease.json");
     let backup = temp.path().join("state/backups");
-    let applied = apply_isolated_runtime_router_config(&home, RouterApplyOptions {
-        remote_compaction_models: None,
-        conversation_git: true,
-        local_router: None,
-        use_official_catalog: false,
-        model_contexts: None,
-        stream_max_retries: 5,
-        default_model: None,
-        fastctx_command: None,
-        subagent_optimization: false,
-        subagent_model: DEFAULT_SUBAGENT_MODEL,
-        subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
-        subagent_roles: None,
-        marker: &marker,
-        backup_root: &backup,
-    }).unwrap();
-    assert!(applied.runtime_config_overrides.iter().any(|entry| entry == "features.hooks=true"));
-    let hooks: serde_json::Value = serde_json::from_slice(&fs::read(home.join("hooks.json")).unwrap()).unwrap();
+    let applied = apply_isolated_runtime_router_config(
+        &home,
+        RouterApplyOptions {
+            remote_compaction_models: None,
+            conversation_git: true,
+            local_router: None,
+            use_official_catalog: false,
+            model_contexts: None,
+            stream_max_retries: 5,
+            default_model: None,
+            fastctx_command: None,
+            subagent_optimization: false,
+            subagent_model: DEFAULT_SUBAGENT_MODEL,
+            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+            subagent_roles: None,
+            marker: &marker,
+            backup_root: &backup,
+        },
+    )
+    .unwrap();
+    assert!(
+        applied
+            .runtime_config_overrides
+            .iter()
+            .any(|entry| entry == "features.hooks=true")
+    );
+    let hooks: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.join("hooks.json")).unwrap()).unwrap();
     for event in ["PreToolUse", "PostToolUse"] {
         let handlers = hooks["hooks"][event].as_array().unwrap();
         assert_eq!(handlers.len(), 1);
-        assert!(handlers[0]["hooks"][0]["command"].as_str().unwrap().contains(crate::conversation_git::tracking::HOOK_ARGUMENT));
-        assert_eq!(handlers[0]["hooks"][0]["timeout"], crate::conversation_git::tracking::HOOK_TIMEOUT_SECONDS);
+        assert!(
+            handlers[0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains(crate::conversation_git::tracking::HOOK_ARGUMENT)
+        );
+        assert_eq!(
+            handlers[0]["hooks"][0]["timeout"],
+            crate::conversation_git::tracking::HOOK_TIMEOUT_SECONDS
+        );
     }
     assert_eq!(hooks["hooks"].as_object().unwrap().len(), 2);
-    assert!(applied.runtime_config_overrides.iter().any(|entry| entry.starts_with("hooks.state=")));
+    assert!(
+        applied
+            .runtime_config_overrides
+            .iter()
+            .any(|entry| entry.starts_with("hooks.state="))
+    );
     assert!(restore_runtime_config_at(&home, &marker, true).unwrap());
     assert!(!home.join("hooks.json").exists());
 }

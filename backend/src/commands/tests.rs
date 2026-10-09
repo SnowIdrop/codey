@@ -625,7 +625,10 @@ fn provider_secret_merge_preserves_user_remote_compaction_setting() {
     disabled.api_key.clear();
     let merged = merge_profile_secrets(vec![disabled], &previous).unwrap();
     assert!(!merged[0].supports_remote_compaction);
-    assert_eq!(merged[0].remote_compaction_protocol, crate::config::RemoteCompactionProtocol::CompactEndpoint);
+    assert_eq!(
+        merged[0].remote_compaction_protocol,
+        crate::config::RemoteCompactionProtocol::CompactEndpoint
+    );
     assert_eq!(merged[0].api_key, "saved-secret");
 
     let mut previous_disabled_profile = saved;
@@ -1531,25 +1534,27 @@ async fn codey_update_policy_save_persists_explicit_and_legacy_values() {
         payload["autoCheckCodeyUpdates"] = json!(enabled);
         let input = codey_config_save_input(&json!({ "config": payload })).unwrap();
         save_codey_config_locked(&state, input).await.unwrap();
-        let expected = if enabled { crate::config::CodeyUpdatePolicy::Stable } else { crate::config::CodeyUpdatePolicy::Off };
+        let expected = if enabled {
+            crate::config::CodeyUpdatePolicy::Stable
+        } else {
+            crate::config::CodeyUpdatePolicy::Off
+        };
         assert_eq!(state.config.read().await.codey_update_policy, expected);
     }
-    for policy in [crate::config::CodeyUpdatePolicy::Off, crate::config::CodeyUpdatePolicy::Stable, crate::config::CodeyUpdatePolicy::Experimental] {
+    for policy in [
+        crate::config::CodeyUpdatePolicy::Off,
+        crate::config::CodeyUpdatePolicy::Stable,
+        crate::config::CodeyUpdatePolicy::Experimental,
+    ] {
         let mut payload = serde_json::to_value(state.config.read().await.clone()).unwrap();
         payload["codeyUpdatePolicy"] = json!(policy);
         let input = codey_config_save_input(&json!({ "config": payload })).unwrap();
         save_codey_config_locked(&state, input).await.unwrap();
         assert_eq!(state.config.read().await.codey_update_policy, policy);
-        assert_eq!(
-            state.store.load().unwrap().codey_update_policy,
-            policy
-        );
+        assert_eq!(state.store.load().unwrap().codey_update_policy, policy);
 
         let mut legacy = serde_json::to_value(state.config.read().await.clone()).unwrap();
-        legacy
-            .as_object_mut()
-            .unwrap()
-            .remove("codeyUpdatePolicy");
+        legacy.as_object_mut().unwrap().remove("codeyUpdatePolicy");
         legacy["slimCodexPet"] = json!(false);
         let input = codey_config_save_input(&json!({ "config": legacy })).unwrap();
         save_codey_config_locked(&state, input).await.unwrap();

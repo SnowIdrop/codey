@@ -347,7 +347,9 @@ impl NativeResponsesHistory {
                 // it must not turn an already delivered generation into a retry.
                 let output = terminal_output.map_or(&[][..], Vec::as_slice);
                 if self.history.pending_input.as_ref().is_some_and(|input| {
-                    input.iter().any(|item| item["type"] == "compaction_trigger")
+                    input
+                        .iter()
+                        .any(|item| item["type"] == "compaction_trigger")
                 }) {
                     // 显式压缩的 output 是完整的新窗口，不能再拼接旧历史与触发项。
                     self.history.pending_input = Some(Vec::new());
@@ -408,10 +410,10 @@ fn validate_native_tool_history_for_restore(
                 anyhow::bail!("历史包含无法在协议切换时展开的引用，请重新发送完整上下文");
             }
             Some("compaction")
-                if !item
+                if item
                     .get("encrypted_content")
                     .and_then(Value::as_str)
-                    .is_some_and(|content| !content.is_empty()) =>
+                    .is_none_or(|content| content.is_empty()) =>
             {
                 anyhow::bail!("压缩历史缺少完整加密内容，请重新发送完整上下文");
             }
@@ -776,16 +778,21 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_compaction_restores_history_before_switching_to_http() {
-        assert_websocket_compaction_history(crate::config::RemoteCompactionProtocol::Responses).await;
+        assert_websocket_compaction_history(crate::config::RemoteCompactionProtocol::Responses)
+            .await;
     }
 
     #[tokio::test]
     async fn websocket_compaction_compatibility_restores_and_replaces_the_history_window() {
-        assert_websocket_compaction_history(crate::config::RemoteCompactionProtocol::CompactEndpoint)
-            .await;
+        assert_websocket_compaction_history(
+            crate::config::RemoteCompactionProtocol::CompactEndpoint,
+        )
+        .await;
     }
 
-    async fn assert_websocket_compaction_history(protocol: crate::config::RemoteCompactionProtocol) {
+    async fn assert_websocket_compaction_history(
+        protocol: crate::config::RemoteCompactionProtocol,
+    ) {
         let compat = protocol == crate::config::RemoteCompactionProtocol::CompactEndpoint;
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let (mut config, provider, model) =
@@ -836,9 +843,12 @@ mod tests {
                 let response = if compat {
                     json!({"id":"resp-compact","object":"response.compaction","output":window})
                 } else {
-                    completed("resp-compact", window.as_array().unwrap().clone())["response"].clone()
+                    completed("resp-compact", window.as_array().unwrap().clone())["response"]
+                        .clone()
                 };
-                write_json_response(&mut http, 200, &response).await.unwrap();
+                write_json_response(&mut http, 200, &response)
+                    .await
+                    .unwrap();
             }
             let (mut http, _) = listener.accept().await.unwrap();
             let request = read_http_request(&mut http).await.unwrap();
@@ -882,7 +892,10 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            assert_eq!(terminal(&mut client).await["response"]["id"], "resp-compact");
+            assert_eq!(
+                terminal(&mut client).await["response"]["id"],
+                "resp-compact"
+            );
         }
         client
             .send(WebSocketMessage::Text(

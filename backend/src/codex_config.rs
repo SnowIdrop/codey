@@ -551,7 +551,9 @@ fn apply_isolated_runtime_router_config(
     }
     let git_hook_commands = conversation_git
         .then(|| {
-            crate::subagent_gate::hook_commands_for(crate::conversation_git::tracking::HOOK_ARGUMENT)
+            crate::subagent_gate::hook_commands_for(
+                crate::conversation_git::tracking::HOOK_ARGUMENT,
+            )
         })
         .transpose()?;
     let original_hooks = if runtime_hooks_enabled {
@@ -2574,6 +2576,7 @@ fn json_hook_group_is_codey_owned(group: &serde_json::Value) -> bool {
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_isolated_runtime_overrides(
     effective: &DocumentMut,
     root_instructions: Option<&str>,

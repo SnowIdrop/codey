@@ -1130,11 +1130,10 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
                             if self.handle_steering_message(&message).await? {
                                 continue;
                             }
-                            if let Some(interrupt) = Self::response_interrupt_from_message(&message)? {
-                                if self.interrupt_forwarding {
-                                    self.pending_interrupt = Some(interrupt);
-                                    return Err(DownstreamResponseInterrupt.into());
-                                }
+                            if let Some(interrupt) = Self::response_interrupt_from_message(&message)?
+                                && self.interrupt_forwarding {
+                                self.pending_interrupt = Some(interrupt);
+                                return Err(DownstreamResponseInterrupt.into());
                             }
                             // ponytail: full queues delay control frames; use an explicit
                             // cancellation channel if cancellation must bypass queued requests.

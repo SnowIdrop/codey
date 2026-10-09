@@ -131,7 +131,9 @@ pub fn run_hook_if_requested() -> Result<bool> {
     let mode = match std::env::args_os().nth(1).as_deref() {
         Some(argument) if argument == OsStr::new(HOOK_ARGUMENT) => HookMode::SubagentOnly,
         Some(argument) if argument == OsStr::new(COMBINED_HOOK_ARGUMENT) => HookMode::WithFastctx,
-        Some(argument) if argument == OsStr::new(crate::conversation_git::tracking::HOOK_ARGUMENT) => {
+        Some(argument)
+            if argument == OsStr::new(crate::conversation_git::tracking::HOOK_ARGUMENT) =>
+        {
             HookMode::ConversationGit
         }
         _ => return Ok(false),
@@ -147,7 +149,11 @@ pub fn run_hook_if_requested() -> Result<bool> {
         "读取 Codex 子代理门禁 Hook 输入失败",
     )?;
     if mode == HookMode::ConversationGit {
-        if crate::config::ConfigStore::default().load()?.conversation_git.enabled {
+        if crate::config::ConfigStore::default()
+            .load()?
+            .conversation_git
+            .enabled
+        {
             let result = serde_json::from_slice::<Value>(&raw)
                 .map_err(anyhow::Error::from)
                 .and_then(|input| {

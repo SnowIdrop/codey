@@ -1292,10 +1292,20 @@ fn conversation_git_toggle_requires_restart_but_model_change_is_live() {
     let mut current = applied.clone();
     current.conversation_git.enabled = true;
     current.conversation_git.model = "model".into();
-    assert!(config_requires_restart_with_route_status(false, &applied,
-        &RuntimeModelConfig::from_config(&applied), &RuntimeSubagentConfig::from_config(&applied), &current));
+    assert!(config_requires_restart_with_route_status(
+        false,
+        &applied,
+        &RuntimeModelConfig::from_config(&applied),
+        &RuntimeSubagentConfig::from_config(&applied),
+        &current
+    ));
     let enabled = current.clone();
     current.conversation_git.model = "another-model".into();
-    assert!(!config_requires_restart_with_route_status(false, &enabled,
-        &RuntimeModelConfig::from_config(&enabled), &RuntimeSubagentConfig::from_config(&enabled), &current));
+    assert!(!config_requires_restart_with_route_status(
+        false,
+        &enabled,
+        &RuntimeModelConfig::from_config(&enabled),
+        &RuntimeSubagentConfig::from_config(&enabled),
+        &current
+    ));
 }

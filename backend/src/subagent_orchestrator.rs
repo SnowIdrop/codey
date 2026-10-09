@@ -2207,9 +2207,11 @@ pub(crate) fn trusted_child_workspace(
     }
     let reservation = &ledger.reservations[&task];
     let agent_hash = hash_component(context.agent_id);
-    if reservation.agent_id_hash.as_deref().is_some_and(|bound| {
-        bound != agent_hash && !is_provisional_task_binding(bound, &task)
-    }) {
+    if reservation
+        .agent_id_hash
+        .as_deref()
+        .is_some_and(|bound| bound != agent_hash && !is_provisional_task_binding(bound, &task))
+    {
         return Ok(false);
     }
     Ok(reservation

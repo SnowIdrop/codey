@@ -1782,7 +1782,8 @@ pub(crate) async fn write_validated_compaction<D: ResponsesDownstream + ?Sized>(
                 probe.as_ref(),
             )
             .await?;
-            let mut value: Value = serde_json::from_slice(&bytes).context("远程压缩返回无效 JSON")?;
+            let mut value: Value =
+                serde_json::from_slice(&bytes).context("远程压缩返回无效 JSON")?;
             validate_compaction_result(&value, v2)?;
             if matches!(format, CompactionResponseFormat::CompactToResponses) {
                 // 先校验旧接口的完整结果，再补 Responses 终态；output 与密文原样保留。

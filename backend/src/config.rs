@@ -1904,7 +1904,11 @@ impl CodeyConfig {
                 } else {
                     profile.name.clone()
                 },
-                reason: if profile.plugin_route_spec.as_ref().is_some_and(|s| s.transport.is_some()) {
+                reason: if profile
+                    .plugin_route_spec
+                    .as_ref()
+                    .is_some_and(|s| s.transport.is_some())
+                {
                     "插件传输不支持原生压缩"
                 } else if profile.upstream_protocol != UPSTREAM_PROTOCOL_OPENAI_RESPONSES {
                     "上游协议不支持原生压缩"
@@ -4517,7 +4521,10 @@ mod tests {
 
     #[test]
     fn codey_update_policy_migrates_legacy_and_preserves_channels() {
-        assert_eq!(CodeyConfig::default().codey_update_policy, CodeyUpdatePolicy::Stable);
+        assert_eq!(
+            CodeyConfig::default().codey_update_policy,
+            CodeyUpdatePolicy::Stable
+        );
         let legacy = serde_json::from_str::<CodeyConfig>(r#"{}"#)
             .unwrap()
             .normalize();
@@ -4529,7 +4536,11 @@ mod tests {
             }))
             .unwrap()
             .normalize();
-            let expected = if enabled { CodeyUpdatePolicy::Stable } else { CodeyUpdatePolicy::Off };
+            let expected = if enabled {
+                CodeyUpdatePolicy::Stable
+            } else {
+                CodeyUpdatePolicy::Off
+            };
             assert_eq!(config.codey_update_policy, expected);
             assert_eq!(
                 serde_json::to_value(config).unwrap()["codeyUpdatePolicy"],
@@ -4537,12 +4548,18 @@ mod tests {
             );
         }
         for policy in ["off", "stable", "experimental"] {
-            let config: CodeyConfig = serde_json::from_value(serde_json::json!({"codeyUpdatePolicy": policy})).unwrap();
+            let config: CodeyConfig =
+                serde_json::from_value(serde_json::json!({"codeyUpdatePolicy": policy})).unwrap();
             let serialized = serde_json::to_value(config).unwrap();
             assert_eq!(serialized["codeyUpdatePolicy"], policy);
             assert!(serialized.get("autoCheckCodeyUpdates").is_none());
         }
-        assert!(serde_json::from_value::<CodeyConfig>(serde_json::json!({"codeyUpdatePolicy": "unknown"})).is_err());
+        assert!(
+            serde_json::from_value::<CodeyConfig>(
+                serde_json::json!({"codeyUpdatePolicy": "unknown"})
+            )
+            .is_err()
+        );
     }
 
     #[test]

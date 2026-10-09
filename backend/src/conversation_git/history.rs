@@ -85,10 +85,12 @@ struct Spawn {
     role: String,
 }
 
+type RecordedCall = (String, Value, Value, Option<i64>, Option<i64>, usize);
+
 #[derive(Clone, Default)]
 struct Transcript {
     meta: Value,
-    calls: Vec<(String, Value, Value, Option<i64>, Option<i64>, usize)>,
+    calls: Vec<RecordedCall>,
     spawns: Vec<Spawn>,
     native_changes: Vec<(Value, i64, i64, usize)>,
     incomplete: bool,
@@ -1031,13 +1033,12 @@ pub(super) fn recover(
                     None
                 } else {
                     let text = tracking::output_text(&response).context("替换回执不完整")?;
-                    let count = text.lines().find_map(|line| {
+                    text.lines().find_map(|line| {
                         let (raw, count) = line.rsplit_once(": ")?;
                         (relative_path(root, workspace, raw).ok().as_deref() == Some(&file))
                             .then(|| count.split_whitespace().next()?.parse().ok())
                             .flatten()
-                    });
-                    count
+                    })
                 };
                 history.files.entry(file).or_default().push(RecordedEdit {
                     actor: actor.clone(),
