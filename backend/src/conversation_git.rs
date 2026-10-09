@@ -28,11 +28,83 @@ pub(crate) const MESSAGE_INSTRUCTION: &str = concat!(
     "ci 持续集成，chore 其他维护，revert 撤销明确的既有改动。按主要实际改动选择，不确定时用 chore，不强行归为 feat 或 fix。",
     "scope 可选；提供时从 diff 中受影响的功能或模块提炼，例如 conversation-git、local-router、request-log；",
     "scope 使用 1 至 40 个小写英文字母、数字、连字符或斜杠，必须以字母开头，分隔符之间不能为空，不写完整文件路径；跨多个无共同模块的改动用 app。",
-    "摘要用中文动词简洁、准确地概括主要改动，必要时正文最多三条说明，正文与标题之间空一行，总计不超过 300 字。",
+    "摘要用中文动词简洁、准确地概括主要改动。单文件的简单改动允许只写标题。",
+    "涉及多个文件，或单文件包含复杂逻辑、多个行为变化、较大范围改动时，必须附正文，不得只给标题。",
+    "正文写一至三条具体说明，分别描述实际修改及 diff 能直接证明的影响或边界；按相关功能归纳，不逐个罗列文件，不重复标题，不凑条数。",
+    "无法从 diff 确认影响时只说明具体修改，不编造影响、测试结果或性能收益。正文与标题之间空一行，总计不超过 300 字。",
     "仅当 diff 明确证明破坏兼容时允许 type!: 中文摘要 或 type(scope)!: 中文摘要（! 与冒号之间不要空格），并在摘要或正文说明具体兼容性变化。",
     "示例格式：fix(conversation-git): 校验当前对话的提交范围。示例不代表本次改动。",
     "只输出一个提交说明，不输出代码围栏、前言、备选标题或其他建议。"
 );
+pub(crate) fn analysis_inputs(diff: &str) -> Result<Vec<String>> {
+    const LIMIT: usize = 28_000;
+    ensure!(
+        diff.chars().count() <= LIMIT * 4,
+        "文件改动超过模型完整分析上限，请拆分后再提交"
+    );
+    let mut chunks = Vec::new();
+    let mut chunk = String::new();
+    let mut file = String::new();
+    let flush = |file: &mut String, chunk: &mut String, chunks: &mut Vec<String>| -> Result<()> {
+        if file.is_empty() {
+            return Ok(());
+        }
+        let parts = if file.chars().count() <= LIMIT {
+            vec![std::mem::take(file)]
+        } else {
+            let mut header = String::new();
+            let mut hunks = Vec::new();
+            let mut hunk = String::new();
+            for line in file.split_inclusive('\n') {
+                if line.starts_with("@@ ") && !hunk.is_empty() {
+                    hunks.push(std::mem::take(&mut hunk));
+                }
+                if line.starts_with("@@ ") || !hunk.is_empty() {
+                    hunk.push_str(line);
+                } else {
+                    header.push_str(line);
+                }
+            }
+            if !hunk.is_empty() {
+                hunks.push(hunk);
+            }
+            ensure!(
+                header.starts_with("diff --git ") && !hunks.is_empty(),
+                "文件改动无法按完整补丁段分析，请拆分后再提交"
+            );
+            file.clear();
+            hunks
+                .into_iter()
+                .map(|hunk| format!("{header}{hunk}"))
+                .collect()
+        };
+        for part in parts {
+            ensure!(
+                part.chars().count() <= LIMIT,
+                "单个补丁段超过模型完整分析上限，请拆分后再提交"
+            );
+            if chunk.chars().count() + part.chars().count() > LIMIT {
+                chunks.push(std::mem::take(chunk));
+            }
+            chunk.push_str(&part);
+            ensure!(chunks.len() < 16, "改动分段过多，请拆分后再提交");
+        }
+        Ok(())
+    };
+    for line in diff.split_inclusive('\n') {
+        if line.starts_with("diff --git ") && !file.is_empty() {
+            flush(&mut file, &mut chunk, &mut chunks)?;
+        }
+        file.push_str(line);
+    }
+    flush(&mut file, &mut chunk, &mut chunks)?;
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    ensure!(!chunks.is_empty(), "没有可分析的提交改动");
+    Ok(chunks)
+}
+
 mod history;
 pub(crate) mod tracking;
 
@@ -65,6 +137,96 @@ enum Edit {
     Patch(Vec<(Vec<String>, Vec<String>)>),
     NativePatch(String),
     Replace(Value),
+    FormatRust { root: PathBuf, edition: String },
+}
+
+// 重现已完成的明确格式化记录，只读取临时输入，不运行历史命令或修改工作区。
+fn format_rust(root: &Path, edition: &str, input: &[u8]) -> Result<Vec<u8>> {
+    ensure!(
+        matches!(edition, "2015" | "2018" | "2021" | "2024"),
+        "Rust 格式化版本参数无效"
+    );
+    for directory in root.ancestors() {
+        ensure!(
+            !directory.join("rustfmt.toml").exists() && !directory.join(".rustfmt.toml").exists(),
+            "格式化配置缺少执行前基线，无法精确重现历史格式化"
+        );
+    }
+    ensure!(input.len() as u64 <= MAX_BYTES, "格式化文件过大");
+    std::str::from_utf8(input).context("格式化仅支持 UTF-8 文本")?;
+    static CACHE: OnceLock<Mutex<BTreeMap<String, Vec<u8>>>> = OnceLock::new();
+    let key = format!("{edition}:{}", digest(input));
+    if let Some(value) = CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| anyhow::anyhow!("格式化缓存不可用"))?
+        .get(&key)
+        .cloned()
+    {
+        return Ok(value);
+    }
+    use std::io::{Seek, SeekFrom};
+    let directory = tempfile::tempdir()?;
+    fs::write(directory.path().join("rustfmt.toml"), "")?;
+    let mut stdin = tempfile::tempfile()?;
+    stdin.write_all(input)?;
+    stdin.seek(SeekFrom::Start(0))?;
+    let mut stdout = tempfile::tempfile()?;
+    let mut stderr = tempfile::tempfile()?;
+    let mut command = Command::new("rustfmt");
+    command
+        .current_dir(directory.path())
+        .args([
+            "--edition",
+            edition,
+            "--emit",
+            "stdout",
+            "--config",
+            "skip_children=true",
+            "--config-path",
+        ])
+        .arg(directory.path())
+        .stdin(stdin)
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let mut child = command
+        .spawn()
+        .context("无法重现历史格式化：rustfmt 不可用")?;
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("历史格式化校验超时，已停止提交");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    stderr.seek(SeekFrom::Start(0))?;
+    let mut error = String::new();
+    stderr.take(2048).read_to_string(&mut error)?;
+    ensure!(status.success(), "历史格式化校验失败：{}", error.trim());
+    ensure!(stdout.metadata()?.len() <= MAX_BYTES, "格式化输出过大");
+    stdout.seek(SeekFrom::Start(0))?;
+    let mut value = Vec::new();
+    stdout.read_to_end(&mut value)?;
+    std::str::from_utf8(&value)?;
+    let mut cache = CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| anyhow::anyhow!("格式化缓存不可用"))?;
+    if cache.len() >= 32 {
+        cache.clear();
+    }
+    cache.insert(key, value.clone());
+    Ok(value)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -409,6 +571,10 @@ fn apply_edit(before: Option<&Entry>, edit: &Edit) -> Result<Option<Entry>> {
             let before = before.context("待修改文件不存在")?;
             history::apply_native_patch(std::str::from_utf8(&before.bytes)?, diff, false)?
         }
+        Edit::FormatRust { root, edition } => {
+            let before = before.context("待格式化文件不存在")?;
+            String::from_utf8(format_rust(root, edition, &before.bytes)?)?
+        }
     };
     ensure!(!text.as_bytes().contains(&0), "暂不支持二进制编辑");
     Ok(Some(Entry {
@@ -667,12 +833,9 @@ fn build_snapshot(home: &Path, session: &str, workspace: &Path) -> Result<Snapsh
         None,
         None,
     )?)?;
+    analysis_inputs(&diff)?;
     ensure!(
-        diff.chars().count() <= 28_000,
-        "文件改动超过模型完整分析上限，请拆分后再提交"
-    );
-    ensure!(
-        !diff.contains("GIT binary patch"),
+        !diff.lines().any(|line| line == "GIT binary patch"),
         "暂不支持二进制文件的提交分析"
     );
     let index_hash = digest(&read_bounded(&index_path(&root)?, MAX_BYTES)?);
@@ -778,6 +941,29 @@ pub(crate) fn validate_message(message: &str) -> Result<String> {
         "模型提交正文与标题之间须空一行，请重新生成"
     );
     Ok(message.into())
+}
+
+pub(crate) fn validate_message_for_diff(message: &str, diff: &str) -> Result<String> {
+    let message = validate_message(message)?;
+    let files = diff
+        .lines()
+        .filter(|line| line.starts_with("diff --git "))
+        .count();
+    let changed_lines = diff
+        .lines()
+        .filter(|line| {
+            (line.starts_with('+') && !line.starts_with("+++"))
+                || (line.starts_with('-') && !line.starts_with("---"))
+        })
+        .count();
+    let hunks = diff.lines().filter(|line| line.starts_with("@@ ")).count();
+    if files > 1 || changed_lines >= 80 || hunks >= 4 {
+        ensure!(
+            message.lines().skip(2).any(|line| !line.trim().is_empty()),
+            "多文件或较复杂的改动须包含具体提交正文，模型只生成了标题，请重新生成"
+        );
+    }
+    Ok(message)
 }
 
 pub(crate) fn save_preview(snapshot: Snapshot, message: String, model: String) -> Result<Value> {

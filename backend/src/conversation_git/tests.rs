@@ -1,13 +1,48 @@
 use super::*;
 
 #[test]
+fn commit_analysis_preserves_complete_file_diffs() {
+    let first = format!("diff --git a/first b/first\n{}\n", "a".repeat(20_000));
+    let second = format!("diff --git a/second b/second\n{}\n", "b".repeat(20_000));
+    let diff = format!("{first}{second}");
+    assert_eq!(analysis_inputs(&diff).unwrap(), vec![first, second]);
+    assert_eq!(analysis_inputs(&diff).unwrap().concat(), diff);
+    assert!(
+        analysis_inputs(&format!(
+            "diff --git a/large b/large\n{}",
+            "x".repeat(28_000)
+        ))
+        .is_err()
+    );
+    assert!(analysis_inputs("").is_err());
+}
+
+#[test]
+fn large_file_analysis_preserves_each_complete_hunk_and_repeats_file_metadata() {
+    let header =
+        "diff --git a/large.rs b/large.rs\nindex abc..def 100644\n--- a/large.rs\n+++ b/large.rs\n";
+    let first = format!("@@ -1 +1,2 @@\n-old\n+{}\n", "中".repeat(18_000));
+    let second = format!("@@ -8 +9,2 @@\n-old\n+{}\n", "文".repeat(18_000));
+    let diff = format!("{header}{first}{second}");
+    let chunks = analysis_inputs(&diff).unwrap();
+    assert_eq!(
+        chunks,
+        vec![format!("{header}{first}"), format!("{header}{second}")]
+    );
+    assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 28_000));
+    assert!(analysis_inputs(&format!("{header}@@ -1 +1 @@\n+{}", "x".repeat(28_000))).is_err());
+}
+
+#[test]
 #[ignore = "仅供显式指定本地会话的只读诊断"]
 fn diagnose_local_conversation_git_status() {
     let home = PathBuf::from(std::env::var("CODEY_GIT_DIAGNOSTIC_HOME").expect("指定诊断目录"));
     let session = std::env::var("CODEY_GIT_DIAGNOSTIC_SESSION").expect("指定诊断会话");
-    match status(&home, &session) {
-        Ok(value) => eprintln!("{value}"),
-        Err(error) => panic!("{error:#}"),
+    if std::env::var_os("CODEY_GIT_DIAGNOSTIC_VALIDATE").is_none() {
+        match status(&home, &session) {
+            Ok(value) => eprintln!("{value}"),
+            Err(error) => panic!("{error:#}"),
+        }
     }
     if std::env::var_os("CODEY_GIT_DIAGNOSTIC_VALIDATE").is_some() {
         let (_, workspace, _) = source(&home, &session).unwrap();
@@ -16,10 +51,33 @@ fn diagnose_local_conversation_git_status() {
             .unwrap();
         let head = git_text(&root, &["rev-parse", "--verify", "HEAD"]).unwrap();
         let history = history::recover(&home, &session, &root, &workspace).unwrap();
+        if let (Ok(base), Ok(target), Ok(path)) = (
+            std::env::var("CODEY_GIT_DIAGNOSTIC_BASE"),
+            std::env::var("CODEY_GIT_DIAGNOSTIC_TARGET"),
+            std::env::var("CODEY_GIT_DIAGNOSTIC_PATH"),
+        ) {
+            let before = head_entry(&root, &base, &path).unwrap();
+            let after = head_entry(&root, &target, &path).unwrap();
+            eprintln!(
+                "提交历史校验: {:?}",
+                history.replay(&path, before.as_ref(), after.as_ref())
+            );
+            eprintln!(
+                "提交反向校验: {}",
+                history.changes_in_head(&path, after.as_ref())
+            );
+            return;
+        }
         for path in history.paths() {
             let before = head_entry(&root, &head, path).unwrap();
             let after = disk_entry(&root, path).unwrap();
             if before != after {
+                if std::env::var_os("CODEY_GIT_DIAGNOSTIC_RECORDS").is_some() {
+                    eprintln!(
+                        "记录校验 {path}: {:?}",
+                        history.diagnostic_replay(path, before.as_ref())
+                    );
+                }
                 eprintln!(
                     "历史校验 {path}: {:?}",
                     history
@@ -46,6 +104,22 @@ fn diagnose_local_conversation_git_status() {
             Err(error) => panic!("{error:#}"),
         }
     }
+}
+
+#[test]
+#[ignore = "仅供显式指定本地会话的只读预览诊断"]
+fn diagnose_local_conversation_git_snapshot() {
+    let home = PathBuf::from(std::env::var("CODEY_GIT_DIAGNOSTIC_HOME").expect("指定诊断目录"));
+    let session = std::env::var("CODEY_GIT_DIAGNOSTIC_SESSION").expect("指定诊断会话");
+    let prepared = snapshot(&home, &session).unwrap_or_else(|error| panic!("{error:#}"));
+    eprintln!(
+        "完整预览校验：{:?}",
+        prepared
+            .changes
+            .iter()
+            .map(|change| (&change.path, change.after != change.disk))
+            .collect::<Vec<_>>()
+    );
 }
 
 const SESSION: &str = "11111111-1111-4111-8111-111111111111";
@@ -350,6 +424,568 @@ fn shared_file_refuses_overlap_reverted_hunks_and_staged_contents() {
         assert_eq!(git_text(&repo.root, &["rev-parse", "HEAD"]).unwrap(), head);
         assert_eq!(fs::read(index_path(&repo.root).unwrap()).unwrap(), index);
         assert_eq!(fs::read(repo.root.join("owned.txt")).unwrap(), before);
+    }
+}
+
+#[test]
+fn committed_native_history_survives_unique_context_line_shifts() {
+    let (repo, own, _) = shared_native_repo();
+    let committed = format!("prefix\n{own}");
+    fs::write(repo.root.join("owned.txt"), &committed).unwrap();
+    git(&repo.root, &["add", "--", "owned.txt"], None, None).unwrap();
+    git(
+        &repo.root,
+        &["commit", "-m", "commit shifted content"],
+        None,
+        None,
+    )
+    .unwrap();
+    fs::write(
+        repo.root.join("owned.txt"),
+        committed.replace("end", "outside"),
+    )
+    .unwrap();
+    let history = history::recover(&repo.home, SESSION, &repo.root, &repo.root).unwrap();
+    let head = head_entry(&repo.root, "HEAD", "owned.txt").unwrap();
+    assert!(history.changes_in_head("owned.txt", head.as_ref()));
+    assert!(tracking::dirty_paths(&repo.home, SESSION, &repo.root, &repo.root, "HEAD").is_err());
+    fs::write(repo.root.join("owned.txt"), format!("mine\n{committed}")).unwrap();
+    git(&repo.root, &["add", "--", "owned.txt"], None, None).unwrap();
+    git(
+        &repo.root,
+        &["commit", "-m", "duplicate context"],
+        None,
+        None,
+    )
+    .unwrap();
+    let head = head_entry(&repo.root, "HEAD", "owned.txt").unwrap();
+    assert!(!history.changes_in_head("owned.txt", head.as_ref()));
+}
+
+#[test]
+fn external_native_artifact_does_not_block_repository_history() {
+    let (repo, _, _) = shared_native_repo();
+    repo.append_record(
+        SESSION,
+        &repo.native_change(
+            SESSION,
+            "/tmp/codey-preview-artifact.patch",
+            "@@ -1 +1 @@\n-old\n+new\n",
+            2,
+        ),
+    );
+    let history = history::recover(&repo.home, SESSION, &repo.root, &repo.root).unwrap();
+    assert_eq!(
+        history.paths().cloned().collect::<Vec<_>>(),
+        vec!["owned.txt"]
+    );
+}
+
+#[test]
+fn complete_history_resolves_repeated_context_but_never_isolates_it() {
+    let repo = Repo::new();
+    let base = "anchor\nsame\ngap\nsame\nend\n";
+    fs::write(repo.root.join("owned.txt"), base).unwrap();
+    git(&repo.root, &["add", "--", "owned.txt"], None, None).unwrap();
+    git(
+        &repo.root,
+        &["commit", "-m", "repeated baseline"],
+        None,
+        None,
+    )
+    .unwrap();
+    repo.append_record(
+        SESSION,
+        &repo.native_change(SESSION, "owned.txt", "@@ -2 +2 @@\n-same\n+mine\n", 1),
+    );
+    // 空原生 diff 不能打断此前成功编辑，也不能凭空产生其他文件归属。
+    repo.append_record(SESSION, &repo.native_change(SESSION, "owned.txt", "", 2));
+    let own = "anchor\nmine\ngap\nsame\nend\n";
+    fs::write(repo.root.join("owned.txt"), own).unwrap();
+    let prepared = snapshot(&repo.home, SESSION).unwrap();
+    assert_eq!(
+        prepared.changes[0].after.as_ref().unwrap().bytes,
+        own.as_bytes()
+    );
+    fs::write(repo.root.join("owned.txt"), own.replace("end", "outside")).unwrap();
+    let head = git_text(&repo.root, &["rev-parse", "HEAD"]).unwrap();
+    let index = fs::read(index_path(&repo.root).unwrap()).unwrap();
+    assert!(snapshot(&repo.home, SESSION).is_err());
+    assert_eq!(git_text(&repo.root, &["rev-parse", "HEAD"]).unwrap(), head);
+    assert_eq!(fs::read(index_path(&repo.root).unwrap()).unwrap(), index);
+    assert!(
+        fs::read_to_string(repo.root.join("owned.txt"))
+            .unwrap()
+            .contains("outside")
+    );
+}
+
+#[test]
+fn invalid_own_summary_requires_complete_history_proof_even_when_expected_matches_disk() {
+    for scenario in ["own", "other", "missing", "unrecorded"] {
+        let repo = Repo::new();
+        let base = "anchor\nsame\ngap\nsame\nend\n";
+        fs::write(repo.root.join("owned.txt"), base).unwrap();
+        git(&repo.root, &["add", "--", "owned.txt"], None, None).unwrap();
+        git(
+            &repo.root,
+            &["commit", "-m", "repeated baseline"],
+            None,
+            None,
+        )
+        .unwrap();
+        if scenario != "missing" {
+            repo.append_record(
+                SESSION,
+                &repo.native_change(SESSION, "owned.txt", "@@ -2 +2 @@\n-same\n+mine\n", 1),
+            );
+        }
+        let own = "anchor\nmine\ngap\nsame\nend\n";
+        let disk = if scenario == "unrecorded" {
+            own.replace("end", "outside")
+        } else {
+            own.to_string()
+        };
+        fs::write(repo.root.join("owned.txt"), &disk).unwrap();
+        let directory = repo.home.join("codey-conversation-git-v2");
+        fs::create_dir_all(&directory).unwrap();
+        // 模拟 Hook 已记录最终摘要，但执行前后校验未能确认归属的情况。
+        fs::write(
+            directory.join(format!(
+                "{}.json",
+                digest(repo.root.as_os_str().as_encoded_bytes())
+            )),
+            serde_json::to_vec(&json!({"files":{"owned.txt":{
+                "sessions": if scenario == "other" { vec![SESSION, OTHER] } else { vec![SESSION] },
+                "baseline":{"mode":"100644","hash":digest(base.as_bytes())},
+                "expected":{"mode":"100644","hash":digest(disk.as_bytes())},
+                "valid":false
+            }},"pending":{}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let prepared = snapshot(&repo.home, SESSION);
+        if scenario == "own" {
+            let prepared = prepared.unwrap();
+            assert_eq!(
+                prepared.changes[0].after.as_ref().unwrap().bytes,
+                own.as_bytes()
+            );
+            assert_eq!(prepared.changes[0].after, prepared.changes[0].disk);
+        } else {
+            assert!(prepared.is_err(), "{scenario} 不得通过完整归属校验");
+        }
+        assert_eq!(
+            fs::read(repo.root.join("owned.txt")).unwrap(),
+            disk.as_bytes()
+        );
+    }
+}
+
+#[test]
+fn repeated_context_search_refuses_overflow_instead_of_truncating_candidates() {
+    let repo = Repo::new();
+    let base = "same\n".repeat(17);
+    fs::write(repo.root.join("owned.txt"), &base).unwrap();
+    git(&repo.root, &["add", "--", "owned.txt"], None, None).unwrap();
+    git(&repo.root, &["commit", "-m", "many candidates"], None, None).unwrap();
+    repo.append_record(
+        SESSION,
+        &repo.native_change(SESSION, "owned.txt", "@@ -1 +1 @@\n-same\n+mine\n", 1),
+    );
+    fs::write(
+        repo.root.join("owned.txt"),
+        base.replacen("same", "mine", 1),
+    )
+    .unwrap();
+    assert!(snapshot(&repo.home, SESSION).is_err());
+}
+
+#[test]
+fn full_file_history_can_verify_regex_receipts_without_weakening_partial_isolation() {
+    for count in [1, 2] {
+        let repo = Repo::new();
+        repo.history(
+            SESSION,
+            Some("mcp__codey_fastctx"),
+            "replace",
+            json!({"path":repo.root.join("owned.txt"), "pattern":"o(l)d", "replacement":"n${1}ew"}),
+            json!(format!(
+                "{}: {count} replacement\n\n(Complete: {count} replacement in 1 file.)",
+                repo.root.join("owned.txt").display()
+            )),
+            1,
+        );
+        fs::write(repo.root.join("owned.txt"), "nlew\n").unwrap();
+        assert_eq!(snapshot(&repo.home, SESSION).is_ok(), count == 1);
+        fs::write(repo.root.join("owned.txt"), "nlew\noutside\n").unwrap();
+        assert!(snapshot(&repo.home, SESSION).is_err());
+        assert_eq!(
+            git(&repo.root, &["show", "HEAD:owned.txt"], None, None).unwrap(),
+            b"old\n"
+        );
+        assert_eq!(
+            fs::read(repo.root.join("owned.txt")).unwrap(),
+            b"nlew\noutside\n"
+        );
+    }
+}
+
+#[test]
+fn binary_patch_marker_inside_text_does_not_block_commit_analysis() {
+    let repo = Repo::new();
+    repo.old_patch(SESSION, "owned.txt", "old", "GIT binary patch", 1);
+    let prepared = snapshot(&repo.home, SESSION).unwrap();
+    assert!(
+        prepared
+            .diff
+            .lines()
+            .any(|line| line == "+GIT binary patch")
+    );
+}
+
+#[test]
+fn fixed_multiple_patch_wrapper_keeps_following_formatter_record() {
+    let repo = Repo::new();
+    fs::write(repo.root.join("owned.rs"), "fn main(){let value=1;}\n").unwrap();
+    git(&repo.root, &["add", "--", "owned.rs"], None, None).unwrap();
+    git(&repo.root, &["commit", "-m", "rust baseline"], None, None).unwrap();
+    repo.append_record(
+        SESSION,
+        &repo.native_change(
+            SESSION,
+            "owned.rs",
+            "@@ -1 +1 @@\n-fn main(){let value=1;}\n+fn main(){let value=2;}\n",
+            1,
+        ),
+    );
+    repo.append_record(
+        SESSION,
+        &repo.native_change(SESSION, "other.txt", "@@ -1 +1 @@\n-other\n+updated\n", 2),
+    );
+    let first = "*** Begin Patch\n*** Update File: owned.rs\n@@\n-fn main(){let value=1;}\n+fn main(){let value=2;}\n*** End Patch";
+    let second = "*** Begin Patch\n*** Update File: other.txt\n@@\n-other\n+updated\n*** End Patch";
+    let code = format!(
+        "text(await tools.apply_patch({}));\ntext(await tools.apply_patch({}));\ntext(await tools.exec_command({{cmd:\"rustfmt --edition 2024 owned.rs\",workdir:{}}}));",
+        json!(first),
+        json!(second),
+        json!(repo.root)
+    );
+    repo.append_record(SESSION, &json!({"timestamp":"2026-10-08T00:00:00.500Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"two-patches-fmt","input":code}}));
+    repo.append_record(SESSION, &json!({"timestamp":"2026-10-08T00:00:03.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"two-patches-fmt","output":[{"type":"text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n"},{"type":"text","text":"{}"},{"type":"text","text":"{}"},{"type":"text","text":"{\"exit_code\":0}"}]}}));
+    let formatted = format_rust(&repo.root, "2024", b"fn main(){let value=2;}\n").unwrap();
+    fs::write(repo.root.join("owned.rs"), &formatted).unwrap();
+    fs::write(repo.root.join("other.txt"), "updated\n").unwrap();
+    let prepared = snapshot(&repo.home, SESSION).unwrap();
+    assert_eq!(prepared.changes.len(), 2);
+    assert_eq!(
+        prepared
+            .changes
+            .iter()
+            .find(|change| change.path == "owned.rs")
+            .unwrap()
+            .after
+            .as_ref()
+            .unwrap()
+            .bytes,
+        formatted
+    );
+}
+
+#[test]
+fn native_history_replays_unique_context_after_head_line_shift() {
+    let repo = Repo::new();
+    fs::write(repo.root.join("owned.txt"), "prefix\nold\n").unwrap();
+    git(&repo.root, &["add", "--", "owned.txt"], None, None).unwrap();
+    git(&repo.root, &["commit", "-m", "shift baseline"], None, None).unwrap();
+    git(&repo.root, &["push"], None, None).unwrap();
+    repo.append_record(
+        SESSION,
+        &repo.native_change(SESSION, "owned.txt", "@@ -1 +1 @@\n-old\n+mine\n", 1),
+    );
+    fs::write(repo.root.join("owned.txt"), "prefix\nmine\n").unwrap();
+    let snapshot = snapshot(&repo.home, SESSION).unwrap();
+    assert_eq!(
+        snapshot.changes[0].after.as_ref().unwrap().bytes,
+        b"prefix\nmine\n"
+    );
+    fs::write(repo.root.join("owned.txt"), "old\nold\n").unwrap();
+    git(&repo.root, &["add", "--", "owned.txt"], None, None).unwrap();
+    git(
+        &repo.root,
+        &["commit", "-m", "duplicate baseline"],
+        None,
+        None,
+    )
+    .unwrap();
+    fs::write(repo.root.join("owned.txt"), "old\nmine\n").unwrap();
+    let before = fs::read(repo.root.join("owned.txt")).unwrap();
+    let index = fs::read(index_path(&repo.root).unwrap()).unwrap();
+    let head = git_text(&repo.root, &["rev-parse", "HEAD"]).unwrap();
+    assert!(super::snapshot(&repo.home, SESSION).is_ok());
+    assert_eq!(fs::read(repo.root.join("owned.txt")).unwrap(), before);
+    assert_eq!(fs::read(index_path(&repo.root).unwrap()).unwrap(), index);
+    assert_eq!(git_text(&repo.root, &["rev-parse", "HEAD"]).unwrap(), head);
+}
+
+#[test]
+fn history_replays_successful_explicit_formatter_after_committed_add() {
+    for outcome in ["success", "failed", "shell", "running"] {
+        let repo = Repo::new();
+        let base = "fn main(){let value=1;}\n";
+        fs::write(repo.root.join("owned.rs"), base).unwrap();
+        git(&repo.root, &["add", "--", "owned.rs"], None, None).unwrap();
+        git(&repo.root, &["commit", "-m", "Rust baseline"], None, None).unwrap();
+        git(&repo.root, &["push"], None, None).unwrap();
+        let path = repo.root.join("owned.rs").to_string_lossy().to_string();
+        let mut add = repo.native_change(SESSION, "owned.rs", "", 1);
+        add["payload"]["item"]["changes"][&path] = json!({"type":"add", "content":base});
+        repo.append_record(SESSION, &add);
+        repo.append_record(
+            SESSION,
+            &repo.native_change(
+                SESSION,
+                "owned.rs",
+                "@@ -1 +1 @@\n-fn main(){let value=1;}\n+fn main(){let value=2;}\n",
+                2,
+            ),
+        );
+        let command = if outcome == "shell" {
+            "rustfmt --edition 2024 owned.rs; touch other.txt"
+        } else {
+            "rustfmt --edition 2024 owned.rs"
+        };
+        let code = format!(
+            "text(await tools.exec_command({{cmd:{},workdir:{}}}));\ntext(await tools.write_stdin({{session_id:100,chars:\"\"}}));",
+            serde_json::to_string(command).unwrap(),
+            serde_json::to_string(&repo.root).unwrap()
+        );
+        repo.append_record(SESSION, &json!({"timestamp":"2026-10-08T00:00:03.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"formatter", "input":code}}));
+        let receipt = if outcome == "running" {
+            json!({"session_id":100})
+        } else {
+            json!({"exit_code":if outcome == "failed" {1} else {0}})
+        };
+        repo.append_record(SESSION, &json!({"timestamp":"2026-10-08T00:00:03.200Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"formatter","output":[{"type":"text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n"},{"type":"text","text":receipt.to_string()},{"type":"text","text":"{\"exit_code\":0}"}]}}));
+        let formatted = format_rust(&repo.root, "2024", b"fn main(){let value=2;}\n").unwrap();
+        fs::write(repo.root.join("owned.rs"), &formatted).unwrap();
+        fs::write(repo.root.join("other.txt"), "outside\n").unwrap();
+        let result = snapshot(&repo.home, SESSION);
+        if outcome == "success" {
+            let prepared = result.unwrap();
+            assert_eq!(prepared.changes.len(), 1);
+            assert_eq!(prepared.changes[0].path, "owned.rs");
+            assert_eq!(prepared.changes[0].after.as_ref().unwrap().bytes, formatted);
+            commit_and_push(&prepared, "fix: 更新测试数值并格式化", None).unwrap();
+            assert_eq!(fs::read(repo.root.join("other.txt")).unwrap(), b"outside\n");
+            assert_eq!(
+                git(&repo.root, &["show", "HEAD:owned.rs"], None, None).unwrap(),
+                formatted
+            );
+        } else {
+            assert!(result.is_err(), "{outcome}");
+            assert_eq!(fs::read(repo.root.join("owned.rs")).unwrap(), formatted);
+            assert_eq!(
+                git(&repo.root, &["show", "HEAD:owned.rs"], None, None).unwrap(),
+                base.as_bytes()
+            );
+        }
+    }
+}
+
+#[test]
+fn historical_cargo_format_tracks_only_prior_owned_files_and_resolves_polls() {
+    for outcome in ["success", "failed", "running", "unsafe"] {
+        let repo = Repo::new();
+        fs::create_dir_all(repo.root.join("backend/src")).unwrap();
+        fs::write(
+            repo.root.join("Cargo.toml"),
+            "[workspace.package]\nedition = '2024'\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.root.join("backend/Cargo.toml"),
+            "[package]\nname = 'codey'\nedition.workspace = true\n",
+        )
+        .unwrap();
+        let path = "backend/src/owned.rs";
+        fs::write(repo.root.join(path), "fn main(){let value=1;}\n").unwrap();
+        git(&repo.root, &["add", "--", path], None, None).unwrap();
+        git(&repo.root, &["commit", "-m", "baseline"], None, None).unwrap();
+        repo.append_record(
+            SESSION,
+            &repo.native_change(
+                SESSION,
+                path,
+                "@@ -1 +1 @@\n-fn main(){let value=1;}\n+fn main(){let value=2;}\n",
+                1,
+            ),
+        );
+        let command = if outcome == "unsafe" {
+            "cargo fmt -p codey; true"
+        } else {
+            "cargo fmt -p codey && cargo test -p codey --lib 2>&1 | tail -6"
+        };
+        repo.append_record(SESSION, &json!({"timestamp":"2026-10-08T00:00:02.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"fmt","arguments":json!({"cmd":command,"workdir":repo.root}).to_string()}}));
+        repo.append_record(SESSION, &json!({"timestamp":"2026-10-08T00:00:02.100Z","type":"response_item","payload":{"type":"function_call_output","call_id":"fmt","output":"Chunk ID: aaa\nWall time: 30 seconds\nProcess running with session ID 10\nOriginal token count: 0\nOutput:\n"}}));
+        if outcome != "running" {
+            repo.append_record(SESSION, &json!({"timestamp":"2026-10-08T00:00:03.000Z","type":"response_item","payload":{"type":"function_call","name":"write_stdin","call_id":"poll","arguments":"{\"session_id\":10,\"chars\":\"\"}"}}));
+            let code = if outcome == "failed" { 1 } else { 0 };
+            repo.append_record(SESSION, &json!({"timestamp":"2026-10-08T00:00:03.100Z","type":"response_item","payload":{"type":"function_call_output","call_id":"poll","output":format!("Chunk ID: bbb\nWall time: 1 seconds\nProcess exited with code {code}\nOriginal token count: 0\nOutput:\n")}}));
+        }
+        let formatted = format_rust(&repo.root, "2024", b"fn main(){let value=2;}\n").unwrap();
+        fs::write(repo.root.join(path), &formatted).unwrap();
+        let other = "backend/src/other.rs";
+        fs::write(repo.root.join(other), "fn other(){}\n").unwrap();
+        let recovered = history::recover(&repo.home, SESSION, &repo.root, &repo.root).unwrap();
+        assert!(!recovered.paths().any(|path| path == other));
+        let head = git_text(&repo.root, &["rev-parse", "HEAD"]).unwrap();
+        let before = head_entry(&repo.root, &head, path).unwrap();
+        let after = disk_entry(&repo.root, path).unwrap();
+        assert_eq!(
+            recovered
+                .replay(path, before.as_ref(), after.as_ref())
+                .is_ok(),
+            outcome == "success",
+            "{outcome}"
+        );
+        assert_eq!(fs::read(repo.root.join(other)).unwrap(), b"fn other(){}\n");
+    }
+}
+
+#[test]
+fn committed_other_session_claim_does_not_block_proven_later_history() {
+    let repo = Repo::new();
+    repo.fastctx(repo.hook(OTHER, "mcp__codey_fastctx__replace", json!({"path":repo.root.join("owned.txt"), "pattern":"old", "replacement":"outside", "literal":true})));
+    git(&repo.root, &["add", "--", "owned.txt"], None, None).unwrap();
+    git(
+        &repo.root,
+        &["commit", "-m", "other conversation"],
+        None,
+        None,
+    )
+    .unwrap();
+    fs::write(repo.root.join("owned.txt"), "prefix\noutside\n").unwrap();
+    git(&repo.root, &["add", "--", "owned.txt"], None, None).unwrap();
+    git(
+        &repo.root,
+        &["commit", "-m", "later committed prefix"],
+        None,
+        None,
+    )
+    .unwrap();
+    git(&repo.root, &["push"], None, None).unwrap();
+    repo.append_record(
+        SESSION,
+        &repo.native_change(SESSION, "owned.txt", "@@ -2 +2 @@\n-outside\n+mine\n", 1),
+    );
+    fs::write(repo.root.join("owned.txt"), "prefix\nmine\n").unwrap();
+    let prepared = snapshot(&repo.home, SESSION).unwrap();
+    assert_eq!(
+        prepared.changes[0].after.as_ref().unwrap().bytes,
+        b"prefix\nmine\n"
+    );
+    commit_and_push(&prepared, "fix: 更新本对话文本", None).unwrap();
+    assert_eq!(
+        git(&repo.root, &["show", "HEAD:owned.txt"], None, None).unwrap(),
+        b"prefix\nmine\n"
+    );
+}
+
+#[test]
+fn equivalent_history_suffixes_have_one_commit_content() {
+    let repo = Repo::new();
+    let base = format_rust(&repo.root, "2024", b"fn main(){let value=1;}\n").unwrap();
+    fs::write(repo.root.join("owned.rs"), &base).unwrap();
+    git(&repo.root, &["add", "--", "owned.rs"], None, None).unwrap();
+    git(
+        &repo.root,
+        &["commit", "-m", "formatted baseline"],
+        None,
+        None,
+    )
+    .unwrap();
+    git(&repo.root, &["push"], None, None).unwrap();
+    repo.append_record(SESSION, &json!({"timestamp":"2026-10-08T00:00:01.000Z","type":"response_item","payload":{"type":"function_call", "name":"exec_command", "namespace":"functions", "call_id":"noop-format", "arguments":json!({"cmd":"rustfmt --edition 2024 owned.rs"}).to_string()}}));
+    repo.append_record(SESSION, &json!({"timestamp":"2026-10-08T00:00:01.100Z","type":"response_item","payload":{"type":"function_call_output", "call_id":"noop-format", "output":"{\"exit_code\":0}"}}));
+    repo.append_record(
+        SESSION,
+        &repo.native_change(
+            SESSION,
+            "owned.rs",
+            "@@ -1,3 +1,3 @@\n fn main() {\n-    let value = 1;\n+    let value = 2;\n }\n",
+            2,
+        ),
+    );
+    let disk = String::from_utf8(base)
+        .unwrap()
+        .replace("value = 1", "value = 2");
+    fs::write(repo.root.join("owned.rs"), &disk).unwrap();
+    let prepared = snapshot(&repo.home, SESSION).unwrap();
+    assert_eq!(
+        prepared.changes[0].after.as_ref().unwrap().bytes,
+        disk.as_bytes()
+    );
+    let history = history::recover(&repo.home, SESSION, &repo.root, &repo.root).unwrap();
+    assert_eq!(
+        history
+            .isolate_changes(
+                &repo.root,
+                "owned.rs",
+                prepared.changes[0].before.as_ref(),
+                prepared.changes[0].disk.as_ref()
+            )
+            .unwrap(),
+        prepared.changes[0].after.clone().unwrap()
+    );
+}
+
+#[test]
+fn successful_patch_keeps_full_context_when_native_receipt_is_shortened() {
+    for fixed_wrapper in [true, false] {
+        let repo = Repo::new();
+        fs::write(
+            repo.root.join("owned.txt"),
+            "anchor-a\nold\nanchor-b\nold\nend\n",
+        )
+        .unwrap();
+        git(&repo.root, &["add", "--", "owned.txt"], None, None).unwrap();
+        git(
+            &repo.root,
+            &["commit", "-m", "duplicate short context"],
+            None,
+            None,
+        )
+        .unwrap();
+        git(&repo.root, &["push"], None, None).unwrap();
+        let patch = "*** Begin Patch\n*** Update File: owned.txt\n@@\n anchor-a\n-old\n+mine\n anchor-b\n*** End Patch";
+        let code = format!(
+            "text(await tools.apply_patch({}));",
+            serde_json::to_string(patch).unwrap()
+        );
+        let code = if fixed_wrapper {
+            code
+        } else {
+            format!("if (true) {{ {code} }}")
+        };
+        repo.append_record(SESSION, &json!({"timestamp":"2026-10-08T00:00:01.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"context-patch","input":code}}));
+        repo.append_record(
+            SESSION,
+            &repo.native_change(SESSION, "owned.txt", "@@ -2 +2 @@\n-old\n+mine\n", 1),
+        );
+        repo.append_record(SESSION, &json!({"timestamp":"2026-10-08T00:00:01.500Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"context-patch","output":[{"type":"text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n"},{"type":"text","text":"{}"}]}}));
+        fs::write(
+            repo.root.join("owned.txt"),
+            "anchor-a\nmine\nanchor-b\nold\noutside\n",
+        )
+        .unwrap();
+        let result = snapshot(&repo.home, SESSION);
+        if fixed_wrapper {
+            let prepared = result.unwrap();
+            assert_ne!(prepared.changes[0].after, prepared.changes[0].disk);
+        } else {
+            assert!(result.is_err());
+        }
     }
 }
 
@@ -1013,7 +1649,7 @@ fn old_conversation_refuses_later_user_changes_and_other_conversation_claims() {
 }
 
 #[test]
-fn old_conversation_refuses_incomplete_receipts_regex_and_unknown_creation_baselines() {
+fn old_conversation_refuses_incomplete_receipts_regex_and_unrecorded_new_file_content() {
     let repo = Repo::new();
     repo.history(
         SESSION,
@@ -1037,6 +1673,7 @@ fn old_conversation_refuses_incomplete_receipts_regex_and_unknown_creation_basel
         2,
     );
     assert_eq!(status(&repo.home, SESSION).unwrap()["visible"], true);
+    fs::write(repo.root.join("owned.txt"), "new\noutside\n").unwrap();
     assert!(snapshot(&repo.home, SESSION).is_err());
     let other = Repo::new();
     other.history(
@@ -1047,12 +1684,182 @@ fn old_conversation_refuses_incomplete_receipts_regex_and_unknown_creation_basel
         json!("Success. Updated the following files:\nA created.txt"),
         1,
     );
-    fs::write(other.root.join("created.txt"), "created\n").unwrap();
+    fs::write(other.root.join("created.txt"), "created\nunrecorded\n").unwrap();
     assert_eq!(
         status(&other.home, SESSION).unwrap()["files"],
         json!(["created.txt"])
     );
     assert!(snapshot(&other.home, SESSION).is_err());
+}
+
+#[test]
+fn historical_new_file_creation_and_followup_edits_commit_only_owned_content() {
+    for native in [false, true] {
+        let repo = Repo::new();
+        if native {
+            let mut creation = repo.native_change(SESSION, "created.txt", "", 1);
+            let path = repo.root.join("created.txt").to_string_lossy().to_string();
+            creation["payload"]["item"]["changes"][&path] =
+                json!({"type":"add", "content":"created\n"});
+            repo.append_record(SESSION, &creation);
+        } else {
+            repo.history(
+                SESSION,
+                None,
+                "apply_patch",
+                json!("*** Begin Patch\n*** Add File: created.txt\n+created\n*** End Patch"),
+                json!("Success. Updated the following files:\nA created.txt"),
+                1,
+            );
+        }
+        repo.old_patch(SESSION, "created.txt", "created", "updated", 2);
+        fs::write(repo.root.join("other.txt"), "outside\n").unwrap();
+        let prepared = snapshot(&repo.home, SESSION).unwrap();
+        assert_eq!(prepared.changes.len(), 1);
+        assert_eq!(prepared.changes[0].path, "created.txt");
+        assert!(prepared.changes[0].before.is_none());
+        commit_and_push(&prepared, "feat: 增加当前对话文件", None).unwrap();
+        assert_eq!(
+            git(&repo.root, &["show", "HEAD:created.txt"], None, None).unwrap(),
+            b"updated\n"
+        );
+        assert_eq!(fs::read(repo.root.join("other.txt")).unwrap(), b"outside\n");
+    }
+}
+
+#[test]
+fn historical_tracked_deletion_is_supported_but_mixed_ownership_is_rejected() {
+    for native in [false, true] {
+        let repo = Repo::new();
+        if native {
+            let mut deletion = repo.native_change(SESSION, "owned.txt", "", 1);
+            let path = repo.root.join("owned.txt").to_string_lossy().to_string();
+            deletion["payload"]["item"]["changes"][&path] = json!({"type":"delete"});
+            repo.append_record(SESSION, &deletion);
+        } else {
+            repo.history(
+                SESSION,
+                None,
+                "apply_patch",
+                json!("*** Begin Patch\n*** Delete File: owned.txt\n*** End Patch"),
+                json!("Success. Updated the following files:\nD owned.txt"),
+                1,
+            );
+        }
+        fs::remove_file(repo.root.join("owned.txt")).unwrap();
+        let prepared = snapshot(&repo.home, SESSION).unwrap();
+        assert!(prepared.changes[0].after.is_none());
+        commit_and_push(&prepared, "chore: 删除当前对话文件", None).unwrap();
+        assert!(
+            head_entry(
+                &repo.root,
+                &git_text(&repo.root, &["rev-parse", "HEAD"]).unwrap(),
+                "owned.txt"
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+    let mixed = Repo::new();
+    mixed.fastctx(mixed.hook(OTHER, "mcp__codey_fastctx__replace", json!({"path":mixed.root.join("owned.txt"), "pattern":"old", "replacement":"outside", "literal":true})));
+    mixed.history(
+        SESSION,
+        None,
+        "apply_patch",
+        json!("*** Begin Patch\n*** Delete File: owned.txt\n*** End Patch"),
+        json!("Success. Updated the following files:\nD owned.txt"),
+        1,
+    );
+    fs::remove_file(mixed.root.join("owned.txt")).unwrap();
+    assert!(
+        snapshot(&mixed.home, SESSION)
+            .unwrap_err()
+            .to_string()
+            .contains("其他对话")
+    );
+}
+
+#[test]
+fn historical_creation_rejects_another_sessions_stale_claim_even_if_content_matches() {
+    let repo = Repo::new();
+    repo.history(
+        SESSION,
+        None,
+        "apply_patch",
+        json!("*** Begin Patch\n*** Add File: created.txt\n+created\n*** End Patch"),
+        json!("Success. Updated the following files:\nA created.txt"),
+        1,
+    );
+    fs::write(repo.root.join("created.txt"), "created\n").unwrap();
+    repo.fastctx(repo.hook(OTHER, "mcp__codey_fastctx__replace", json!({"path":repo.root.join("created.txt"), "pattern":"created", "replacement":"outside", "literal":true})));
+    fs::write(repo.root.join("created.txt"), "created\n").unwrap();
+    let head = git_text(&repo.root, &["rev-parse", "HEAD"]).unwrap();
+    let index = fs::read(index_path(&repo.root).unwrap()).unwrap();
+    assert!(
+        snapshot(&repo.home, SESSION)
+            .unwrap_err()
+            .to_string()
+            .contains("其他对话")
+    );
+    assert_eq!(git_text(&repo.root, &["rev-parse", "HEAD"]).unwrap(), head);
+    assert_eq!(fs::read(index_path(&repo.root).unwrap()).unwrap(), index);
+    assert_eq!(
+        fs::read(repo.root.join("created.txt")).unwrap(),
+        b"created\n"
+    );
+}
+
+#[test]
+fn committed_historical_creation_does_not_claim_later_unrecorded_changes() {
+    let repo = Repo::new();
+    repo.history(
+        SESSION,
+        None,
+        "apply_patch",
+        json!("*** Begin Patch\n*** Add File: created.txt\n+created\n*** End Patch"),
+        json!("Success. Updated the following files:\nA created.txt"),
+        1,
+    );
+    fs::write(repo.root.join("created.txt"), "created\n").unwrap();
+    let prepared = snapshot(&repo.home, SESSION).unwrap();
+    commit_and_push(&prepared, "feat: 增加文件", None).unwrap();
+    fs::write(repo.root.join("created.txt"), "outside\n").unwrap();
+    repo.old_patch(SESSION, "owned.txt", "old", "new", 2);
+    let prepared = snapshot(&repo.home, SESSION).unwrap();
+    assert_eq!(prepared.changes.len(), 1);
+    assert_eq!(prepared.changes[0].path, "owned.txt");
+    commit_and_push(&prepared, "fix: 修改当前对话文件", None).unwrap();
+    assert_eq!(
+        git(&repo.root, &["show", "HEAD:created.txt"], None, None).unwrap(),
+        b"created\n"
+    );
+    assert_eq!(
+        fs::read(repo.root.join("created.txt")).unwrap(),
+        b"outside\n"
+    );
+}
+
+#[test]
+fn historical_add_cannot_overwrite_a_tracked_baseline() {
+    let repo = Repo::new();
+    repo.history(
+        SESSION,
+        None,
+        "apply_patch",
+        json!("*** Begin Patch\n*** Add File: owned.txt\n+replacement\n*** End Patch"),
+        json!("Success. Updated the following files:\nA owned.txt"),
+        1,
+    );
+    fs::write(repo.root.join("owned.txt"), "replacement\n").unwrap();
+    assert!(snapshot(&repo.home, SESSION).is_err());
+    assert_eq!(
+        git(&repo.root, &["show", "HEAD:owned.txt"], None, None).unwrap(),
+        b"old\n"
+    );
+    assert_eq!(
+        fs::read(repo.root.join("owned.txt")).unwrap(),
+        b"replacement\n"
+    );
 }
 
 #[test]
@@ -1817,6 +2624,9 @@ async fn model_receives_full_diff_and_conventional_chinese_message_rules() {
                 .iter()
                 .any(|item| { item["role"] == "system" && item["content"] == MESSAGE_INSTRUCTION })
         );
+        assert!(MESSAGE_INSTRUCTION.contains("单文件的简单改动允许只写标题"));
+        assert!(MESSAGE_INSTRUCTION.contains("必须附正文，不得只给标题"));
+        assert!(MESSAGE_INSTRUCTION.contains("不编造影响、测试结果或性能收益"));
         let body =
             json!({"choices":[{"message":{"role":"assistant", "content":"chore(files): 更新当前对话文件内容"}}]})
                 .to_string();
@@ -1842,6 +2652,36 @@ async fn model_receives_full_diff_and_conventional_chinese_message_rules() {
         "chore(files): 更新当前对话文件内容"
     );
     server.await.unwrap();
+}
+
+#[test]
+fn detailed_commit_body_is_required_for_multiple_files_or_large_changes() {
+    let simple = "diff --git a/owned.txt b/owned.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let title = "fix: 更新文件内容";
+    let scoped = "fix(files): 更新文件内容\n\n- 调整文件内容，保留原有接口。";
+    let unscoped = "fix: 更新文件内容\n\n- 调整文件内容，保留原有接口。";
+    assert_eq!(validate_message_for_diff(title, simple).unwrap(), title);
+    let multiple = format!("{simple}diff --git a/other.txt b/other.txt\n@@ -1 +1 @@\n-old\n+new\n");
+    let large = format!(
+        "diff --git a/owned.txt b/owned.txt\n@@ -1 +1 @@\n{}",
+        "+value\n".repeat(80)
+    );
+    let many_hunks = format!(
+        "diff --git a/owned.txt b/owned.txt\n{}",
+        "@@ -1 +1 @@\n-old\n+new\n".repeat(4)
+    );
+    for diff in [&multiple, &large, &many_hunks] {
+        assert!(validate_message_for_diff(title, diff).is_err());
+        assert!(validate_message_for_diff(&format!("{title}\n\n  "), diff).is_err());
+        assert_eq!(validate_message_for_diff(scoped, diff).unwrap(), scoped);
+        assert_eq!(validate_message_for_diff(unscoped, diff).unwrap(), unscoped);
+    }
+    let smaller = format!(
+        "diff --git a/owned.txt b/owned.txt\n@@ -1 +1 @@\n{}",
+        "+value\n".repeat(79)
+    );
+    assert!(validate_message_for_diff(title, &smaller).is_ok());
+    assert!(validate_message_for_diff("fix: 更新内容\n缺少空行", &multiple).is_err());
 }
 
 #[tokio::test]

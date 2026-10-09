@@ -652,11 +652,24 @@ pub(super) fn changes(
             "{path} 仍有编辑未完成或缺少完成回执，已停止提交"
         );
         let after = if let Some(claim) = ledger.files.get(path) {
+            ensure!(
+                before.is_some() && disk.is_some()
+                    || claim.sessions == BTreeSet::from([session.to_string()]),
+                "{path} 的新增或删除含其他对话的编辑记录，无法确认完整归属，已停止提交"
+            );
             if claim.valid
                 && claim.sessions == BTreeSet::from([session.to_string()])
                 && claim.baseline == fingerprint(before.as_ref())
                 && claim.expected == fingerprint(disk.as_ref())
             {
+                disk.clone()
+            } else if (claim.sessions == BTreeSet::from([session.to_string()])
+                || claim.expected != fingerprint(disk.as_ref())
+                || before.is_none()
+                || disk.is_none())
+                && history.replay(path, before.as_ref(), disk.as_ref()).is_ok()
+            {
+                // 本对话无效摘要或过时摘要只能由完整重放证明替代，其他对话的当前归属仍需分离。
                 disk.clone()
             } else {
                 let candidate = history
@@ -670,12 +683,25 @@ pub(super) fn changes(
                     })?;
                 // 混合归属却没有可独立保留的剩余改动时，仍不能把整份文件认领为本对话。
                 ensure!(
-                    Some(&candidate) != disk.as_ref(),
+                    claim.sessions == BTreeSet::from([session.to_string()])
+                        || Some(&candidate) != disk.as_ref(),
                     "{path} 含其他对话的编辑记录且无法确认独立改动，已停止提交"
                 );
                 Some(candidate)
             }
         } else {
+            if before.is_none() || disk.is_none() {
+                history.replay(path, before.as_ref(), disk.as_ref()).with_context(|| {
+                    format!("{path} 的新增或删除缺少完整的成功记录，或后续内容与记录不一致，已停止提交")
+                })?;
+                changes.push(Change {
+                    path: path.clone(),
+                    before,
+                    after: disk.clone(),
+                    disk,
+                });
+                continue;
+            }
             match history.replay(path, before.as_ref(), disk.as_ref()) {
                 Ok(()) => disk.clone(),
                 Err(error) => Some(

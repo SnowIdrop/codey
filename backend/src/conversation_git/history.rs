@@ -26,6 +26,19 @@ impl RecordedEdit {
                 .is_some_and(|(start, end)| start <= end),
             "编辑时间记录不完整"
         );
+        if let Edit::NativePatch(diff) = &self.edit {
+            let before = value.context("缺少原生编辑基线")?;
+            let (text, inverse) =
+                apply_native_patch_checked(std::str::from_utf8(&before.bytes)?, diff, false, true)?;
+            ensure!(
+                apply_native_patch(&text, &inverse, false)?.as_bytes() == before.bytes,
+                "原生编辑无法唯一还原基线"
+            );
+            return Ok(Some(Entry {
+                mode: before.mode.clone(),
+                bytes: text.into_bytes(),
+            }));
+        }
         let next = apply_edit(value, &self.edit)?;
         let reverse = match &self.edit {
             Edit::Patch(hunks) => Edit::Patch(
@@ -69,7 +82,10 @@ impl RecordedEdit {
                 );
                 return Ok(next);
             }
-            Edit::Add(_) | Edit::Delete => bail!("历史新增或删除缺少执行前基线，不能自动认领"),
+            // 格式化是可重现的确定操作；最终候选仍须精确匹配完整磁盘内容或通过隔离校验。
+            Edit::FormatRust { .. } => return Ok(next),
+            // 创建内容和删除目标由成功回执限定，后续完整链仍须与 HEAD 和磁盘精确对应。
+            Edit::Add(_) | Edit::Delete => return Ok(next),
         };
         ensure!(
             apply_edit(next.as_ref(), &reverse)?.as_ref() == value,
@@ -83,6 +99,115 @@ impl RecordedEdit {
 struct Spawn {
     binding: String,
     role: String,
+}
+
+// 仅用于完整文件证明：保留全部可能位置，直到后续成功记录和完整磁盘内容消除歧义。
+// 共享文件的分离仍使用 verified_apply，不能通过这里枚举出一部分提交内容。
+fn full_replay_candidates(
+    record: &RecordedEdit,
+    value: Option<&Entry>,
+    work: &mut usize,
+) -> Result<Vec<Option<Entry>>> {
+    *work += 1;
+    ensure!(*work <= 4096, "历史完整重放超过安全计算上限，已停止提交");
+    if let Ok(next) = record.verified_apply(value) {
+        return Ok(vec![next]);
+    }
+    if record
+        .start
+        .zip(record.end)
+        .is_none_or(|(start, end)| start > end)
+    {
+        return Ok(Vec::new());
+    }
+    let Some(before) = value else {
+        return Ok(Vec::new());
+    };
+    if let Edit::Replace(args) = &record.edit {
+        let Some(pattern) = args["pattern"].as_str() else {
+            return Ok(Vec::new());
+        };
+        let pattern = if args["literal"] == true {
+            regex::escape(pattern)
+        } else {
+            pattern.to_string()
+        };
+        let regex = regex::RegexBuilder::new(&pattern)
+            .case_insensitive(args["case_insensitive"] == true)
+            .dot_matches_new_line(args["dot_all"] == true)
+            .build()?;
+        let count = regex.find_iter(std::str::from_utf8(&before.bytes)?).count();
+        if record.replacements != Some(count) || count == 0 {
+            return Ok(Vec::new());
+        }
+        return Ok(apply_edit(value, &record.edit).ok().into_iter().collect());
+    }
+    let hunks = match &record.edit {
+        Edit::NativePatch(diff) => parse_native_hunks(diff, false)?
+            .into_iter()
+            .map(|(_, _, old, new)| {
+                (
+                    old.into_iter().map(str::to_string).collect(),
+                    new.into_iter().map(str::to_string).collect(),
+                )
+            })
+            .collect(),
+        Edit::Patch(hunks) => hunks.clone(),
+        _ => return Ok(Vec::new()),
+    };
+    let text = std::str::from_utf8(&before.bytes)?;
+    ensure!(
+        !text.contains('\r') && (text.is_empty() || text.ends_with('\n')),
+        "历史补丁换行无法精确确认"
+    );
+    let mut states = vec![(text.lines().map(str::to_string).collect::<Vec<_>>(), 0usize)];
+    for (old, new) in hunks {
+        let mut next = Vec::new();
+        for (lines, cursor) in states {
+            if old.is_empty() && !lines.is_empty() {
+                continue;
+            }
+            *work += 1;
+            ensure!(*work <= 4096, "历史完整重放超过安全计算上限，已停止提交");
+            let positions: Vec<_> = (cursor..=lines.len())
+                .filter(|start| {
+                    *start + old.len() <= lines.len() && lines[*start..*start + old.len()] == old
+                })
+                .take(17)
+                .collect();
+            ensure!(
+                positions.len() <= 16,
+                "历史补丁候选位置过多，无法可靠确认归属，已停止提交"
+            );
+            for position in positions {
+                let mut candidate = lines.clone();
+                candidate.splice(position..position + old.len(), new.iter().cloned());
+                let state = (candidate, position + new.len());
+                if !next.contains(&state) {
+                    next.push(state);
+                }
+                ensure!(next.len() <= 16, "历史补丁候选内容过多，已停止提交");
+            }
+        }
+        states = next;
+    }
+    let mut entries = Vec::new();
+    for (lines, _) in states {
+        let text = if lines.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", lines.join("\n"))
+        };
+        ensure!(text.len() as u64 <= MAX_BYTES, "历史文件内容超过安全上限");
+        let entry = Some(Entry {
+            mode: before.mode.clone(),
+            bytes: text.into_bytes(),
+        });
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
 }
 
 type RecordedCall = (String, Value, Value, Option<i64>, Option<i64>, usize);
@@ -99,16 +224,20 @@ struct Transcript {
 
 // 原生完成记录带精确行号；严格按坐标校验，避免把相同上下文中的其他位置认作本次编辑。
 pub(super) fn apply_native_patch(input: &str, diff: &str, reverse: bool) -> Result<String> {
-    ensure!(
-        !input.contains('\r') && (input.is_empty() || input.ends_with('\n')),
-        "原生补丁的换行格式无法精确确认"
-    );
+    apply_native_patch_at(input, diff, reverse, false)
+}
+
+fn apply_native_patch_at(input: &str, diff: &str, reverse: bool, relocate: bool) -> Result<String> {
+    Ok(apply_native_patch_checked(input, diff, reverse, relocate)?.0)
+}
+
+type NativeHunk<'a> = (usize, usize, Vec<&'a str>, Vec<&'a str>);
+
+fn parse_native_hunks(diff: &str, reverse: bool) -> Result<Vec<NativeHunk<'_>>> {
     let header = regex::Regex::new(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$")?;
-    let source: Vec<_> = input.lines().collect();
     let lines: Vec<_> = diff.lines().collect();
-    let mut output = Vec::new();
-    let mut cursor = 0usize;
     let mut i = 0;
+    let mut hunks = Vec::new();
     ensure!(!lines.is_empty(), "原生补丁缺少内容");
     while i < lines.len() {
         let captures = header.captures(lines[i]).context("原生补丁头无效")?;
@@ -158,6 +287,36 @@ pub(super) fn apply_native_patch(input: &str, diff: &str, reverse: bool) -> Resu
                 new,
             )
         };
+        hunks.push((from, to, removed, added));
+    }
+    Ok(hunks)
+}
+
+fn apply_native_patch_checked(
+    input: &str,
+    diff: &str,
+    reverse: bool,
+    relocate: bool,
+) -> Result<(String, String)> {
+    ensure!(
+        !input.contains('\r') && (input.is_empty() || input.ends_with('\n')),
+        "原生补丁的换行格式无法精确确认"
+    );
+    let source: Vec<_> = input.lines().collect();
+    let mut output = Vec::new();
+    let mut inverse = String::new();
+    let mut cursor = 0usize;
+    for (mut from, to, removed, added) in parse_native_hunks(diff, reverse)? {
+        if relocate {
+            ensure!(!removed.is_empty(), "无上下文补丁不能按内容定位");
+            let matches: Vec<_> = source
+                .windows(removed.len())
+                .enumerate()
+                .filter_map(|(position, lines)| (lines == removed.as_slice()).then_some(position))
+                .collect();
+            ensure!(matches.len() == 1, "原生补丁上下文不能唯一定位");
+            from = matches[0];
+        }
         ensure!(
             from >= cursor && from <= source.len(),
             "原生补丁位置超出基线或相互重叠"
@@ -170,16 +329,41 @@ pub(super) fn apply_native_patch(input: &str, diff: &str, reverse: bool) -> Resu
             "原生补丁内容与当前基线不一致"
         );
         output.extend_from_slice(&source[cursor..from]);
-        ensure!(output.len() == to, "原生补丁前后行号不一致");
+        ensure!(relocate || output.len() == to, "原生补丁前后行号不一致");
+        let new_position = output.len();
+        let inverse_start = if added.is_empty() {
+            new_position
+        } else {
+            new_position + 1
+        };
+        let original_start = if removed.is_empty() { from } else { from + 1 };
+        inverse.push_str(&format!(
+            "@@ -{inverse_start},{} +{original_start},{} @@\n",
+            added.len(),
+            removed.len()
+        ));
+        for line in &added {
+            inverse.push('-');
+            inverse.push_str(line);
+            inverse.push('\n');
+        }
+        for line in &removed {
+            inverse.push('+');
+            inverse.push_str(line);
+            inverse.push('\n');
+        }
         output.extend(added);
         cursor = end;
     }
     output.extend_from_slice(&source[cursor..]);
-    Ok(if output.is_empty() {
-        String::new()
-    } else {
-        format!("{}\n", output.join("\n"))
-    })
+    Ok((
+        if output.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", output.join("\n"))
+        },
+        inverse,
+    ))
 }
 
 type Signature = Vec<(PathBuf, u64, SystemTime, String)>;
@@ -247,6 +431,367 @@ fn batch_patch_receipt(response: &Value, trailing: usize) -> Option<Value> {
         }
     }
     Some(json!({"content": &content[..2]}))
+}
+
+fn multiple_patches(name: &str, args: &Value) -> Option<(Vec<Value>, usize)> {
+    if !matches!(name, "exec" | "functions.exec") {
+        return None;
+    }
+    let mut code = args
+        .as_str()
+        .or_else(|| args["code"].as_str())
+        .or_else(|| args["input"].as_str())?
+        .trim();
+    if code.starts_with("// @exec:") {
+        code = code.split_once('\n')?.1.trim();
+    }
+    let mut patches = Vec::new();
+    while !code.is_empty() {
+        if !code.starts_with("text(await tools.apply_patch(") {
+            break;
+        }
+        let literal = code.strip_prefix("text(await tools.apply_patch(")?;
+        let mut stream = serde_json::Deserializer::from_str(literal).into_iter::<String>();
+        patches.push(json!(stream.next()?.ok()?));
+        code = literal[stream.byte_offset()..].strip_prefix("));")?.trim();
+        if patches.len() > 8 {
+            return None;
+        }
+    }
+    let trailing = if code.is_empty() {
+        0
+    } else {
+        batch_patch(
+            "exec",
+            &json!(format!("text(await tools.apply_patch(\"\"));{code}")),
+        )?
+        .1
+    };
+    (patches.len() > 1).then_some((patches, trailing))
+}
+
+fn completed_multiple_patches(response: &Value, count: usize, trailing: usize) -> bool {
+    if response["isError"] == true {
+        return false;
+    }
+    let Some(content) = response["content"].as_array() else {
+        return false;
+    };
+    content.len() == count + trailing + 1
+        && content[0]["text"].as_str().is_some_and(|text| {
+            text.starts_with("Script completed\n") && text.trim_end().ends_with("Output:")
+        })
+        && content[1..count + 1].iter().all(|block| {
+            block["text"]
+                .as_str()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                == Some(json!({}))
+        })
+        && content[count + 1..].iter().all(|block| {
+            block["text"]
+                .as_str()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                .is_some_and(|value| value.is_object())
+        })
+}
+
+#[test]
+fn relocated_native_patch_rejects_repeated_context_even_with_unique_anchor() {
+    let input = "prefix\nanchor\nrepeat\nuser\nrepeat\n";
+    let diff = "@@ -1 +1 @@\n-anchor\n+own-anchor\n@@ -2 +2 @@\n-repeat\n+own-repeat\n";
+    assert!(apply_native_patch_checked(input, diff, false, true).is_err());
+}
+
+#[test]
+fn relocated_native_deletion_reverses_using_resolved_coordinates() {
+    let input = "prefix\nunique\nrepeat\nrepeat\n";
+    let diff = "@@ -1 +0,0 @@\n-unique\n";
+    let (after, inverse) = apply_native_patch_checked(input, diff, false, true).unwrap();
+    assert_eq!(after, "prefix\nrepeat\nrepeat\n");
+    assert_eq!(apply_native_patch(&after, &inverse, false).unwrap(), input);
+}
+
+fn retain_input_context(
+    history: &mut History,
+    actor: &str,
+    scopes: &[(i64, i64, BTreeSet<String>)],
+    start: Option<i64>,
+    end: Option<i64>,
+    edits: &[(String, Edit)],
+) -> Result<bool> {
+    let Some((start, end)) = start.zip(end) else {
+        return Ok(false);
+    };
+    let reported: BTreeSet<_> = edits.iter().map(|(file, _)| file.clone()).collect();
+    let matches: Vec<_> = scopes
+        .iter()
+        .filter(|(from, to, files)| start <= *from && *to <= end && *files == reported)
+        .collect();
+    if matches.len() != 1 {
+        return Ok(false);
+    }
+    let Some((from, to, _)) = matches.first() else {
+        return Ok(false);
+    };
+    for (file, edit) in edits {
+        if matches!(edit, Edit::Patch(_)) {
+            if let Edit::Patch(hunks) = edit
+                && hunks
+                    .iter()
+                    .any(|(old, new)| old == new || old.len() < 2 || new.len() < 2)
+            {
+                continue;
+            }
+            let records = history
+                .files
+                .get_mut(file)
+                .context("原生编辑缺少文件记录")?;
+            let records: Vec<_> = records
+                .iter_mut()
+                .filter(|record| {
+                    record.actor == actor && record.start == Some(*from) && record.end == Some(*to)
+                })
+                .collect();
+            ensure!(records.len() == 1, "原生编辑记录不能唯一对应补丁输入");
+            let record = records.into_iter().next().unwrap();
+            // 原生回执可能缩短上下文；保留成功请求中的完整上下文并继续验证正反向结果。
+            record.edit = edit.clone();
+        }
+    }
+    Ok(true)
+}
+
+// 只解析固定字面量调用，历史脚本本身永远不会被执行。
+fn formatter_calls(name: &str, args: &Value) -> Option<(Vec<Option<Value>>, usize)> {
+    if matches!(name, "exec_command" | "functions.exec_command") {
+        return Some((vec![Some(args.clone())], 0));
+    }
+    if !matches!(name, "exec" | "functions.exec") {
+        return None;
+    }
+    let mut code = args
+        .as_str()
+        .or_else(|| args["code"].as_str())
+        .or_else(|| args["input"].as_str())?
+        .trim();
+    if !code.contains("rustfmt ") {
+        return None;
+    }
+    if code.starts_with("// @exec:") {
+        code = code.split_once('\n')?.1.trim();
+    }
+    let mut offset = 1;
+    while let Some(literal) = code.strip_prefix("text(await tools.apply_patch(") {
+        let mut stream = serde_json::Deserializer::from_str(literal).into_iter::<String>();
+        stream.next()?.ok()?;
+        code = literal[stream.byte_offset()..].strip_prefix("));")?.trim();
+        offset += 1;
+        if offset > 9 {
+            return None;
+        }
+    }
+    let string = r#""(?:[^"\\\r\n]|\\.)*""#;
+    let primitive = format!(r"(?:{string}|-?\d+(?:\.\d+)?|true|false|null)");
+    let field = format!(r"(?:[a-zA-Z_][a-zA-Z0-9_]*|{string})\s*:\s*{primitive}");
+    let call = regex::Regex::new(&format!(r"^text\(await tools\.(exec_command|write_stdin)\(\{{\s*((?:{field}(?:\s*,\s*{field})*\s*,?)?)\s*\}}\)\);")).ok()?;
+    let fields = regex::Regex::new(&format!(
+        r"([a-zA-Z_][a-zA-Z0-9_]*|{string})\s*:\s*({primitive})"
+    ))
+    .ok()?;
+    let mut calls = Vec::new();
+    while !code.is_empty() {
+        let captures = call.captures(code)?;
+        let mut object = serde_json::Map::new();
+        for field in fields.captures_iter(&captures[2]) {
+            let key = if field[1].starts_with('"') {
+                serde_json::from_str::<String>(&field[1]).ok()?
+            } else {
+                field[1].to_string()
+            };
+            let value = serde_json::from_str::<Value>(&field[2]).ok()?;
+            if object.insert(key, value).is_some() {
+                return None;
+            }
+        }
+        calls.push((captures[1] == *"exec_command").then_some(Value::Object(object)));
+        code = code[captures.get(0)?.end()..].trim();
+        if calls.len() > 8 {
+            return None;
+        }
+    }
+    (!calls.is_empty()).then_some((calls, offset))
+}
+
+fn has_formatter(name: &str, args: &Value) -> bool {
+    formatter_calls(name, args).is_some_and(|(calls, _)| {
+        calls.iter().flatten().any(|args| {
+            args["cmd"]
+                .as_str()
+                .is_some_and(|cmd| cmd.starts_with("rustfmt "))
+        })
+    })
+}
+
+fn cargo_formatter(name: &str, args: &Value) -> bool {
+    if args["tty"] == true || args.get("shell").is_some_and(|value| !value.is_null()) {
+        return false;
+    }
+    if !matches!(name, "exec_command" | "functions.exec_command") {
+        return false;
+    }
+    let Some(command) = args["cmd"].as_str() else {
+        return false;
+    };
+    let parts: Vec<_> = command.split(" && ").collect();
+    parts.first() == Some(&"cargo fmt -p codey")
+        && parts.iter().skip(1).all(|part| {
+            *part == "cargo fmt -p codey -- --check" || *part == "echo FORMAT_OK" || {
+                let command = part.split(" 2>&1 | tail -").collect::<Vec<_>>();
+                command.len() <= 2
+                    && command
+                        .get(1)
+                        .is_none_or(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+                    && (command[0].starts_with("cargo test -p codey")
+                        || command[0].starts_with("cargo clippy -p codey"))
+                    && command[0]
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b" _:-".contains(&c))
+            }
+        })
+}
+
+fn terminal_receipt(response: &Value) -> Option<Value> {
+    if response.get("exit_code").is_some() {
+        return Some(response.clone());
+    }
+    let text = tracking::output_text(response)?;
+    if let Ok(value) = serde_json::from_str::<Value>(&text) {
+        return Some(value);
+    }
+    let header = text.split_once("\nOutput:\n")?.0;
+    if !header.starts_with("Chunk ID: ") {
+        return None;
+    }
+    for line in header.lines() {
+        if let Some(code) = line.strip_prefix("Process exited with code ") {
+            return Some(json!({"exit_code": code.parse::<i32>().ok()?}));
+        }
+        if let Some(session) = line.strip_prefix("Process running with session ID ") {
+            return Some(json!({"session_id": session.parse::<u64>().ok()?}));
+        }
+    }
+    None
+}
+
+fn completed_formatters(
+    name: &str,
+    args: &Value,
+    response: &Value,
+    root: &Path,
+    workspace: &Path,
+) -> Result<Vec<(String, Edit)>> {
+    if response["isError"] == true || response.get("error").is_some_and(|value| !value.is_null()) {
+        return Ok(Vec::new());
+    }
+    let Some((calls, offset)) = formatter_calls(name, args) else {
+        return Ok(Vec::new());
+    };
+    let wrapped = matches!(name, "exec" | "functions.exec");
+    let receipts = if wrapped {
+        let Some(content) = response["content"].as_array() else {
+            return Ok(Vec::new());
+        };
+        if content.len() != calls.len() + offset {
+            return Ok(Vec::new());
+        }
+        let envelope = content[0]["text"].as_str().unwrap_or_default();
+        if !envelope.starts_with("Script completed\n") || !envelope.trim_end().ends_with("Output:")
+        {
+            return Ok(Vec::new());
+        }
+        let mut receipts = Vec::new();
+        for block in &content[offset..] {
+            let Some(text) = block["text"].as_str() else {
+                return Ok(Vec::new());
+            };
+            let Ok(value) = serde_json::from_str::<Value>(text) else {
+                return Ok(Vec::new());
+            };
+            if !value.is_object() {
+                return Ok(Vec::new());
+            }
+            receipts.push(value);
+        }
+        receipts
+    } else {
+        let value = if response.is_object() && response.get("exit_code").is_some() {
+            response.clone()
+        } else {
+            match tracking::output_text(response)
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            {
+                Some(value) => value,
+                None => return Ok(Vec::new()),
+            }
+        };
+        vec![value]
+    };
+    let mut edits = Vec::new();
+    for (args, receipt) in calls.iter().zip(receipts) {
+        let Some(args) = args else {
+            continue;
+        };
+        let Some(command) = args["cmd"].as_str() else {
+            continue;
+        };
+        if receipt["exit_code"] != 0
+            || receipt
+                .get("session_id")
+                .is_some_and(|value| !value.is_null())
+            || receipt["isError"] == true
+            || receipt.get("error").is_some_and(|value| !value.is_null())
+        {
+            continue;
+        }
+        let tokens: Vec<_> = command.split_whitespace().collect();
+        if tokens.len() < 4
+            || tokens[0] != "rustfmt"
+            || tokens[1] != "--edition"
+            || !matches!(tokens[2], "2015" | "2018" | "2021" | "2024")
+        {
+            continue;
+        }
+        if let Some(workdir) = args["workdir"].as_str()
+            && Path::new(workdir).canonicalize().ok().as_deref() != Some(workspace)
+        {
+            continue;
+        }
+        if tokens.len() - 3 > MAX_FILES
+            || tokens[3..].iter().any(|path| {
+                !path.ends_with(".rs")
+                    || path.starts_with('-')
+                    || !path
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"_./:-".contains(&byte))
+            })
+        {
+            continue;
+        }
+        let mut paths = BTreeSet::new();
+        for raw in &tokens[3..] {
+            paths.insert(relative_path(root, workspace, raw)?);
+        }
+        for path in paths {
+            edits.push((
+                path,
+                Edit::FormatRust {
+                    root: root.to_path_buf(),
+                    edition: tokens[2].into(),
+                },
+            ));
+        }
+    }
+    Ok(edits)
 }
 
 #[cfg(test)]
@@ -513,6 +1058,10 @@ fn read_transcript(home: &Path, raw: &Path) -> Result<Transcript> {
                     .flatten()
                     .is_some()
                 || batch_patch(&name, &args).is_some()
+                || multiple_patches(&name, &args).is_some()
+                || has_formatter(&name, &args)
+                || cargo_formatter(&name, &args)
+                || matches!(name.as_str(), "write_stdin" | "functions.write_stdin")
             {
                 ensure!(
                     seen.insert(id.to_string()),
@@ -558,9 +1107,12 @@ fn read_transcript(home: &Path, raw: &Path) -> Result<Transcript> {
             }
         }
     }
-    result.incomplete = calls
-        .values()
-        .any(|(name, _, _, _)| name != "agents.spawn_agent");
+    result.incomplete = calls.values().any(|(name, _, _, _)| {
+        !matches!(
+            name.as_str(),
+            "agents.spawn_agent" | "write_stdin" | "functions.write_stdin"
+        )
+    });
     for (segment, length, modified, hash) in &signature {
         let current = fs::metadata(segment)?;
         ensure!(
@@ -643,6 +1195,37 @@ pub(super) struct History {
 }
 
 impl History {
+    #[cfg(test)]
+    pub(super) fn diagnostic_replay(&self, path: &str, before: Option<&Entry>) -> Vec<String> {
+        let Some(records) = self.files.get(path) else {
+            return Vec::new();
+        };
+        let mut records = records.clone();
+        records.sort_by_key(|record| (record.start, record.ordinal));
+        let mut result = Vec::new();
+        for start in records.len().saturating_sub(12)..records.len() {
+            let mut value = before.cloned();
+            let mut error = None;
+            for record in &records[start..] {
+                match record.verified_apply(value.as_ref()) {
+                    Ok(next) => value = next,
+                    Err(e) => {
+                        error = Some(format!("{}: {e:#}", record.ordinal));
+                        break;
+                    }
+                }
+            }
+            result.push(format!(
+                "{} -> {}",
+                records[start].ordinal,
+                error.unwrap_or_else(|| format!(
+                    "成功 {}",
+                    value.map_or_else(|| "删除".into(), |entry| digest(&entry.bytes))
+                ))
+            ));
+        }
+        result
+    }
     pub(super) fn paths(&self) -> impl Iterator<Item = &String> {
         self.files.keys()
     }
@@ -654,6 +1237,13 @@ impl History {
         let Some(records) = self.files.get(path) else {
             return false;
         };
+        // 新建文件的完整创建链已进入 HEAD 后，不再认领随后无记录的磁盘改动。
+        if records
+            .iter()
+            .any(|record| matches!(record.edit, Edit::Add(_)))
+        {
+            return self.replay(path, None, Some(head)).is_ok();
+        }
         if records.is_empty()
             || !records.iter().all(|record| {
                 matches!(
@@ -668,6 +1258,39 @@ impl History {
         records.sort_by_key(|record| (record.start, record.ordinal));
         let mut value = head.clone();
         for record in records.iter().rev() {
+            if let Edit::NativePatch(diff) = &record.edit {
+                let result = (|| -> Result<Entry> {
+                    ensure!(
+                        record
+                            .start
+                            .zip(record.end)
+                            .is_some_and(|(start, end)| start <= end),
+                        "编辑时间记录不完整"
+                    );
+                    let previous = apply_native_patch_at(
+                        std::str::from_utf8(&value.bytes)?,
+                        diff,
+                        true,
+                        true,
+                    )?;
+                    ensure!(
+                        apply_native_patch_at(&previous, diff, false, true)?.as_bytes()
+                            == value.bytes,
+                        "原生补丁不能唯一还原"
+                    );
+                    Ok(Entry {
+                        bytes: previous.into_bytes(),
+                        mode: value.mode.clone(),
+                    })
+                })();
+                match result {
+                    Ok(previous) => {
+                        value = previous;
+                        continue;
+                    }
+                    Err(_) => return false,
+                }
+            }
             let previous = (|| -> Result<Entry> {
                 let edit = match &record.edit {
                     Edit::NativePatch(diff) => {
@@ -758,8 +1381,33 @@ impl History {
                 matches += 1;
             }
         }
+        if matches == 0 {
+            let mut work = 0;
+            for start in (0..ordered.len()).rev() {
+                let mut values = vec![before.cloned()];
+                for record in &ordered[start..] {
+                    let mut next = Vec::new();
+                    for value in values {
+                        for candidate in full_replay_candidates(record, value.as_ref(), &mut work)?
+                        {
+                            if !next.contains(&candidate) {
+                                next.push(candidate);
+                            }
+                            ensure!(next.len() <= 16, "历史完整重放候选过多，已停止提交");
+                        }
+                    }
+                    values = next;
+                    if values.is_empty() {
+                        break;
+                    }
+                }
+                if values.iter().any(|value| value.as_ref() == after) {
+                    return Ok(());
+                }
+            }
+        }
         ensure!(
-            matches == 1,
+            matches > 0,
             "{path} 的历史编辑无法与当前 HEAD 和文件内容唯一对应，可能缺少执行前基线、含其他改动或记录不完整，已停止提交"
         );
         Ok(())
@@ -785,11 +1433,7 @@ impl History {
             .clone();
         records.sort_by_key(|record| (record.start, record.ordinal));
         ensure!(
-            records.len() <= 256
-                && records.iter().all(|record| matches!(
-                    record.edit,
-                    Edit::NativePatch(_) | Edit::Patch(_) | Edit::Replace(_)
-                )),
+            records.len() <= 256,
             "{path} 缺少可验证的修改记录，无法自动分离"
         );
         for pair in records.windows(2) {
@@ -815,7 +1459,10 @@ impl History {
                 Ok(value)
             })();
             if let Ok(candidate) = candidate {
-                candidates.push(candidate);
+                // 已提交的格式化等记录可能产生相同结果；范围由内容决定，不能重复计数。
+                if !candidates.contains(&candidate) {
+                    candidates.push(candidate);
+                }
             }
         }
         ensure!(
@@ -904,10 +1551,19 @@ pub(super) fn recover(
         );
         let mut native_scopes = Vec::new();
         for (item, start, end, ordinal) in transcript.native_changes {
-            let reported = tracking::reported_files(&item["stdout"], true, root, workspace)?;
             let changes = item["changes"]
                 .as_object()
                 .context("原生编辑记录缺少文件范围")?;
+            // 临时产物等明确位于工作区外的编辑不属于此仓库；混合范围仍需完整校验。
+            if !changes.is_empty()
+                && changes.keys().all(|raw| {
+                    let path = Path::new(raw);
+                    path.is_absolute() && !path.starts_with(workspace)
+                })
+            {
+                continue;
+            }
+            let reported = tracking::reported_files(&item["stdout"], true, root, workspace)?;
             let mut edits = BTreeMap::new();
             for (raw, change) in changes {
                 let file = relative_path(root, workspace, raw)?;
@@ -939,6 +1595,10 @@ pub(super) fn recover(
             );
             native_scopes.push((start, end, reported));
             for (file, edit) in edits {
+                // 成功但没有实际 diff 的原生补丁不产生归属，也不能阻断此前的编辑链。
+                if matches!(&edit, Edit::NativePatch(diff) if diff.trim().is_empty()) {
+                    continue;
+                }
                 history.files.entry(file).or_default().push(RecordedEdit {
                     actor: actor.clone(),
                     start: Some(start),
@@ -949,7 +1609,137 @@ pub(super) fn recover(
                 });
             }
         }
-        for (name, args, response, start, end, ordinal) in transcript.calls {
+        let mut running_formats = BTreeMap::new();
+        for (mut name, mut args, response, mut start, end, mut ordinal) in transcript.calls {
+            if matches!(name.as_str(), "write_stdin" | "functions.write_stdin") {
+                if args["chars"]
+                    .as_str()
+                    .is_some_and(|chars| !chars.is_empty())
+                {
+                    continue;
+                }
+                let Some(session) = args["session_id"].as_u64() else {
+                    continue;
+                };
+                let Some((original_name, original_args, original_start, original_order)) =
+                    running_formats.remove(&session)
+                else {
+                    continue;
+                };
+                name = original_name;
+                args = original_args;
+                start = original_start;
+                ordinal = original_order;
+            }
+            if cargo_formatter(&name, &args) {
+                let Some(receipt) = terminal_receipt(&response) else {
+                    continue;
+                };
+                if let Some(session) = receipt["session_id"].as_u64() {
+                    running_formats.insert(session, (name, args, start, ordinal));
+                    continue;
+                }
+                if receipt["exit_code"] != 0 || response["isError"] == true {
+                    continue;
+                }
+                if args["workdir"]
+                    .as_str()
+                    .and_then(|p| Path::new(p).canonicalize().ok())
+                    .as_deref()
+                    != Some(workspace)
+                {
+                    continue;
+                }
+                let manifest = std::str::from_utf8(&read_bounded(
+                    &workspace.join("backend/Cargo.toml"),
+                    MAX_BYTES,
+                )?)?
+                .parse::<toml_edit::DocumentMut>()?;
+                let Some(package) = manifest.get("package").and_then(toml_edit::Item::as_table)
+                else {
+                    continue;
+                };
+                if package.get("name").and_then(toml_edit::Item::as_str) != Some("codey") {
+                    continue;
+                }
+                let root_manifest =
+                    std::str::from_utf8(&read_bounded(&workspace.join("Cargo.toml"), MAX_BYTES)?)?
+                        .parse::<toml_edit::DocumentMut>()?;
+                let inherited = package
+                    .get("edition")
+                    .and_then(|item| item.get("workspace"))
+                    .and_then(toml_edit::Item::as_bool)
+                    == Some(true);
+                let inherited_edition = root_manifest
+                    .get("workspace")
+                    .and_then(|item| item.get("package"))
+                    .and_then(|item| item.get("edition"))
+                    .and_then(toml_edit::Item::as_str);
+                let Some(edition) = package
+                    .get("edition")
+                    .and_then(toml_edit::Item::as_str)
+                    .or_else(|| inherited.then_some(inherited_edition).flatten())
+                    .filter(|edition| matches!(*edition, "2015" | "2018" | "2021" | "2024"))
+                else {
+                    continue;
+                };
+                let paths: Vec<_> = history
+                    .files
+                    .iter()
+                    .filter(|(path, records)| {
+                        path.starts_with("backend/src/")
+                            && path.ends_with(".rs")
+                            && records.iter().any(|record| {
+                                record.actor == actor
+                                    && record
+                                        .end
+                                        .zip(start)
+                                        .is_some_and(|(end, start)| end < start)
+                            })
+                    })
+                    .map(|(path, _)| path.clone())
+                    .collect();
+                for file in paths {
+                    history.files.entry(file).or_default().push(RecordedEdit {
+                        actor: actor.clone(),
+                        start: end,
+                        end,
+                        ordinal,
+                        edit: Edit::FormatRust {
+                            root: root.to_path_buf(),
+                            edition: edition.into(),
+                        },
+                        replacements: None,
+                    });
+                }
+                continue;
+            }
+            for (file, edit) in completed_formatters(&name, &args, &response, root, workspace)? {
+                history.files.entry(file).or_default().push(RecordedEdit {
+                    actor: actor.clone(),
+                    start: end,
+                    end,
+                    ordinal,
+                    edit,
+                    replacements: None,
+                });
+            }
+            if let Some((patches, trailing)) = multiple_patches(&name, &args) {
+                if completed_multiple_patches(&response, patches.len(), trailing) {
+                    for patch in patches {
+                        let edits = tracking::operations(root, workspace, true, &patch)?;
+                        retain_input_context(
+                            &mut history,
+                            &actor,
+                            &native_scopes,
+                            start,
+                            end,
+                            &edits,
+                        )?;
+                    }
+                }
+                continue;
+            }
             let batch = batch_patch(&name, &args);
             let Some((patch, args)) = tracking::normalized_input(&name, &args)
                 .ok()
@@ -1025,6 +1815,14 @@ pub(super) fn recover(
                         contained.len() == 1 && contained[0].2 == reported,
                         "补丁调用与原生完成记录不能唯一对应"
                     );
+                    retain_input_context(
+                        &mut history,
+                        &actor,
+                        &native_scopes,
+                        start.into(),
+                        end.into(),
+                        &edits,
+                    )?;
                     continue;
                 }
             }
@@ -1050,6 +1848,7 @@ pub(super) fn recover(
                 });
             }
         }
+        history.incomplete |= !running_formats.is_empty();
         if !transcript.spawns.is_empty() {
             for (id, child_path) in child_paths(home, &actor, workspace)? {
                 let meta = tracking::metadata(home, &child_path)?;
