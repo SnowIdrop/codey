@@ -1165,6 +1165,111 @@ fn wrapped_cargo_all_format_recovers_committed_edits_without_claiming_other_file
 }
 
 #[test]
+fn wrapped_patch_before_cargo_format_keeps_format_record() {
+    let repo = Repo::new();
+    fs::create_dir_all(repo.root.join("backend/src")).unwrap();
+    fs::write(
+        repo.root.join("Cargo.toml"),
+        "[workspace.package]\nedition = '2024'\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.root.join("backend/Cargo.toml"),
+        "[package]\nname = 'codey'\nedition.workspace = true\n",
+    )
+    .unwrap();
+    let path = "backend/src/owned.rs";
+    fs::write(repo.root.join(path), "fn main(){let value=1;}\n").unwrap();
+    git(&repo.root, &["add", "--", path], None, None).unwrap();
+    git(&repo.root, &["commit", "-m", "rust baseline"], None, None).unwrap();
+    repo.append_record(
+        SESSION,
+        &repo.native_change(
+            SESSION,
+            path,
+            "@@ -1 +1 @@\n-fn main(){let value=1;}\n+fn main(){let value=2;}\n",
+            1,
+        ),
+    );
+    let patch = "*** Begin Patch\n*** Update File: backend/src/owned.rs\n@@\n-fn main(){let value=1;}\n+fn main(){let value=2;}\n*** End Patch";
+    let code = format!(
+        "text(await tools.apply_patch({}));\ntext(await tools.exec_command({}));",
+        serde_json::to_string(patch).unwrap(),
+        json!({"cmd":"cargo fmt --all"})
+    );
+    repo.history(
+        SESSION,
+        None,
+        "exec",
+        json!(code),
+        json!({"content":[
+            {"type":"text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n"},
+            {"type":"text","text":"{}"},
+            {"type":"text","text":"{\"exit_code\":0}"}
+        ]}),
+        2,
+    );
+    let formatted = format_rust(&repo.root, "2024", b"fn main(){let value=2;}\n").unwrap();
+    fs::write(repo.root.join(path), &formatted).unwrap();
+    let prepared = snapshot(&repo.home, SESSION).unwrap();
+    assert_eq!(prepared.changes.len(), 1);
+    assert_eq!(prepared.changes[0].path, path);
+    assert_eq!(prepared.changes[0].after.as_ref().unwrap().bytes, formatted);
+}
+
+#[test]
+fn expired_pending_does_not_block_proven_history() {
+    let repo = Repo::new();
+    let hook = repo.hook(
+        SESSION,
+        "apply_patch",
+        json!("*** Begin Patch\n*** Update File: owned.txt\n@@\n-old\n+new\n*** End Patch"),
+    );
+    repo.observe(&hook).unwrap();
+    let ledger = repo.home.join("codey-conversation-git-v2").join(format!(
+        "{}.json",
+        digest(repo.root.as_os_str().as_encoded_bytes())
+    ));
+    let mut value: Value = serde_json::from_slice(&fs::read(&ledger).unwrap()).unwrap();
+    for pending in value["pending"].as_object_mut().unwrap().values_mut() {
+        pending["created_millis"] = json!(1);
+    }
+    fs::write(&ledger, serde_json::to_vec(&value).unwrap()).unwrap();
+    repo.append_record(
+        SESSION,
+        &repo.native_change(SESSION, "owned.txt", "@@ -1 +1 @@\n-old\n+new\n", 1),
+    );
+    fs::write(repo.root.join("owned.txt"), "new\n").unwrap();
+    let prepared = snapshot(&repo.home, SESSION).unwrap();
+    assert_eq!(prepared.changes[0].path, "owned.txt");
+    assert_eq!(prepared.changes[0].after.as_ref().unwrap().bytes, b"new\n");
+    // 过期记录只在读取时解除阻塞，不要求立刻回写；再次取快照必须仍然成功。
+    assert!(snapshot(&repo.home, SESSION).is_ok());
+}
+
+#[test]
+fn duplicate_tool_call_identity_is_rejected() {
+    let repo = Repo::new();
+    repo.append_record(
+        SESSION,
+        &json!({"timestamp":"2026-10-08T00:00:01.000Z","ordinal":1,"type":"response_item","payload":{
+            "type":"custom_tool_call","name":"apply_patch","call_id":"dup",
+            "input":"*** Begin Patch\n*** Update File: owned.txt\n@@\n-old\n+new\n*** End Patch"}}),
+    );
+    repo.append_record(
+        SESSION,
+        &json!({"timestamp":"2026-10-08T00:00:02.000Z","ordinal":2,"type":"response_item","payload":{
+            "type":"function_call","name":"exec_command","call_id":"dup",
+            "arguments":json!({"cmd":"ls"}).to_string()}}),
+    );
+    let error = snapshot(&repo.home, SESSION).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("重复工具调用身份"),
+        "{error:#}"
+    );
+}
+
+#[test]
 fn committed_other_session_claim_does_not_block_proven_later_history() {
     let repo = Repo::new();
     repo.fastctx(repo.hook(OTHER, "mcp__codey_fastctx__replace", json!({"path":repo.root.join("owned.txt"), "pattern":"old", "replacement":"outside", "literal":true})));
@@ -1298,6 +1403,47 @@ fn successful_patch_keeps_full_context_when_native_receipt_is_shortened() {
             assert!(result.is_err());
         }
     }
+}
+
+#[test]
+fn native_diff_stays_authoritative_when_request_context_indentation_differs() {
+    let repo = Repo::new();
+    let base = "context-a\n                let value = 1;\ncontext-b\n";
+    let native = "context-a\n                let value = 2;\ncontext-b\n";
+    fs::write(repo.root.join("owned.txt"), base).unwrap();
+    git(&repo.root, &["add", "--", "owned.txt"], None, None).unwrap();
+    git(
+        &repo.root,
+        &["commit", "-m", "indented baseline"],
+        None,
+        None,
+    )
+    .unwrap();
+    git(&repo.root, &["push"], None, None).unwrap();
+    // 成功请求的上下文缩进与真实文件不一致，不能覆盖原生补丁。
+    let patch = "*** Begin Patch\n*** Update File: owned.txt\n@@\n context-a\n-             let value = 1;\n+             let value = 2;\n context-b\n*** End Patch";
+    let code = format!(
+        "text(await tools.apply_patch({}));",
+        serde_json::to_string(patch).unwrap()
+    );
+    repo.append_record(SESSION, &json!({"timestamp":"2026-10-08T00:00:01.000Z","ordinal":101,"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"context-indent","input":code}}));
+    repo.append_record(
+        SESSION,
+        &repo.native_change(
+            SESSION,
+            "owned.txt",
+            "@@ -1,3 +1,3 @@\n context-a\n-                let value = 1;\n+                let value = 2;\n context-b\n",
+            1,
+        ),
+    );
+    repo.append_record(SESSION, &json!({"timestamp":"2026-10-08T00:00:01.500Z","ordinal":103,"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"context-indent","output":[{"type":"text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n"},{"type":"text","text":"{}"}]}}));
+    fs::write(repo.root.join("owned.txt"), native).unwrap();
+    let prepared = snapshot(&repo.home, SESSION).unwrap();
+    assert_eq!(prepared.public()["files"], json!(["owned.txt"]));
+    assert_eq!(
+        prepared.changes[0].after.as_ref().unwrap().bytes,
+        native.as_bytes()
+    );
 }
 
 #[test]

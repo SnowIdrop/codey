@@ -2,9 +2,13 @@
 use super::*;
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) const HOOK_ARGUMENT: &str = "--codey-conversation-git-hook";
 pub(crate) const HOOK_TIMEOUT_SECONDS: u64 = 60;
+// 执行前记录若长期收不到完成回执，说明持有它的运行时已经退出；只清理会话级阻塞，
+// 文件归属仍要由历史重放或磁盘校验证明，不能凭过期记录直接取得提交权限。
+const PENDING_LIFETIME_MILLIS: u64 = 30 * 60 * 1000;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct Fingerprint {
@@ -53,12 +57,57 @@ struct Pending {
     patch: bool,
     #[serde(default)]
     aggregate: bool,
+    #[serde(default)]
+    created_millis: u64,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 struct Ledger {
     files: BTreeMap<String, Claim>,
     pending: BTreeMap<String, Pending>,
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// 过期的执行前记录只解除对话级阻塞；文件仍以无效归属保存，必须由重放证明后才能提交。
+fn expire_pending(ledger: &mut Ledger) {
+    let now = now_millis();
+    let expired: Vec<String> = ledger
+        .pending
+        .iter()
+        .filter(|(_, pending)| {
+            // 缺少时间字段的是升级前遗留记录，同样视为已过期；这只解除阻塞，不授予归属。
+            pending.created_millis == 0
+                || now.saturating_sub(pending.created_millis) > PENDING_LIFETIME_MILLIS
+        })
+        .map(|(token, _)| token.clone())
+        .collect();
+    for token in expired {
+        let Some(pending) = ledger.pending.remove(&token) else {
+            continue;
+        };
+        for (file, mut candidate) in pending.candidates {
+            candidate.claim.valid = false;
+            merge_expired_claim(ledger, file, candidate.claim);
+        }
+    }
+}
+
+// 过期记录的结果未知，只合并会话范围，不覆盖其它会话已经验证过的摘要与状态。
+fn merge_expired_claim(ledger: &mut Ledger, file: String, claim: Claim) {
+    match ledger.files.get_mut(&file) {
+        Some(existing) => {
+            existing.sessions.extend(claim.sessions);
+        }
+        None => {
+            ledger.files.insert(file, claim);
+        }
+    }
 }
 
 fn ledger_path(home: &Path, root: &Path) -> PathBuf {
@@ -70,7 +119,7 @@ fn ledger_path(home: &Path, root: &Path) -> PathBuf {
 
 fn load(path: &Path) -> Result<Ledger> {
     match read_bounded(path, MAX_BYTES) {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Ok(bytes) => Ok(serde_json::from_slice::<Ledger>(&bytes)?),
         Err(error)
             if error
                 .downcast_ref::<std::io::Error>()
@@ -80,6 +129,14 @@ fn load(path: &Path) -> Result<Ledger> {
         }
         Err(error) => Err(error),
     }
+}
+
+// 查询和提交前先淘汰过期记录；Hook 处理本身使用原始账本，避免长时间运行的编辑
+// 在完成回执到达之前被误判为过期。
+fn load_for_query(path: &Path) -> Result<Ledger> {
+    let mut ledger = load(path)?;
+    expire_pending(&mut ledger);
+    Ok(ledger)
 }
 
 fn lock_ledger(path: &Path) -> Result<File> {
@@ -519,6 +576,7 @@ pub(super) fn observe_with_runtime(
                 candidates,
                 patch,
                 aggregate: matches!(name, "functions.exec" | "exec"),
+                created_millis: now_millis(),
             },
         );
     } else if let Some(pending) = ledger.pending.remove(&token) {
@@ -550,7 +608,12 @@ pub(super) fn observe_with_runtime(
         }
     }
     ensure!(ledger.files.len() <= 10_000, "文件归属记录过多，停止记录");
-    crate::fs_util::atomic_write_private(&path, &serde_json::to_vec(&ledger)?)?;
+    let bytes = serde_json::to_vec(&ledger)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_BYTES,
+        "文件归属记录过大，停止记录"
+    );
+    crate::fs_util::atomic_write_private(&path, &bytes)?;
     Ok(())
 }
 
@@ -632,7 +695,7 @@ pub(super) fn has_dirty_files(
         let path = ledger_path(home, root);
         let ledger = {
             let _lock = lock_ledger(&path)?;
-            load(&path)?
+            load_for_query(&path)?
         };
         let mut candidates: BTreeSet<_> = ledger
             .files
@@ -695,7 +758,7 @@ fn dirty_paths_mode(
     };
     let path = ledger_path(home, root);
     let lock = lock_ledger(&path)?;
-    let ledger = load(&path)?;
+    let ledger = load_for_query(&path)?;
     // 展示使用当前记录的快照，耗时的 Git 和磁盘读取无需阻塞新的编辑回执。
     let _lock = if display_only {
         drop(lock);
@@ -773,7 +836,7 @@ pub(super) fn changes(
     let history = history::recover(home, session, root, workspace)?;
     let path = ledger_path(home, root);
     let _lock = lock_ledger(&path)?;
-    let ledger = load(&path)?;
+    let ledger = load_for_query(&path)?;
     ensure!(
         !ledger
             .pending

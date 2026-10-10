@@ -16,7 +16,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
+// 索引只用来做摘要与恢复，允许比单个源文件大得多；仍设上限避免异常仓库拖垮内存。
+const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_FILES: usize = 100;
+// 提交总字节预算：diff 分析、暂存与内存中同时保留的 before/disk/after 都受此约束。
+const MAX_COMMIT_BYTES: u64 = 16 * 1024 * 1024;
 const PREVIEW_LIFETIME: Duration = Duration::from_secs(300);
 pub(crate) const MESSAGE_INSTRUCTION: &str = concat!(
     "你负责生成符合 Conventional Commits 的简洁中文 Git 提交说明。",
@@ -267,10 +271,41 @@ struct Preview {
 }
 
 static PREVIEWS: OnceLock<Mutex<HashMap<String, Preview>>> = OnceLock::new();
-static EXECUTION: Mutex<()> = Mutex::new(());
+// 按仓库路径分锁：同一仓库仍严格串行，不同仓库的慢速远端检查互不阻塞。
+static EXECUTION: OnceLock<Mutex<HashMap<PathBuf, std::sync::Arc<Mutex<()>>>>> = OnceLock::new();
+
+fn execution_lock(root: &Path) -> Result<std::sync::Arc<Mutex<()>>> {
+    let registry = EXECUTION.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .map_err(|_| anyhow::anyhow!("提交执行状态不可用"))?;
+    // 没有执行者的条目可以回收，避免长期运行后按仓库路径持续累积。
+    registry.retain(|_, lock| std::sync::Arc::strong_count(lock) > 1);
+    Ok(registry.entry(root.to_path_buf()).or_default().clone())
+}
 
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+// 索引可能远大于单个源文件，按块读取摘要，避免为校验一次性持有整份索引。
+fn digest_file(path: &Path, limit: u64) -> Result<String> {
+    let file = File::open(path)?;
+    ensure!(file.metadata()?.len() <= limit, "索引文件超过安全上限");
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        ensure!(total <= limit, "索引文件读取期间超过安全上限");
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 // 文件输出避免 stdout 管道堵塞；所有命令有时间、输出上限和独立参数。
@@ -334,6 +369,12 @@ fn git_with_output_limit(
         if let Some(status) = child.try_wait()? {
             break status;
         }
+        // 输出增长到上限就立即结束子进程，避免超限内容继续写满临时盘。
+        if stdout.metadata()?.len() > output_limit || stderr.metadata()?.len() > MAX_BYTES {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("Git 输出超过安全上限");
+        }
         if start.elapsed() > Duration::from_secs(45) {
             let _ = child.kill();
             let _ = child.wait();
@@ -377,6 +418,17 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     file.take(limit + 1).read_to_end(&mut bytes)?;
     ensure!(bytes.len() as u64 <= limit, "文件读取期间发生变化，请重试");
     Ok(bytes)
+}
+
+// 只按明确上限复制索引等大文件；超过上限时保持目标文件为空，避免写出截断内容。
+fn copy_bounded(source: &Path, destination: &Path, limit: u64) -> Result<()> {
+    let input = File::open(source)?;
+    ensure!(input.metadata()?.len() <= limit, "索引文件超过安全上限");
+    let mut output = File::create(destination)?;
+    let copied = std::io::copy(&mut input.take(limit + 1), &mut output)?;
+    ensure!(copied <= limit, "索引文件读取期间超过安全上限");
+    output.sync_all()?;
+    Ok(())
 }
 
 fn relative_path(root: &Path, workspace: &Path, raw: &str) -> Result<String> {
@@ -837,36 +889,82 @@ fn check_repository(root: &Path) -> Result<(String, String)> {
 }
 
 fn stage(index: &Path, root: &Path, changes: &[Change]) -> Result<()> {
-    for change in changes {
+    ensure!(changes.len() <= MAX_FILES, "Git 文件范围过大");
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let temp = tempfile::tempdir()?;
+    let mut paths = String::new();
+    let mut total_bytes = 0u64;
+    let mut object_count = 0;
+    for (position, change) in changes.iter().enumerate() {
         if let Some(entry) = &change.after {
-            let oid = String::from_utf8(git(
-                root,
-                &["hash-object", "-w", "--stdin"],
-                None,
-                Some(&entry.bytes),
-            )?)?;
-            git(
-                root,
-                &[
-                    "update-index",
-                    "--add",
-                    "--cacheinfo",
-                    &entry.mode,
-                    oid.trim(),
-                    &change.path,
-                ],
-                Some(index),
-                None,
-            )?;
-        } else {
-            git(
-                root,
-                &["update-index", "--force-remove", "--", &change.path],
-                Some(index),
-                None,
-            )?;
+            ensure!(
+                entry.bytes.len() as u64 <= MAX_BYTES,
+                "Git 文件内容超过安全上限"
+            );
+            total_bytes += entry.bytes.len() as u64;
+            ensure!(total_bytes <= MAX_COMMIT_BYTES, "本次提交内容超过安全上限");
+            let path = temp.path().join(position.to_string());
+            fs::write(&path, &entry.bytes)?;
+            // Git 的 C 风格路径引用支持八进制字节，兼容临时目录中的空格和非 ASCII 字符。
+            paths.push('"');
+            for byte in path.to_str().context("临时文件名编码不受支持")?.bytes() {
+                use std::fmt::Write;
+                write!(&mut paths, "\\{byte:03o}")?;
+            }
+            paths.push_str("\"\n");
+            ensure!(paths.len() as u64 <= MAX_BYTES, "Git 输入超过安全上限");
+            object_count += 1;
         }
     }
+    // 与 --stdin 一样直接保存 after 字节，不执行工作区的 clean 或换行过滤。
+    let objects = if object_count == 0 {
+        String::new()
+    } else {
+        String::from_utf8(git(
+            root,
+            &["hash-object", "-w", "--no-filters", "--stdin-paths"],
+            None,
+            Some(paths.as_bytes()),
+        )?)?
+    };
+    let oids: Vec<_> = objects.lines().collect();
+    ensure!(oids.len() == object_count, "Git 对象数量不一致");
+    ensure!(
+        oids.iter()
+            .all(|oid| matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit())),
+        "Git 对象身份无效"
+    );
+    let oid_length = if let Some(oid) = oids.first() {
+        oid.len()
+    } else {
+        match git_text(root, &["rev-parse", "--show-object-format"])?.as_str() {
+            "sha1" => 40,
+            "sha256" => 64,
+            _ => bail!("Git 对象格式不受支持"),
+        }
+    };
+    let null_oid = "0".repeat(oid_length);
+    let mut oids = oids.into_iter();
+    let mut updates = Vec::new();
+    for change in changes {
+        let header = match &change.after {
+            Some(entry) => format!("{} {}\t", entry.mode, oids.next().unwrap()),
+            // mode 0 会删除该路径，空对象 ID 长度必须与仓库的对象格式一致。
+            None => format!("0 {null_oid}\t"),
+        };
+        updates.extend_from_slice(header.as_bytes());
+        updates.extend_from_slice(change.path.as_bytes());
+        updates.push(0);
+        ensure!(updates.len() as u64 <= MAX_BYTES, "Git 输入超过安全上限");
+    }
+    git(
+        root,
+        &["update-index", "-z", "--index-info"],
+        Some(index),
+        Some(&updates),
+    )?;
     Ok(())
 }
 
@@ -914,6 +1012,22 @@ fn build_snapshot(home: &Path, session: &str, workspace: &Path) -> Result<Snapsh
     .canonicalize()?;
     let (head, branch) = check_repository(&root)?;
     let changes = tracking::changes(home, session, &root, &workspace, &head)?;
+    let total_bytes: u64 = changes
+        .iter()
+        .map(|change| {
+            change
+                .before
+                .iter()
+                .chain(change.disk.iter())
+                .chain(change.after.iter())
+                .map(|entry| entry.bytes.len() as u64)
+                .sum::<u64>()
+        })
+        .sum();
+    ensure!(
+        total_bytes <= MAX_COMMIT_BYTES,
+        "本次提交内容超过安全上限，请拆分后再提交"
+    );
     for change in &changes {
         let path = &change.path;
         ensure!(
@@ -972,7 +1086,7 @@ fn build_snapshot(home: &Path, session: &str, workspace: &Path) -> Result<Snapsh
         !diff.lines().any(|line| line == "GIT binary patch"),
         "暂不支持二进制文件的提交分析"
     );
-    let index_hash = digest(&read_bounded(&index_path(&root)?, MAX_BYTES)?);
+    let index_hash = digest_file(&index_path(&root)?, MAX_INDEX_BYTES)?;
     Ok(Snapshot {
         session: session.into(),
         workspace,
@@ -1184,6 +1298,34 @@ impl Drop for IndexLock {
     }
 }
 
+fn save_index_recovery(source: &Path, real_index: &Path) -> Result<PathBuf> {
+    let base = real_index.with_extension("codey-recovery");
+    for attempt in 0..16 {
+        let mut name = base.as_os_str().to_os_string();
+        if attempt > 0 {
+            name.push(format!(".{attempt}"));
+        }
+        let path = PathBuf::from(name);
+        let mut destination = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let saved = (|| -> Result<()> {
+            std::io::copy(&mut File::open(source)?, &mut destination)?;
+            destination.sync_all()?;
+            Ok(())
+        })();
+        drop(destination);
+        if let Err(error) = saved {
+            let _ = fs::remove_file(&path);
+            return Err(error);
+        }
+        return Ok(path);
+    }
+    bail!("Git 索引恢复文件名已用尽")
+}
+
 #[cfg(test)]
 fn commit_and_push(
     snapshot: &Snapshot,
@@ -1223,7 +1365,7 @@ fn commit_transaction(
         file: Some(lock_file),
     };
     ensure!(
-        digest(&read_bounded(&real_index, MAX_BYTES)?) == snapshot.index_hash,
+        digest_file(&real_index, MAX_INDEX_BYTES)? == snapshot.index_hash,
         "暂存区已变化，请重新预览"
     );
     ensure!(
@@ -1257,7 +1399,7 @@ fn commit_transaction(
     )?;
     stage(&commit_index, &snapshot.root, &snapshot.changes)?;
     // 仅更新选中文件的索引项，其他暂存内容按字节保留其语义。
-    fs::copy(&real_index, &preserved_index)?;
+    copy_bounded(&real_index, &preserved_index, MAX_INDEX_BYTES)?;
     stage(&preserved_index, &snapshot.root, &snapshot.changes)?;
     let tree = String::from_utf8(git(
         &snapshot.root,
@@ -1293,8 +1435,8 @@ fn commit_transaction(
     )?)?
     .trim()
     .to_string();
-    let index_bytes = read_bounded(&preserved_index, MAX_BYTES)?;
-    lock.file.as_mut().unwrap().write_all(&index_bytes)?;
+    let mut preserved = File::open(&preserved_index)?;
+    std::io::copy(&mut preserved, lock.file.as_mut().unwrap())?;
     lock.file.as_ref().unwrap().sync_all()?;
     ensure!(
         check_repository(&snapshot.root)? == (snapshot.head.clone(), snapshot.branch.clone()),
@@ -1322,8 +1464,14 @@ fn commit_transaction(
     )?;
     lock.file.take();
     if let Err(error) = fs::rename(&lock.path, &real_index) {
+        // 提交已经写好，但暂存区没能替换。把新索引另存一份再释放锁，避免恢复内容随锁文件一起被删除。
+        let recovery = save_index_recovery(&lock.path, &real_index).ok();
         return Ok(
-            json!({"status": "committed", "commit": commit, "message": format!("本地提交已生成，但更新暂存区失败：{error}。已停止推送，请检查 Git 暂存区。")}),
+            json!({"status": "committed", "commit": commit, "message": if let Some(recovery) = recovery {
+                format!("本地提交已生成，但更新暂存区失败：{error}。已停止推送，新暂存区内容保留在 {}，请检查 Git 暂存区。", recovery.display())
+            } else {
+                format!("本地提交已生成，但更新暂存区失败：{error}。已停止推送，请检查 Git 暂存区。")
+            }}),
         );
     }
     drop(lock);
@@ -1369,9 +1517,18 @@ pub(crate) fn execute(
     model: &str,
     push: bool,
 ) -> Result<Value> {
-    let _execution = EXECUTION
-        .try_lock()
-        .map_err(|_| anyhow::anyhow!("另一个对话正在执行 Git 提交，请稍后重试"))?;
+    let preview = PREVIEWS
+        .get_or_init(Mutex::default)
+        .lock()
+        .map_err(|_| anyhow::anyhow!("提交预览状态不可用"))?
+        .get(token)
+        .map(|preview| (preview.snapshot.root.clone(),))
+        .context("提交预览已失效或已使用，请重新生成")?;
+    let execution = execution_lock(&preview.0)?;
+    let _execution = match execution.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => bail!("另一个对话正在执行 Git 提交，请稍后重试"),
+    };
     let preview = PREVIEWS
         .get_or_init(Mutex::default)
         .lock()
@@ -1396,3 +1553,106 @@ pub(crate) fn execute(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod io_tests {
+    use super::*;
+
+    #[test]
+    fn recovery_preserves_existing_files_and_has_a_finite_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = temp.path().join("index");
+        let source = temp.path().join("index.lock");
+        fs::write(&source, b"new index").unwrap();
+        let base = index.with_extension("codey-recovery");
+        fs::write(&base, b"old index").unwrap();
+        for suffix in 1..16 {
+            let recovered = save_index_recovery(&source, &index).unwrap();
+            assert_eq!(
+                recovered,
+                temp.path().join(format!("index.codey-recovery.{suffix}"))
+            );
+            assert_eq!(fs::read(recovered).unwrap(), b"new index");
+        }
+        assert!(save_index_recovery(&source, &index).is_err());
+        assert_eq!(fs::read(base).unwrap(), b"old index");
+    }
+
+    #[test]
+    fn failed_recovery_removes_only_its_new_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = temp.path().join("index");
+        assert!(save_index_recovery(&temp.path().join("missing"), &index).is_err());
+        assert!(!index.with_extension("codey-recovery").exists());
+    }
+
+    #[test]
+    fn batch_stage_preserves_bytes_modes_paths_and_deletions() {
+        for format in ["sha1", "sha256"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            git(
+                root,
+                &["init", &format!("--object-format={format}")],
+                None,
+                None,
+            )
+            .unwrap();
+            let index = root.join("custom-index");
+            git(root, &["read-tree", "--empty"], Some(&index), None).unwrap();
+            let change = |path: &str, mode: &str, bytes: &[u8]| Change {
+                path: path.into(),
+                before: None,
+                disk: None,
+                after: Some(Entry {
+                    mode: mode.into(),
+                    bytes: bytes.to_vec(),
+                }),
+            };
+            let deleted = change("deleted", "100644", b"old");
+            stage(&index, root, &[deleted]).unwrap();
+            fs::write(root.join(".gitattributes"), b"* text eol=lf\n").unwrap();
+            let path = "space \t\n中文.txt";
+            let bytes = b"after\r\n\0partial";
+            let changes = vec![
+                change(path, "100755", bytes),
+                change("empty", "100644", b""),
+                Change {
+                    path: "deleted".into(),
+                    before: None,
+                    after: None,
+                    disk: None,
+                },
+            ];
+            stage(&index, root, &changes).unwrap();
+            let entries = git(root, &["ls-files", "--stage", "-z"], Some(&index), None).unwrap();
+            assert_eq!(entries.iter().filter(|&&b| b == 0).count(), 2);
+            let entry = entries
+                .split(|&b| b == 0)
+                .find(|entry| entry.ends_with(path.as_bytes()))
+                .unwrap();
+            let fields = std::str::from_utf8(entry)
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>();
+            assert_eq!(fields[0], "100755");
+            assert_eq!(
+                git(root, &["cat-file", "blob", fields[1]], None, None).unwrap(),
+                bytes
+            );
+            stage(
+                &index,
+                root,
+                &[Change {
+                    path: path.into(),
+                    before: None,
+                    after: None,
+                    disk: None,
+                }],
+            )
+            .unwrap();
+            let remaining = git(root, &["ls-files", "-z"], Some(&index), None).unwrap();
+            assert_eq!(remaining, b"empty\0");
+        }
+    }
+}

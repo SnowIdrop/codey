@@ -15,22 +15,40 @@ struct RecordedEdit {
     end: Option<i64>,
     ordinal: usize,
     edit: Edit,
+    // 成功补丁请求里的完整上下文。原生回执可能缩短上下文，也可能与请求补丁的空白
+    // 细节不完全一致，所以这里保存为备用候选，只有主记录无法套用时才采用。
+    alternate: Option<Edit>,
     replacements: Option<usize>,
 }
 
 impl RecordedEdit {
+    // 主记录代表实际写入结果，优先使用；失败后才退回成功请求中的完整上下文。
+    fn apply_preferred<T>(&self, mut apply: impl FnMut(&Edit) -> Result<T>) -> Result<T> {
+        match apply(&self.edit) {
+            Ok(value) => Ok(value),
+            Err(error) => match &self.alternate {
+                Some(alternate) => apply(alternate),
+                None => Err(error),
+            },
+        }
+    }
+
     /// 原生补丁先按记录坐标套用，坐标不成立时才退回按内容唯一定位。
     /// 与 `verified_apply` 的严格模式相反，这里放宽的只是单个补丁的定位方式；
     /// 整条链仍须与 HEAD 和磁盘字节精确一致，共享文件的归属还要经过三方合并校验。
     fn replay_apply(&self, value: Option<&Entry>) -> Result<Option<Entry>> {
+        self.apply_preferred(|edit| self.replay_apply_edit(value, edit))
+    }
+
+    fn replay_apply_edit(&self, value: Option<&Entry>, edit: &Edit) -> Result<Option<Entry>> {
         ensure!(
             self.start
                 .zip(self.end)
                 .is_some_and(|(start, end)| start <= end),
             "编辑时间记录不完整"
         );
-        let Edit::NativePatch(diff) = &self.edit else {
-            return self.verified_apply(value);
+        let Edit::NativePatch(diff) = edit else {
+            return self.verified_apply_edit(value, edit);
         };
         let before = value.context("缺少原生编辑基线")?;
         let text = std::str::from_utf8(&before.bytes)?;
@@ -49,13 +67,17 @@ impl RecordedEdit {
     }
 
     fn verified_apply(&self, value: Option<&Entry>) -> Result<Option<Entry>> {
+        self.apply_preferred(|edit| self.verified_apply_edit(value, edit))
+    }
+
+    fn verified_apply_edit(&self, value: Option<&Entry>, edit: &Edit) -> Result<Option<Entry>> {
         ensure!(
             self.start
                 .zip(self.end)
                 .is_some_and(|(start, end)| start <= end),
             "编辑时间记录不完整"
         );
-        if let Edit::NativePatch(diff) = &self.edit {
+        if let Edit::NativePatch(diff) = edit {
             let before = value.context("缺少原生编辑基线")?;
             let (text, inverse) =
                 apply_native_patch_checked(std::str::from_utf8(&before.bytes)?, diff, false, true)?;
@@ -68,8 +90,8 @@ impl RecordedEdit {
                 bytes: text.into_bytes(),
             }));
         }
-        let next = apply_edit(value, &self.edit)?;
-        let reverse = match &self.edit {
+        let next = apply_edit(value, edit)?;
+        let reverse = match edit {
             Edit::Patch(hunks) => Edit::Patch(
                 hunks
                     .iter()
@@ -338,13 +360,13 @@ fn apply_native_patch_checked(
     for (mut from, to, removed, added) in parse_native_hunks(diff, reverse)? {
         if relocate {
             ensure!(!removed.is_empty(), "无上下文补丁不能按内容定位");
-            let matches: Vec<_> = source
+            // 只需要确认位置唯一，找到第二个匹配即可停止，避免大文件重复上下文反复分配。
+            let mut matches = source
                 .windows(removed.len())
                 .enumerate()
-                .filter_map(|(position, lines)| (lines == removed.as_slice()).then_some(position))
-                .collect();
-            ensure!(matches.len() == 1, "原生补丁上下文不能唯一定位");
-            from = matches[0];
+                .filter_map(|(position, lines)| (lines == removed.as_slice()).then_some(position));
+            from = matches.next().context("原生补丁上下文不能唯一定位")?;
+            ensure!(matches.next().is_none(), "原生补丁上下文不能唯一定位");
         }
         ensure!(
             from >= cursor && from <= source.len(),
@@ -583,8 +605,9 @@ fn retain_input_context(
                 .collect();
             ensure!(records.len() == 1, "原生编辑记录不能唯一对应补丁输入");
             let record = records.into_iter().next().unwrap();
-            // 原生回执可能缩短上下文；保留成功请求中的完整上下文并继续验证正反向结果。
-            record.edit = edit.clone();
+            // 请求补丁可能带有执行前改写过的空白或缩进，不能覆盖原生实际写入的 diff。
+            // 只在原生记录无法套用时，才退回这份完整上下文。
+            record.alternate = Some(edit.clone());
         }
     }
     Ok(true)
@@ -670,162 +693,331 @@ fn formatter_calls(name: &str, args: &Value) -> Option<(Vec<Option<Value>>, usiz
 
 fn has_formatter(name: &str, args: &Value) -> bool {
     formatter_calls(name, args).is_some_and(|(calls, _)| {
-        calls.iter().flatten().any(|args| {
-            args["cmd"].as_str().is_some_and(|command| {
-                command
-                    .split(';')
-                    .flat_map(|statement| statement.split(" && "))
-                    .any(|segment| segment.trim_start().starts_with("rustfmt "))
-            })
-        })
+        calls
+            .iter()
+            .flatten()
+            .any(|args| args["cmd"].as_str().is_some_and(is_formatter_command))
     })
 }
 
-// 常见的验证命令会把 rustfmt 夹在只读检查之间；只接受工作区内的固定形式，避免把其它
-// 命令的回执误当成格式化记录。
-fn explicit_rustfmt_targets(command: &str, workspace: &Path) -> Option<(String, Vec<String>)> {
-    let mut found: Option<(String, Vec<String>)> = None;
-    for statement in command.split(';') {
+// 只按固定的简单命令识别格式化调用。先去掉独立注释行，再按 ; 和 && 拆分，
+// 避免把变量、命令替换、重定向或任意脚本当成格式化调用。
+fn simple_segments(command: &str) -> Option<Vec<String>> {
+    if command.contains('`') || command.contains("$(") || command.contains("${") {
+        return None;
+    }
+    let mut cleaned = String::new();
+    for line in command.split('\n') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        cleaned.push_str(line);
+        cleaned.push('\n');
+    }
+    let mut segments = Vec::new();
+    for statement in cleaned.split(';') {
         for segment in statement.split(" && ") {
             let segment = segment.trim();
-            if segment.is_empty() {
-                continue;
+            if !segment.is_empty() {
+                segments.push(segment.to_string());
             }
-            if let Some(directory) = segment.strip_prefix("cd ") {
-                if Path::new(directory.trim()).canonicalize().ok().as_deref() != Some(workspace) {
-                    return None;
-                }
-                continue;
-            }
-            if matches!(
-                segment,
-                "git diff --stat" | "git diff --check" | "git status --short"
-            ) {
-                continue;
-            }
-            let (main, pipeline) = match segment.split_once(" | ") {
-                Some((main, tail)) => (main, Some(tail)),
-                None => (segment, None),
-            };
-            if let Some(tail) = pipeline {
-                let size = tail.strip_prefix("head -")?;
-                if size.is_empty() || !size.bytes().all(|byte| byte.is_ascii_digit()) {
-                    return None;
-                }
-            }
-            let mut tokens = main
-                .split_whitespace()
-                .filter(|token| *token != "2>&1")
-                .peekable();
-            if tokens.next()? != "rustfmt" || found.is_some() {
+        }
+    }
+    (!segments.is_empty()).then_some(segments)
+}
+
+fn workspace_cd(segment: &str) -> Option<&str> {
+    let rest = segment.strip_prefix("cd ")?;
+    let mut tokens = rest.split_whitespace();
+    let directory = tokens.next()?;
+    if tokens.next().is_some()
+        || directory.is_empty()
+        || !directory
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_./:-".contains(&byte))
+    {
+        return None;
+    }
+    Some(directory)
+}
+
+fn is_readonly_check(segment: &str) -> bool {
+    matches!(
+        segment,
+        "git diff --stat" | "git diff --check" | "git status --short" | "echo FORMAT_OK"
+    )
+}
+
+fn is_readonly_cargo_fmt_check(segment: &str) -> bool {
+    matches!(
+        segment,
+        "cargo fmt -p codey -- --check" | "cargo fmt --all -- --check"
+    )
+}
+
+fn is_readonly_test(segment: &str) -> bool {
+    let parts: Vec<_> = segment.split(" 2>&1 | tail -").collect();
+    if parts.len() > 2 {
+        return false;
+    }
+    if let Some(size) = parts.get(1)
+        && (size.is_empty() || !size.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return false;
+    }
+    (parts[0].starts_with("cargo test -p codey") || parts[0].starts_with("cargo clippy -p codey"))
+        && parts[0]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b" _:-".contains(&byte))
+}
+
+fn is_readonly_segment(segment: &str) -> bool {
+    is_readonly_check(segment) || is_readonly_cargo_fmt_check(segment) || is_readonly_test(segment)
+}
+
+fn rust_source_path(token: &str) -> bool {
+    token.ends_with(".rs")
+        && !token.starts_with('-')
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_./:-".contains(&byte))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DirectFormatter {
+    Rustfmt { edition: String, paths: Vec<String> },
+    // 空路径表示 cargo fmt -p codey 或 cargo fmt --all，按已有编辑范围选择文件。
+    Cargo { paths: Vec<String> },
+}
+
+// 只解析固定的 rustfmt 与 cargo fmt 形式；路径交给调用方按工作区再次校验。
+fn parse_formatter_segment(segment: &str) -> Option<DirectFormatter> {
+    let main = match segment.split_once(" | ") {
+        Some((main, tail)) => {
+            let size = tail.strip_prefix("head -")?;
+            if size.is_empty() || !size.bytes().all(|byte| byte.is_ascii_digit()) {
                 return None;
             }
+            main
+        }
+        None => segment,
+    };
+    let tokens: Vec<_> = main
+        .split_whitespace()
+        .filter(|token| *token != "2>&1")
+        .collect();
+    let (command, rest) = tokens.split_first()?;
+    match *command {
+        "rustfmt" => {
             let mut edition = None;
             let mut paths = Vec::new();
+            let mut tokens = rest.iter();
             while let Some(token) = tokens.next() {
-                if token == "--edition" {
+                if *token == "--edition" {
                     if edition.is_some() {
                         return None;
                     }
-                    edition = tokens.next().map(str::to_string);
+                    edition = Some((*tokens.next()?).to_string());
                 } else if token.starts_with('-') {
                     return None;
                 } else {
-                    paths.push(token.to_string());
+                    paths.push((*token).to_string());
                 }
             }
             let edition = edition?;
             if !matches!(edition.as_str(), "2015" | "2018" | "2021" | "2024")
                 || paths.is_empty()
                 || paths.len() > MAX_FILES
-                || paths.iter().any(|path| {
-                    !path.ends_with(".rs")
-                        || path.starts_with('-')
-                        || !path
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || b"_./:-".contains(&byte))
-                })
+                || paths.iter().any(|path| !rust_source_path(path))
             {
                 return None;
             }
-            found = Some((edition, paths));
+            Some(DirectFormatter::Rustfmt { edition, paths })
         }
+        "cargo" => {
+            let paths = match rest {
+                ["fmt", "-p", "codey"] | ["fmt", "--all"] => Vec::new(),
+                ["fmt", "--", paths @ ..] if !paths.is_empty() => {
+                    paths.iter().map(|path| (*path).to_string()).collect()
+                }
+                _ => return None,
+            };
+            if paths.len() > MAX_FILES || paths.iter().any(|path| !rust_source_path(path)) {
+                return None;
+            }
+            Some(DirectFormatter::Cargo { paths })
+        }
+        _ => None,
+    }
+}
+
+// 去掉只读检查和切换工作区后，命令里只能有一个格式化调用。
+fn formatter_command_shape(command: &str) -> Option<DirectFormatter> {
+    let mut found = None;
+    for segment in simple_segments(command)? {
+        if workspace_cd(&segment).is_some() || is_readonly_segment(&segment) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(parse_formatter_segment(&segment)?);
     }
     found
 }
 
-fn cargo_formatter(name: &str, args: &Value) -> bool {
-    if args["tty"] == true || args.get("shell").is_some_and(|value| !value.is_null()) {
-        return false;
-    }
-    if !matches!(name, "exec_command" | "functions.exec_command") {
-        return false;
-    }
-    let Some(command) = args["cmd"].as_str() else {
-        return false;
-    };
-    let parts: Vec<_> = command.split(" && ").collect();
-    matches!(
-        parts.first(),
-        Some(&"cargo fmt -p codey" | &"cargo fmt --all")
-    ) && parts.iter().skip(1).all(|part| {
-        *part == "cargo fmt -p codey -- --check" || *part == "echo FORMAT_OK" || {
-            let command = part.split(" 2>&1 | tail -").collect::<Vec<_>>();
-            command.len() <= 2
-                && command
-                    .get(1)
-                    .is_none_or(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
-                && (command[0].starts_with("cargo test -p codey")
-                    || command[0].starts_with("cargo clippy -p codey"))
-                && command[0]
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b" _:-".contains(&c))
-        }
-    })
+fn is_formatter_command(command: &str) -> bool {
+    formatter_command_shape(command).is_some()
 }
 
-// 固定顺序的原生终端调用可以拆开核对；不接受变量、任意脚本或修改文件的附加命令。
-fn wrapped_cargo_calls(name: &str, args: &Value) -> Option<Vec<(String, Value)>> {
+// 常见的验证命令会把格式化调用夹在只读检查之间；切换工作区必须指向当前工作区，
+// 且列举路径必须落在 codey 包内。
+fn direct_formatter_targets(command: &str, workspace: &Path) -> Option<DirectFormatter> {
+    for segment in simple_segments(command)? {
+        if let Some(directory) = workspace_cd(&segment)
+            && Path::new(directory).canonicalize().ok().as_deref() != Some(workspace)
+        {
+            return None;
+        }
+    }
+    let found = formatter_command_shape(command)?;
+    // 显式列出的文件必须位于 codey 包内，版本号才能从同一个清单稳定读取。
+    if let DirectFormatter::Cargo { paths } = &found
+        && paths.iter().any(|path| !path.starts_with("backend/"))
+    {
+        return None;
+    }
+    Some(found)
+}
+
+// 返回 cargo fmt 的显式文件列表；空列表表示按包或整个工作区格式化。
+fn cargo_fmt_paths(name: &str, args: &Value, workspace: &Path) -> Option<Vec<String>> {
+    if args["tty"] == true || args.get("shell").is_some_and(|value| !value.is_null()) {
+        return None;
+    }
+    if !matches!(name, "exec_command" | "functions.exec_command") {
+        return None;
+    }
+    match direct_formatter_targets(args["cmd"].as_str()?, workspace)? {
+        DirectFormatter::Cargo { paths } => Some(paths),
+        DirectFormatter::Rustfmt { .. } => None,
+    }
+}
+
+// 固定包装脚本中的有序步骤；补丁与终端调用都保留原始参数，供回执逐位核对。
+enum WrappedStep {
+    Patch(String),
+    Command(Value),
+}
+
+fn wrapped_steps(name: &str, args: &Value) -> Option<Vec<WrappedStep>> {
     if !matches!(name, "exec" | "functions.exec") {
         return None;
     }
-    let (calls, offset) = formatter_calls(name, args)?;
-    if offset != 1 {
+    let mut code = args
+        .as_str()
+        .or_else(|| args["code"].as_str())
+        .or_else(|| args["input"].as_str())?
+        .trim();
+    if !code.contains("rustfmt ") && !code.contains("cargo fmt ") && !code.contains("write_stdin") {
         return None;
     }
-    let mut result = Vec::new();
-    for args in calls {
-        let mut args = args?;
-        let name = if args["__codey_poll"] == true {
-            args.as_object_mut()?.remove("__codey_poll");
-            if args["session_id"].as_u64().is_none()
-                || args["chars"].as_str().is_some_and(|s| !s.is_empty())
-            {
-                return None;
-            }
-            "write_stdin"
-        } else {
-            if args["tty"] == true || args.get("shell").is_some_and(|v| !v.is_null()) {
-                return None;
-            }
-            if !cargo_formatter("exec_command", &args)
-                && !matches!(
-                    args["cmd"].as_str(),
-                    Some(
-                        "cargo fmt --all -- --check"
-                            | "cargo fmt -p codey -- --check"
-                            | "git diff --check"
-                            | "git diff --stat"
-                    )
-                )
-            {
-                return None;
-            }
-            "exec_command"
-        };
-        result.push((name.into(), args));
+    if code.starts_with("// @exec:") {
+        code = code.split_once('\n')?.1.trim();
     }
-    Some(result)
+    let string = r#""(?:[^"\\\r\n]|\\.)*""#;
+    let primitive = format!(r"(?:{string}|-?\d+(?:\.\d+)?|true|false|null)");
+    let field = format!(r"(?:[a-zA-Z_][a-zA-Z0-9_]*|{string})\s*:\s*{primitive}");
+    let call = regex::Regex::new(&format!(r"^text\(await tools\.(exec_command|write_stdin)\(\{{\s*((?:{field}(?:\s*,\s*{field})*\s*,?)?)\s*\}}\)\);")).ok()?;
+    let fields = regex::Regex::new(&format!(
+        r"([a-zA-Z_][a-zA-Z0-9_]*|{string})\s*:\s*({primitive})"
+    ))
+    .ok()?;
+    let mut steps = Vec::new();
+    while !code.is_empty() {
+        if let Some(literal) = code.strip_prefix("text(await tools.apply_patch(") {
+            let mut stream = serde_json::Deserializer::from_str(literal).into_iter::<String>();
+            let patch = stream.next()?.ok()?;
+            code = literal[stream.byte_offset()..].strip_prefix("));")?.trim();
+            steps.push(WrappedStep::Patch(patch));
+            if steps.len() > 8 {
+                return None;
+            }
+            continue;
+        }
+        let captures = call.captures(code)?;
+        let mut object = serde_json::Map::new();
+        for field in fields.captures_iter(&captures[2]) {
+            let key = if field[1].starts_with('"') {
+                serde_json::from_str::<String>(&field[1]).ok()?
+            } else {
+                field[1].to_string()
+            };
+            let value = serde_json::from_str::<Value>(&field[2]).ok()?;
+            if key == "__codey_poll" {
+                return None;
+            }
+            if object.insert(key, value).is_some() {
+                return None;
+            }
+        }
+        if captures[1] == *"write_stdin" {
+            object.insert("__codey_poll".into(), Value::Bool(true));
+        }
+        steps.push(WrappedStep::Command(Value::Object(object)));
+        code = code[captures.get(0)?.end()..].trim();
+        if steps.len() > 8 {
+            return None;
+        }
+    }
+    (!steps.is_empty()).then_some(steps)
+}
+
+// 固定顺序包装脚本里的补丁与终端调用可以拆开核对；不接受变量、任意脚本或会改写其它文件的附加命令。
+fn wrapped_cargo_calls(name: &str, args: &Value) -> Option<Vec<(String, Value)>> {
+    let mut result = Vec::new();
+    let mut commands = 0;
+    for step in wrapped_steps(name, args)? {
+        match step {
+            // 补丁步骤只用来补齐原生记录中可能被缩短的上下文，本身不产生新的归属。
+            WrappedStep::Patch(patch) => {
+                result.push(("wrapped_patch".into(), Value::String(patch)))
+            }
+            WrappedStep::Command(mut args) => {
+                let name = if args["__codey_poll"] == true {
+                    args.as_object_mut()?.remove("__codey_poll");
+                    if args["session_id"].as_u64().is_none()
+                        || args["chars"].as_str().is_some_and(|s| !s.is_empty())
+                    {
+                        return None;
+                    }
+                    "write_stdin"
+                } else {
+                    if args["tty"] == true || args.get("shell").is_some_and(|v| !v.is_null()) {
+                        return None;
+                    }
+                    if cargo_fmt_paths("exec_command", &args, Path::new("")).is_none()
+                        && !matches!(
+                            args["cmd"].as_str(),
+                            Some(
+                                "cargo fmt --all -- --check"
+                                    | "cargo fmt -p codey -- --check"
+                                    | "git diff --check"
+                                    | "git diff --stat"
+                            )
+                        )
+                    {
+                        return None;
+                    }
+                    "exec_command"
+                };
+                commands += 1;
+                result.push((name.into(), args));
+            }
+        }
+    }
+    (commands > 0).then_some(result)
 }
 
 fn wrapped_cargo_receipts(
@@ -975,10 +1167,10 @@ fn completed_formatters(
                 tokens[3..].iter().map(|path| path.to_string()).collect(),
             )
         } else {
-            let Some((edition, targets)) = explicit_rustfmt_targets(command, workspace) else {
-                continue;
-            };
-            (edition, targets)
+            match direct_formatter_targets(command, workspace) {
+                Some(DirectFormatter::Rustfmt { edition, paths }) => (edition, paths),
+                _ => continue,
+            }
         };
         if targets.len() > MAX_FILES
             || targets.iter().any(|path| {
@@ -1151,7 +1343,7 @@ fn read_transcript_mode(home: &Path, raw: &Path, display_only: bool) -> Result<T
         ..Default::default()
     };
     let mut calls = HashMap::<String, (String, Value, Option<i64>, usize)>::new();
-    let mut seen = BTreeSet::new();
+    let mut seen = BTreeMap::new();
     let mut native_seen = BTreeSet::new();
     let mut captured = 0usize;
     let mut records = Vec::new();
@@ -1285,7 +1477,7 @@ fn read_transcript_mode(home: &Path, raw: &Path, display_only: bool) -> Result<T
             } else {
                 payload["arguments"].clone()
             };
-            if name == "agents.spawn_agent"
+            let is_edit = name == "agents.spawn_agent"
                 || tracking::normalized_input(&name, &args)
                     .ok()
                     .flatten()
@@ -1293,14 +1485,17 @@ fn read_transcript_mode(home: &Path, raw: &Path, display_only: bool) -> Result<T
                 || batch_patch(&name, &args).is_some()
                 || multiple_patches(&name, &args).is_some()
                 || has_formatter(&name, &args)
-                || cargo_formatter(&name, &args)
                 || wrapped_cargo_calls(&name, &args).is_some()
-                || matches!(name.as_str(), "write_stdin" | "functions.write_stdin")
-            {
-                ensure!(
-                    seen.insert(id.to_string()),
-                    "对话中出现重复工具调用身份，无法确认编辑归属"
-                );
+                || matches!(name.as_str(), "write_stdin" | "functions.write_stdin");
+            // 只要能参与编辑归属的调用与其它调用共用身份，回执就可能被错配，归属无法证明。
+            // 纯非编辑调用之间的重复不影响归属，保持兼容。
+            let previous = seen.get(id).copied();
+            ensure!(
+                !(is_edit && previous.is_some() || previous == Some(true)),
+                "对话中出现重复工具调用身份，无法确认编辑归属"
+            );
+            seen.insert(id.to_string(), is_edit || previous == Some(true));
+            if is_edit {
                 captured += args.to_string().len();
                 ensure!(
                     captured <= 16 * 1024 * 1024 && calls.len() < 4096,
@@ -1597,7 +1792,6 @@ impl History {
         }
         // 允许已提交的早期编辑留在历史中，只接受能唯一对应当前 HEAD 的后续编辑链。
         ensure!(ordered.len() <= 256, "{path} 的历史编辑过多，无法可靠重放");
-        let mut matches = 0;
         for start in 0..ordered.len() {
             let mut value = before.cloned();
             let mut valid = true;
@@ -1612,10 +1806,11 @@ impl History {
                 }
             }
             if valid && value.as_ref() == after {
-                matches += 1;
+                // 只要能证明存在一条完整后缀链与 HEAD 和磁盘一致即可，无需继续枚举等价后缀。
+                return Ok(());
             }
         }
-        if matches == 0 {
+        {
             let mut work = 0;
             for start in (0..ordered.len()).rev() {
                 let mut values = vec![before.cloned()];
@@ -1640,11 +1835,9 @@ impl History {
                 }
             }
         }
-        ensure!(
-            matches > 0,
+        bail!(
             "{path} 的历史编辑无法与当前 HEAD 和文件内容唯一对应，可能缺少执行前基线、含其他改动或记录不完整，已停止提交"
         );
-        Ok(())
     }
 
     pub(super) fn isolate_changes(
@@ -1860,6 +2053,7 @@ fn recover_mode(
                     end: Some(end),
                     ordinal,
                     edit,
+                    alternate: None,
                     replacements: None,
                 });
             }
@@ -1885,6 +2079,14 @@ fn recover_mode(
                     }
                 });
         for (mut name, mut args, response, mut start, end, mut ordinal) in calls {
+            // 包装脚本里的补丁只用于补齐原生记录中被缩短的上下文，不额外产生归属。
+            if name == "wrapped_patch" {
+                let patch = args.as_str().context("包装补丁缺少正文")?;
+                let edits =
+                    tracking::operations(root, workspace, true, &Value::String(patch.to_string()))?;
+                retain_input_context(&mut history, &actor, &native_scopes, start, end, &edits)?;
+                continue;
+            }
             if matches!(name.as_str(), "write_stdin" | "functions.write_stdin") {
                 if args["chars"]
                     .as_str()
@@ -1905,7 +2107,7 @@ fn recover_mode(
                 start = original_start;
                 ordinal = original_order;
             }
-            if cargo_formatter(&name, &args) {
+            if let Some(cargo_paths) = cargo_fmt_paths(&name, &args, workspace) {
                 let Some(receipt) = terminal_receipt(&response) else {
                     continue;
                 };
@@ -1919,12 +2121,25 @@ fn recover_mode(
                 {
                     continue;
                 }
-                if args["workdir"]
+                // exec_command 可以省略 workdir，此时命令本身必须显式切换到当前工作区。
+                let command_workdir = args["workdir"]
                     .as_str()
-                    .and_then(|p| Path::new(p).canonicalize().ok())
+                    .map(Path::new)
+                    .and_then(|path| path.canonicalize().ok());
+                let selected_workspace = command_workdir
                     .as_deref()
-                    != Some(workspace)
-                {
+                    .is_some_and(|path| path == workspace)
+                    || (command_workdir.is_none()
+                        && simple_segments(args["cmd"].as_str().unwrap_or_default())
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|segment| {
+                                workspace_cd(segment)
+                                    .and_then(|directory| Path::new(directory).canonicalize().ok())
+                                    .as_deref()
+                                    == Some(workspace)
+                            }));
+                if !selected_workspace {
                     continue;
                 }
                 let manifest = std::str::from_utf8(&read_bounded(
@@ -1966,6 +2181,11 @@ fn recover_mode(
                     .filter(|(path, records)| {
                         path.starts_with("backend/src/")
                             && path.ends_with(".rs")
+                            && (cargo_paths.is_empty()
+                                || cargo_paths.iter().any(|raw| {
+                                    relative_path(root, workspace, raw).ok().as_deref()
+                                        == Some(path.as_str())
+                                }))
                             && records.iter().any(|record| {
                                 record.actor == actor
                                     && record
@@ -1986,6 +2206,7 @@ fn recover_mode(
                             root: root.to_path_buf(),
                             edition: edition.into(),
                         },
+                        alternate: None,
                         replacements: None,
                     });
                 }
@@ -1998,6 +2219,7 @@ fn recover_mode(
                     end,
                     ordinal,
                     edit,
+                    alternate: None,
                     replacements: None,
                 });
             }
@@ -2121,6 +2343,7 @@ fn recover_mode(
                     end,
                     ordinal,
                     edit,
+                    alternate: None,
                     replacements,
                 });
             }
