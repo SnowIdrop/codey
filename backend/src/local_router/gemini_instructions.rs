@@ -1,22 +1,7 @@
 use super::*;
 use crate::model_catalog::{GEMINI_BASE_INSTRUCTIONS, is_gemini_upstream_model};
 
-// Captured from CLI 0.153.3 and checked against both its model catalog and child request.
-const LEGACY_BASE_INSTRUCTIONS: &str =
-    include_str!("../../resources/codex-0.153.3-base-instructions.md");
-// Captured from CLI 0.155.0-alpha.9; the rollout session metadata and the official catalog
-// route `route-mu944g8k-fjc2ct/gpt-6-astra` agree verbatim. Only line endings and outer
-// whitespace are normalized before comparison, so the exact-match contract is unchanged.
-const GPT6_BASE_INSTRUCTIONS: &str =
-    include_str!("../../resources/codex-0.155.0-alpha.9-gpt6-base-instructions.md");
-// CLI 0.160.1 parent and child rollout metadata match the official GPT-6 catalog.
-const GPT6_01601_BASE_INSTRUCTIONS: &str =
-    include_str!("../../resources/codex-0.160.1-gpt6-base-instructions.md");
-const CODING_AGENT_BASE_INSTRUCTIONS: &str =
-    include_str!("../../resources/codex-0.153.3-coding-agent-base-instructions.md");
-const TEMPLATE_VERSION: &str =
-    "antigravity-v1/codex-0.153.3+codex-0.153.3-coding-agent+codex-0.155.0-alpha.9+codex-0.160.1";
-pub(crate) const GEMINI_INSTRUCTIONS_ERROR: &str = "gemini_base_instructions_unrecognized";
+const TEMPLATE_VERSION: &str = "antigravity-v1";
 pub(crate) const GEMINI_CHAT_TAIL_ERROR: &str = "gemini_chat_tail_unsupported";
 
 /// 在共享发送入口补齐 Gemini 不接受的文本预填充尾轮；不修改历史或工具结果。
@@ -132,38 +117,19 @@ pub(crate) fn adapt_gemini_base_instructions(
     body: &mut Value,
     upstream_model: &str,
     official_account: bool,
-) -> Result<Option<bool>> {
+) -> Option<bool> {
     if official_account || !is_gemini_upstream_model(upstream_model) {
-        return Ok(None);
+        return None;
     }
-    // Only normalize line endings and surrounding whitespace. Never strip user content
-    // or search input/developer messages for a prefix that resembles the base template.
-    let instructions = body.get("instructions").and_then(Value::as_str);
-    let normalized = instructions.map(|text| text.replace("\r\n", "\n"));
-    let legacy = LEGACY_BASE_INSTRUCTIONS.replace("\r\n", "\n");
-    let gpt6 = GPT6_BASE_INSTRUCTIONS.replace("\r\n", "\n");
-    let gpt6_01601 = GPT6_01601_BASE_INSTRUCTIONS.replace("\r\n", "\n");
-    let coding_agent = CODING_AGENT_BASE_INSTRUCTIONS.replace("\r\n", "\n");
+    // Gemini routes own this field, including when a child inherits its parent's base
+    // instructions. Keep role/user messages and tool definitions in their original fields.
     let gemini = GEMINI_BASE_INSTRUCTIONS.replace("\r\n", "\n");
-    let matched_baseline = normalized.as_deref().map(str::trim).and_then(|text| {
-        [
-            ("antigravity-v1", gemini.as_str()),
-            ("codex-0.153.3", legacy.as_str()),
-            ("codex-0.155.0-alpha.9-gpt6", gpt6.as_str()),
-            ("codex-0.160.1-gpt6", gpt6_01601.as_str()),
-            ("codex-0.153.3-coding-agent", coding_agent.as_str()),
-        ]
-        .into_iter()
-        .find(|(_, template)| text == template.trim())
-        .map(|(baseline, _)| baseline)
-    });
-    let outcome = match matched_baseline {
-        Some("antigravity-v1") => "already_adapted",
-        Some(_) => {
-            body["instructions"] = Value::String(gemini.trim().to_string());
-            "replaced"
-        }
-        _ => "rejected_unrecognized",
+    let changed = body.get("instructions").and_then(Value::as_str) != Some(gemini.trim());
+    let outcome = if changed {
+        body["instructions"] = Value::String(gemini.trim().to_string());
+        "replaced"
+    } else {
+        "already_adapted"
     };
     let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
         "router.gemini_base_instructions",
@@ -171,15 +137,10 @@ pub(crate) fn adapt_gemini_base_instructions(
             "requestId": ROUTER_REQUEST_ID.try_with(Clone::clone).ok(),
             "model": upstream_model,
             "outcome": outcome,
-            "matchedBaseline": matched_baseline,
             "templateVersion": TEMPLATE_VERSION,
         }),
     );
-    anyhow::ensure!(
-        outcome != "rejected_unrecognized",
-        "Gemini 基础指令未识别：仅支持顶层 instructions 中完整的已核实 GPT 或 Antigravity 模板；不支持缺失、空值、非字符串、自定义混合内容或 input 内基础指令。请求未发送上游；客户端模板更新后需更新 Codey 匹配基线"
-    );
-    Ok(Some(outcome == "replaced"))
+    Some(changed)
 }
 
 #[cfg(test)]

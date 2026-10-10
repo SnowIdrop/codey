@@ -1876,24 +1876,12 @@ impl RouterServer {
             }
         };
         if request_kind == ResponsesRequestKind::Create && !compacting {
-            match adapt_gemini_base_instructions(
+            body_mutated |= adapt_gemini_base_instructions(
                 &mut body,
                 &resolved.upstream_model,
                 resolved.route.official_account,
-            ) {
-                Ok(Some(changed)) => body_mutated |= changed,
-                Ok(None) => {}
-                Err(error) => {
-                    return downstream
-                        .write_error(
-                            400,
-                            GEMINI_INSTRUCTIONS_ERROR,
-                            error.to_string(),
-                            Some(&resolved.route),
-                        )
-                        .await;
-                }
-            }
+            )
+            .unwrap_or(false);
         }
         let replay_reasoning_summary = should_replay_reasoning_text(
             resolved.route.official_account,

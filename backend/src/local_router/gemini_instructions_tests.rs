@@ -2,6 +2,15 @@ use super::*;
 use crate::local_router::tests::{connect_router_websocket, router_config};
 
 const MODEL: &str = "gemini-3.8-flash-high";
+// Historical CLI prompts are regression inputs, not a production allowlist.
+const LEGACY_BASE_INSTRUCTIONS: &str =
+    include_str!("../../resources/codex-0.153.3-base-instructions.md");
+const GPT6_BASE_INSTRUCTIONS: &str =
+    include_str!("../../resources/codex-0.155.0-alpha.9-gpt6-base-instructions.md");
+const GPT6_01601_BASE_INSTRUCTIONS: &str =
+    include_str!("../../resources/codex-0.160.1-gpt6-base-instructions.md");
+const CODING_AGENT_BASE_INSTRUCTIONS: &str =
+    include_str!("../../resources/codex-0.153.3-coding-agent-base-instructions.md");
 
 fn adapt_chat_tail(body: &mut Value) -> Result<Option<bool>> {
     adapt_gemini_chat_tail(
@@ -317,17 +326,18 @@ fn payload_with(model: &str, instructions: &str) -> Value {
 }
 
 #[test]
-fn gemini_exact_templates_and_scope() {
+fn gemini_forces_template_and_respects_route_scope() {
     for template in [
         LEGACY_BASE_INSTRUCTIONS,
         GPT6_BASE_INSTRUCTIONS,
+        GPT6_01601_BASE_INSTRUCTIONS,
         CODING_AGENT_BASE_INSTRUCTIONS,
     ] {
         for name in ["gemini", "GEMINI-3.8", "route/vendor/gemini-3.8-flash-high"] {
             let mut body = payload_with(name, template);
             let before = body.clone();
             assert_eq!(
-                adapt_gemini_base_instructions(&mut body, name, false).unwrap(),
+                adapt_gemini_base_instructions(&mut body, name, false),
                 Some(true)
             );
             assert_eq!(
@@ -339,7 +349,7 @@ fn gemini_exact_templates_and_scope() {
             }
             let adapted = body.clone();
             assert_eq!(
-                adapt_gemini_base_instructions(&mut body, name, false).unwrap(),
+                adapt_gemini_base_instructions(&mut body, name, false),
                 Some(false)
             );
             assert_eq!(body, adapted);
@@ -354,7 +364,7 @@ fn gemini_exact_templates_and_scope() {
         let mut body = json!({"instructions":"custom"});
         let before = body.clone();
         assert_eq!(
-            adapt_gemini_base_instructions(&mut body, name, official).unwrap(),
+            adapt_gemini_base_instructions(&mut body, name, official),
             None
         );
         assert_eq!(body, before);
@@ -362,10 +372,11 @@ fn gemini_exact_templates_and_scope() {
 }
 
 #[test]
-fn gemini_line_endings_and_whitespace_only_are_normalized() {
+fn gemini_always_writes_the_canonical_template() {
     for template in [
         LEGACY_BASE_INSTRUCTIONS,
         GPT6_BASE_INSTRUCTIONS,
+        GPT6_01601_BASE_INSTRUCTIONS,
         CODING_AGENT_BASE_INSTRUCTIONS,
         GEMINI_BASE_INSTRUCTIONS,
     ] {
@@ -374,13 +385,20 @@ fn gemini_line_endings_and_whitespace_only_are_normalized() {
             template.replace("\r\n", "\n").replace('\n', "\r\n"),
         ] {
             let mut body = json!({"instructions":format!(" \n{text}\r\n\t")});
-            assert!(adapt_gemini_base_instructions(&mut body, MODEL, false).is_ok());
+            assert_eq!(
+                adapt_gemini_base_instructions(&mut body, MODEL, false),
+                Some(true)
+            );
+            assert_eq!(
+                body["instructions"],
+                GEMINI_BASE_INSTRUCTIONS.replace("\r\n", "\n").trim()
+            );
         }
     }
 }
 
 #[test]
-fn gemini_unknown_or_input_only_instructions_are_rejected_without_mutation() {
+fn gemini_overrides_any_base_instructions_without_changing_other_fields() {
     for value in [
         Value::Null,
         json!(42),
@@ -395,14 +413,20 @@ fn gemini_unknown_or_input_only_instructions_are_rejected_without_mutation() {
         json!(format!("{GPT6_BASE_INSTRUCTIONS}\nCUSTOM")),
         json!(format!("CUSTOM\n{GPT6_BASE_INSTRUCTIONS}")),
     ] {
-        let mut body = json!({"instructions":value,"input":[{"role":"developer","content":LEGACY_BASE_INSTRUCTIONS}]});
-        let before = body.clone();
-        assert!(adapt_gemini_base_instructions(&mut body, MODEL, false).is_err());
-        assert_eq!(body, before);
+        let mut body = payload(MODEL);
+        body["instructions"] = value;
+        let mut expected = body.clone();
+        expected["instructions"] = json!(GEMINI_BASE_INSTRUCTIONS.replace("\r\n", "\n").trim());
+        assert_eq!(
+            adapt_gemini_base_instructions(&mut body, MODEL, false),
+            Some(true)
+        );
+        assert_eq!(body, expected);
     }
     for embedded in [
         LEGACY_BASE_INSTRUCTIONS,
         GPT6_BASE_INSTRUCTIONS,
+        GPT6_01601_BASE_INSTRUCTIONS,
         CODING_AGENT_BASE_INSTRUCTIONS,
         GEMINI_BASE_INSTRUCTIONS,
     ] {
@@ -412,21 +436,39 @@ fn gemini_unknown_or_input_only_instructions_are_rejected_without_mutation() {
             embedded.replacen('a', "b", 1),
         ] {
             let mut body = payload_with(MODEL, &altered);
-            let before = body.clone();
-            assert!(adapt_gemini_base_instructions(&mut body, MODEL, false).is_err());
-            assert_eq!(body, before);
+            let mut expected = body.clone();
+            expected["instructions"] = json!(GEMINI_BASE_INSTRUCTIONS.replace("\r\n", "\n").trim());
+            assert_eq!(
+                adapt_gemini_base_instructions(&mut body, MODEL, false),
+                Some(true)
+            );
+            assert_eq!(body, expected);
         }
         let mut body =
             json!({"instructions":"custom","input":[{"role":"developer","content":embedded}]});
-        let before = body.clone();
-        assert!(adapt_gemini_base_instructions(&mut body, MODEL, false).is_err());
-        assert_eq!(body, before);
+        let mut expected = body.clone();
+        expected["instructions"] = json!(GEMINI_BASE_INSTRUCTIONS.replace("\r\n", "\n").trim());
+        assert_eq!(
+            adapt_gemini_base_instructions(&mut body, MODEL, false),
+            Some(true)
+        );
+        assert_eq!(body, expected);
         body.as_object_mut().unwrap().remove("instructions");
-        let before = body.clone();
-        assert!(adapt_gemini_base_instructions(&mut body, MODEL, false).is_err());
-        assert_eq!(body, before);
+        assert_eq!(
+            adapt_gemini_base_instructions(&mut body, MODEL, false),
+            Some(true)
+        );
+        assert_eq!(body, expected);
     }
-    assert!(adapt_gemini_base_instructions(&mut json!({"input":"hello"}), MODEL, false).is_err());
+    let mut body = json!({"input":"hello"});
+    assert_eq!(
+        adapt_gemini_base_instructions(&mut body, MODEL, false),
+        Some(true)
+    );
+    assert_eq!(
+        body,
+        json!({"input":"hello", "instructions":GEMINI_BASE_INSTRUCTIONS.replace("\r\n", "\n").trim()})
+    );
 }
 
 #[tokio::test]
@@ -441,7 +483,10 @@ async fn gemini_native_raw_rewrite_and_offload_preserve_unrelated_slices() {
             serde_json::to_string(CODING_AGENT_BASE_INSTRUCTIONS).unwrap()
         );
         let mut body: Value = serde_json::from_str(&raw).unwrap();
-        adapt_gemini_base_instructions(&mut body, MODEL, false).unwrap();
+        assert_eq!(
+            adapt_gemini_base_instructions(&mut body, MODEL, false),
+            Some(true)
+        );
         let (encoded, _) =
             rewrite_native_responses_encoded_body_offloaded(raw.into_bytes(), &body, None)
                 .await
@@ -514,7 +559,10 @@ async fn gemini_routes_adapt_before_all_bridges_for_http_and_websocket() {
     for template in [
         LEGACY_BASE_INSTRUCTIONS,
         GPT6_BASE_INSTRUCTIONS,
+        GPT6_01601_BASE_INSTRUCTIONS,
         CODING_AGENT_BASE_INSTRUCTIONS,
+        "Unrecognized future CLI template",
+        "Custom base instructions",
     ] {
         for protocol in [
             UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
@@ -592,51 +640,6 @@ async fn gemini_routes_adapt_before_all_bridges_for_http_and_websocket() {
                 }
                 router.stop().await.unwrap();
             }
-        }
-    }
-}
-
-#[tokio::test]
-async fn gemini_unknown_instructions_never_connect_to_upstream() {
-    for instructions in [
-        "custom instructions".to_string(),
-        format!("{GPT6_BASE_INSTRUCTIONS}CUSTOM"),
-        format!("CUSTOM\n{LEGACY_BASE_INSTRUCTIONS}"),
-        format!("{CODING_AGENT_BASE_INSTRUCTIONS}CUSTOM"),
-        format!("CUSTOM\n{CODING_AGENT_BASE_INSTRUCTIONS}"),
-        CODING_AGENT_BASE_INSTRUCTIONS.replacen('a', "b", 1),
-    ] {
-        for websocket in [false, true] {
-            let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-            let (config, provider) = gemini_config(
-                format!("http://{}/v1", upstream.local_addr().unwrap()),
-                UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
-            );
-            let router = LocalRouter::start(&config).await.unwrap();
-            let mut body = payload(&model_id::model_alias(&provider, MODEL));
-            body["instructions"] = json!(instructions);
-            let response = if websocket {
-                send_test_request(&router.endpoint(), &body, true).await
-            } else {
-                let endpoint = router.endpoint();
-                let response = reqwest::Client::new()
-                    .post(format!("{}/responses", endpoint.base_url))
-                    .bearer_auth(&endpoint.token)
-                    .json(&body)
-                    .timeout(Duration::from_secs(10))
-                    .send()
-                    .await
-                    .unwrap();
-                assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
-                response.text().await.unwrap()
-            };
-            assert!(response.contains(GEMINI_INSTRUCTIONS_ERROR), "{response}");
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), upstream.accept())
-                    .await
-                    .is_err()
-            );
-            router.stop().await.unwrap();
         }
     }
 }

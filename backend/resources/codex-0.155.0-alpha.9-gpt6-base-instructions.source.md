@@ -16,6 +16,5 @@ digest below is the same value recorded in the Gemini instruction fingerprint te
 - Normalization: replace `CRLF` with `LF`, then trim surrounding whitespace
 - SHA256 (normalized): `be213cc3a9566255f6d43f61c54cbc33cafbc3461680ad6513afa0850050c7d6`
 
-The router only compares this normalized form against the exact stored template. A missing,
-unknown, concatenated, or input-embedded template is still rejected before the request reaches
-the upstream.
+This captured template is retained as a historical regression input. Gemini routes now set
+the Antigravity template by model, without using this fingerprint for request admission.
