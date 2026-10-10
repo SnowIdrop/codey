@@ -1001,8 +1001,8 @@ function ModelSectionComponent({
                                 size="icon-sm"
                                 disabled={routeConfigReadOnly || isBusy || dirty || config.profiles.length <= 1}
                                 onClick={() => onDeleteRoute(profile.id)}
-                                aria-label={`删除线路 ${profile.name}`}
-                                title={config.profiles.length <= 1 ? "至少需要保留一条线路" : `删除线路 ${profile.name}`}
+                                aria-label={`删除线路 ${prefixedRouteName(profile)}`}
+                                title={config.profiles.length <= 1 ? "至少需要保留一条线路" : `删除线路 ${prefixedRouteName(profile)}`}
                               >
                                 <Trash size={14} aria-hidden="true" />
                               </Button>

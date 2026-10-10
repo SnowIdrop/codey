@@ -35,6 +35,7 @@ import type { DiagnosticStorageCleanup, DiagnosticStorageTarget } from "./diagno
 import { DiagnosticCleanupNotice } from "./DiagnosticCleanupNotice";
 import { modelIdsEqual, uniqueModelIds } from "./modelIds";
 import { globalDefaultForRoute, routeProviderId } from "./modelRoutes";
+import { prefixedRouteName } from "./routeShortNames";
 import { customContextRestoredNote, subagentUpdateNote, type ModelRuntimeUpdate } from "./modelSelectionNotice";
 import { PromptOptimizationCard } from "./PromptOptimizationCard";
 import { CodeyBrandMark, SettingsModalShell } from "./SettingsModalShell";
@@ -791,7 +792,7 @@ export function App({
     const route = config.profiles.find((profile) => profile.id === routeId);
     setConfirmation({
       action: "delete-route",
-      title: `删除线路「${route?.name || "未命名线路"}」？`,
+      title: `删除线路「${route ? prefixedRouteName(route) : "未命名线路"}」？`,
       description: "该线路及其模型选择会立即从对话模型选择器移除。此操作无法撤销。",
       confirmLabel: "删除线路",
       run: () => void deleteRoute(routeId),
