@@ -600,6 +600,17 @@ fn formatter_calls(name: &str, args: &Value) -> Option<(Vec<Option<Value>>, usiz
     .ok()?;
     let mut calls = Vec::new();
     while !code.is_empty() {
+        // 原生补丁可与只读检查、格式化调用交错；保留回执位置，避免遗漏后续格式化。
+        if let Some(literal) = code.strip_prefix("text(await tools.apply_patch(") {
+            let mut stream = serde_json::Deserializer::from_str(literal).into_iter::<String>();
+            stream.next()?.ok()?;
+            code = literal[stream.byte_offset()..].strip_prefix("));")?.trim();
+            calls.push(None);
+            if calls.len() > 8 {
+                return None;
+            }
+            continue;
+        }
         let captures = call.captures(code)?;
         let mut object = serde_json::Map::new();
         for field in fields.captures_iter(&captures[2]) {

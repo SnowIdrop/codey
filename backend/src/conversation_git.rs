@@ -156,23 +156,16 @@ fn format_rust(root: &Path, edition: &str, input: &[u8]) -> Result<Vec<u8>> {
     std::str::from_utf8(input).context("格式化仅支持 UTF-8 文本")?;
     static CACHE: OnceLock<Mutex<BTreeMap<String, Vec<u8>>>> = OnceLock::new();
     let key = format!("{edition}:{}", digest(input));
-    if let Some(value) = CACHE
+    // 保持锁直到结果入缓存，避免并行请求重复启动 rustfmt，也限制启动期间的资源竞争。
+    let mut cache = CACHE
         .get_or_init(Default::default)
         .lock()
-        .map_err(|_| anyhow::anyhow!("格式化缓存不可用"))?
-        .get(&key)
-        .cloned()
-    {
-        return Ok(value);
+        .map_err(|_| anyhow::anyhow!("格式化缓存不可用"))?;
+    if let Some(value) = cache.get(&key) {
+        return Ok(value.clone());
     }
-    use std::io::{Seek, SeekFrom};
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("rustfmt.toml"), "")?;
-    let mut stdin = tempfile::tempfile()?;
-    stdin.write_all(input)?;
-    stdin.seek(SeekFrom::Start(0))?;
-    let mut stdout = tempfile::tempfile()?;
-    let mut stderr = tempfile::tempfile()?;
     let mut command = Command::new("rustfmt");
     command
         .current_dir(directory.path())
@@ -185,7 +178,25 @@ fn format_rust(root: &Path, edition: &str, input: &[u8]) -> Result<Vec<u8>> {
             "skip_children=true",
             "--config-path",
         ])
-        .arg(directory.path())
+        .arg(directory.path());
+    // Windows 的工具链代理和安全扫描可能延迟启动；仍保持明确的执行期限。
+    let timeout = if cfg!(windows) { 60 } else { 30 };
+    let value = run_formatter(&mut command, input, Duration::from_secs(timeout))?;
+    if cache.len() >= 32 {
+        cache.clear();
+    }
+    cache.insert(key, value.clone());
+    Ok(value)
+}
+
+fn run_formatter(command: &mut Command, input: &[u8], timeout: Duration) -> Result<Vec<u8>> {
+    use std::io::{Seek, SeekFrom};
+    let mut stdin = tempfile::tempfile()?;
+    stdin.write_all(input)?;
+    stdin.seek(SeekFrom::Start(0))?;
+    let mut stdout = tempfile::tempfile()?;
+    let mut stderr = tempfile::tempfile()?;
+    command
         .stdin(stdin)
         .stdout(stdout.try_clone()?)
         .stderr(stderr.try_clone()?);
@@ -199,10 +210,16 @@ fn format_rust(root: &Path, edition: &str, input: &[u8]) -> Result<Vec<u8>> {
         .context("无法重现历史格式化：rustfmt 不可用")?;
     let started = Instant::now();
     let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => (),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).context("无法读取历史格式化进程状态");
+            }
         }
-        if started.elapsed() > Duration::from_secs(10) {
+        if started.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
             bail!("历史格式化校验超时，已停止提交");
@@ -218,14 +235,6 @@ fn format_rust(root: &Path, edition: &str, input: &[u8]) -> Result<Vec<u8>> {
     let mut value = Vec::new();
     stdout.read_to_end(&mut value)?;
     std::str::from_utf8(&value)?;
-    let mut cache = CACHE
-        .get_or_init(Default::default)
-        .lock()
-        .map_err(|_| anyhow::anyhow!("格式化缓存不可用"))?;
-    if cache.len() >= 32 {
-        cache.clear();
-    }
-    cache.insert(key, value.clone());
     Ok(value)
 }
 

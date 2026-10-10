@@ -1,6 +1,71 @@
 use super::*;
 
 #[test]
+#[ignore = "仅由格式化子进程测试启动"]
+fn formatter_process_child() {
+    let Some(marker) = std::env::var_os("CODEY_FORMATTER_TEST_MARKER") else {
+        return;
+    };
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input).unwrap();
+    fs::write(&marker, &input).unwrap();
+    if std::env::var_os("CODEY_FORMATTER_TEST_WAIT").is_some() {
+        loop {
+            std::thread::sleep(Duration::from_millis(20));
+            fs::write(&marker, b"running").unwrap();
+        }
+    }
+    std::io::stdout().write_all(&input).unwrap();
+    std::process::exit(0);
+}
+
+fn formatter_child_command(marker: &Path) -> Command {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "conversation_git::tests::formatter_process_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("CODEY_FORMATTER_TEST_MARKER", marker);
+    command
+}
+
+#[test]
+fn formatter_process_receives_eof_and_collects_output_without_pipes() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("input");
+    let input = b"fn main() {}\n".repeat(8192);
+    let output = run_formatter(
+        &mut formatter_child_command(&marker),
+        &input,
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    assert_eq!(fs::read(marker).unwrap(), input);
+    assert!(output.ends_with(&input));
+}
+
+#[test]
+fn formatter_timeout_terminates_and_reaps_process() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("heartbeat");
+    let mut command = formatter_child_command(&marker);
+    command.env("CODEY_FORMATTER_TEST_WAIT", "1");
+    let error = run_formatter(&mut command, b"input", Duration::from_millis(250)).unwrap_err();
+    assert!(format!("{error:#}").contains("历史格式化校验超时"));
+    let after = fs::read(&marker).ok();
+    let modified = fs::metadata(&marker).and_then(|m| m.modified()).ok();
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(fs::read(&marker).ok(), after);
+    assert_eq!(
+        fs::metadata(marker).and_then(|m| m.modified()).ok(),
+        modified
+    );
+}
+
+#[test]
 fn commit_analysis_preserves_complete_file_diffs() {
     let first = format!("diff --git a/first b/first\n{}\n", "a".repeat(20_000));
     let second = format!("diff --git a/second b/second\n{}\n", "b".repeat(20_000));
@@ -690,6 +755,70 @@ fn fixed_multiple_patch_wrapper_keeps_following_formatter_record() {
             .bytes,
         formatted
     );
+}
+
+#[test]
+fn formatter_after_interleaved_checks_and_patch_keeps_ordered_receipts() {
+    for outcome in ["success", "failed", "missing", "script"] {
+        let repo = Repo::new();
+        let base = "fn main(){let value=1;}\n";
+        let edited = "fn main(){let value=2;}\n";
+        fs::write(repo.root.join("owned.rs"), base).unwrap();
+        git(&repo.root, &["add", "--", "owned.rs"], None, None).unwrap();
+        git(&repo.root, &["commit", "-m", "baseline"], None, None).unwrap();
+        repo.append_record(
+            SESSION,
+            &repo.native_change(
+                SESSION,
+                "owned.rs",
+                "@@ -1 +1 @@\n-fn main(){let value=1;}\n+fn main(){let value=2;}\n",
+                1,
+            ),
+        );
+        let patch = "*** Begin Patch\n*** Update File: owned.rs\n@@\n-fn main(){let value=1;}\n+fn main(){let value=2;}\n*** End Patch";
+        let mut code = format!(
+            "text(await tools.exec_command({}));\ntext(await tools.apply_patch({}));\ntext(await tools.exec_command({}));",
+            json!({"cmd":"git status --short"}),
+            json!(patch),
+            json!({"cmd":"rustfmt --edition 2024 owned.rs"})
+        );
+        if outcome == "script" {
+            code.push_str("\nunknownFunction();");
+        }
+        let mut content = vec![
+            json!({"type":"text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n"}),
+            json!({"type":"text","text":"{\"exit_code\":0}"}),
+            json!({"type":"text","text":"{}"}),
+            json!({"type":"text","text":json!({"exit_code":if outcome == "failed" {1} else {0}}).to_string()}),
+        ];
+        if outcome == "missing" {
+            content.remove(2);
+        }
+        repo.history(
+            SESSION,
+            None,
+            "exec",
+            json!(code),
+            json!({"content":content}),
+            2,
+        );
+        let formatted = format_rust(&repo.root, "2024", edited.as_bytes()).unwrap();
+        fs::write(repo.root.join("owned.rs"), &formatted).unwrap();
+        // 过时的其他会话摘要只能由本会话完整重放的证明替代。
+        let directory = repo.home.join("codey-conversation-git-v2");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(format!("{}.json", digest(repo.root.as_os_str().as_encoded_bytes()))),
+            serde_json::to_vec(&json!({"files":{"owned.rs":{
+                "sessions":[OTHER], "baseline":{"mode":"100644","hash":digest(b"obsolete baseline")},
+                "expected":{"mode":"100644","hash":digest(b"obsolete result")}, "valid":false
+            }},"pending":{}})).unwrap()).unwrap();
+        let prepared = snapshot(&repo.home, SESSION);
+        assert_eq!(prepared.is_ok(), outcome == "success", "{outcome}");
+        if let Ok(prepared) = prepared {
+            assert_eq!(prepared.changes[0].after.as_ref().unwrap().bytes, formatted);
+        }
+        assert_eq!(fs::read(repo.root.join("owned.rs")).unwrap(), formatted);
+    }
 }
 
 #[test]
