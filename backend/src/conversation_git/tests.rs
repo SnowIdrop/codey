@@ -468,6 +468,47 @@ fn shared_fastctx_history_requires_reversible_edits_and_matching_receipts() {
 }
 
 #[test]
+fn isolate_accepts_disk_when_the_full_history_reproduces_it() {
+    let repo = Repo::new();
+    let base = (1..=12)
+        .map(|line| format!("line{line}\n"))
+        .collect::<String>();
+    fs::write(repo.root.join("owned.txt"), &base).unwrap();
+    git(&repo.root, &["add", "--", "owned.txt"], None, None).unwrap();
+    git(&repo.root, &["commit", "-m", "spread edits"], None, None).unwrap();
+    git(&repo.root, &["push"], None, None).unwrap();
+    // 两段本对话补丁相隔足够远，后一段单独套用到 HEAD 也成立，于是除了完整后缀之外
+    // 还会多出一个只含后一段改动的候选。完整后缀已经能还原磁盘，说明整份文件都属于
+    // 本对话，较短的候选只是少套用了前面的本对话改动。
+    repo.append_record(
+        SESSION,
+        &repo.native_change(
+            SESSION,
+            "owned.txt",
+            "@@ -10 +10 @@\n-line10\n+line10-own\n",
+            1,
+        ),
+    );
+    repo.append_record(
+        SESSION,
+        &repo.native_change(SESSION, "owned.txt", "@@ -2 +2 @@\n-line2\n+line2-own\n", 2),
+    );
+    let disk = base
+        .replace("line2\n", "line2-own\n")
+        .replace("line10\n", "line10-own\n");
+    fs::write(repo.root.join("owned.txt"), &disk).unwrap();
+    let history = history::recover(&repo.home, SESSION, &repo.root, &repo.root).unwrap();
+    let before = head_entry(&repo.root, "HEAD", "owned.txt").unwrap();
+    let after = disk_entry(&repo.root, "owned.txt").unwrap();
+    assert_eq!(
+        history
+            .isolate_changes(&repo.root, "owned.txt", before.as_ref(), after.as_ref())
+            .unwrap(),
+        after.clone().unwrap()
+    );
+}
+
+#[test]
 fn shared_file_refuses_overlap_reverted_hunks_and_staged_contents() {
     for scenario in ["overlap", "reverted", "staged"] {
         let (repo, _, disk) = shared_native_repo();
@@ -1444,6 +1485,110 @@ fn native_diff_stays_authoritative_when_request_context_indentation_differs() {
         prepared.changes[0].after.as_ref().unwrap().bytes,
         native.as_bytes()
     );
+}
+
+#[test]
+fn concurrent_patches_use_file_scope_to_pair_native_receipts() {
+    let repo = Repo::new();
+    // 两个补丁的调用时间窗完全重叠，各自的原生完成记录也落在对方的时间窗内。
+    // 配对原生回执时必须依据文件范围，否则窗口内其他文件的记录会被误认为本次调用的回执。
+    let millis = |second: u64| {
+        chrono::DateTime::parse_from_rfc3339(&format!("2026-10-08T00:00:{second:02}.100Z"))
+            .unwrap()
+            .timestamp_millis()
+    };
+    let call = |ordinal: usize,
+                timestamp: &str,
+                id: &str,
+                file: &str,
+                before: &str,
+                after: &str| {
+        json!({"timestamp": timestamp, "ordinal": ordinal, "type":"response_item", "payload":{
+            "type":"custom_tool_call", "name":"apply_patch", "call_id": id,
+            "input": format!("*** Begin Patch\n*** Update File: {file}\n@@\n-{before}\n+{after}\n*** End Patch")}})
+    };
+    let output = |ordinal: usize, timestamp: &str, id: &str, file: &str| {
+        json!({"timestamp": timestamp, "ordinal": ordinal, "type":"response_item", "payload":{
+            "type":"function_call_output", "call_id": id,
+            "output": format!("Success. Updated the following files:\nM {file}")}})
+    };
+    let native = |ordinal: usize,
+                  timestamp: &str,
+                  file: &str,
+                  before: &str,
+                  after: &str,
+                  second: u64| {
+        let start = millis(second);
+        json!({"timestamp": timestamp, "ordinal": ordinal, "type":"event_msg", "payload":{
+            "type":"item_completed", "thread_id": SESSION, "started_at_ms": start, "completed_at_ms": start + 50,
+            "item":{"type":"FileChange", "id": uuid::Uuid::new_v4().to_string(), "status":"completed",
+                "stdout": format!("Success. Updated the following files:\nM {}\n", repo.root.join(file).display()),
+                "changes": {repo.root.join(file).to_string_lossy().to_string(): {
+                    "type":"update", "move_path": null,
+                    "unified_diff": format!("@@ -1 +1 @@\n-{before}\n+{after}\n")}}}}})
+    };
+    repo.append_record(
+        SESSION,
+        &call(
+            201,
+            "2026-10-08T00:00:01.000Z",
+            "first",
+            "owned.txt",
+            "old",
+            "owned-new",
+        ),
+    );
+    repo.append_record(
+        SESSION,
+        &call(
+            202,
+            "2026-10-08T00:00:02.000Z",
+            "second",
+            "other.txt",
+            "other",
+            "other-new",
+        ),
+    );
+    repo.append_record(
+        SESSION,
+        &native(
+            203,
+            "2026-10-08T00:00:03.200Z",
+            "owned.txt",
+            "old",
+            "owned-new",
+            3,
+        ),
+    );
+    repo.append_record(
+        SESSION,
+        &native(
+            204,
+            "2026-10-08T00:00:04.200Z",
+            "other.txt",
+            "other",
+            "other-new",
+            4,
+        ),
+    );
+    repo.append_record(
+        SESSION,
+        &output(205, "2026-10-08T00:00:09.000Z", "first", "owned.txt"),
+    );
+    repo.append_record(
+        SESSION,
+        &output(206, "2026-10-08T00:00:10.000Z", "second", "other.txt"),
+    );
+    fs::write(repo.root.join("owned.txt"), "owned-new\n").unwrap();
+    fs::write(repo.root.join("other.txt"), "other-new\n").unwrap();
+    let prepared = snapshot(&repo.home, SESSION).unwrap();
+    assert_eq!(
+        prepared.public()["files"],
+        json!(["other.txt", "owned.txt"])
+    );
+    for change in &prepared.changes {
+        assert_eq!(change.after, change.disk);
+    }
 }
 
 #[test]

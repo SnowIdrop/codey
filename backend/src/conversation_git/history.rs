@@ -1873,8 +1873,8 @@ impl History {
                 "{path} 的主代理与子代理编辑顺序不明确，无法自动分离"
             );
         }
-        // 记录按时间排序，每段能完整套用到 HEAD 的后缀各给出一个候选；候选唯一才说明本对话
-        // 改动与当前 HEAD 的对应关系明确，否则无法确定该提交哪一段。
+        // 记录按时间排序，每段能完整套用到 HEAD 的后缀各给出一个候选。多个候选说明记录中
+        // 存在可以整段跳过的本对话改动，需要再判断哪一段才对应磁盘内容。
         let mut candidates = Vec::new();
         for start in 0..records.len() {
             let candidate = (|| -> Result<Entry> {
@@ -1894,11 +1894,18 @@ impl History {
                 }
             }
         }
-        ensure!(
-            candidates.len() == 1,
-            "{path} 的本对话补丁不能唯一对应当前 HEAD，无法自动分离"
-        );
-        let candidate = candidates.pop().unwrap();
+        // 某个候选等于磁盘时，说明整份文件都能由本对话记录还原，可直接提交磁盘内容。较短
+        // 的候选只是少套用了中间的本对话改动，不能据此认为归属不唯一而把本对话改动留在
+        // 外面。候选都不等于磁盘时，仍按唯一性严格判断。
+        let candidate = if candidates.iter().any(|candidate| candidate == disk) {
+            disk.clone()
+        } else {
+            ensure!(
+                candidates.len() == 1,
+                "{path} 的本对话补丁不能唯一对应当前 HEAD，无法自动分离"
+            );
+            candidates.pop().unwrap()
+        };
         for entry in [before, &candidate, disk] {
             ensure!(
                 !entry.bytes.contains(&0) && std::str::from_utf8(&entry.bytes).is_ok(),
@@ -2304,16 +2311,15 @@ fn recover_mode(
                 "历史工具输入与完成回执的文件范围不一致"
             );
             // 同一次补丁可能同时留下工具回执和原生事件，只重放原生实际改动一次。
+            // 多个补丁会在同一时间窗口内并发完成，所以配对原生记录时必须核对文件范围；
+            // 否则窗口内其他文件的完成事件会被误认为本次补丁的回执。
             if patch && let Some((start, end)) = start.zip(end) {
                 let contained: Vec<_> = native_scopes
                     .iter()
-                    .filter(|(from, to, _)| start <= *from && *to <= end)
+                    .filter(|(from, to, files)| start <= *from && *to <= end && *files == reported)
                     .collect();
+                ensure!(contained.len() <= 1, "补丁调用与原生完成记录不能唯一对应");
                 if !contained.is_empty() {
-                    ensure!(
-                        contained.len() == 1 && contained[0].2 == reported,
-                        "补丁调用与原生完成记录不能唯一对应"
-                    );
                     retain_input_context(
                         &mut history,
                         &actor,
@@ -2324,6 +2330,15 @@ fn recover_mode(
                     )?;
                     continue;
                 }
+                // 窗口内有覆盖同一文件的原生记录却与补丁回执范围不同，归属无法证明。
+                ensure!(
+                    !native_scopes.iter().any(|(from, to, files)| {
+                        start <= *from
+                            && *to <= end
+                            && files.iter().any(|file| reported.contains(file))
+                    }),
+                    "补丁调用与原生完成记录不能唯一对应"
+                );
             }
             for (file, edit) in edits {
                 let replacements = if patch {
