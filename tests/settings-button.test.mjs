@@ -1027,11 +1027,11 @@ test("hung cached update state does not schedule an update check", async () => {
   );
 });
 
-test("legacy automatic update preferences cannot enable polling; manual badges remain", async () => {
+test("saved update policy cannot enable renderer polling and preserves manual update badges", async () => {
   const calls = [];
   const fixture = createStartupUpdateFixture(async (path) => {
     calls.push(path);
-    if (path === "/backend/status") return { autoCheckCodeyUpdates: false };
+    if (path === "/backend/status") return { codeyUpdatePolicy: "off" };
     if (path === "/backend/health") return { status: "ok" };
     if (path === "/account/usage") return { status: "disabled" };
     if (path === "/api/check_for_updates") return { updateAvailable: false };
@@ -1042,7 +1042,7 @@ test("legacy automatic update preferences cannot enable polling; manual badges r
   assert.equal(updateTimers().length, 0);
   assert.equal(calls.includes("/api/check_for_updates"), false);
 
-  fixture.window.dispatchEvent({ type: "codey:config-changed", detail: { config: { autoCheckCodeyUpdates: true } } });
+  fixture.window.dispatchEvent({ type: "codey:config-changed", detail: { config: { codeyUpdatePolicy: "stable" } } });
   for (const timer of fixture.activeTimers().filter((timer) => timer.delay === 0)) {
     timer.cleared = true;
     timer.callback();
@@ -1051,7 +1051,7 @@ test("legacy automatic update preferences cannot enable polling; manual badges r
   assert.equal(calls.filter((path) => path === "/api/check_for_updates").length, 0);
   assert.equal(updateTimers().length, 0);
 
-  fixture.window.dispatchEvent({ type: "codey:config-changed", detail: { config: { autoCheckCodeyUpdates: false } } });
+  fixture.window.dispatchEvent({ type: "codey:config-changed", detail: { config: { codeyUpdatePolicy: "off" } } });
   assert.equal(updateTimers().length, 0);
   fixture.window.dispatchEvent({ type: "codey:config-changed" });
   assert.equal(updateTimers().length, 0);

@@ -14,6 +14,26 @@ use crate::model_id;
 const MODEL_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-official.json";
 pub(crate) const GEMINI_BASE_INSTRUCTIONS: &str =
     include_str!("../resources/gemini-antigravity-base-instructions.md");
+
+/// Only exact catalog IDs carry route capabilities. A raw model name may exist
+/// on several routes and must never inherit capability from a matching suffix.
+pub(crate) fn remote_compaction_models_from_catalog(path: &Path) -> HashSet<String> {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|catalog| catalog.get("models").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter(|model| {
+            model
+                .get("codey_remote_compaction")
+                .and_then(Value::as_bool)
+                == Some(true)
+        })
+        .filter_map(|model| model.get("slug").and_then(Value::as_str))
+        .map(model_id::key)
+        .collect()
+}
 /// Raw `codex debug models` output Codey captured itself. Recent Codex builds
 /// no longer maintain `models_cache.json` on disk, so this snapshot is the
 /// durable source for models that need instruction-bearing entries.
@@ -230,6 +250,7 @@ pub(crate) struct CapabilityLists<'a> {
     pub(crate) websocket_models: Option<&'a [String]>,
     pub(crate) native_web_search_models: Option<&'a [String]>,
     pub(crate) image_detail_original_models: Option<&'a [String]>,
+    pub(crate) remote_compaction_models: Option<&'a [String]>,
 }
 
 /// 生成目录时一并应用的上下文与思考等级覆盖。
@@ -600,6 +621,7 @@ fn render_catalog_for_provider(
         websocket_models,
         native_web_search_models,
         image_detail_original_models,
+        remote_compaction_models,
     } = capabilities;
     if !official_provider
         && upstream_models.is_some_and(|models| models.is_empty())
@@ -768,6 +790,10 @@ fn render_catalog_for_provider(
         // 选中它，请求会被静默改成该模型的默认档（luna 是 medium）。
         ensure_forwarded_ultra_level(model);
     }
+    apply_remote_compaction_models(
+        &mut catalog_models,
+        remote_compaction_models.unwrap_or_default(),
+    );
     // Third-party routes still fail closed when their template lacks runtime
     // fields. Official-only catalogs never drop incompatible slugs above, so
     // this remains all-or-nothing for that path.
@@ -1007,12 +1033,15 @@ pub(crate) fn prepare_cached_catalog_for_current_capabilities(
     home: &Path,
     native_web_search_models: &[String],
     image_detail_original_models: &[String],
+    remote_compaction_models: &[String],
 ) -> Result<bool> {
     if !is_available(home) {
         return Ok(false);
     }
 
     let mut models = read_runtime_catalog_models(home)?;
+    let original_models = models.clone();
+    apply_remote_compaction_models(&mut models, remote_compaction_models);
     let allowed_model_keys = native_web_search_models
         .iter()
         .map(|model| model_id::key(model))
@@ -1021,7 +1050,7 @@ pub(crate) fn prepare_cached_catalog_for_current_capabilities(
         .iter()
         .map(|model| model_id::key(model))
         .collect::<HashSet<_>>();
-    let mut changed = false;
+    let mut changed = models != original_models;
     for model in &mut models {
         let previous = model.clone();
         gate_cached_native_web_search(model, &allowed_model_keys);
@@ -1035,6 +1064,7 @@ pub(crate) fn prepare_cached_catalog_for_current_capabilities(
 
     let written_models = read_runtime_catalog_models(home)?;
     let mut safely_gated_models = written_models.clone();
+    apply_remote_compaction_models(&mut safely_gated_models, remote_compaction_models);
     for model in &mut safely_gated_models {
         gate_cached_native_web_search(model, &allowed_model_keys);
         gate_cached_image_detail_original(model, &image_detail_original_model_keys);
@@ -1044,6 +1074,21 @@ pub(crate) fn prepare_cached_catalog_for_current_capabilities(
         bail!("复用的 Codey 模型目录仍包含与当前线路不匹配的模型能力");
     }
     Ok(true)
+}
+
+fn apply_remote_compaction_models(models: &mut [Value], allowed: &[String]) {
+    let allowed = allowed
+        .iter()
+        .map(|model| model_id::key(model))
+        .collect::<HashSet<_>>();
+    for model in models {
+        let enabled = model
+            .get("slug")
+            .and_then(Value::as_str)
+            .is_some_and(|slug| allowed.contains(&model_id::key(slug)));
+        // Codex 忽略扩展字段，Codey 的原生请求入口用它选择会话 Provider。
+        model["codey_remote_compaction"] = json!(enabled);
+    }
 }
 
 /// Repairs catalogs written by older Codey versions that copied model-cache
@@ -4455,7 +4500,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
 
         assert!(
-            prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[]).unwrap(),
+            prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[], &[]).unwrap(),
             "the legacy window must be rewritten"
         );
         let catalog: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -4516,6 +4561,48 @@ mod tests {
     }
 
     #[test]
+    fn remote_compaction_catalog_and_cached_refresh_keep_routes_independent() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+        let selected = vec![
+            "route-a/gpt-5.6-sol".to_string(),
+            "route-b/gpt-5.6-sol".to_string(),
+        ];
+        refresh_for_provider_with_capabilities(
+            home.path(),
+            false,
+            Some(&selected),
+            &selected,
+            CapabilityLists {
+                remote_compaction_models: Some(&selected[..1]),
+                ..CapabilityLists::default()
+            },
+            "",
+        )
+        .unwrap();
+        let path = home.path().join(MODEL_CATALOG_RELATIVE_PATH);
+        assert_eq!(
+            remote_compaction_models_from_catalog(&path),
+            HashSet::from([selected[0].clone()])
+        );
+        assert!(
+            prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[], &selected[1..],)
+                .unwrap()
+        );
+        assert_eq!(
+            remote_compaction_models_from_catalog(&path),
+            HashSet::from([selected[1].clone()])
+        );
+        let models = read_runtime_catalog_models(home.path()).unwrap();
+        assert_eq!(models.len(), 2);
+        assert!(
+            models
+                .iter()
+                .all(|model| model["base_instructions"].as_str().is_some())
+        );
+    }
+
+    #[test]
     fn cached_catalog_fallback_removes_stale_image_detail_original_metadata() {
         let home = tempfile::tempdir().unwrap();
         write_cache_with_image_detail_original(home.path());
@@ -4537,7 +4624,9 @@ mod tests {
         let stale: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(stale["models"][0]["supports_image_detail_original"], true);
 
-        assert!(prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[]).unwrap());
+        assert!(
+            prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[], &[]).unwrap()
+        );
         let sanitized: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert!(
             sanitized["models"][0]
@@ -4774,7 +4863,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
 
         assert!(
-            prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[]).unwrap(),
+            prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[], &[]).unwrap(),
             "a valid cached catalog should remain usable after stale capabilities are removed"
         );
         let sanitized: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -4786,7 +4875,9 @@ mod tests {
         );
         let sanitized_bytes = fs::read(&path).unwrap();
 
-        assert!(prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[]).unwrap());
+        assert!(
+            prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[], &[]).unwrap()
+        );
         assert_eq!(fs::read(&path).unwrap(), sanitized_bytes);
     }
 

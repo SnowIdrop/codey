@@ -412,6 +412,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "toml_edit",
+ "unicode-normalization",
  "uuid",
  "webpki-roots 0.26.11",
  "windows 0.58.0",
@@ -436,13 +437,6 @@ dependencies = [
  "toml_edit",
  "uuid",
  "zip",
-]
-
-[[package]]
-name = "codey-plugin-header-demo"
-version = "0.1.0"
-dependencies = [
- "codey-plugin-sdk",
 ]
 
 [[package]]

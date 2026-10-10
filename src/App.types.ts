@@ -27,6 +27,7 @@ export type Profile = {
   /** 该线路来自哪个已保存的官方账号；多条官方线路靠它区分。 */
   officialAccountId?: string;
   supportsRemoteCompaction?: boolean;
+  remoteCompactionProtocol?: "responses" | "compactEndpoint";
   supportsWebsockets?: boolean;
   supportsNativeWebSearch?: boolean;
   supportsAutoReview?: boolean;
@@ -104,6 +105,7 @@ export type WorkflowConfig = {
 
 export type Config = {
   settingsRevision: number;
+  codeyUpdatePolicy: "off" | "stable" | "experimental";
   localRouterEnabled: boolean;
   routeRequestLog: RouteRequestLogConfig;
   streamMaxRetries: number;
@@ -112,6 +114,7 @@ export type Config = {
   initialRouteImportCompleted: boolean;
   webhook: { channels: NotificationChannel[] };
   promptOptimization: PromptOptimizationConfig;
+  conversationGit: { enabled: boolean; model: string };
   codexAppPath: string;
   userScripts: string[];
   selectedModelsByProvider: Record<string, string[]>;
@@ -224,6 +227,14 @@ export type OfficialAccountsResult = {
 
 export type RuntimeStatus = {
   running: boolean;
+  remoteCompaction?: {
+    configured: boolean;
+    active: boolean | null;
+    configuredMode?: "local" | "remote" | "mixed";
+    activeMode?: "local" | "remote" | "mixed" | null;
+    restartRequired: boolean;
+    blockingRoutes: Array<{ routeId: string; routeName: string; reason: string }>;
+  };
   appVersion?: string;
   availableUpdate?: UpdateCheck;
   codexAppVersion?: string;
@@ -284,6 +295,7 @@ export type Confirmation = {
     | "repair-codex-config"
     | "install-update"
     | "download-update"
+    | "enable-experimental-updates"
     | "discard-settings-changes"
     | "delete-notification-channel"
     | "delete-route"

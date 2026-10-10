@@ -578,7 +578,14 @@ pub(crate) fn classify_tool(tool_name: &str) -> ToolClass {
         ToolClass::Network
     } else if matches!(
         normalized.as_str(),
-        "read_file" | "inspect_local_file" | "grep" | "glob" | "tool_search"
+        "read_file"
+            | "inspect_local_file"
+            | "grep"
+            | "glob"
+            | "tool_search"
+            | "read_mcp_resource"
+            | "list_mcp_resources"
+            | "list_mcp_resource_templates"
     ) {
         ToolClass::Read
     } else if matches!(
@@ -660,6 +667,11 @@ pub(crate) fn normalize_tool_name(tool_name: &str) -> String {
             Some("glob")
         }
         "tool_search" => Some("tool_search"),
+        "read_mcp_resource" | "functions.read_mcp_resource" => Some("read_mcp_resource"),
+        "list_mcp_resources" | "functions.list_mcp_resources" => Some("list_mcp_resources"),
+        "list_mcp_resource_templates" | "functions.list_mcp_resource_templates" => {
+            Some("list_mcp_resource_templates")
+        }
         "view_image" | "functions.view_image" => Some("view_image"),
         "mcp__cua_repl__js" => Some("cua_repl_js"),
         "mcp__cua_repl__js_reset" => Some("cua_repl_js_reset"),
@@ -675,7 +687,13 @@ pub(crate) fn normalize_tool_name(tool_name: &str) -> String {
         "read_thread_terminal" | "codex_app__read_thread_terminal" => Some("read_thread_terminal"),
         "web_search" => Some("web_search"),
         "websearch" => Some("websearch"),
-        "web.run" | "web/run" | "web::run" | "web__run" | "web_run" | "webrun" => Some("web_run"),
+        "web.run"
+        | "web/run"
+        | "web::run"
+        | "web__run"
+        | "web_run"
+        | "webrun"
+        | "mcp__codex_apps__search_service_web_run" => Some("web_run"),
         "open" => Some("open"),
         "find" => Some("find"),
         "screenshot" => Some("screenshot"),
@@ -814,21 +832,9 @@ mod tests {
                 "{role}"
             );
         }
-        for class in [ToolClass::Read, ToolClass::Network] {
-            assert_eq!(
-                rules
-                    .evaluate(&RuleContext {
-                        actor: RuleActor::Root,
-                        role: None,
-                        tool_name: "root-read",
-                        tool_class: class,
-                    })
-                    .effect,
-                RuleEffect::Allow,
-                "{class:?}"
-            );
-        }
         for class in [
+            ToolClass::Read,
+            ToolClass::Network,
             ToolClass::Write,
             ToolClass::Command,
             ToolClass::Visual,

@@ -12,7 +12,7 @@ function harness(enabled, installReport = null) {
   const hooks = [], effects = [], timers = new Map(), requests = [];
   let cursor = 0, timerId = 0, result;
   const options = {
-    embedded: false, configLoaded: true, autoCheckCodeyUpdates: enabled,
+    embedded: !enabled, configLoaded: true, codeyUpdatePolicy: "stable",
     isBusy: false, setBusy() {}, setNotice() {}, setConfirmation() {}, beforeInstall: async () => {},
   };
   const react = {
@@ -76,7 +76,7 @@ test("only a manual check requests update information", async () => {
   const checking = h.render().checkForUpdates();
   assert.equal(h.requests.length, 1);
   assert.equal(h.requests[0].command, "check_for_updates");
-  assert.deepEqual(h.requests[0].args, { forceRefresh: true });
+  assert.deepEqual(h.requests[0].args, { forceRefresh: true, manual: true });
   h.requests[0].resolve(available);
   await checking;
   assert.deepEqual(h.render().updateCheck, available);
@@ -108,7 +108,7 @@ test("手动重新检查可清除之前发现的更新", async () => {
   await first;
   const second = h.render().checkForUpdates();
   assert.equal(h.requests.length, 2);
-  assert.deepEqual(h.requests[1].args, { forceRefresh: true });
+  assert.deepEqual(h.requests[1].args, { forceRefresh: true, manual: true });
   const latest = { currentVersion: "1.1.1", latestVersion: "1.1.1", updateAvailable: false };
   h.requests[1].resolve(latest);
   await second;
@@ -153,7 +153,7 @@ for (const scenario of [
 
     const checking = h.render().checkForUpdates();
     assert.equal(h.requests.length, 3);
-    assert.deepEqual(h.requests[2].args, { forceRefresh: true });
+    assert.deepEqual(h.requests[2].args, { forceRefresh: true, manual: true });
     assert.equal(confirmation, null);
     h.requests[2].resolve({
       ...update,
@@ -365,3 +365,66 @@ for (const deferred of ['rollback:rollback-1', 'rollback:older-rollback', '1.0.0
     assert.equal(h.timers.size, 0);
   });
 }
+
+test("不检查策略停止自动检查，仍可手动检查、下载和安装稳定版", async () => {
+  const fixture = harness(false);
+  let confirmation = null;
+  let saved = false;
+  fixture.options.setConfirmation = value => { confirmation = typeof value === "function" ? value(confirmation) : value; };
+  fixture.options.beforeInstall = async () => { saved = true; };
+  fixture.options.codeyUpdatePolicy = "off";
+  fixture.options.embedded = false;
+  fixture.render();
+  assert.equal(fixture.requests.length, 0);
+  assert.equal(fixture.timers.size, 0);
+  const checking = fixture.render().checkForUpdates();
+  assert.equal(fixture.requests.length, 1);
+  assert.deepEqual(fixture.requests[0].args, { forceRefresh: true, manual: true });
+  const stable = { ...available, selectedAsset: { fileName: "Codey-1.2.0.dmg", size: 1024, sha256: "a".repeat(64) } };
+  fixture.requests[0].resolve(stable);
+  await checking;
+  assert.deepEqual(fixture.render().updateCheck, stable);
+  assert.equal(confirmation.action, "download-update");
+  confirmation.run();
+  assert.equal(fixture.requests[1].command, "download_update");
+  assert.deepEqual(fixture.requests[1].args, { expectedVersion: "1.2.0", expectedPolicyId: null });
+  const downloaded = { latestVersion: "1.2.0", filePath: "/updates/Codey-1.2.0.dmg", fileName: "Codey-1.2.0.dmg", size: 1024 };
+  fixture.requests[1].resolve(downloaded);
+  await settle();
+  assert.equal(confirmation.action, "install-update");
+  confirmation.run();
+  await settle();
+  assert.equal(saved, true);
+  assert.equal(fixture.requests[2].command, "install_downloaded_update");
+  fixture.requests[2].resolve();
+  await settle();
+  assert.equal(fixture.timers.size, 0);
+});
+
+test("不检查策略的手动检查不接受实验版", async () => {
+  const fixture = harness(false);
+  let confirmation = null;
+  fixture.options.setConfirmation = value => { confirmation = typeof value === "function" ? value(confirmation) : value; };
+  fixture.options.codeyUpdatePolicy = "off";
+  const checking = fixture.render().checkForUpdates();
+  fixture.requests[0].resolve({ ...available, latestVersion: "1.2.0-beta.1", selectedAsset: { fileName: "beta.dmg" } });
+  await checking;
+  assert.equal(fixture.render().updateCheck, null);
+  assert.equal(confirmation, null);
+  assert.match(fixture.render().updateResult.text, /仅检查稳定版/);
+});
+
+test("切换频道丢弃进行中的旧请求并清除已发现的更新", async () => {
+  const fixture = harness(false);
+  const checking = fixture.render().checkForUpdates();
+  fixture.options.codeyUpdatePolicy = "experimental";
+  fixture.render();
+  fixture.requests[0].resolve(available);
+  await checking;
+  assert.equal(fixture.render().updateCheck, null);
+  assert.equal(fixture.window.__codeyUpdateAvailability, null);
+  fixture.options.embedded = false;
+  fixture.render();
+  assert.equal(fixture.requests.length, 1);
+  assert.equal(fixture.timers.size, 0);
+});

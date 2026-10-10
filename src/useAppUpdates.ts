@@ -2,12 +2,14 @@ import {
   type Dispatch,
   type SetStateAction,
   useEffect,
+  useRef,
   useState,
 } from "react";
 
 import { invoke } from "./api";
 import type {
   Confirmation,
+  Config,
   InlineResult,
   Notice,
   UpdateCheck,
@@ -34,6 +36,7 @@ function updateInstallReportText(report: UpdateInstallReport): string {
 
 type UseAppUpdatesOptions = {
   configLoaded: boolean;
+  codeyUpdatePolicy: Config["codeyUpdatePolicy"];
   isBusy: boolean;
   setBusy: Dispatch<SetStateAction<string | null>>;
   setNotice: Dispatch<SetStateAction<Notice>>;
@@ -44,6 +47,10 @@ type UseAppUpdatesOptions = {
 const updateAvailable = (
   check: UpdateCheck | null | undefined,
 ): check is UpdateCheck => check?.updateAvailable === true;
+
+function updateVersionAllowed(version: string, policy: Config["codeyUpdatePolicy"]): boolean {
+  return policy === "experimental" || !version.includes("-");
+}
 
 function updateCheckText(result: UpdateCheck) {
   if (result.rollback) return `可从 v${result.currentVersion} 回退至 v${result.latestVersion}：${result.rollback.reason}`;
@@ -73,6 +80,7 @@ function publishUpdateAvailability(result: UpdateCheck | null) {
 
 export function useAppUpdates({
   configLoaded,
+  codeyUpdatePolicy,
   isBusy,
   setBusy,
   setNotice,
@@ -86,6 +94,20 @@ export function useAppUpdates({
   const [updateCheck, setUpdateCheck] = useState<UpdateCheck | null>(null);
   const [downloadedUpdate, setDownloadedUpdate] =
     useState<UpdateDownload | null>(null);
+  const manualCheckVersion = useRef(0);
+  const policyRef = useRef(codeyUpdatePolicy);
+  const previousPolicyRef = useRef(codeyUpdatePolicy);
+  policyRef.current = codeyUpdatePolicy;
+  useEffect(() => {
+    if (previousPolicyRef.current === codeyUpdatePolicy) return;
+    previousPolicyRef.current = codeyUpdatePolicy;
+    manualCheckVersion.current += 1;
+    setUpdateCheck(null);
+    setDownloadedUpdate(null);
+    setUpdateResult({ tone: "idle", text: "" });
+    publishUpdateAvailability(null);
+    setConfirmation(current => current && ["download-update", "install-update"].includes(current.action) ? null : current);
+  }, [codeyUpdatePolicy, setConfirmation]);
 
   // 上一次"安装并重启"的真实结果。助手把结论写在配置目录里，这里读一次并
   // 展示，避免用户只看到版本号没变却没有任何解释。
@@ -118,7 +140,7 @@ export function useAppUpdates({
     const applyDetectedUpdate = (
       result: UpdateCheck | null | undefined,
     ) => {
-      if (!updateAvailable(result)) return;
+      if (policyRef.current === "off" || !updateAvailable(result) || (policyRef.current === "stable" && result.latestVersion.includes("-"))) return;
       setUpdateCheck(result);
       setDownloadedUpdate(null);
       setUpdateResult({
@@ -145,16 +167,22 @@ export function useAppUpdates({
 
   async function checkForUpdates() {
     if (!configLoaded || isBusy) return;
+    manualCheckVersion.current += 1;
+    const requestVersion = manualCheckVersion.current;
     setBusy("check-update");
     setUpdateResult({ tone: "pending", text: "正在检查更新…" });
     setUpdateCheck(null);
     setDownloadedUpdate(null);
     try {
       const result = await withTimeout(
-        invoke<UpdateCheck>("check_for_updates", { forceRefresh: true }),
+        invoke<UpdateCheck>("check_for_updates", { forceRefresh: true, manual: true }),
         UPDATE_CHECK_TIMEOUT_MS,
         "检查更新超时，请检查网络",
       );
+      if (requestVersion !== manualCheckVersion.current) return;
+      if (result.updateAvailable && !updateVersionAllowed(result.latestVersion, policyRef.current)) {
+        throw new Error("当前更新策略仅检查稳定版，已忽略实验版更新");
+      }
       setUpdateCheck(result);
       publishUpdateAvailability(result);
       const text = updateCheckText(result);
@@ -187,6 +215,7 @@ export function useAppUpdates({
         }
       }
     } catch (error) {
+      if (requestVersion !== manualCheckVersion.current) return;
       const text = errorText(error);
       setUpdateResult({ tone: "error", text });
       setNotice({ tone: "error", text });
@@ -223,6 +252,7 @@ export function useAppUpdates({
     )
       return;
     setBusy("download-update");
+    const requestVersion = manualCheckVersion.current;
     setDownloadedUpdate(null);
     setUpdateResult({ tone: "pending", text: "正在下载并校验更新…" });
     try {
@@ -231,12 +261,14 @@ export function useAppUpdates({
         300_000,
         "下载更新超时，请稍后重试",
       );
+      if (requestVersion !== manualCheckVersion.current) return;
       setDownloadedUpdate(result);
       const text = `已下载 ${result.fileName}（${formatBytes(result.size)}），校验通过`;
       setUpdateResult({ tone: "success", text });
       setNotice({ tone: "success", text });
       askInstallDownloadedUpdate(result);
     } catch (error) {
+      if (requestVersion !== manualCheckVersion.current) return;
       const text = errorText(error);
       setUpdateResult({ tone: "error", text });
       setNotice({ tone: "error", text });

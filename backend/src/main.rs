@@ -36,9 +36,6 @@ fn run() -> anyhow::Result<Option<i32>> {
     if codey_lib::run_node_options_repair_if_requested()? {
         return Ok(None);
     }
-    if codey_lib::run_overlay_recovery_if_requested()? {
-        return Ok(None);
-    }
     if let Some(exit_code) = app_server_proxy::run_helper_if_requested()? {
         return Ok(Some(exit_code));
     }

@@ -1069,6 +1069,13 @@ impl RouterServer {
             let Some(message) = downstream.next_message().await? else {
                 break;
             };
+            if downstream.handle_steering_message(&message).await? {
+                downstream.write_steering_notifications().await?;
+                continue;
+            }
+            if downstream.handle_idle_response_interrupt(&message)? {
+                continue;
+            }
             if matches!(message, WebSocketMessage::Text(_)) {
                 match acquire_connection_permit_within(
                     &self.connection_limit,
@@ -1148,16 +1155,37 @@ impl RouterServer {
                     };
                     let request_body_bytes = Some(text.len() as u64);
                     drop(text);
-                    let message_type = body
-                        .as_object_mut()
-                        .and_then(|body| body.remove("type"))
-                        .and_then(|value| value.as_str().map(str::to_string));
-                    if message_type.as_deref() != Some("response.create") {
+                    if body["type"] == "response.steer" {
+                        let event = downstream.steering.accept(&body, &self.request_body_budget);
+                        downstream.write_steering_event(&event).await?;
+                        downstream.write_steering_notifications().await?;
+                        continue;
+                    }
+                    let message_type = body.as_object_mut().and_then(|body| body.remove("type"));
+                    if message_type.as_ref().and_then(Value::as_str) != Some("response.create") {
+                        // 仅显示有界的协议标识，不把任意字段内容写入错误信息。
+                        let received = match message_type.as_ref() {
+                            None => "缺少 type 字段".to_string(),
+                            Some(Value::String(value))
+                                if !value.is_empty()
+                                    && value.len() <= 64
+                                    && value.bytes().all(|byte| {
+                                        byte.is_ascii_alphanumeric()
+                                            || matches!(byte, b'.' | b'_' | b'-')
+                                    }) =>
+                            {
+                                format!("收到事件类型 {value}")
+                            }
+                            Some(Value::String(_)) => "type 不是有效的事件标识".to_string(),
+                            Some(_) => "type 字段必须为字符串".to_string(),
+                        };
                         downstream
                             .write_error(
                                 400,
                                 "unsupported_websocket_message",
-                                "Codey Responses WebSocket 仅支持 response.create".to_string(),
+                                format!(
+                                    "Codey Responses WebSocket 支持 response.create、response.steer 和 response.interrupt；{received}"
+                                ),
                                 None,
                             )
                             .await?;
@@ -1211,6 +1239,34 @@ impl RouterServer {
                         // fallback and never forwards either field over WS.
                         body.remove("stream");
                         body.remove("background");
+                    }
+                    match downstream
+                        .steering
+                        .begin_request(&mut body, &self.request_body_budget)
+                    {
+                        Ok(events) => {
+                            for event in events {
+                                downstream.write_steering_event(&event).await?;
+                            }
+                        }
+                        Err(error) => {
+                            // 这次 create 校验失败，不改变仍在等待工具结果的原响应。
+                            let mut event = ResponsesFailure::new(
+                                400,
+                                "steering_required_input",
+                                error.to_string(),
+                                None,
+                            )
+                            .normalized_event();
+                            downstream.steering.sequence_response_event(&mut event);
+                            downstream
+                                .write_text(encode_responses_websocket_event(
+                                    &event,
+                                    stream_id.as_deref(),
+                                )?)
+                                .await?;
+                            continue;
+                        }
                     }
                     downstream.set_stream_id(stream_id);
                     let request = HttpRequest {
@@ -1272,6 +1328,7 @@ impl RouterServer {
                                 .await?;
                         }
                     }
+                    downstream.write_steering_notifications().await?;
                 }
                 WebSocketMessage::Ping(payload) => downstream.write_pong(payload).await?,
                 WebSocketMessage::Pong(_) => {}
@@ -1675,6 +1732,23 @@ impl RouterServer {
             }
         }
         let bridge = ProtocolBridge::from_upstream_protocol(resolved.protocol);
+        if let Some(probe) = downstream.request_log_probe() {
+            probe.resolve_route(
+                &resolved.provider_id,
+                &resolved.route.route_name,
+                resolved
+                    .route
+                    .official_auth
+                    .as_ref()
+                    .map(|auth| auth.account_id.as_str()),
+                &resolved.requested_model,
+                &resolved.upstream_model,
+                &resolved.route.upstream_authority,
+                bridge.upstream_protocol().label(),
+                bridge.label(),
+                subagent_request,
+            );
+        }
         if compacting && !resolved.route.supports_remote_compaction {
             return downstream
                 .write_error(
@@ -1706,23 +1780,6 @@ impl RouterServer {
                     )
                     .await;
             }
-        }
-        if let Some(probe) = downstream.request_log_probe() {
-            probe.resolve_route(
-                &resolved.provider_id,
-                &resolved.route.route_name,
-                resolved
-                    .route
-                    .official_auth
-                    .as_ref()
-                    .map(|auth| auth.account_id.as_str()),
-                &resolved.requested_model,
-                &resolved.upstream_model,
-                &resolved.route.upstream_authority,
-                bridge.upstream_protocol().label(),
-                bridge.label(),
-                subagent_request,
-            );
         }
         downstream.select_route(&resolved.route);
         if bridge != ProtocolBridge::NativeResponses
@@ -1857,9 +1914,14 @@ impl RouterServer {
                 .insert("stream".to_string(), Value::Bool(true));
             body_mutated = true;
         }
-        let upstream_url = match request_kind {
-            ResponsesRequestKind::Create => &resolved.route.upstream_url,
-            ResponsesRequestKind::Compact => &resolved.route.upstream_compact_url,
+        let compact_endpoint_compat = compacting
+            && request_kind == ResponsesRequestKind::Create
+            && !resolved.route.official_account
+            && resolved.route.remote_compaction_protocol
+                == crate::config::RemoteCompactionProtocol::CompactEndpoint;
+        let upstream_url = match (request_kind, compact_endpoint_compat) {
+            (ResponsesRequestKind::Compact, _) | (_, true) => &resolved.route.upstream_compact_url,
+            _ => &resolved.route.upstream_url,
         };
         let upstream_url = match upstream_url {
             Ok(upstream_url) => upstream_url.as_str(),
@@ -2201,7 +2263,29 @@ impl RouterServer {
             body_mutated = true;
             encoded_body = None;
         }
-        let xai_response_fix = if bridge == ProtocolBridge::NativeResponses
+        if compact_endpoint_compat {
+            if let Err(error) = adapt_compaction_trigger_to_compact(&mut upstream_body) {
+                return downstream
+                    .write_error(
+                        400,
+                        "unsupported_compaction_payload",
+                        error.to_string(),
+                        Some(&resolved.route),
+                    )
+                    .await;
+            }
+            body_mutated = true;
+            encoded_body = None;
+            headers.insert(
+                reqwest::header::ACCEPT,
+                HeaderValue::from_static("application/json"),
+            );
+            if let Some(probe) = downstream.request_log_probe() {
+                probe.mark_fallback("compaction_compact_endpoint");
+            }
+        }
+        let xai_response_fix = if !compacting
+            && bridge == ProtocolBridge::NativeResponses
             && !resolved.route.official_account
             && native_upstream_needs_xai_compat(upstream_url, &resolved.upstream_model)
         {
@@ -2536,7 +2620,13 @@ impl RouterServer {
                 write_validated_compaction(
                     downstream,
                     response,
-                    request_kind == ResponsesRequestKind::Create,
+                    if compact_endpoint_compat {
+                        CompactionResponseFormat::CompactToResponses
+                    } else if request_kind == ResponsesRequestKind::Create {
+                        CompactionResponseFormat::Responses
+                    } else {
+                        CompactionResponseFormat::Compact
+                    },
                     stream_requested,
                     &resolved.route,
                 )

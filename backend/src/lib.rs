@@ -10,6 +10,7 @@ mod codey_plugins;
 mod commands;
 mod computer_use;
 mod config;
+mod conversation_git;
 mod crashpad_pending_guard;
 #[cfg(windows)]
 mod desktop_instance;
@@ -31,7 +32,6 @@ mod model_list;
 mod native_update_ui;
 mod notifications;
 mod official_accounts;
-mod overlay_recovery;
 mod pending_approval;
 mod pet_slim_patch;
 mod plugin_log_terminal;
@@ -85,10 +85,6 @@ pub fn run_plugin_log_terminal_if_requested() -> Result<bool> {
 
 pub fn run_codex_cli_wrapper_if_requested() -> Result<bool> {
     codex_startup_patch::run_cli_wrapper_if_requested()
-}
-
-pub fn run_overlay_recovery_if_requested() -> Result<bool> {
-    overlay_recovery::run_if_requested()
 }
 
 pub fn run_node_options_repair_if_requested() -> Result<bool> {
@@ -253,8 +249,10 @@ async fn run(ui: NativeUpdateUi) -> Result<()> {
                         }
                     }
                 }
-                let error =
-                    initial_startup_failure_error(&error, cleanup.as_ref().err().map(String::as_str));
+                let error = initial_startup_failure_error(
+                    &error,
+                    cleanup.as_ref().err().map(String::as_str),
+                );
                 show_initial_startup_failure(&error).await;
                 return Err(anyhow::Error::msg(error));
             }
