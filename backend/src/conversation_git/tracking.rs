@@ -454,6 +454,17 @@ pub(super) fn completed_files(
         .collect())
 }
 
+pub(super) fn observation_token(
+    session: &str,
+    actor: &str,
+    name: &str,
+    turn: &Value,
+    call: &Value,
+    args: &Value,
+) -> String {
+    digest(format!("{session}:{actor}:{name}:{turn}:{call}:{args}").as_bytes())
+}
+
 pub(crate) fn observe(home: &Path, input: &Value) -> Result<()> {
     observe_with_runtime(
         home,
@@ -496,12 +507,13 @@ pub(super) fn observe_with_runtime(
         .or_else(|| input.get("call_id"))
         .cloned()
         .unwrap_or(Value::Null);
-    let token = digest(
-        format!(
-            "{session}:{actor}:{name}:{}:{call}:{args}",
-            field(input, "turn_id", "turnId").context("编辑缺少轮次身份")?
-        )
-        .as_bytes(),
+    let token = observation_token(
+        &session,
+        &actor,
+        name,
+        field(input, "turn_id", "turnId").context("编辑缺少轮次身份")?,
+        &call,
+        &args,
     );
     let path = ledger_path(home, &root);
     let _lock = lock_ledger(&path)?;
@@ -836,7 +848,45 @@ pub(super) fn changes(
     let history = history::recover(home, session, root, workspace)?;
     let path = ledger_path(home, root);
     let _lock = lock_ledger(&path)?;
-    let ledger = load_for_query(&path)?;
+    let mut ledger = load_for_query(&path)?;
+    let mut blocked = Vec::new();
+    for (token, pending) in &ledger.pending {
+        if pending.session != session {
+            continue;
+        }
+        let Some(operations) =
+            history.blocked_operations(root, workspace, pending.created_millis, token)?
+        else {
+            continue;
+        };
+        if operations.len() != pending.candidates.len() {
+            continue;
+        }
+        let mut matches = true;
+        for (file, candidate) in &pending.candidates {
+            let Some(edit) = operations.get(file) else {
+                matches = false;
+                break;
+            };
+            let before = head_entry(root, head, file)?;
+            if fingerprint(before.as_ref()) != candidate.before
+                || apply_edit(before.as_ref(), edit)
+                    .ok()
+                    .map(|entry| fingerprint(entry.as_ref()))
+                    != Some(candidate.claim.expected.clone())
+            {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            blocked.push(token.clone());
+        }
+    }
+    // 仅解除与原始拒绝回执及完整基线匹配的阻塞，不授予归属，也不改写账本。
+    for token in blocked {
+        ledger.pending.remove(&token);
+    }
     ensure!(
         !ledger
             .pending

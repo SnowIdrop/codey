@@ -270,6 +270,7 @@ struct Transcript {
     spawns: Vec<Spawn>,
     native_changes: Vec<(Value, i64, i64, usize)>,
     incomplete: bool,
+    denied: Vec<(String, Value, Value, String)>,
     bytes: u64,
 }
 
@@ -1343,6 +1344,7 @@ fn read_transcript_mode(home: &Path, raw: &Path, display_only: bool) -> Result<T
         ..Default::default()
     };
     let mut calls = HashMap::<String, (String, Value, Option<i64>, usize)>::new();
+    let mut turns = HashMap::<String, Value>::new();
     let mut seen = BTreeMap::new();
     let mut native_seen = BTreeSet::new();
     let mut captured = 0usize;
@@ -1502,11 +1504,27 @@ fn read_transcript_mode(home: &Path, raw: &Path, display_only: bool) -> Result<T
                     "对话编辑记录过多"
                 );
                 calls.insert(id.into(), (name, args, timestamp(&record), ordinal));
+                turns.insert(
+                    id.into(),
+                    payload["internal_chat_message_metadata_passthrough"]["turn_id"].clone(),
+                );
             }
         } else if matches!(kind, "function_call_output" | "custom_tool_call_output")
             && let Some((name, args, start, order)) = calls.remove(id)
         {
             let response = output(&payload["output"]);
+            if tracking::output_text(&response).is_some_and(|text| {
+                text.starts_with(
+                    "Tool call blocked by PreToolUse hook: CODEY_SUBAGENT_WORKSPACE_BUSY:",
+                ) && text
+                    .trim_end()
+                    .ends_with(&format!(". Tool: {}", name.replace('.', "__")))
+            }) && let Some(turn) = turns.remove(id).filter(|turn| turn.as_str().is_some())
+            {
+                result
+                    .denied
+                    .push((name.clone(), args.clone(), turn, id.into()));
+            }
             if name == "agents.spawn_agent" {
                 let value = if let Some(text) = response.as_str() {
                     serde_json::from_str::<Value>(text).ok()
@@ -1620,10 +1638,45 @@ fn child_paths(home: &Path, parent: &str, workspace: &Path) -> Result<Vec<(Strin
 #[derive(Default)]
 pub(super) struct History {
     files: BTreeMap<String, Vec<RecordedEdit>>,
+    blocked: Vec<(i64, i64, bool, Value)>,
+    blocked_tokens: BTreeSet<String>,
     incomplete: bool,
 }
 
 impl History {
+    pub(super) fn blocked_operations(
+        &self,
+        root: &Path,
+        workspace: &Path,
+        created_millis: u64,
+        token: &str,
+    ) -> Result<Option<BTreeMap<String, Edit>>> {
+        if !self.blocked_tokens.contains(token) {
+            return Ok(None);
+        }
+        let Ok(created) = i64::try_from(created_millis) else {
+            return Ok(None);
+        };
+        let matches: Vec<_> = self
+            .blocked
+            .iter()
+            .filter(|(start, end, _, _)| *start <= created && created <= *end)
+            .collect();
+        if created == 0 || matches.len() != 1 {
+            return Ok(None);
+        }
+        let (_, _, patch, args) = matches[0];
+        let operations = tracking::operations(root, workspace, *patch, args)?;
+        let mut result = BTreeMap::new();
+        for (path, edit) in operations {
+            ensure!(
+                result.insert(path, edit).is_none(),
+                "拒绝执行记录含重复文件范围"
+            );
+        }
+        Ok(Some(result))
+    }
+
     #[cfg(test)]
     pub(super) fn diagnostic_replay(&self, path: &str, before: Option<&Entry>) -> Vec<String> {
         let Some(records) = self.files.get(path) else {
@@ -2065,6 +2118,22 @@ fn recover_mode(
                 });
             }
         }
+        for (name, args, turn, call_id) in &transcript.denied {
+            if let Some((_, normalized)) = tracking::normalized_input(name, args)? {
+                for tool in [name.clone(), name.replace('.', "__")] {
+                    for call in [Value::Null, Value::String(call_id.clone())] {
+                        history.blocked_tokens.insert(tracking::observation_token(
+                            session,
+                            &actor,
+                            &tool,
+                            turn,
+                            &call,
+                            &normalized,
+                        ));
+                    }
+                }
+            }
+        }
         let mut running_formats = BTreeMap::new();
         let calls =
             transcript
@@ -2086,6 +2155,18 @@ fn recover_mode(
                     }
                 });
         for (mut name, mut args, response, mut start, end, mut ordinal) in calls {
+            // 执行前基线可能早于另一个门禁的拒绝；原始拒绝回执不产生文件归属。
+            if tracking::output_text(&response).is_some_and(|text| {
+                let tool = name.replace('.', "__");
+                text.starts_with(
+                    "Tool call blocked by PreToolUse hook: CODEY_SUBAGENT_WORKSPACE_BUSY:",
+                ) && text.trim_end().ends_with(&format!(". Tool: {tool}"))
+            }) && let Some((patch, normalized)) = tracking::normalized_input(&name, &args)?
+                && let Some((start, end)) = start.zip(end).filter(|(start, end)| start <= end)
+            {
+                history.blocked.push((start, end, patch, normalized));
+                continue;
+            }
             // 包装脚本里的补丁只用于补齐原生记录中被缩短的上下文，不额外产生归属。
             if name == "wrapped_patch" {
                 let patch = args.as_str().context("包装补丁缺少正文")?;

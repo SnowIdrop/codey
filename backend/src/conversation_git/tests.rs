@@ -1,6 +1,81 @@
 use super::*;
 
 #[test]
+fn gate_denied_edit_reconciles_only_exact_pending_call_without_granting_ownership() {
+    for scenario in [
+        "denied",
+        "different_turn",
+        "different_args",
+        "different_time",
+        "missing",
+        "failed",
+        "unrecorded",
+    ] {
+        let repo = Repo::new();
+        let args = json!({"path":repo.root.join("owned.txt"),"pattern":"old","replacement":"blocked","literal":true});
+        let hook = repo.hook(SESSION, "mcp__codey_fastctx__replace", args.clone());
+        let start = chrono::Utc::now() - chrono::Duration::seconds(1);
+        repo.observe(&hook).unwrap();
+        let turn = if scenario == "different_turn" {
+            json!(OTHER)
+        } else {
+            hook["turn_id"].clone()
+        };
+        let call_args = if scenario == "different_args" {
+            json!({"path":repo.root.join("owned.txt"),"pattern":"old","replacement":"another","literal":true})
+        } else {
+            args
+        };
+        let start = if scenario == "different_time" {
+            start - chrono::Duration::hours(1)
+        } else {
+            start
+        };
+        repo.append_record(SESSION, &json!({"timestamp":start.to_rfc3339(), "type":"response_item", "payload":{
+            "type":"function_call","namespace":"mcp__codey_fastctx","name":"replace","call_id":"denied-edit",
+            "arguments":call_args.to_string(),"internal_chat_message_metadata_passthrough":{"turn_id":turn}
+        }}));
+        if scenario != "missing" {
+            let end = if scenario == "different_time" {
+                start + chrono::Duration::seconds(1)
+            } else {
+                chrono::Utc::now() + chrono::Duration::seconds(1)
+            };
+            let output = if scenario == "failed" {
+                "编辑失败"
+            } else {
+                "Tool call blocked by PreToolUse hook: CODEY_SUBAGENT_WORKSPACE_BUSY: 活动任务已占用该文件，本次工具未执行。. Tool: mcp__codey_fastctx__replace"
+            };
+            repo.append_record(
+                SESSION,
+                &json!({"timestamp":end.to_rfc3339(), "type":"response_item", "payload":{
+                    "type":"function_call_output","call_id":"denied-edit","output":output
+                }}),
+            );
+        }
+        repo.old_patch(SESSION, "owned.txt", "old", "new", 1);
+        if scenario == "unrecorded" {
+            fs::write(repo.root.join("owned.txt"), "new\nunknown\n").unwrap();
+        }
+        let ledger_path = repo.home.join("codey-conversation-git-v2").join(format!(
+            "{}.json",
+            digest(repo.root.as_os_str().as_encoded_bytes())
+        ));
+        let ledger_before = fs::read(&ledger_path).unwrap();
+        let prepared = snapshot(&repo.home, SESSION);
+        assert_eq!(prepared.is_ok(), scenario == "denied", "{scenario}");
+        if let Ok(prepared) = prepared {
+            assert_eq!(prepared.changes[0].after.as_ref().unwrap().bytes, b"new\n");
+        }
+        assert_eq!(
+            fs::read(ledger_path).unwrap(),
+            ledger_before,
+            "查询不得制造完成回执或修改基线"
+        );
+    }
+}
+
+#[test]
 #[ignore = "仅由格式化子进程测试启动"]
 fn formatter_process_child() {
     let Some(marker) = std::env::var_os("CODEY_FORMATTER_TEST_MARKER") else {
