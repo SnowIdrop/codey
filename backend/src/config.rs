@@ -2181,6 +2181,42 @@ impl CodeyConfig {
         )
     }
 
+    /// Native display names keyed by the route-qualified runtime catalog id.
+    ///
+    /// Codex renders this field directly in places Codey cannot patch, such as
+    /// the synthetic model-change divider. Raw ids keep the native official
+    /// names so a single-account setup stays unchanged; aliased ids gain the
+    /// same `[短名] 模型名` form the Codey model menu already shows.
+    pub(crate) fn runtime_catalog_display_names(&self) -> BTreeMap<String, String> {
+        let qualify_official = self.qualifies_official_model_ids();
+        let mut names = BTreeMap::new();
+        for profile in &self.profiles {
+            if !profile.enabled {
+                continue;
+            }
+            let provider_id = profile.provider_id();
+            if profile.official_account {
+                if !self.official_route_usable(profile) {
+                    continue;
+                }
+                for model in self.enabled_official_route_models(provider_id) {
+                    let id = runtime_catalog_model_id(profile, &model, qualify_official);
+                    if id.contains('/') {
+                        names.insert(id, route_model_display_name(profile, &model));
+                    }
+                }
+                continue;
+            }
+            for model in self.enabled_route_models(provider_id) {
+                names.insert(
+                    local_router::model_alias(provider_id, &model),
+                    route_model_display_name(profile, &model),
+                );
+            }
+        }
+        names
+    }
+
     /// Catalog id of one runtime model target. It matches the ids produced by
     /// `runtime_catalog_models` so the default model always names a model that
     /// Codex can find in the generated catalog.
@@ -2416,6 +2452,12 @@ fn runtime_catalog_model_id(
     } else {
         local_router::model_alias(profile.provider_id(), model)
     }
+}
+
+/// One line for the Codex model picker and other native surfaces: route short
+/// name plus the upstream model, without the internal provider selector.
+fn route_model_display_name(profile: &ProviderProfile, model: &str) -> String {
+    format!("[{}] {}", profile.display_short_name(), model.trim())
 }
 
 fn model_references_provider(model: &str, provider_id: &str) -> bool {
@@ -3637,6 +3679,54 @@ mod tests {
                 "relay/shared-model",
                 "relay/manual-model",
             ]
+        );
+    }
+
+    #[test]
+    fn runtime_catalog_display_names_use_route_short_names_for_aliased_ids() {
+        let mut first = ProviderProfile::new("Official");
+        first.id = "codey-official-account-one".into();
+        first.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        first.official_account_id = Some("acct-one".into());
+        first.short_name = "main".into();
+        first.normalize();
+
+        let mut second = ProviderProfile::new("Official Two");
+        second.id = "codey-official-account-two".into();
+        second.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        second.official_account_id = Some("acct-two".into());
+        second.short_name = "alt".into();
+        second.normalize();
+
+        let mut relay = ProviderProfile::new("Relay");
+        relay.id = "relay".into();
+        relay.short_name = "pro".into();
+        relay.base_url = "https://relay.example/v1".into();
+        relay.api_key = "relay-key".into();
+        relay.normalize();
+
+        let mut config = CodeyConfig {
+            active_profile_id: first.id.clone(),
+            profiles: vec![first, second, relay],
+            local_router_enabled: true,
+            official_account_available_this_launch: true,
+            ..CodeyConfig::default()
+        };
+        config
+            .selected_models_by_provider
+            .insert("relay".into(), vec!["shared-model".into()]);
+
+        let names = config.runtime_catalog_display_names();
+
+        assert_eq!(
+            names.get("relay/shared-model").map(String::as_str),
+            Some("[pro] shared-model")
+        );
+        assert_eq!(
+            names
+                .get("codey-official-account-one/gpt-5.6-sol")
+                .map(String::as_str),
+            Some("[main] gpt-5.6-sol")
         );
     }
 

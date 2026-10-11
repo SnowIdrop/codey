@@ -346,7 +346,8 @@
       routedModel = cleanText(route?.sourceModel) || model;
     }
     const next = { ...source };
-    if (routedModel || Object.hasOwn(source, "model")) next.model = routedModel;
+    // null 表示沿用对话模型；空字符串会让 app-server 报没有可用模型。
+    if (routedModel) next.model = routedModel;
     delete next.model_provider;
     if (threadProviderRequestMethods.has(method)) {
       next.modelProvider = routedProviderId;
@@ -2544,7 +2545,8 @@
   const patchedRequestParams = (method, params) => {
     if (!modelBoundRequestMethods.has(method)) return params;
     let source = params && typeof params === "object" ? params : {};
-    const hasModelOverride = Object.hasOwn(source, "model");
+    const hasModelOverride = Object.hasOwn(source, "model")
+      && (method === "thread/settings/update" || source.model != null);
     const restoredBinding = !hasModelOverride && (method === "thread/resume" || method === "thread/fork" || method === "turn/start")
       ? threadRoutes.get(threadIdFromParams(source)) : null;
     if (restoredBinding) source = { ...source, model: restoredBinding.sourceModel };

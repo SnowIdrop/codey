@@ -715,6 +715,7 @@ async fn prepare_startup_model_catalog(
     let runtime_model_reasoning_efforts = config.runtime_model_reasoning_efforts();
     let runtime_model_contexts = config.runtime_model_contexts();
     let runtime_plugin_model_contexts = config.runtime_plugin_model_contexts();
+    let runtime_display_names = config.runtime_catalog_display_names();
     let plugin_context = !runtime_plugin_model_contexts.is_empty();
     let custom_context = !runtime_model_contexts.is_empty();
     let refresh_official_provider =
@@ -773,6 +774,7 @@ async fn prepare_startup_model_catalog(
                     plugin_contexts: &runtime_plugin_model_contexts,
                     contexts: &runtime_model_contexts,
                     reasoning_efforts: &runtime_model_reasoning_efforts,
+                    display_names: &runtime_display_names,
                 },
                 &catalog_codex_app_path,
             );
@@ -791,6 +793,7 @@ async fn prepare_startup_model_catalog(
                                 plugin_contexts: &runtime_plugin_model_contexts,
                                 contexts: &runtime_model_contexts,
                                 reasoning_efforts: &runtime_model_reasoning_efforts,
+                                display_names: &runtime_display_names,
                             },
                         )?;
                     }

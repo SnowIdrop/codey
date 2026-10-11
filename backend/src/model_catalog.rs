@@ -235,6 +235,9 @@ pub(crate) struct CatalogOverrides<'a> {
     pub(crate) contexts: &'a std::collections::BTreeMap<String, crate::config::ModelContextConfig>,
     pub(crate) reasoning_efforts:
         &'a std::collections::BTreeMap<String, Vec<crate::config::ModelReasoningEffort>>,
+    /// Route-qualified model id to native display name. Codex shows this field
+    /// in surfaces Codey cannot patch, so aliased ids must not read as raw ids.
+    pub(crate) display_names: &'a std::collections::BTreeMap<String, String>,
 }
 
 #[cfg(test)]
@@ -426,6 +429,15 @@ fn apply_overrides_to_models(models: &mut [Value], overrides: CatalogOverrides<'
                 .map(|(_, efforts)| efforts.as_slice())
         });
         apply_model_reasoning_efforts(model, declaration);
+        if let Some(display_name) = model.get("slug").and_then(Value::as_str).and_then(|slug| {
+            overrides
+                .display_names
+                .iter()
+                .find(|(key, _)| model_id::equal(key, slug))
+                .map(|(_, name)| name)
+        }) {
+            model["display_name"] = json!(display_name);
+        }
     }
     Ok(())
 }
@@ -2623,6 +2635,7 @@ fn removing_context_override_restores_the_original_model_budget() {
                 plugin_contexts: &empty,
                 contexts: overrides,
                 reasoning_efforts: &Default::default(),
+                display_names: &Default::default(),
             },
         )
         .unwrap();
@@ -3433,6 +3446,7 @@ mod tests {
             plugin_contexts: &Default::default(),
             contexts: &contexts,
             reasoning_efforts: &efforts,
+            display_names: &Default::default(),
         };
         staged_catalog_refresh(staged.path(), &selected, overrides);
         refresh_for_provider_with_contexts(
@@ -3459,6 +3473,7 @@ mod tests {
                 plugin_contexts: &Default::default(),
                 contexts: &contexts,
                 reasoning_efforts: &no_efforts,
+                display_names: &Default::default(),
             },
         )
         .unwrap();
@@ -3466,6 +3481,70 @@ mod tests {
             fs::read(staged.path().join(relative_path())).unwrap(),
             fs::read(combined.path().join(relative_path())).unwrap()
         );
+    }
+
+    #[test]
+    fn route_display_names_replace_raw_route_ids_in_the_generated_catalog() {
+        // Codex renders this field in the model picker and the model-change
+        // divider; a route alias there reads as a long internal id.
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+        let selected = vec![
+            "route/gpt-5.6-sol".to_string(),
+            "route/custom-model".to_string(),
+        ];
+        let display_names = std::collections::BTreeMap::from([
+            (
+                "route/gpt-5.6-sol".to_string(),
+                "[ro] gpt-5.6-sol".to_string(),
+            ),
+            (
+                "route/custom-model".to_string(),
+                "[ro] custom-model".to_string(),
+            ),
+        ]);
+        refresh_for_provider_with_contexts(
+            home.path(),
+            false,
+            Some(&selected),
+            &selected,
+            CapabilityLists::default(),
+            CatalogOverrides {
+                plugin_contexts: &Default::default(),
+                contexts: &Default::default(),
+                reasoning_efforts: &Default::default(),
+                display_names: &display_names,
+            },
+            "",
+        )
+        .unwrap();
+        for model in read_runtime_catalog_models(home.path()).unwrap() {
+            let slug = model["slug"].as_str().unwrap();
+            assert_eq!(
+                model["display_name"].as_str().unwrap(),
+                display_names[slug].as_str(),
+                "unexpected display name for {slug}"
+            );
+        }
+        // Reusing the cached catalog must keep the same display names instead
+        // of restoring the raw route ids.
+        apply_catalog_overrides(
+            home.path(),
+            CatalogOverrides {
+                plugin_contexts: &Default::default(),
+                contexts: &Default::default(),
+                reasoning_efforts: &Default::default(),
+                display_names: &display_names,
+            },
+        )
+        .unwrap();
+        for model in read_runtime_catalog_models(home.path()).unwrap() {
+            let slug = model["slug"].as_str().unwrap();
+            assert_eq!(
+                model["display_name"].as_str().unwrap(),
+                display_names[slug].as_str()
+            );
+        }
     }
 
     #[test]
@@ -3497,6 +3576,7 @@ mod tests {
             plugin_contexts: &Default::default(),
             contexts: &contexts,
             reasoning_efforts: &efforts,
+            display_names: &Default::default(),
         };
         assert!(
             refresh_for_provider_with_contexts(
@@ -3550,6 +3630,7 @@ mod tests {
             plugin_contexts: &Default::default(),
             contexts: &contexts,
             reasoning_efforts: &efforts,
+            display_names: &Default::default(),
         };
         let mut staged_us = Vec::new();
         let mut combined_us = Vec::new();
@@ -5948,6 +6029,7 @@ fn plugin_context_defaults_yield_to_users_and_restore_after_override_removal() {
             plugin_contexts: &plugin,
             contexts: &empty,
             reasoning_efforts: &reasoning,
+            display_names: &Default::default(),
         },
     )
     .unwrap();
@@ -5959,6 +6041,7 @@ fn plugin_context_defaults_yield_to_users_and_restore_after_override_removal() {
             plugin_contexts: &plugin,
             contexts: &user,
             reasoning_efforts: &reasoning,
+            display_names: &Default::default(),
         },
     )
     .unwrap();
@@ -5970,6 +6053,7 @@ fn plugin_context_defaults_yield_to_users_and_restore_after_override_removal() {
             plugin_contexts: &plugin,
             contexts: &empty,
             reasoning_efforts: &reasoning,
+            display_names: &Default::default(),
         },
     )
     .unwrap();

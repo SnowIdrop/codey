@@ -4557,6 +4557,30 @@ test("the catalog load retries when the bridge appears after injection", async (
   runtime.patch.dispose();
 });
 
+test("cold resume and fork preserve null models before and after the catalog arrives", async () => {
+  const runtime = await loadPatch({
+    status: "ok", models: ["unrelated"], default_model: "unrelated",
+  }, [statsigClient()], { bridgeReady: false });
+  for (const loaded of [false, true]) {
+    if (loaded) {
+      runtime.connectBridge();
+      await runtime.runNextTimer();
+    }
+    for (const method of ["thread/resume", "thread/fork"]) {
+      for (const modelParams of [{ model: null }, {}]) {
+        const params = Object.freeze({ threadId: "cold", ...modelParams });
+        const rewritten = runtime.patch.rewriteOutgoingMessage({
+          type: "mcp-request", request: { method, params },
+        }).request.params;
+        assert.equal(rewritten.model, modelParams.model);
+        assert.equal(Object.hasOwn(rewritten, "model"), Object.hasOwn(modelParams, "model"));
+        assert.equal(rewritten.modelProvider, "codey_router");
+      }
+    }
+  }
+  runtime.patch.dispose();
+});
+
 test("failed catalog responses preserve the native allowlist", async () => {
   const client = statsigClient();
   const { patch } = await loadPatch({
@@ -4656,6 +4680,27 @@ test("persisted encoded aliases recover on a fresh renderer and history-only ref
   } }, [statsigClient()]);
   assert.equal(reopened.patch.rewriteOutgoingMessage(original).request.params.model, "new%2Froute/vendor/model");
   reopened.patch.dispose();
+});
+
+test("a null-model resume restores its saved route instead of selecting the global default", async () => {
+  const storage = memoryStorage();
+  storage.setItem("codey.thread-route-bindings.v1", JSON.stringify([
+    ["restored", { routeProviderId: "current", sourceModel: "vendor/model" }],
+  ]));
+  const catalog = historicalRouteCatalog(["current"]);
+  const unrelated = historicalRouteCatalog(["another"], "different-model");
+  const runtime = await loadPatch({
+    ...catalog, models: [...unrelated.models, ...catalog.models],
+    default_model: unrelated.default_model,
+    model_metadata: [...unrelated.model_metadata, ...catalog.model_metadata],
+  }, [statsigClient()], { storage });
+  const resumed = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request", request: { method: "thread/resume", params: {
+      threadId: "restored", model: null, modelProvider: "codey_router",
+    } },
+  });
+  assert.equal(resumed.request.params.model, "current/vendor/model");
+  runtime.patch.dispose();
 });
 
 test("a model-less resume restores and persists the same model after its route disappears", async () => {
