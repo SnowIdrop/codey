@@ -984,9 +984,11 @@ fn wrapped_rustfmt_after_readonly_checks_recovers_format() {
             1,
         ),
     );
+    // 使用简单 shell 路径，避免 Windows 规范化路径的前缀和反斜杠。
+    let directory = repo.root.to_string_lossy().replace('\\', "/");
+    let directory = directory.strip_prefix("//?/").unwrap_or(&directory);
     let command = format!(
-        "cd {} && git diff --stat && rustfmt --edition 2024 owned.rs 2>&1 | head -5; git diff --stat",
-        repo.root.display()
+        "cd {directory} && git diff --stat && rustfmt --edition 2024 owned.rs 2>&1 | head -5; git diff --stat"
     );
     repo.append_record(
         SESSION,

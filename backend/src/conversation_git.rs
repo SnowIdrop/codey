@@ -1612,7 +1612,12 @@ mod io_tests {
             let deleted = change("deleted", "100644", b"old");
             stage(&index, root, &[deleted]).unwrap();
             fs::write(root.join(".gitattributes"), b"* text eol=lf\n").unwrap();
-            let path = "space \t\n中文.txt";
+            // Git for Windows 会忽略含控制字符的非法文件名；Unix 继续覆盖制表符和换行符。
+            let path = if cfg!(windows) {
+                "space 中文.txt"
+            } else {
+                "space \t\n中文.txt"
+            };
             let bytes = b"after\r\n\0partial";
             let changes = vec![
                 change(path, "100755", bytes),
