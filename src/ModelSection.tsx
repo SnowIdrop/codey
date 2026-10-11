@@ -1659,7 +1659,7 @@ function ModelSectionComponent({
                               <IconArchive size={14} />
                             </span>
                             <strong className="route-option-title">原生远程压缩</strong>
-                            <Tooltip content="仅在上游明确支持时开启，并选择服务商支持的压缩接口；该线路可独立使用远程压缩，能力变更需重启 Codex。">
+                            <Tooltip content="仅在上游明确支持时开启，并选择服务商支持的压缩接口；未声明原生支持的线路由网关按等价方式压缩。">
                               <span className="route-option-info-trigger" aria-label="原生远程压缩详细说明">
                                 <IconInfoCircle size={13} />
                               </span>
@@ -1675,7 +1675,7 @@ function ModelSectionComponent({
                           />
                         </div>
                         <p className="route-field-hint">
-                          支持的线路独立启用；会话切换压缩方式需重启 Codex 或新建任务
+                          声明该线路是否原生支持远程压缩；未声明的线路由网关按等价方式压缩
                         </p>
                         {routeDraft.supportsRemoteCompaction && (
                           <div className="route-option-subpanel">

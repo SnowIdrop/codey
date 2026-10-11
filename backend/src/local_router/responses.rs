@@ -1755,27 +1755,41 @@ impl RouterServer {
                 subagent_request,
             );
         }
-        if compacting && !resolved.route.supports_remote_compaction {
-            return downstream
-                .write_error(
-                    400,
-                    "compaction_unsupported",
-                    "当前线路未启用原生远程压缩，请使用 Codex 本地摘要".into(),
-                    Some(&resolved.route),
-                )
-                .await;
-        }
-        if bridge != ProtocolBridge::NativeResponses {
-            if compacting {
+        let native_compaction = compacting
+            && resolved.route.supports_remote_compaction
+            && bridge == ProtocolBridge::NativeResponses;
+        match restore_codey_compaction_summaries(&mut body) {
+            Ok(true) => {
+                body_mutated = true;
+                encoded_body = None;
+            }
+            Ok(false) => {}
+            Err(error) => {
                 return downstream
                     .write_error(
                         400,
-                        "compaction_unsupported",
-                        "当前线路不支持原生远程压缩，请使用 Codex 本地摘要".into(),
+                        "context_not_portable",
+                        error.to_string(),
                         Some(&resolved.route),
                     )
                     .await;
             }
+        }
+        if compacting && !native_compaction {
+            if let Err(error) = prepare_gateway_compaction(&mut body) {
+                return downstream
+                    .write_error(
+                        400,
+                        "unsupported_responses_payload",
+                        error.to_string(),
+                        Some(&resolved.route),
+                    )
+                    .await;
+            }
+            body_mutated = true;
+            encoded_body = None;
+        }
+        if bridge != ProtocolBridge::NativeResponses {
             if let Err(error) = validate_portable_context(&body) {
                 return downstream
                     .write_error(
@@ -1821,6 +1835,23 @@ impl RouterServer {
             // Expansion changed the input too; do not reuse its original raw
             // JSON slice, which would contain only the latest delta.
             encoded_body = None;
+        }
+        match restore_codey_compaction_summaries(&mut body) {
+            Ok(true) => {
+                body_mutated = true;
+                encoded_body = None;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return downstream
+                    .write_error(
+                        400,
+                        "context_not_portable",
+                        error.to_string(),
+                        Some(&resolved.route),
+                    )
+                    .await;
+            }
         }
         if bridge == ProtocolBridge::NativeResponses
             && route_changed
@@ -1876,13 +1907,16 @@ impl RouterServer {
                 .insert("stream".to_string(), Value::Bool(true));
             body_mutated = true;
         }
-        let compact_endpoint_compat = compacting
+        let compact_endpoint_compat = native_compaction
             && request_kind == ResponsesRequestKind::Create
             && !resolved.route.official_account
             && resolved.route.remote_compaction_protocol
                 == crate::config::RemoteCompactionProtocol::CompactEndpoint;
         let upstream_url = match (request_kind, compact_endpoint_compat) {
-            (ResponsesRequestKind::Compact, _) | (_, true) => &resolved.route.upstream_compact_url,
+            (ResponsesRequestKind::Compact, _) if native_compaction => {
+                &resolved.route.upstream_compact_url
+            }
+            (_, true) => &resolved.route.upstream_compact_url,
             _ => &resolved.route.upstream_url,
         };
         let upstream_url = match upstream_url {
@@ -2165,6 +2199,11 @@ impl RouterServer {
             // A failed/reconnected WebSocket can restore full history after the
             // first normalization pass. Validate and normalize the exact body
             // that will be sent through the HTTP fallback as well.
+            match restore_codey_compaction_summaries(&mut upstream_body) {
+                Ok(true) => { body_mutated = true; encoded_body = None; }
+                Ok(false) => {}
+                Err(error) => return downstream.write_error(400, "context_not_portable", error.to_string(), Some(&resolved.route)).await,
+            }
             if route_changed && let Err(error) = validate_cross_route_context(&upstream_body) {
                 return downstream
                     .write_error(
@@ -2490,6 +2529,9 @@ impl RouterServer {
         }
         // 首次错误正文已经读完且没有重发时，直接把它写回下游。
         let Some(response) = upstream_response else {
+            if compacting && !native_compaction {
+                return write_gateway_compaction_http_error(downstream, preloaded_error_body.as_deref().unwrap_or_default(), &resolved.route).await;
+            }
             return write_upstream_http_error(
                 downstream,
                 UpstreamHttpErrorResponse {
@@ -2517,6 +2559,9 @@ impl RouterServer {
                 .await
                 {
                     Ok(Ok(body)) => {
+                        if compacting && !native_compaction {
+                            return write_gateway_compaction_http_error(downstream, &body, &resolved.route).await;
+                        }
                         write_upstream_http_error(
                             downstream,
                             UpstreamHttpErrorResponse {
@@ -2539,6 +2584,10 @@ impl RouterServer {
                 }
             }
             _ if compacting => {
+                if !native_compaction {
+                    write_gateway_compaction(downstream, response, bridge, &resolved.upstream_model,
+                        stream_requested, &resolved.route, &tool_bridge).await
+                } else {
                 write_validated_compaction(
                     downstream,
                     response,
@@ -2553,6 +2602,7 @@ impl RouterServer {
                     &resolved.route,
                 )
                 .await
+                }
             }
             ProtocolBridge::ResponsesToAnthropicMessages
             | ProtocolBridge::ResponsesToChatCompletions => {

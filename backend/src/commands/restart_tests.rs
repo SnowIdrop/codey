@@ -515,7 +515,7 @@ fn renderer_model_catalog_routes_official_account_models_through_the_codey_route
     assert_eq!(catalog["default_model"], "gpt-5.6-sol");
     assert_eq!(
         catalog["model_provider"],
-        crate::local_router::REMOTE_COMPACTION_PROVIDER_ID
+        crate::local_router::ROUTER_PROVIDER_ID
     );
     assert_eq!(
         catalog["model_metadata"][0],
@@ -524,7 +524,7 @@ fn renderer_model_catalog_routes_official_account_models_through_the_codey_route
             "display_name": "[默认] gpt-5.6-sol",
             "route_name": "默认配置",
             "route_prefix": "默认",
-            "provider_id": crate::local_router::REMOTE_COMPACTION_PROVIDER_ID,
+            "provider_id": crate::local_router::ROUTER_PROVIDER_ID,
             "supports_remote_compaction": true,
             "source_model": "gpt-5.6-sol",
             "official_account": true,

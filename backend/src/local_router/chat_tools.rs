@@ -133,6 +133,9 @@ pub(crate) fn append_chat_message_item(
     messages: &mut Vec<Value>,
     tool_bridge: &mut ResponsesToolBridge,
 ) -> Result<()> {
+    if let Some(message) = codey_summary_message(item)? {
+        return append_chat_message_item(&message, messages, tool_bridge);
+    }
     match item {
         Value::String(text) => push_chat_text_message(messages, "user", text),
         Value::Object(object) => match object.get("type").and_then(Value::as_str) {

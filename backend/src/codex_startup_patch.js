@@ -1116,29 +1116,7 @@
   const localRouterProviderIds = new Set(["codey_router", "codey_router_remote"]);
   const defaultRouterProvider = runtimeConfigValue(nativeRuntimeConfigOverrides, "model_provider");
   const localRouterRuntimeEnabled = localRouterProviderIds.has(defaultRouterProvider);
-  const routerProviderForParams = (method, params) => {
-    const requestedModel = typeof params?.model === "string" ? params.model.trim() : "";
-    // Resume/fork inherit their model from history. A saved carrier or the
-    // launch default does not prove that history's route still supports compact.
-    if (!requestedModel && method !== "thread/start") return "codey_router";
-    const model = requestedModel || runtimeConfigValue(nativeRuntimeConfigOverrides, "model");
-    if (!model) return defaultRouterProvider;
-    const catalogPath = runtimeConfigValue(nativeRuntimeConfigOverrides, "model_catalog_json");
-    // Built-in-catalog launches have no model metadata file. Only an all-capable
-    // launch may default to remote; a renderer-selected carrier stays explicit.
-    if (!catalogPath) return localRouterProviderIds.has(params?.modelProvider)
-      ? params.modelProvider : defaultRouterProvider;
-    try {
-      const catalog = JSON.parse(process.getBuiltinModule("fs").readFileSync(catalogPath, "utf8"));
-      const entry = catalog.models?.find((entry) => (
-        typeof entry.slug === "string" && entry.slug.trim().toLowerCase() === String(model).trim().toLowerCase()
-      ));
-      if (entry?.codey_remote_compaction === true) return "codey_router_remote";
-    } catch {
-      // An unknown model has no verified remote compaction route.
-    }
-    return "codey_router";
-  };
+  const routerProviderForParams = () => "codey_router";
   if (localRouterRuntimeEnabled) {
     // A shared daemon or external WebSocket can retain another provider and
     // never read this launch's overrides. Use Codex's own process-local mode.

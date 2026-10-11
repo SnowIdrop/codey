@@ -1660,13 +1660,9 @@ impl CodeyConfig {
 
     pub(crate) fn runtime_gateway_provider_id_for_profile(
         &self,
-        profile: &ProviderProfile,
+        _profile: &ProviderProfile,
     ) -> &'static str {
-        if self.route_supports_remote_compaction_this_launch(profile) {
-            local_router::REMOTE_COMPACTION_PROVIDER_ID
-        } else {
-            local_router::ROUTER_PROVIDER_ID
-        }
+        local_router::ROUTER_PROVIDER_ID
     }
 
     /// Whether a route can use upstream Responses WebSocket this launch.
@@ -1837,7 +1833,7 @@ impl CodeyConfig {
             && profile.upstream_protocol == UPSTREAM_PROTOCOL_OPENAI_RESPONSES
     }
 
-    /// 这里只汇总可用能力；会话通过独立 Provider 选择压缩方式。
+    /// 这里只汇总可用能力；压缩方式由网关按所选线路热切换。
     pub(crate) fn runtime_supports_remote_compaction(&self) -> bool {
         self.remote_compaction_runtime_profiles()
             .any(|profile| self.route_supports_remote_compaction_this_launch(profile))
@@ -4018,7 +4014,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_compaction_uses_separate_providers_for_mixed_routes() {
+    fn remote_compaction_uses_one_provider_for_mixed_routes() {
         let mut capable = ProviderProfile::new("Responses Route");
         capable.id = "route-capable".into();
         capable.base_url = "https://responses.example/v1".into();
@@ -4046,7 +4042,7 @@ mod tests {
         assert_eq!(config.remote_compaction_mode(), "mixed");
         assert_eq!(
             config.runtime_gateway_provider_id_for_profile(&config.profiles[0]),
-            local_router::REMOTE_COMPACTION_PROVIDER_ID
+            local_router::ROUTER_PROVIDER_ID
         );
         assert_eq!(
             config.runtime_gateway_provider_id_for_profile(&config.profiles[1]),

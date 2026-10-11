@@ -28,6 +28,7 @@ pub(crate) struct RuntimeRouterEndpoint {
     pub base_url: String,
     pub token: String,
     pub supports_websockets: bool,
+    /// 至少一条线路支持原生远程压缩；不影响统一 Provider 的选择。
     pub supports_remote_compaction: bool,
     /// Official ChatGPT routes are available this launch. Codex keeps its
     /// native OpenAI login for this provider; the independent router header
@@ -215,8 +216,7 @@ impl LocalRouter {
             base_url: format!("http://127.0.0.1:{port}/v1"),
             token,
             supports_websockets: config.runtime_supports_websockets(),
-            // 未携带线路信息的原生会话只在全部线路兼容时默认使用远程压缩。
-            supports_remote_compaction: config.remote_compaction_mode() == "remote",
+            supports_remote_compaction: config.runtime_supports_remote_compaction(),
             requires_openai_auth: config.router_requires_openai_auth(),
         };
         let snapshot = Arc::new(RwLock::new(Arc::new(RouterSnapshot::from_config(config))));

@@ -462,6 +462,9 @@ fn replayable_reasoning_item(item: &Value) -> bool {
 fn validate_native_tool_history(input: &[Value], restoring: bool) -> Result<()> {
     let mut calls = HashSet::new();
     for item in input {
+        if codey_summary_message(item)?.is_some() {
+            continue;
+        }
         let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
         // compaction_trigger is a request instruction, not a history reference.
         match kind {

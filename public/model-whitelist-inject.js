@@ -1,11 +1,11 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "65";
+  const patchVersion = "66";
   const nativeSelectionOnly = window.__codeyNativeModelSelectionOnly === true;
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
-  const remoteCompactionProviderId = "codey_router_remote";
-  const routerProviderIds = new Set([localRouterProviderId, remoteCompactionProviderId]);
+  const legacyRemoteCompactionProviderId = "codey_router_remote";
+  const routerProviderIds = new Set([localRouterProviderId, legacyRemoteCompactionProviderId]);
   const legacyOfficialRouteProviderIds = new Set([
     officialProviderId,
     "local-official",
@@ -13,7 +13,7 @@
   const gatewayProviderIds = new Set([
     officialProviderId,
     localRouterProviderId,
-    remoteCompactionProviderId,
+    legacyRemoteCompactionProviderId,
   ]);
   const existingPatch = window.__codeyModelWhitelistPatch;
   if (existingPatch?.version === patchVersion
@@ -111,7 +111,7 @@
   const threadRuntimeProviders = new Map();
   const unconfirmedThreadProviders = new Set();
   const threadRoutes = new Map();
-  // A blocked mode change is an intent for the next process, not an active
+  // A blocked provider migration is an intent for the next process, not an active
   // binding. Keep it separate so reopening a loaded thread cannot fake migration.
   const threadRequestedRoutes = new Map();
   const pendingThreadRequests = new Map();
@@ -279,6 +279,8 @@
   );
   const providersAreCompatible = (method, currentProviderId, targetProviderId, threadId) => (
     modelKey(currentProviderId) === modelKey(targetProviderId)
+    || (routerProviderIds.has(modelKey(currentProviderId))
+      && routerProviderIds.has(modelKey(targetProviderId)))
     || (
       method === "thread/resume"
       && routerProviderIds.has(modelKey(targetProviderId))
@@ -333,8 +335,7 @@
     const currentProviderId = providerBoundExistingThreadMethods.has(method)
       ? (threadId ? knownThreadProvider(source) : paramsProviderId(source))
       : "";
-    const routedProviderId = route?.supportsRemoteCompaction === true
-      ? remoteCompactionProviderId : localRouterProviderId;
+    const routedProviderId = localRouterProviderId;
     const turnSendsUpstreamModel = method === "turn/start" && Boolean(routeProviderId);
     const officialRoute = isOfficialRoute(route);
     let routedModel = model;
@@ -376,11 +377,12 @@
     }
     let blocked = false;
     if (providerBoundExistingThreadMethods.has(method) && routedProviderId) {
-      // Only an unloaded thread can adopt a provider during resume. Turn and
-      // settings requests cannot change the running thread's compaction mode.
+      // Only an unloaded thread can migrate from an external provider during
+      // resume. Both Codey provider IDs share the same gateway carrier.
       if (
         threadId
-        && ((method !== "thread/resume" && unconfirmedThreadProviders.has(threadId)) || (!currentProviderId
+        && ((method !== "thread/resume" && unconfirmedThreadProviders.has(threadId)
+          && !routerProviderIds.has(modelKey(currentProviderId))) || (!currentProviderId
           ? method !== "thread/resume"
           : !providersAreCompatible(method, currentProviderId, routedProviderId, threadId)))
       ) {
@@ -392,8 +394,7 @@
           targetProviderId: routedProviderId,
           currentProviderId,
           routeName: cleanText(route?.routeName),
-          reason: routerProviderIds.has(modelKey(currentProviderId))
-            ? "compaction_mode_change_required" : "provider_migration_required",
+          reason: "provider_migration_required",
         });
         if (routeProviderId) rememberBoundedThreadRoute(
           threadId, route, threadRequestedRoutes, persistedRequestedRoutesKey,
@@ -497,7 +498,7 @@
           routeName,
           officialAccount: metadataBoolean(metadata, "official_account"),
           supportsRemoteCompaction: typeof metadata?.supports_remote_compaction === "boolean"
-            ? metadata.supports_remote_compaction : modelKey(providerId) === remoteCompactionProviderId,
+            ? metadata.supports_remote_compaction : modelKey(providerId) === legacyRemoteCompactionProviderId,
         }];
       }).filter(([, route]) => (
         route.providerId && route.routeProviderId && route.sourceModel
@@ -2944,9 +2945,7 @@
     const blocked = blockedProviderRequest(detail);
     if (!blocked) return false;
     const target = blocked.routeName || "所选线路";
-    const message = blocked.message || (blocked.reason === "compaction_mode_change_required"
-      ? `切换到 ${target} 需要更换会话的压缩方式。已记住所选线路，请重启 Codex 后恢复任务，或用该线路新建任务。`
-      : `暂时无法确认此任务的线路配置。请重启 Codex 后恢复任务，或用 ${target} 新建任务。`);
+    const message = blocked.message || `暂时无法确认此任务的线路配置。请重启 Codex 后恢复任务，或用 ${target} 新建任务。`;
     console.warn("[Codey] provider migration required before routed turn", blocked);
     try {
       const noticeId = "codey-provider-mismatch-notice";
@@ -3120,7 +3119,7 @@
         const routed = rewrittenOutgoingMessage({ type: "mcp-request", request: { method, params } });
         if (blockedProviderRequest(routed)) {
           showBlockedProviderNotice(routed);
-          return Promise.reject(new Error("Codey blocked incompatible compaction mode"));
+          return Promise.reject(new Error("Codey blocked provider migration"));
         }
         return enqueue.call(this, routed.request.method, routed.request.params, ...args);
       },

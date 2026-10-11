@@ -8020,7 +8020,7 @@ async fn adapted_agent_payloads_are_rejected_before_sending() {
 }
 
 #[tokio::test]
-async fn responses_compact_rejects_adapted_routes_before_sending() {
+async fn responses_rejects_opaque_compaction_on_adapted_routes_before_sending() {
     for protocol in [
         crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
         crate::config::UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES,
@@ -8032,23 +8032,11 @@ async fn responses_compact_rejects_adapted_routes_before_sending() {
         config.profiles[0].normalize();
         let router = LocalRouter::start(&config).await.unwrap();
         let endpoint = router.endpoint();
-        for (path, input, code) in [
-            (
-                "responses/compact",
-                json!("full context"),
-                "compaction_unsupported",
-            ),
-            (
-                "responses",
-                json!([{"type":"compaction_trigger"}]),
-                "compaction_unsupported",
-            ),
-            (
-                "responses",
-                json!([{"role":"user","content":"continue"},{"type":"compaction","encrypted_content":"opaque"}]),
-                "context_not_portable",
-            ),
-        ] {
+        for (path, input, code) in [(
+            "responses",
+            json!([{"role":"user","content":"continue"},{"type":"compaction","encrypted_content":"opaque"}]),
+            "context_not_portable",
+        )] {
             let response = reqwest::Client::new()
                 .post(format!("{}/{path}", endpoint.base_url))
                 .bearer_auth(&endpoint.token)
