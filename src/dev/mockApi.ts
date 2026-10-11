@@ -438,6 +438,10 @@ if (import.meta.env.DEV) {
       const outputTokens = failed ? undefined : 240 + index * 29;
       const cachedInputTokens = index % 4 === 0 ? 640 + index * 11 : undefined;
       const codexSessionIsParent = index % 8 === 0;
+      const ttftMs = failed ? undefined : 190 + index * 13;
+      const downstreamFirstContentMs = failed ? undefined : 215 + index * 14;
+      const totalDurationMs = failed ? 1_640 + index * 31 : 2_350 + index * 91;
+      const outputDurationMs = totalDurationMs - (downstreamFirstContentMs ?? ttftMs ?? totalDurationMs);
       return {
         requestId: `preview-request-${String(index + 1).padStart(4, "0")}`,
         traceId: `preview-trace-${String(index + 1).padStart(4, "0")}`,
@@ -462,12 +466,14 @@ if (import.meta.env.DEV) {
               : "claude-sonnet-4-5-20250929",
         reasoningEffort: (["low", "medium", "high"] as const)[index % 3],
         thinkingBudgetTokens: undefined,
-        ttftMs: failed ? undefined : 190 + index * 13,
+        ttftMs,
         routerPreUpstreamMs: failed ? undefined : 12 + index,
         upstreamFirstByteMs: failed ? undefined : 190 + index * 13,
-        downstreamFirstContentMs: failed ? undefined : 215 + index * 14,
+        downstreamFirstContentMs,
         upstreamHeaderMs: 120 + index * 8,
-        totalDurationMs: failed ? 1_640 + index * 31 : 2_350 + index * 91,
+        totalDurationMs,
+        outputTokensPerSecond: outputTokens != null && outputTokens > 0 && outputDurationMs > 0
+          ? outputTokens * 1_000 / outputDurationMs : undefined,
         queueDelayMs: index % 5,
         inputTokens: failed ? undefined : inputTokens,
         outputTokens,
@@ -1001,11 +1007,13 @@ if (import.meta.env.DEV) {
             const succeededCount = rows.filter((item) => item.status === "succeeded").length;
             const durations = rows.map((item) => item.totalDurationMs);
             const ttfts = rows.map((item) => item.downstreamFirstContentMs ?? item.ttftMs).filter((value): value is number => value != null);
+            const outputSpeeds = rows.map((item) => item.outputTokensPerSecond).filter((value): value is number => value != null && Number.isFinite(value) && value > 0);
             return {
               total, succeededCount, failedCount: total - succeededCount, incompleteCount: 0, cancelledCount: 0,
               successRate: total ? succeededCount / total * 100 : null,
               avgDuration: total ? sum(durations)! / total : null,
               avgTtft: ttfts.length ? sum(ttfts)! / ttfts.length : null,
+              avgOutputTokensPerSecond: outputSpeeds.length ? sum(outputSpeeds)! / outputSpeeds.length : null,
               avgRouterPreUpstream: null, avgUpstreamHeader: null, avgUpstreamFirstByte: null,
               avgDownstreamFirstContent: ttfts.length ? sum(ttfts)! / ttfts.length : null, avgQueueDelay: null,
               inputTokensSum: sum(rows.map((item) => item.inputTokens)),

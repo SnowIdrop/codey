@@ -46,6 +46,34 @@ test("request log cache hit rate uses input tokens and preserves unknown usage",
   }
 });
 
+test("request log output speed uses one decimal and preserves unknown values", async () => {
+  const [viewer, usage, preview] = await Promise.all([
+    readSource("src/RequestLogDialog.tsx"),
+    readSource("src/usageAnalysis.ts"),
+    readSource("src/dev/mockApi.ts"),
+  ]);
+  const source = viewer.match(/function formatTokensPerSecond\([\s\S]*?\n\}/)?.[0];
+  assert.ok(source);
+  const compiled = ts.transpileModule(source, {}).outputText;
+  const format = new Function(`${compiled}; return formatTokensPerSecond;`)();
+  assert.equal(format(123.44), "123.4 tok/s");
+  assert.equal(format(123.46), "123.5 tok/s");
+  assert.equal(format(1), "1.0 tok/s");
+  for (const value of [null, undefined, 0, -1, NaN, Infinity, -Infinity]) {
+    assert.equal(format(value), "—");
+  }
+  assert.match(viewer, /outputTokensPerSecond\?: number \| null;/);
+  assert.match(viewer, /速度<\/span>[\s\S]*?formatTokensPerSecond\(item\.outputTokensPerSecond\)/);
+  assert.match(viewer, /输出速度<\/span>[\s\S]*?formatTokensPerSecond\(selectedItem\.outputTokensPerSecond\)/);
+  assert.match(viewer, /平均总耗时 \{formatDuration\(stats\.avgDuration\)\} · 平均输出 \{formatTokensPerSecond\(stats\.avgOutputTokensPerSecond\)\}/);
+  assert.match(viewer, /hidden md:inline">速度:[\s\S]*?formatTokensPerSecond\(stats\.avgOutputTokensPerSecond\)/);
+  assert.equal((usage.match(/avgOutputTokensPerSecond: number \| null/g) ?? []).length, 2);
+  assert.match(preview, /totalDurationMs - \(downstreamFirstContentMs \?\? ttftMs \?\? totalDurationMs\)/);
+  assert.match(preview, /outputTokensPerSecond: outputTokens != null && outputTokens > 0 && outputDurationMs > 0/);
+  assert.match(preview, /outputTokens \* 1_000 \/ outputDurationMs : undefined/);
+  assert.match(preview, /avgOutputTokensPerSecond: outputSpeeds\.length \? sum\(outputSpeeds\)! \/ outputSpeeds\.length : null/);
+});
+
 test("request log model cell shows the model sent upstream and the upstream model when it differs", async () => {
   const [viewer, preview] = await Promise.all([
     readSource("src/RequestLogDialog.tsx"),
