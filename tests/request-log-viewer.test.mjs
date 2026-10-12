@@ -68,10 +68,11 @@ test("request log output speed uses one decimal and preserves unknown values", a
   assert.match(viewer, /平均总耗时 \{formatDuration\(stats\.avgDuration\)\} · 平均输出 \{formatTokensPerSecond\(stats\.avgOutputTokensPerSecond\)\}/);
   assert.match(viewer, /hidden md:inline">速度:[\s\S]*?formatTokensPerSecond\(stats\.avgOutputTokensPerSecond\)/);
   assert.equal((usage.match(/avgOutputTokensPerSecond: number \| null/g) ?? []).length, 2);
-  assert.match(preview, /totalDurationMs - \(downstreamFirstContentMs \?\? ttftMs \?\? totalDurationMs\)/);
-  assert.match(preview, /outputTokensPerSecond: outputTokens != null && outputTokens > 0 && outputDurationMs > 0/);
+  assert.match(preview, /outputDurationMs = downstreamFirstContentMs == null \? undefined : totalDurationMs - downstreamFirstContentMs/);
+  assert.match(preview, /outputTokensPerSecond: outputTokens != null && outputTokens >= 100 && outputDurationMs != null && outputDurationMs >= 100/);
   assert.match(preview, /outputTokens \* 1_000 \/ outputDurationMs : undefined/);
-  assert.match(preview, /avgOutputTokensPerSecond: outputSpeeds\.length \? sum\(outputSpeeds\)! \/ outputSpeeds\.length : null/);
+  assert.match(preview, /item\.downstreamFirstContentMs != null && item\.outputTokens != null && item\.outputTokens >= 100 && item\.totalDurationMs - item\.downstreamFirstContentMs >= 100/);
+  assert.match(preview, /speedTokens \* 1_000 \/ speedDurationMs/);
 });
 
 test("request log model cell shows the model sent upstream and the upstream model when it differs", async () => {

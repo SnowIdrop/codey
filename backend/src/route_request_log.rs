@@ -39,16 +39,32 @@ const MAX_QUERY_PAGE_SIZE: u64 = 100;
 const MAX_QUERY_SEARCH_BYTES: usize = 256;
 const MAX_QUERY_FILTER_BYTES: usize = 128;
 const DAY_MS: u64 = 86_400_000;
+/// 速度门槛参考 cc-switch：输出不足 100 token，或首内容之后的生成窗口短于
+/// 100 毫秒时不计速度，避免把中转站缓冲和短回复的网络突发当成生成速度。
+const SPEED_MIN_OUTPUT_TOKENS: u64 = 100;
+const SPEED_MIN_GENERATION_MS: u64 = 100;
+
 /// 生成阶段每秒输出 Token 数。口径与写入侧的 `output_tokens_per_second` 一致：
-/// 需要已知输出 Token 数与首内容耗时，且首内容之后仍有可计量的时间，
-/// 否则返回 NULL，聚合时自动忽略。
+/// 只统计首个可见内容之后的生成阶段，缺少该计时或未达速度门槛时返回 NULL，
+/// 聚合时自动忽略。
 const OUTPUT_SPEED_SQL: &str = "CASE
-        WHEN output_tokens > 0
-            AND total_duration_ms > COALESCE(downstream_first_content_ms, ttft_ms)
-        THEN output_tokens * 1000.0 / (
-            total_duration_ms - COALESCE(downstream_first_content_ms, ttft_ms)
-        )
+        WHEN downstream_first_content_ms IS NOT NULL
+            AND output_tokens >= 100
+            AND total_duration_ms - downstream_first_content_ms >= 100
+        THEN output_tokens * 1000.0 / (total_duration_ms - downstream_first_content_ms)
     END";
+
+/// 汇总速度与单条速度口径一致，但按合格请求的输出总量除以生成总时长，
+/// 逐条取平均会被短请求带偏。
+const OUTPUT_SPEED_SUM_SQL: &str = "SUM(CASE
+        WHEN downstream_first_content_ms IS NOT NULL
+            AND output_tokens >= 100
+            AND total_duration_ms - downstream_first_content_ms >= 100
+        THEN output_tokens END) * 1000.0 / SUM(CASE
+        WHEN downstream_first_content_ms IS NOT NULL
+            AND output_tokens >= 100
+            AND total_duration_ms - downstream_first_content_ms >= 100
+        THEN total_duration_ms - downstream_first_content_ms END)";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1413,13 +1429,12 @@ impl RouteRequestLogProbe {
         }
         let token_usage = std::mem::take(&mut pending.token_usage);
         let usage_reported = token_usage.reported();
-        // 输出速度只覆盖首内容之后的生成阶段；首内容耗时缺失时无法区分
-        // 等待与生成，按不可计算处理。
+        // 输出速度只覆盖首个可见内容之后的生成阶段；上游首字节时间只反映
+        // 数据到达，无法替代可见内容的开始时间，缺失时按不可计算处理。
         let output_tokens_per_second = output_tokens_per_second(
             token_usage.output_tokens,
             total_duration_ms,
-            load_duration_ms(&self.shared.downstream_first_content_micros)
-                .or_else(|| load_duration_ms(&self.shared.first_byte_micros)),
+            load_duration_ms(&self.shared.downstream_first_content_micros),
         );
         let usage_unavailable_reason = if usage_reported {
             None
@@ -2698,7 +2713,7 @@ fn summary_columns() -> String {
     AVG(CASE WHEN total_duration_ms >= 0 THEN total_duration_ms END),
     AVG(CASE WHEN COALESCE(downstream_first_content_ms, ttft_ms) >= 0
         THEN COALESCE(downstream_first_content_ms, ttft_ms) END),
-    AVG({OUTPUT_SPEED_SQL}),
+    {OUTPUT_SPEED_SUM_SQL},
     AVG(CASE WHEN router_pre_upstream_ms >= 0 THEN router_pre_upstream_ms END),
     AVG(CASE WHEN upstream_header_ms >= 0 THEN upstream_header_ms END),
     AVG(CASE WHEN upstream_first_byte_ms >= 0 THEN upstream_first_byte_ms END),
@@ -3102,7 +3117,7 @@ pub(crate) fn query_route_request_log_stats(
     let sql = format!("SELECT timestamp_unix_ms / {bucket_ms} * {bucket_ms} AS bucket,
         COUNT(*), SUM(total_tokens), AVG(CASE WHEN total_duration_ms >= 0 THEN total_duration_ms END),
         AVG(CASE WHEN COALESCE(downstream_first_content_ms, ttft_ms) >= 0 THEN COALESCE(downstream_first_content_ms, ttft_ms) END),
-        AVG({OUTPUT_SPEED_SQL}),
+        {OUTPUT_SPEED_SUM_SQL},
         AVG(CASE WHEN downstream_first_content_ms >= 0 THEN downstream_first_content_ms END)
         FROM route_request_logs{where_clause} GROUP BY bucket ORDER BY bucket");
     result.trend = transaction
@@ -3575,18 +3590,18 @@ fn to_i64(value: u64) -> i64 {
 }
 
 /// 生成阶段每秒输出 Token 数。需要已知输出 Token 数和首个可见内容时间，
-/// 且首内容之后仍有可计量的时间；条件不足时返回 None。
+/// 且满足最小输出量与最短生成窗口；条件不足时返回 None。
 fn output_tokens_per_second(
     output_tokens: Option<u64>,
     total_duration_ms: u64,
     first_content_ms: Option<u64>,
 ) -> Option<f64> {
     let output_tokens = output_tokens?;
-    if output_tokens == 0 {
+    if output_tokens < SPEED_MIN_OUTPUT_TOKENS {
         return None;
     }
     let generation_ms = total_duration_ms.checked_sub(first_content_ms?)?;
-    if generation_ms == 0 {
+    if generation_ms < SPEED_MIN_GENERATION_MS {
         return None;
     }
     Some(output_tokens as f64 * 1_000.0 / generation_ms as f64)
@@ -4549,22 +4564,27 @@ mod tests {
         a.timestamp_unix_ms = 100;
         a.total_duration_ms = 0;
         a.downstream_first_content_ms = Some(0);
+        a.token_usage.output_tokens = Some(150);
         a.token_usage.input_tokens = Some(5);
         a.token_usage.total_tokens = Some(10);
+        a.ttft_ms = Some(0);
         let mut b = a.clone();
         b.request_id = "b".into();
-        b.total_duration_ms = 30;
+        b.total_duration_ms = 900;
         b.status = RequestStatus::Failed;
         b.token_usage = RequestTokenUsage::default();
+        b.token_usage.output_tokens = Some(300);
         b.usage_reported = false;
         b.downstream_first_content_ms = None;
-        b.ttft_ms = None;
+        b.ttft_ms = Some(100);
         let mut c = sample_entry("c");
         c.timestamp_unix_ms = 100;
-        c.total_duration_ms = 60;
+        c.total_duration_ms = 260;
         c.status = RequestStatus::Incomplete;
-        c.token_usage.output_tokens = Some(10);
+        c.token_usage.output_tokens = Some(160);
         c.token_usage.total_tokens = Some(20);
+        c.downstream_first_content_ms = Some(60);
+        c.ttft_ms = Some(60);
         let mut outside = sample_entry("outside");
         outside.timestamp_unix_ms = 200;
         sink.write_batch(&[queued(a), queued(b), queued(c.clone()), queued(outside)])
@@ -4597,6 +4617,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(second.items[0].request_id, "b");
+        // 明细行与统计口径一致：b 缺少首个可见内容时间时速度保持未知。
+        assert_eq!(second.items[0].output_tokens_per_second, None);
+        assert_eq!(
+            first.items[0].output_tokens_per_second,
+            Some(160_000.0 / 200.0)
+        );
         let third = query_route_request_logs(
             directory.path(),
             RouteRequestLogBackend::Sqlite,
@@ -4618,18 +4644,12 @@ mod tests {
         assert_eq!(stats.summary.succeeded_count, 1);
         assert_eq!(stats.summary.failed_count, 1);
         assert_eq!(stats.summary.incomplete_count, 1);
-        assert_eq!(stats.summary.avg_duration, Some(30.0));
-        assert_eq!(stats.summary.avg_ttft, Some(7.0));
-        let avg_output_tokens_per_second = stats
-            .summary
-            .avg_output_tokens_per_second
-            .expect("只有 c 具备完整的输出速度口径");
-        assert!(
-            (avg_output_tokens_per_second - 10_000.0 / 46.0).abs() < 1e-9,
-            "{avg_output_tokens_per_second}"
-        );
+        assert_eq!(stats.summary.avg_duration, Some(386.6666666666667));
+        assert_eq!(stats.summary.avg_ttft, Some(53.333333333333336));
+        // a 的生成窗口为 0，b 缺少首个可见内容时间，均被排除；只剩 c 参与汇总。
+        assert_eq!(stats.summary.avg_output_tokens_per_second, Some(800.0));
         assert_eq!(stats.summary.input_tokens_sum, Some(15));
-        assert_eq!(stats.summary.output_tokens_sum, Some(15));
+        assert_eq!(stats.summary.output_tokens_sum, Some(610));
         assert_eq!(stats.summary.total_tokens_sum, Some(30));
         assert_eq!(stats.summary.total_tokens_known_count, 2);
         assert_eq!(stats.summary.usage_reported_count, 2);
@@ -4650,7 +4670,18 @@ mod tests {
         .unwrap();
         assert_eq!(missing.summary.total, 1);
         assert_eq!(missing.summary.total_tokens_sum, None);
+        // 上游首字节时间只代表数据到达，缺少首个可见内容时间时保持未知。
         assert_eq!(missing.summary.avg_output_tokens_per_second, None);
+        let unknown_speed = query_route_request_log_stats(
+            directory.path(),
+            RouteRequestLogBackend::Sqlite,
+            RouteRequestLogQuery {
+                request_id: Some("a".into()),
+                ..query.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(unknown_speed.summary.avg_output_tokens_per_second, None);
         let empty = query_route_request_log_stats(
             directory.path(),
             RouteRequestLogBackend::Sqlite,
@@ -4690,6 +4721,38 @@ mod tests {
             "{plan}"
         );
         assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+    }
+
+    #[test]
+    fn aggregate_output_speed_uses_total_tokens_over_total_generation_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(SQLITE_FILE_NAME);
+        let mut sink = SqliteSink::open(&path, 30).unwrap();
+        let mut fast = sample_entry("fast");
+        fast.total_duration_ms = 1_100;
+        fast.downstream_first_content_ms = Some(100);
+        fast.token_usage.output_tokens = Some(100);
+        let mut slow = sample_entry("slow");
+        slow.request_id = "slow".into();
+        slow.trace_id = "slow".into();
+        slow.total_duration_ms = 5_000;
+        slow.downstream_first_content_ms = Some(1_000);
+        slow.token_usage.output_tokens = Some(500);
+        sink.write_batch(&[queued(fast), queued(slow)]).unwrap();
+
+        let stats = query_route_request_log_stats(
+            directory.path(),
+            RouteRequestLogBackend::Sqlite,
+            RouteRequestLogQuery {
+                from_unix_ms: Some(0),
+                to_unix_ms: Some(10_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // fast 为 1 秒 100 token，slow 为 4 秒 500 token；汇总按总量相除，
+        // 不像逐条求平均那样让短请求等权。
+        assert_eq!(stats.summary.avg_output_tokens_per_second, Some(120.0));
     }
 
     #[test]
@@ -5533,7 +5596,7 @@ mod tests {
     }
 
     #[test]
-    fn output_speed_requires_tokens_time_and_a_generation_window() {
+    fn output_speed_requires_the_shared_thresholds_and_a_generation_window() {
         assert_eq!(
             output_tokens_per_second(Some(100), 1_000, Some(200)),
             Some(125.0)
@@ -5541,6 +5604,13 @@ mod tests {
         assert_eq!(output_tokens_per_second(Some(100), 1_000, None), None);
         assert_eq!(output_tokens_per_second(Some(100), 200, Some(200)), None);
         assert_eq!(output_tokens_per_second(Some(100), 100, Some(200)), None);
+        // 输出或生成窗口任意一项低于门槛都不计速度，避免短回复失真。
+        assert_eq!(output_tokens_per_second(Some(99), 10_000, Some(0)), None);
+        assert_eq!(output_tokens_per_second(Some(1_000), 299, Some(200)), None);
+        assert_eq!(
+            output_tokens_per_second(Some(1_000), 300, Some(200)),
+            Some(10_000.0)
+        );
         assert_eq!(output_tokens_per_second(Some(0), 1_000, Some(200)), None);
         assert_eq!(output_tokens_per_second(None, 1_000, Some(200)), None);
     }

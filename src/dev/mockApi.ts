@@ -438,10 +438,12 @@ if (import.meta.env.DEV) {
       const outputTokens = failed ? undefined : 240 + index * 29;
       const cachedInputTokens = index % 4 === 0 ? 640 + index * 11 : undefined;
       const codexSessionIsParent = index % 8 === 0;
+      // 每 11 条留一条只有上游首字节、没有首个可见内容的记录，用于核对速度保持未知。
+      const missingFirstContent = index % 11 === 7;
       const ttftMs = failed ? undefined : 190 + index * 13;
-      const downstreamFirstContentMs = failed ? undefined : 215 + index * 14;
+      const downstreamFirstContentMs = failed || missingFirstContent ? undefined : 215 + index * 14;
       const totalDurationMs = failed ? 1_640 + index * 31 : 2_350 + index * 91;
-      const outputDurationMs = totalDurationMs - (downstreamFirstContentMs ?? ttftMs ?? totalDurationMs);
+      const outputDurationMs = downstreamFirstContentMs == null ? undefined : totalDurationMs - downstreamFirstContentMs;
       return {
         requestId: `preview-request-${String(index + 1).padStart(4, "0")}`,
         traceId: `preview-trace-${String(index + 1).padStart(4, "0")}`,
@@ -472,7 +474,7 @@ if (import.meta.env.DEV) {
         downstreamFirstContentMs,
         upstreamHeaderMs: 120 + index * 8,
         totalDurationMs,
-        outputTokensPerSecond: outputTokens != null && outputTokens > 0 && outputDurationMs > 0
+        outputTokensPerSecond: outputTokens != null && outputTokens >= 100 && outputDurationMs != null && outputDurationMs >= 100
           ? outputTokens * 1_000 / outputDurationMs : undefined,
         queueDelayMs: index % 5,
         inputTokens: failed ? undefined : inputTokens,
@@ -1007,13 +1009,15 @@ if (import.meta.env.DEV) {
             const succeededCount = rows.filter((item) => item.status === "succeeded").length;
             const durations = rows.map((item) => item.totalDurationMs);
             const ttfts = rows.map((item) => item.downstreamFirstContentMs ?? item.ttftMs).filter((value): value is number => value != null);
-            const outputSpeeds = rows.map((item) => item.outputTokensPerSecond).filter((value): value is number => value != null && Number.isFinite(value) && value > 0);
+            const eligibleSpeeds = rows.filter((item) => item.downstreamFirstContentMs != null && item.outputTokens != null && item.outputTokens >= 100 && item.totalDurationMs - item.downstreamFirstContentMs >= 100);
+            const speedTokens = sum(eligibleSpeeds.map((item) => item.outputTokens));
+            const speedDurationMs = sum(eligibleSpeeds.map((item) => item.totalDurationMs - item.downstreamFirstContentMs!));
             return {
               total, succeededCount, failedCount: total - succeededCount, incompleteCount: 0, cancelledCount: 0,
               successRate: total ? succeededCount / total * 100 : null,
               avgDuration: total ? sum(durations)! / total : null,
               avgTtft: ttfts.length ? sum(ttfts)! / ttfts.length : null,
-              avgOutputTokensPerSecond: outputSpeeds.length ? sum(outputSpeeds)! / outputSpeeds.length : null,
+              avgOutputTokensPerSecond: speedTokens != null && speedDurationMs != null && speedDurationMs > 0 ? speedTokens * 1_000 / speedDurationMs : null,
               avgRouterPreUpstream: null, avgUpstreamHeader: null, avgUpstreamFirstByte: null,
               avgDownstreamFirstContent: ttfts.length ? sum(ttfts)! / ttfts.length : null, avgQueueDelay: null,
               inputTokensSum: sum(rows.map((item) => item.inputTokens)),
