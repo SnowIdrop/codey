@@ -1209,12 +1209,12 @@ fn build_snapshot(home: &Path, session: &str, workspace: &Path) -> Result<Snapsh
     let changes = &snapshot.changes;
     let temp = tempfile::tempdir()?;
     let index = temp.path().join("index");
-    git(&root, &["read-tree", &head], Some(&index), None)?;
-    stage(&index, &root, &changes)?;
-    let tree = String::from_utf8(git(&root, &["write-tree"], Some(&index), None)?)?;
-    verify_tree(&root, &head, tree.trim(), &changes)?;
+    git(root, &["read-tree", head], Some(&index), None)?;
+    stage(&index, root, changes)?;
+    let tree = String::from_utf8(git(root, &["write-tree"], Some(&index), None)?)?;
+    verify_tree(root, head, tree.trim(), changes)?;
     let diff = String::from_utf8(git(
-        &root,
+        root,
         &[
             "diff",
             "--no-ext-diff",
@@ -1222,7 +1222,7 @@ fn build_snapshot(home: &Path, session: &str, workspace: &Path) -> Result<Snapsh
             "--no-renames",
             "--no-color",
             "--binary",
-            &head,
+            head,
             tree.trim(),
             "--",
         ],
@@ -1386,7 +1386,7 @@ fn push_public(snapshot: &Snapshot, push: &std::result::Result<PushTarget, Strin
             );
             if target.unpushed > 0 {
                 public["unpushedCount"] = json!(target.unpushed);
-                public["unpushedCommits"] = json!(unpushed_commits(&snapshot, target));
+                public["unpushedCommits"] = json!(unpushed_commits(snapshot, target));
             }
         }
         Err(reason) => public["pushReason"] = json!(reason),

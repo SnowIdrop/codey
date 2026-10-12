@@ -48,7 +48,8 @@ fn assert_resume_shim(document: &DocumentMut, base_url: &str, requires_openai_au
 }
 
 fn assert_runtime_disk_provider(document: &DocumentMut, base_url: &str, token: &str) {
-    for (id, name) in [(local_router::ROUTER_PROVIDER_ID, LOCAL_ROUTER_PROVIDER_NAME)] {
+    {
+        let (id, name) = (local_router::ROUTER_PROVIDER_ID, LOCAL_ROUTER_PROVIDER_NAME);
         let router = document["model_providers"][id]
             .as_table_like()
             .expect("codey_router runtime disk provider");
@@ -2126,7 +2127,8 @@ fn runtime_router_separates_openai_identity_from_auth_shape() {
         local["capabilities"]["remote_compaction"].as_str(),
         Some("v2")
     );
-    for provider in [&local] {
+    {
+        let provider = &local;
         assert_eq!(provider["requires_openai_auth"].as_bool(), Some(false));
         assert_eq!(
             provider["experimental_bearer_token"].as_str(),

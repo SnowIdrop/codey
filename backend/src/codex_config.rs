@@ -1714,13 +1714,11 @@ fn remove_persistent_codey_runtime_config(doc: &mut DocumentMut, home: &Path) ->
     remove_legacy_codey_hooks(doc, &home.join("config.toml"));
     if document_provider_table(doc, local_router::REMOTE_COMPACTION_PROVIDER_ID)
         .is_some_and(codey_router_provider_table_is_codey_owned)
-    {
-        if let Some(providers) = doc
+        && let Some(providers) = doc
             .get_mut("model_providers")
             .and_then(Item::as_table_like_mut)
-        {
-            providers.remove(local_router::REMOTE_COMPACTION_PROVIDER_ID);
-        }
+    {
+        providers.remove(local_router::REMOTE_COMPACTION_PROVIDER_ID);
     }
     doc.to_string() != before
 }

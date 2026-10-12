@@ -1789,17 +1789,17 @@ impl RouterServer {
             body_mutated = true;
             encoded_body = None;
         }
-        if bridge != ProtocolBridge::NativeResponses {
-            if let Err(error) = validate_portable_context(&body) {
-                return downstream
-                    .write_error(
-                        400,
-                        "context_not_portable",
-                        error.to_string(),
-                        Some(&resolved.route),
-                    )
-                    .await;
-            }
+        if bridge != ProtocolBridge::NativeResponses
+            && let Err(error) = validate_portable_context(&body)
+        {
+            return downstream
+                .write_error(
+                    400,
+                    "context_not_portable",
+                    error.to_string(),
+                    Some(&resolved.route),
+                )
+                .await;
         }
         downstream.select_route(&resolved.route);
         if bridge != ProtocolBridge::NativeResponses
