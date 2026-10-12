@@ -1169,9 +1169,11 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             Ok(text) => optimize_prompt_command(state, text).await,
             Err(error) => Err(error),
         },
-        "conversation_git_status" | "conversation_git_preview" | "conversation_git_execute" => {
-            conversation_git::invoke(state, command, &args).await
-        }
+        "conversation_git_status"
+        | "conversation_git_preview"
+        | "conversation_git_execute"
+        | "conversation_git_push_preview"
+        | "conversation_git_cancel" => conversation_git::invoke(state, command, &args).await,
         "test_prompt_optimization" => {
             match optional_argument::<PromptOptimizationConfig>(&args, "config") {
                 Ok(draft) => test_prompt_optimization_command(state, draft).await,
