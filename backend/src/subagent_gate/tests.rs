@@ -908,10 +908,11 @@ fn interrupt_revokes_queued_writer_before_acknowledgement() {
     replacement_write.tool_name = Some("apply_patch".into());
     replacement_write.tool_input = write.tool_input.clone();
     attest_test_child(&replacement_write, root, runtime_id);
+    // Writing is no longer gated by cross-session resource claims, so the
+    // replacement attempt may proceed while the old attempt is still active.
     assert_eq!(
-        handle_hook_for_runtime_at(&replacement_write, root, runtime_id, 34).unwrap()["hookSpecificOutput"]
-            ["permissionDecision"],
-        "deny"
+        handle_hook_for_runtime_at(&replacement_write, root, runtime_id, 34).unwrap(),
+        json!({})
     );
 
     // Failure cannot re-enable child writes or prematurely release the root.
