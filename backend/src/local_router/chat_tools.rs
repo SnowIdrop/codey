@@ -221,13 +221,109 @@ pub(crate) fn append_responses_agent_message_object(
     tool_bridge: &mut ResponsesToolBridge,
 ) -> Result<()> {
     let mut message = object.clone();
-    message.insert("role".to_string(), Value::String("assistant".to_string()));
+    let role = if agent_message_carries_instruction(object) {
+        "user"
+    } else {
+        "assistant"
+    };
+    message.insert("role".to_string(), Value::String(role.to_string()));
     if !message.contains_key("content")
         && let Some(text) = message.get("message").and_then(Value::as_str)
     {
         message.insert("content".to_string(), Value::String(text.to_string()));
     }
     append_responses_message_object(&message, messages, tool_bridge)
+}
+
+/// 协作消息在对话历史中的方向由收发双方决定。上级发给下级的 NEW_TASK 与
+/// MESSAGE 是任务指令，必须作为用户消息回放；下级回报上级的 FINAL_ANSWER
+/// 与 MESSAGE 属于助手历史。协议转换若一律写成 assistant，模型会把任务正文
+/// 当成自己先前说过的话，从而报告任务正文缺失。
+fn agent_message_carries_instruction(object: &serde_json::Map<String, Value>) -> bool {
+    let content_texts = match object.get("content") {
+        Some(Value::Array(parts)) => parts.iter().filter_map(agent_message_part_text).collect(),
+        Some(Value::String(text)) => vec![text.as_str()],
+        Some(part @ Value::Object(_)) => agent_message_part_text(part).into_iter().collect(),
+        _ => Vec::new(),
+    };
+    let texts = content_texts
+        .into_iter()
+        .chain(
+            ["message", "text"]
+                .into_iter()
+                .filter_map(|field| object.get(field).and_then(Value::as_str)),
+        )
+        .collect::<Vec<_>>();
+    // FINAL_ANSWER 只向下级返回结果，始终属于助手历史。
+    if texts
+        .iter()
+        .any(|text| has_collaboration_header(text, "FINAL_ANSWER"))
+    {
+        return false;
+    }
+    let new_task = texts
+        .iter()
+        .any(|text| has_collaboration_header(text, "NEW_TASK"));
+    // MESSAGE 两个方向都会出现：上级用它补充要求，下级用它回报进度。
+    let message = texts
+        .iter()
+        .any(|text| has_collaboration_header(text, "MESSAGE"));
+    if !new_task && !message {
+        return false;
+    }
+    // 先按收发双方的层级判断方向，路径信息不足时退回 NEW_TASK 与根代理判断。
+    match agent_message_direction(object) {
+        Some(directed_to_child) => directed_to_child,
+        None => new_task || !agent_message_targets_root(object),
+    }
+}
+
+fn agent_message_part_text(part: &Value) -> Option<&str> {
+    part.get("text")
+        .or_else(|| part.get("input_text"))
+        .or_else(|| part.get("output_text"))
+        .and_then(Value::as_str)
+}
+
+fn agent_message_targets_root(object: &serde_json::Map<String, Value>) -> bool {
+    object
+        .get("recipient")
+        .and_then(Value::as_str)
+        .is_some_and(|recipient| recipient.trim() == "/root")
+}
+
+/// 返回 `Some(true)` 表示上级发给下级，`Some(false)` 表示下级回报上级，
+/// `None` 表示路径信息不足。只看收发双方的前缀层级，不假设根代理名称。
+fn agent_message_direction(object: &serde_json::Map<String, Value>) -> Option<bool> {
+    let author = object.get("author").and_then(Value::as_str)?.trim();
+    let recipient = object.get("recipient").and_then(Value::as_str)?.trim();
+    if author.is_empty() || recipient.is_empty() || author == recipient {
+        return None;
+    }
+    if path_nested_below(recipient, author) {
+        Some(true)
+    } else if path_nested_below(author, recipient) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn path_nested_below(candidate: &str, ancestor: &str) -> bool {
+    candidate
+        .strip_prefix(ancestor)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn has_collaboration_header(text: &str, message_type: &str) -> bool {
+    let head = text.trim_start();
+    let marker = format!("Message Type: {message_type}");
+    head.strip_prefix(&marker).is_some_and(|rest| {
+        rest.is_empty()
+            || rest.starts_with('\n')
+            || rest.starts_with("\r\n")
+            || rest.starts_with(' ')
+    })
 }
 
 pub(crate) fn append_responses_message_object(
