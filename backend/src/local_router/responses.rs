@@ -260,9 +260,8 @@ impl RouterServer {
                 };
                 write_json_response(&mut stream, 200, &value).await?;
             }
-            // 系统浏览器里的请求日志页只能经由本地路由访问后端；账号筛选、账号名
-            // 显示和按账号推算额度都依赖同一份账号目录。这里只读取账号文档，不再
-            // 同步 Codex 登录，避免浏览器的只读页面改动登录状态。
+            // 系统浏览器里的请求日志页通过本地路由获取账号目录，用于账号筛选和
+            // 账号名显示。这里只读取账号文档，避免只读页面同步 Codex 登录状态。
             ("POST", "/codey/api/list_official_accounts") => {
                 let store = crate::official_accounts::OfficialAccountStore::for_config_path(
                     &crate::config::default_config_path(),
@@ -301,50 +300,6 @@ impl RouterServer {
                     .request_log_catalog
                     .clone();
                 write_json_response(&mut stream, 200, &json!({"config": catalog})).await?;
-            }
-            ("POST", "/codey/api/query_route_request_log_quota_usage") => {
-                let query = match serde_json::from_slice::<
-                    crate::route_request_log::RouteRequestLogQuotaQuery,
-                >(&request.body)
-                {
-                    Ok(query) => query,
-                    Err(error) => {
-                        write_error_response(
-                            &mut stream,
-                            400,
-                            "invalid_request_log_query",
-                            format!("额度用量查询参数无效：{error}"),
-                            None,
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                };
-                let backend = self
-                    .snapshot
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .request_log_backend;
-                let root = self.request_log.root().to_path_buf();
-                let result = tokio::task::spawn_blocking(move || {
-                    crate::route_request_log::query_route_request_log_quota_usage(
-                        &root, backend, query,
-                    )
-                })
-                .await;
-                let message = match result {
-                    Ok(Ok(usage)) => {
-                        let mut value = serde_json::to_value(usage)?;
-                        value["recordingHealth"] =
-                            serde_json::to_value(self.request_log.health().await)?;
-                        write_json_response(&mut stream, 200, &value).await?;
-                        return Ok(());
-                    }
-                    Ok(Err(error)) => format!("查询额度用量失败：{error:#}"),
-                    Err(error) => format!("额度用量查询任务异常退出：{error}"),
-                };
-                write_error_response(&mut stream, 500, "request_log_query_failed", message, None)
-                    .await?;
             }
             ("POST", "/codey/api/query_route_request_log_models") => {
                 let query = match serde_json::from_slice::<

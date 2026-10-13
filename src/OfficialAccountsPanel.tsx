@@ -7,7 +7,14 @@ import { listOfficialAccounts, rememberOfficialAccounts } from "./officialAccoun
 import { Badge, Button, Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, TextArea, Tooltip } from "./components/ui";
 import { maskEmail } from "./sensitiveText";
 import type { Confirmation, OfficialAccount, OfficialAccountsResult } from "./App.types";
-import type { AccountUsageSnapshot } from "./quotaEstimate";
+
+type AccountUsageSnapshot = {
+  status: string; message?: string; reason?: string; fetchedAt?: number; stale?: boolean;
+  // 官方额度接口随额度一起返回的当前套餐，比账号记录里添加账号时的快照新。
+  planType?: string;
+  primary?: { usedPercent: number; windowMinutes: number; resetsAt?: number } | null;
+  secondary?: { usedPercent: number; windowMinutes: number; resetsAt?: number } | null;
+};
 
 type LoginStart = { loginId: string; authUrl: string; browserOpened?: boolean };
 type LoginPoll = OfficialAccountsResult & { status: "wait" | "ok" | "failed" | "expired"; message?: string };

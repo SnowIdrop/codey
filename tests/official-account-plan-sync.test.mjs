@@ -3,7 +3,6 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const panel = await readFile(new URL("../src/OfficialAccountsPanel.tsx", import.meta.url), "utf8");
-const quota = await readFile(new URL("../src/quotaEstimate.ts", import.meta.url), "utf8");
 const store = await readFile(new URL("../backend/src/official_accounts.rs", import.meta.url), "utf8");
 const commands = await readFile(new URL("../backend/src/commands.rs", import.meta.url), "utf8");
 
@@ -43,7 +42,6 @@ test("额度接口返回的实时套餐回写到账号记录", () => {
 });
 
 test("账号卡片优先显示额度接口的当前套餐", () => {
-  assert.match(quota, /planType\?: string;/);
   assert.match(panel, /const snapshotPlan = usages\[account\.id\]\?\.status === "ok"/);
   assert.match(panel, /const planType = snapshotPlan \|\| account\.planType;/);
   assert.match(panel, /const plan = formatPlan\(planType\);/);

@@ -27,7 +27,6 @@ import { errorText } from "./appUtils";
 import { formatBytes, formatTimestamp } from "./formatters";
 import { modelIdsEqual } from "./modelIds";
 import { formatRouteName } from "./routeShortNames";
-import { QuotaEstimateDialog } from "./QuotaEstimateDialog";
 import type { LogAnalytics } from "./usageAnalysis";
 import { maskEmail } from "./sensitiveText";
 import {
@@ -767,7 +766,6 @@ export function RequestLogDialog({
   standalone = false,
 }: RequestLogDialogProps) {
   const [searchInput, setSearchInput] = useState("");
-  const [quotaOpen, setQuotaOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [provider, setProvider] = useState("all");
   const [officialAccount, setOfficialAccount] = useState("all");
@@ -1157,7 +1155,6 @@ export function RequestLogDialog({
   return (
     <div className="request-log-workspace relative flex h-full min-h-0 flex-1 flex-col">
       <style>{requestLogStyles}</style>
-      {quotaOpen && officialRoutesPresent && <QuotaEstimateDialog container={standalone ? document.body : container} onClose={() => setQuotaOpen(false)} />}
       <div className="request-log-header">
         <div className="request-log-heading">
           <div><p className="request-log-eyebrow">CODEY / 内置路由</p><h1>请求日志</h1></div>
@@ -1195,9 +1192,6 @@ export function RequestLogDialog({
         </div>
 
         <div className="request-log-actions">
-          {officialRoutesPresent && (
-            <Button variant="link" color="primary" size="sm" onClick={() => setQuotaOpen(true)}>周限额度估算</Button>
-          )}
           <Button
             variant="outline"
             size="sm"
