@@ -35,10 +35,6 @@ Codey 是 Codex 桌面客户端的增强启动器，集中管理模型线路、�
 
 ## 第三方声明
 
-PPT Bridge 和 Excel Shield 插件的协议适配迁移自 Kaixxrua/excel-codex-bridge，原项目采用 Unlicense。
-
-Astra Turn State 插件的预请求流程参考 [spumon1/SUCK_MY_ASTRA](https://github.com/spumon1/SUCK_MY_ASTRA)，原项目采用 MIT License，Copyright (c) 2026 boooot。
-
     This product includes FastCtx
     (https://github.com/yc-duan/fastctx), Copyright (c) 2026 yc-duan,
     used under the Apache License 2.0.
