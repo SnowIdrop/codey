@@ -7894,6 +7894,92 @@ fn websocket_failure_event_keeps_provider_codes_and_adds_route_context() {
 }
 
 #[tokio::test]
+async fn native_responses_alias_reserved_collaboration_tools_for_plaintext_delivery() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let request = read_http_request(&mut stream).await.unwrap();
+        let events = [
+            json!({"type":"response.output_item.done","output_index":0,"item":{
+                "type":"function_call","id":"fc_1","namespace":"agents","name":"followup_task",
+                "call_id":"call-1","arguments":"{\"target\":\"/root/a\",\"message\":\"run tests\"}"}}),
+            json!({"type":"response.completed","response":{"id":"resp_1","status":"completed",
+                "output":[{"type":"function_call","id":"fc_1","namespace":"agents",
+                "name":"followup_task","call_id":"call-1",
+                "arguments":"{\"target\":\"/root/a\",\"message\":\"run tests\"}"}]}}),
+        ];
+        let body: String = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        serde_json::from_slice::<Value>(&request.body).unwrap()
+    });
+    let (config, provider_id, model) =
+        router_config(format!("http://{upstream_address}/v1/responses"));
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({
+            "model": model_alias(&provider_id, &model),
+            "stream": true,
+            "input": [
+                {"role":"user","content":"delegate"},
+                {"type":"function_call","namespace":"collaboration","name":"followup_task",
+                 "call_id":"call-0","arguments":"{\"target\":\"/root/a\",\"message\":\"earlier\"}",
+                 "encrypted_function_args":[]},
+                {"type":"function_call_output","call_id":"call-0","output":"queued"}
+            ],
+            "tools": [{
+                "type":"namespace","name":"collaboration","tools":[{
+                    "type":"function","name":"followup_task","parameters":{
+                        "type":"object",
+                        "properties":{
+                            "target":{"type":"string"},
+                            "message":{"type":"string","encrypted":true}
+                        }
+                    }
+                }]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body = response.text().await.unwrap();
+    let sent = upstream_task.await.unwrap();
+    router.stop().await.unwrap();
+
+    assert_eq!(sent["tools"][0]["name"], "agents");
+    assert!(
+        sent["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
+            .get("encrypted")
+            .is_none()
+    );
+    assert_eq!(sent["input"][1]["namespace"], "agents");
+
+    let events = parse_responses_websocket_sse_events(&body).unwrap();
+    let item = &events[0]["item"];
+    assert_eq!(item["namespace"], "collaboration");
+    assert_eq!(item["encrypted_function_args"], json!([]));
+    let output = &events[1]["response"]["output"][0];
+    assert_eq!(output["namespace"], "collaboration");
+    assert_eq!(output["encrypted_function_args"], json!([]));
+}
+
+#[tokio::test]
 async fn native_responses_stream_error_preserves_status_and_safe_details() {
     let logs = tempfile::tempdir().unwrap();
     let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();

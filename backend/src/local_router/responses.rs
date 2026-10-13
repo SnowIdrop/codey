@@ -1669,9 +1669,19 @@ impl RouterServer {
             body_mutated = true;
             encoded_body = None;
         }
+        // 原生 Responses 上游可能为模型保留 `collaboration` 命名空间并逐字校验 schema，
+        // 先改到普通命名空间，下面才能摘掉加密标记；回包由 COLLABORATION_ALIAS 还原。
+        let collaboration_alias = (ProtocolBridge::from_upstream_protocol(resolved.protocol)
+            == ProtocolBridge::NativeResponses)
+            .then(|| alias_reserved_collaboration_namespace(&mut body))
+            .flatten();
+        if collaboration_alias.is_some() {
+            body_mutated = true;
+            encoded_body = None;
+        }
         // 官方上游看到协作工具的加密标记就会把任务正文换成只有它能解开的令牌，
         // 第三方子代理线路没有该密钥。摘掉标记让正文以明文返回，跨线路派发才能送达。
-        if strip_collaboration_message_encryption(&mut body) {
+        if strip_collaboration_message_encryption(&mut body, resolved.route.official_account) {
             body_mutated = true;
             encoded_body = None;
         }
@@ -2080,7 +2090,7 @@ impl RouterServer {
             && !resolved.route.official_account
             && chat_reasoning_summaries.iter().any(Option::is_some))
         .then_some(chat_reasoning_summaries);
-        let (result, stream_failure) = CURRENT_LIFECYCLE_FAILURE.scope(std::cell::RefCell::new(None), async {
+        let (result, stream_failure) = COLLABORATION_ALIAS.scope(collaboration_alias.clone(), CURRENT_LIFECYCLE_FAILURE.scope(std::cell::RefCell::new(None), async {
         let result: Result<()> = async {
         let downstream = &mut observed;
         // Every downstream socket owns its upstream WebSocket cache. Subagents
@@ -2174,6 +2184,14 @@ impl RouterServer {
                 encoded_body = None;
             }
             if resolved.route.official_account && sanitize_official_upstream_history(&mut upstream_body) {
+                body_mutated = true;
+                encoded_body = None;
+            }
+            // 恢复的历史沿用 Codex 侧的 `collaboration` 调用，与改名后的工具保持一致。
+            if collaboration_alias
+                .as_ref()
+                .is_some_and(|alias| alias.alias_history(&mut upstream_body))
+            {
                 body_mutated = true;
                 encoded_body = None;
             }
@@ -2612,7 +2630,7 @@ impl RouterServer {
         result
         }.await;
         (result, CURRENT_LIFECYCLE_FAILURE.with(|failure| failure.borrow_mut().take()))
-        }).await;
+        })).await;
         if let Some((status, code)) = stream_failure {
             observed.status = Some(status);
             observed.error = Some(code);

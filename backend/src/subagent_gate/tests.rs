@@ -3752,6 +3752,9 @@ fn collaboration_tool_aliases_are_allowed() {
         "agents/interrupt_agent",
         "agents::send_message",
         "followup_task",
+        "collaboration.followup_task",
+        "collaboration__spawn_agent",
+        "collaboration/list_agents",
         "functions.wait",
         "functions/wait",
         "functions:wait",
@@ -3760,6 +3763,9 @@ fn collaboration_tool_aliases_are_allowed() {
     ] {
         assert!(is_collaboration_tool(tool), "{tool}");
     }
+    assert!(is_wait_agent_tool("collaboration.wait_agent"));
+    assert!(is_followup_task_tool("collaboration.followup_task"));
+    assert!(!is_collaboration_tool("collaboration.exec_command"));
     assert!(!is_collaboration_tool("functions.exec"));
     assert!(!is_collaboration_tool("update_plan"));
     assert!(is_wait_agent_tool("functions.wait"));

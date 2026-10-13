@@ -505,6 +505,10 @@ impl WebSocketResponsesDownstream {
         if route.official_account {
             sanitize_official_upstream_history(body);
         }
+        let collaboration_alias = current_collaboration_alias();
+        if let Some(alias) = &collaboration_alias {
+            alias.alias_history(body);
+        }
         if route.upstream_url.as_ref().is_ok_and(|url| {
             should_replay_reasoning_text(
                 route.official_account,
@@ -737,6 +741,12 @@ impl WebSocketResponsesDownstream {
                         };
                     let mut raw_json_text = raw_json_text;
                     for mut event in events {
+                        if collaboration_alias
+                            .as_ref()
+                            .is_some_and(|alias| alias.apply(&mut event))
+                        {
+                            raw_json_text = None;
+                        }
                         if responses_event_is_failure(&event) {
                             if let Some(probe) = probe {
                                 let original = raw_json_text
@@ -1291,7 +1301,7 @@ pub(crate) async fn proxy_native_response_to_websocket(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(|value| value.chars().take(128).collect::<String>());
-    let xai_fix = current_xai_response_fix();
+    let response_fix = current_native_response_fix();
     let mut prepared = await_upstream(
         downstream,
         prepare_upstream_response(response, "读取 Responses HTTP 上游响应失败", probe),
@@ -1327,7 +1337,7 @@ pub(crate) async fn proxy_native_response_to_websocket(
                 let mut event = serde_json::from_str::<Value>(&data)
                     .context("Responses HTTP 上游 SSE data 不是有效 JSON")?;
                 normalize_response_failure(&mut event, retry_advice.as_ref());
-                if let Some(fix) = xai_fix.as_ref() {
+                if let Some(fix) = response_fix.as_ref() {
                     fix.apply(&mut event);
                 }
                 terminal |= responses_event_is_terminal(&event);
@@ -1359,7 +1369,7 @@ pub(crate) async fn proxy_native_response_to_websocket(
             let mut event = serde_json::from_str::<Value>(&data)
                 .context("Responses HTTP 上游 SSE 末尾 data 不是有效 JSON")?;
             normalize_response_failure(&mut event, retry_advice.as_ref());
-            if let Some(fix) = xai_fix.as_ref() {
+            if let Some(fix) = response_fix.as_ref() {
                 fix.apply(&mut event);
             }
             terminal |= responses_event_is_terminal(&event);
@@ -1406,7 +1416,7 @@ pub(crate) async fn proxy_native_response_to_websocket(
         downstream.start_event_stream().await?;
         for mut event in events {
             normalize_response_failure(&mut event, retry_advice.as_ref());
-            if let Some(fix) = xai_fix.as_ref() {
+            if let Some(fix) = response_fix.as_ref() {
                 fix.apply(&mut event);
             }
             if let Some(probe) = probe {
@@ -1423,7 +1433,7 @@ pub(crate) async fn proxy_native_response_to_websocket(
     }
     match serde_json::from_slice::<Value>(&body) {
         Ok(mut value) => {
-            if let Some(fix) = xai_fix.as_ref() {
+            if let Some(fix) = response_fix.as_ref() {
                 fix.apply(&mut value);
             }
             if let Some(probe) = probe {
