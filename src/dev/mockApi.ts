@@ -20,6 +20,21 @@ import {
   previewTraceLogStats,
 } from "../previewTraceLogStats";
 
+function eligiblePreviewOutputDurationMs(item: {
+  outputTokens?: number | null;
+  totalDurationMs: number;
+  routerPreUpstreamMs?: number | null;
+  upstreamFirstByteMs?: number | null;
+}) {
+  const { outputTokens, totalDurationMs, routerPreUpstreamMs, upstreamFirstByteMs } = item;
+  if (outputTokens == null || !Number.isFinite(outputTokens) || outputTokens < 100
+    || !Number.isFinite(totalDurationMs) || totalDurationMs < 0
+    || routerPreUpstreamMs == null || !Number.isFinite(routerPreUpstreamMs) || routerPreUpstreamMs < 0
+    || upstreamFirstByteMs == null || !Number.isFinite(upstreamFirstByteMs) || upstreamFirstByteMs < 0) return undefined;
+  const durationMs = totalDurationMs - routerPreUpstreamMs - upstreamFirstByteMs;
+  return durationMs >= 100 ? durationMs : undefined;
+}
+
 // 在 Vite 开发模式下，若未通过 Codey Bridge/Token 访问，自动注入 Mock 接口方便 UI 调试
 if (import.meta.env.DEV) {
   if (!window.__codeyInvokeApi) {
@@ -437,12 +452,19 @@ if (import.meta.env.DEV) {
       const outputTokens = failed ? undefined : 240 + index * 29;
       const cachedInputTokens = index % 4 === 0 ? 640 + index * 11 : undefined;
       const codexSessionIsParent = index % 8 === 0;
-      // 每 11 条留一条只有上游首字节、没有首个可见内容的记录，用于核对速度保持未知。
-      const missingFirstContent = index % 11 === 7;
+      // 缺少路由前置或上游首包计时的记录保持未知；下游内容延迟不参与速度计算。
+      const missingRouterTiming = index % 11 === 7;
+      const missingUpstreamTiming = index % 11 === 8;
+      const buffered = index === 0;
       const ttftMs = failed ? undefined : 190 + index * 13;
-      const downstreamFirstContentMs = failed || missingFirstContent ? undefined : 215 + index * 14;
-      const totalDurationMs = failed ? 1_640 + index * 31 : 2_350 + index * 91;
-      const outputDurationMs = downstreamFirstContentMs == null ? undefined : totalDurationMs - downstreamFirstContentMs;
+      const downstreamFirstContentMs = failed ? undefined : buffered ? 112_374 : 215 + index * 14;
+      const totalDurationMs = buffered ? 112_480 : failed ? 1_640 + index * 31 : 2_350 + index * 91;
+      const routerPreUpstreamMs = failed || missingRouterTiming ? undefined : buffered ? 23 : 12 + index;
+      const upstreamFirstByteMs = failed || missingUpstreamTiming ? undefined : buffered ? 1_992 : 190 + index * 13;
+      const recordedOutputTokens = buffered ? 18_728 : outputTokens;
+      const outputDurationMs = eligiblePreviewOutputDurationMs({
+        outputTokens: recordedOutputTokens, totalDurationMs, routerPreUpstreamMs, upstreamFirstByteMs,
+      });
       return {
         requestId: `preview-request-${String(index + 1).padStart(4, "0")}`,
         traceId: `preview-trace-${String(index + 1).padStart(4, "0")}`,
@@ -468,20 +490,20 @@ if (import.meta.env.DEV) {
         reasoningEffort: (["low", "medium", "high"] as const)[index % 3],
         thinkingBudgetTokens: undefined,
         ttftMs,
-        routerPreUpstreamMs: failed ? undefined : 12 + index,
-        upstreamFirstByteMs: failed ? undefined : 190 + index * 13,
+        routerPreUpstreamMs,
+        upstreamFirstByteMs,
         downstreamFirstContentMs,
         upstreamHeaderMs: 120 + index * 8,
         totalDurationMs,
-        outputTokensPerSecond: outputTokens != null && outputTokens >= 100 && outputDurationMs != null && outputDurationMs >= 100
-          ? outputTokens * 1_000 / outputDurationMs : undefined,
+        outputTokensPerSecond: recordedOutputTokens != null && outputDurationMs != null
+          ? recordedOutputTokens * 1_000 / outputDurationMs : undefined,
         queueDelayMs: index % 5,
         inputTokens: failed ? undefined : inputTokens,
-        outputTokens,
+        outputTokens: recordedOutputTokens,
         cachedInputTokens: failed ? undefined : cachedInputTokens,
         cacheCreationInputTokens: undefined,
-        reasoningOutputTokens: outputTokens ? Math.floor(outputTokens / 4) : undefined,
-        totalTokens: failed ? undefined : inputTokens + (outputTokens ?? 0),
+        reasoningOutputTokens: recordedOutputTokens ? Math.floor(recordedOutputTokens / 4) : undefined,
+        totalTokens: failed ? undefined : inputTokens + (recordedOutputTokens ?? 0),
         usageReported: !failed,
         usageUnavailableReason: failed ? "upstream_error" : undefined,
         requestProtocol: protocol,
@@ -979,9 +1001,9 @@ if (import.meta.env.DEV) {
             const succeededCount = rows.filter((item) => item.status === "succeeded").length;
             const durations = rows.map((item) => item.totalDurationMs);
             const ttfts = rows.map((item) => item.downstreamFirstContentMs ?? item.ttftMs).filter((value): value is number => value != null);
-            const eligibleSpeeds = rows.filter((item) => item.downstreamFirstContentMs != null && item.outputTokens != null && item.outputTokens >= 100 && item.totalDurationMs - item.downstreamFirstContentMs >= 100);
+            const eligibleSpeeds = rows.filter((item) => eligiblePreviewOutputDurationMs(item) != null);
             const speedTokens = sum(eligibleSpeeds.map((item) => item.outputTokens));
-            const speedDurationMs = sum(eligibleSpeeds.map((item) => item.totalDurationMs - item.downstreamFirstContentMs!));
+            const speedDurationMs = sum(eligibleSpeeds.map((item) => eligiblePreviewOutputDurationMs(item)));
             return {
               total, succeededCount, failedCount: total - succeededCount, incompleteCount: 0, cancelledCount: 0,
               successRate: total ? succeededCount / total * 100 : null,
