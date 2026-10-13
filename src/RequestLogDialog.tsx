@@ -44,6 +44,16 @@ import {
 } from "./components/ui";
 
 type RouteRequestLogItem = {
+const fallbackReasonLabels: Record<string, string> = {
+  websocket_not_supported: "当前线路不支持上游 WebSocket，使用 HTTP/SSE",
+  websocket_history_requires_http: "当前续接历史需通过 HTTP/SSE 恢复",
+  websocket_history_unavailable: "WebSocket 续接历史不可用，尝试通过 HTTP/SSE 恢复",
+  websocket_backoff: "WebSocket 正在探测或等待重试，暂用 HTTP/SSE",
+  websocket_endpoint_unsupported: "上游端点不支持 WebSocket，改用 HTTP/SSE",
+  websocket_connect_failed: "WebSocket 握手失败，改用 HTTP/SSE",
+  websocket_to_http_sse: "上游由 WebSocket 转为 HTTP/SSE，旧记录未区分具体原因",
+};
+
   requestId: string;
   traceId: string;
   timestampUnixMs: number;
@@ -2327,11 +2337,11 @@ export function RequestLogDialog({
                     {selectedItem.fallbackCount > 0 ? (
                       <div>
                         <span className="text-[11px] font-medium text-amber-800 dark:text-amber-300">
-                          降级重试：已尝试 {selectedItem.fallbackCount} 次
+                          回退与重试：{selectedItem.fallbackCount} 次
                         </span>
                         {selectedItem.fallbackReason ? (
                           <p className="m-0 mt-1 text-[11px] text-[var(--codey-muted,#6e6e73)]">
-                            原因: {selectedItem.fallbackReason}
+                            原因：{fallbackReasonLabels[selectedItem.fallbackReason] ?? selectedItem.fallbackReason}
                           </p>
                         ) : null}
                       </div>

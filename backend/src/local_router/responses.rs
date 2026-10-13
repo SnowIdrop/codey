@@ -2119,9 +2119,10 @@ impl RouterServer {
                         discard_opaque_reasoning,
                     )
                     .await?;
-                if websocket_attempt == UpstreamWebSocketAttempt::Completed {
-                    return Ok(());
-                }
+                let fallback_reason = match websocket_attempt {
+                    UpstreamWebSocketAttempt::Completed => return Ok(()),
+                    UpstreamWebSocketAttempt::UseHttp(reason) => reason,
+                };
                 if had_previous_response && responses_previous_response_id(&upstream_body).is_none()
                 {
                     // Reconnection may have expanded history before its handshake failed.
@@ -2131,7 +2132,7 @@ impl RouterServer {
                 if resolved.route.supports_websockets
                     && let Some(probe) = downstream.request_log_probe()
                 {
-                    probe.mark_fallback("websocket_to_http_sse");
+                    probe.mark_fallback(fallback_reason);
                 }
             }
             match downstream.prepare_native_http_fallback(

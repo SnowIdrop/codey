@@ -1526,7 +1526,7 @@ async fn declared_responses_route_reuses_upstream_websocket() {
 }
 
 #[tokio::test]
-async fn official_web_search_uses_http_before_upstream_websocket_send() {
+async fn official_web_search_declarations_keep_websocket_for_plain_continuations() {
     let auth_home = tempfile::tempdir().unwrap();
     let auth_path = auth_home.path().join("auth.json");
     std::fs::write(
@@ -1543,24 +1543,42 @@ async fn official_web_search_uses_http_before_upstream_websocket_send() {
         let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = upstream.local_addr().unwrap();
         let upstream_task = tokio::spawn(async move {
-            let (mut stream, _) = upstream.accept().await.unwrap();
-            let request = read_http_request(&mut stream).await.unwrap();
-            assert_eq!(request.method, "POST");
-            let body: Value = serde_json::from_slice(&request.body).unwrap();
-            let event = json!({
-                "type":"response.completed",
-                "response":{
-                    "id":"resp-search",
-                    "status":"completed",
-                    "model":body["model"],
-                    "output":[]
-                }
-            });
-            let sse = format!("data: {event}\n\n");
-            write_static_response(&mut stream, "text/event-stream", sse.as_bytes())
-                .await
-                .unwrap();
-            (request.path, body)
+            let (stream, _) = upstream.accept().await.unwrap();
+            let mut upstream_socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut requests = Vec::new();
+            for sequence in 1..=2 {
+                let message = tokio::time::timeout(Duration::from_secs(5), upstream_socket.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let WebSocketMessage::Text(text) = message else {
+                    panic!("expected response.create");
+                };
+                let body: Value = serde_json::from_str(text.as_str()).unwrap();
+                upstream_socket
+                    .send(WebSocketMessage::Text(
+                        json!({
+                            "type":"response.completed",
+                            "response":{
+                                "id":format!("resp-search-{sequence}"),
+                                "status":"completed",
+                                "model":body["model"],
+                                "output":[{
+                                    "type":"reasoning",
+                                    "encrypted_content":"encrypted-reasoning",
+                                    "summary":[]
+                                }]
+                            }
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                requests.push(body);
+            }
+            requests
         });
         let (mut config, provider_id, model) = router_config(format!("http://{address}/v1"));
         config.profiles[0].supports_websockets = true;
@@ -1580,37 +1598,43 @@ async fn official_web_search_uses_http_before_upstream_websocket_send() {
             {"type":"function","name":"local_tool","parameters":{"type":"object"}},
             {"type":tool_type,"search_context_size":"high"}
         ]);
-        socket
-            .send(WebSocketMessage::Text(
-                json!({
-                    "type":"response.create",
-                    "model":model_alias(&provider_id, &model),
-                    "input":"search the web",
-                    "tools":tools,
-                    "tool_choice":"auto"
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
-            .unwrap();
-        let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        let WebSocketMessage::Text(text) = message else {
-            panic!("expected response.completed");
-        };
-        let event: Value = serde_json::from_str(text.as_str()).unwrap();
-        assert_eq!(event["type"], "response.completed", "{event}");
-        let (path, body) = upstream_task.await.unwrap();
-        assert_eq!(path, "/v1/responses");
-        assert_eq!(body["model"], model);
-        assert_eq!(body["stream"], true);
-        assert_eq!(body["tools"], tools);
-        assert_eq!(body["tool_choice"], "auto");
-        assert!(body.get("type").is_none());
+        for sequence in 1..=2 {
+            let mut body = json!({
+                "type":"response.create",
+                "model":model_alias(&provider_id, &model),
+                "input":format!("plain task {sequence}"),
+                "tools":tools,
+                "tool_choice":"auto"
+            });
+            if sequence == 2 {
+                body["previous_response_id"] = json!("resp-search-1");
+            }
+            socket
+                .send(WebSocketMessage::Text(body.to_string().into()))
+                .await
+                .unwrap();
+            let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let WebSocketMessage::Text(text) = message else {
+                panic!("expected response.completed");
+            };
+            let event: Value = serde_json::from_str(text.as_str()).unwrap();
+            assert_eq!(event["type"], "response.completed", "{tool_type}: {event}");
+            assert_eq!(event["response"]["id"], format!("resp-search-{sequence}"));
+        }
+        let requests = upstream_task.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for body in &requests {
+            assert_eq!(body["type"], "response.create");
+            assert_eq!(body["model"], model);
+            assert_eq!(body["tools"], tools);
+            assert_eq!(body["tool_choice"], "auto");
+            assert!(body.get("stream").is_none());
+        }
+        assert_eq!(requests[1]["previous_response_id"], "resp-search-1");
         assert!(router.websocket_backoffs.lock().unwrap().entries.is_empty());
         socket.close(None).await.unwrap();
         router.stop().await.unwrap();
@@ -1621,7 +1645,6 @@ async fn official_web_search_uses_http_before_upstream_websocket_send() {
 async fn official_opaque_continuation_uses_http_with_complete_history() {
     for output in [
         json!({"type":"web_search_call","status":"completed","action":{"type":"search","query":"test"}}),
-        json!({"type":"reasoning","encrypted_content":"encrypted-reasoning","summary":[]}),
         json!({"type":"compaction","encrypted_content":"encrypted-compaction"}),
     ] {
         let auth_home = tempfile::tempdir().unwrap();
@@ -2372,7 +2395,7 @@ async fn unknown_previous_response_id_uses_http_fallback_instead_of_websocket_re
             )
             .await
             .unwrap(),
-        UpstreamWebSocketAttempt::UseHttp
+        UpstreamWebSocketAttempt::UseHttp("websocket_history_unavailable")
     );
 
     let (first_request, reused_existing_socket, opened_replacement) = upstream_task.await.unwrap();
@@ -2663,6 +2686,7 @@ async fn connections_that_have_not_gone_idle_still_report_router_busy() {
 
 #[tokio::test]
 async fn unsupported_websocket_handshake_falls_back_to_http_until_config_changes() {
+    let logs = tempfile::tempdir().unwrap();
     let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let upstream_address = upstream.local_addr().unwrap();
     let upstream_task = tokio::spawn(async move {
@@ -2713,7 +2737,16 @@ async fn unsupported_websocket_handshake_falls_back_to_http_until_config_changes
 
     let (mut config, provider_id, model) = router_config(format!("http://{upstream_address}/v1"));
     config.profiles[0].supports_websockets = true;
-    let router = LocalRouter::start(&config).await.unwrap();
+    config.route_request_log.enabled = true;
+    config.route_request_log.backend = crate::config::RouteRequestLogBackend::Sqlite;
+    let router = LocalRouter::start_with_logger(
+        &config,
+        Arc::new(RouteRequestLogController::with_root(
+            logs.path().to_path_buf(),
+        )),
+    )
+    .await
+    .unwrap();
     let endpoint = router.endpoint();
     let alias = model_alias(&provider_id, &model);
     let mut socket = connect_router_websocket(&endpoint).await;
@@ -2748,6 +2781,27 @@ async fn unsupported_websocket_handshake_falls_back_to_http_until_config_changes
     assert_eq!(requests[0].2["stream"], true);
     assert!(requests[0].2.get("stream_id").is_none());
     router.stop().await.unwrap();
+    let page = crate::route_request_log::query_route_request_logs(
+        logs.path(),
+        crate::config::RouteRequestLogBackend::Sqlite,
+        crate::route_request_log::RouteRequestLogQuery::default(),
+    )
+    .unwrap();
+    assert_eq!(page.total, 2);
+    assert!(page.items.iter().all(|item| item.fallback_count == 1));
+    let mut reasons: Vec<_> = page
+        .items
+        .iter()
+        .map(|item| item.fallback_reason.as_deref())
+        .collect();
+    reasons.sort();
+    assert_eq!(
+        reasons,
+        vec![
+            Some("websocket_backoff"),
+            Some("websocket_endpoint_unsupported")
+        ]
+    );
 }
 
 #[tokio::test]
