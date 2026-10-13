@@ -172,11 +172,16 @@ fn fastctx_namespace_aliases_pass_attested_child_hooks_without_broadening_permis
             child.tool_name = Some(tool.into());
             let output = handle_hook_for_runtime_at(&child, root, runtime_id, 12).unwrap();
             assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+            let expected_reason = if role == "codey_quick_scan" {
+                "不具备写入权限"
+            } else {
+                "deny-unknown-child-tool"
+            };
             assert!(
                 output["hookSpecificOutput"]["permissionDecisionReason"]
                     .as_str()
                     .unwrap()
-                    .contains("deny-unknown-child-tool"),
+                    .contains(expected_reason),
                 "{role}: {tool}: {output}"
             );
         }
@@ -4013,6 +4018,9 @@ fn collaboration_tool_aliases_are_allowed() {
         "agents/interrupt_agent",
         "agents::send_message",
         "followup_task",
+        "collaboration.followup_task",
+        "collaboration__spawn_agent",
+        "collaboration/list_agents",
         "functions.wait",
         "functions/wait",
         "functions:wait",
@@ -4021,6 +4029,9 @@ fn collaboration_tool_aliases_are_allowed() {
     ] {
         assert!(is_collaboration_tool(tool), "{tool}");
     }
+    assert!(is_wait_agent_tool("collaboration.wait_agent"));
+    assert!(is_followup_task_tool("collaboration.followup_task"));
+    assert!(!is_collaboration_tool("collaboration.exec_command"));
     assert!(!is_collaboration_tool("functions.exec"));
     assert!(!is_collaboration_tool("update_plan"));
     assert!(is_wait_agent_tool("functions.wait"));

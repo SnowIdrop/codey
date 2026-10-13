@@ -786,6 +786,7 @@ fn route_local_app_server_input(
                 Some("thread/start" | "thread/resume" | "thread/fork")
             )
         {
+            let method = message["method"].as_str().unwrap().to_string();
             if message.get("params").is_none_or(serde_json::Value::is_null) {
                 message["params"] = serde_json::json!({});
             }
@@ -793,7 +794,7 @@ fn route_local_app_server_input(
                 .get_mut("params")
                 .and_then(serde_json::Value::as_object_mut)
             {
-                let provider = router_provider_for_params(params, runtime_overrides);
+                let provider = router_provider_for_params(&method, params, runtime_overrides);
                 params.insert("modelProvider".into(), provider.into());
                 params.remove("model_provider");
                 if let Some(config) = params
@@ -1172,52 +1173,11 @@ fn runtime_override_string(overrides: &[String], name: &str) -> Option<String> {
 
 #[cfg(any(windows, target_os = "macos", test))]
 fn router_provider_for_params(
-    params: &serde_json::Map<String, serde_json::Value>,
-    overrides: &[String],
+    _method: &str,
+    _params: &serde_json::Map<String, serde_json::Value>,
+    _overrides: &[String],
 ) -> &'static str {
-    use crate::local_router::{REMOTE_COMPACTION_PROVIDER_ID, ROUTER_PROVIDER_ID};
-    let default_provider = if runtime_override_string(overrides, "model_provider").as_deref()
-        == Some(REMOTE_COMPACTION_PROVIDER_ID)
-    {
-        REMOTE_COMPACTION_PROVIDER_ID
-    } else {
-        ROUTER_PROVIDER_ID
-    };
-    let explicit_provider = params
-        .get("modelProvider")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|provider| match provider {
-            REMOTE_COMPACTION_PROVIDER_ID => Some(REMOTE_COMPACTION_PROVIDER_ID),
-            ROUTER_PROVIDER_ID => Some(ROUTER_PROVIDER_ID),
-            _ => None,
-        });
-    let requested_model = params
-        .get("model")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|model| !model.is_empty());
-    if requested_model.is_none()
-        && let Some(provider) = explicit_provider
-    {
-        return provider;
-    }
-    let default_model = runtime_override_string(overrides, "model");
-    let model = requested_model.or(default_model
-        .as_deref()
-        .filter(|model| !model.trim().is_empty()));
-    let Some(model) = model else {
-        return default_provider;
-    };
-    let Some(path) = runtime_override_string(overrides, "model_catalog_json") else {
-        return explicit_provider.unwrap_or(default_provider);
-    };
-    if crate::model_catalog::remote_compaction_models_from_catalog(std::path::Path::new(&path))
-        .contains(&crate::model_id::key(model))
-    {
-        REMOTE_COMPACTION_PROVIDER_ID
-    } else {
-        ROUTER_PROVIDER_ID
-    }
+    crate::local_router::ROUTER_PROVIDER_ID
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -1735,7 +1695,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_input_uses_exact_compaction_capabilities_in_mixed_catalogs() {
+    fn cli_input_uses_one_provider_in_mixed_catalogs() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("catalog.json");
         std::fs::write(
@@ -1758,7 +1718,7 @@ mod tests {
         assert!(local_router_runtime_enabled(&overrides));
         for method in ["thread/start", "thread/resume", "thread/fork"] {
             for (model, provider) in [
-                ("remote/shared", "codey_router_remote"),
+                ("remote/shared", "codey_router"),
                 ("local/shared", "codey_router"),
                 ("shared", "codey_router"),
             ] {
@@ -1771,19 +1731,70 @@ mod tests {
         }
         let empty = serde_json::Map::new();
         assert_eq!(
-            router_provider_for_params(&empty, &overrides),
-            "codey_router_remote"
+            router_provider_for_params("thread/start", &empty, &overrides),
+            "codey_router"
         );
         let params = serde_json::json!({"modelProvider":"codey_router"});
         assert_eq!(
-            router_provider_for_params(params.as_object().unwrap(), &overrides),
+            router_provider_for_params("thread/start", params.as_object().unwrap(), &overrides),
             "codey_router"
         );
         std::fs::remove_file(&path).unwrap();
         assert_eq!(
-            router_provider_for_params(&empty, &overrides),
+            router_provider_for_params("thread/start", &empty, &overrides),
             "codey_router"
         );
+    }
+
+    #[test]
+    fn model_less_history_requests_keep_the_model_and_use_the_shared_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("catalog.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"models":[
+                {"slug":"remote/shared", "codey_remote_compaction":true}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        for default_provider in ["codey_router", "codey_router_remote"] {
+            for with_catalog in [false, true] {
+                let mut overrides = vec![
+                    format!("model_provider=\"{default_provider}\""),
+                    "model=\"remote/shared\"".into(),
+                ];
+                if with_catalog {
+                    overrides.push(format!(
+                        "model_catalog_json={}",
+                        toml_edit::Value::from(path.to_str().unwrap())
+                    ));
+                }
+                for method in ["thread/resume", "thread/fork"] {
+                    for model in [
+                        None,
+                        Some(serde_json::Value::Null),
+                        Some("".into()),
+                        Some("  ".into()),
+                    ] {
+                        let mut params = serde_json::json!({
+                            "threadId":"saved", "modelProvider":"codey_router_remote"
+                        });
+                        if let Some(model) = model {
+                            params["model"] = model;
+                        }
+                        let input =
+                            serde_json::json!({"method":method,"params":params}).to_string();
+                        let mut output = Vec::new();
+                        route_local_app_server_input(input.as_bytes(), &mut output, &overrides)
+                            .unwrap();
+                        let result: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                        params["modelProvider"] = "codey_router".into();
+                        assert_eq!(result["params"], params);
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(any(windows, target_os = "macos"))]

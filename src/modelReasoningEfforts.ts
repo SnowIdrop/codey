@@ -10,17 +10,11 @@ export const MODEL_REASONING_EFFORT_LEVELS: readonly string[] = [
   "ultra",
 ];
 
-/// 奇数档位排在第二列，界面呈现为两列三行。
-export const MODEL_REASONING_EFFORT_COLUMNS: readonly (readonly string[])[] = [
-  MODEL_REASONING_EFFORT_LEVELS.filter((_, index) => index % 2 === 0),
-  MODEL_REASONING_EFFORT_LEVELS.filter((_, index) => index % 2 === 1),
-];
-
-export const MAX_MODEL_REASONING_EFFORT_VALUE_BYTES = 32;
+const MAX_MODEL_REASONING_EFFORT_VALUE_BYTES = 32;
 
 const valueEncoder = new TextEncoder();
 
-export function isReasoningEffortLevel(level: string): boolean {
+function isReasoningEffortLevel(level: string): boolean {
   return MODEL_REASONING_EFFORT_LEVELS.includes(level.trim());
 }
 

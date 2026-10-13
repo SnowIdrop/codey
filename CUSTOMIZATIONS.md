@@ -1,6 +1,6 @@
 # 个人适配维护
 
-本 fork 为 SnowIdrop/codey，上游为 SuperGness/codey。`develop` 集成 fork 的 `master`、`peropero/customizations` 个人适配和 `codex/workflow-engine-preview` 工作流预览；原三个分支保持不变。当前上游基线为 `a5c0b54c8efc46899b9d9cb2164f35201283a7f9`。
+本 fork 为 SnowIdrop/codey，上游为 SuperGness/codey。`develop` 集成 fork 的 `master`、`peropero/customizations` 个人适配和 `codex/workflow-engine-preview` 工作流预览；原三个分支保持不变。当前上游基线为 `d75dbf8666462f0ec6a0120b37fc87ec67058858`。
 
 ## 已保留的适配
 

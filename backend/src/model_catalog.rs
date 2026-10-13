@@ -66,6 +66,13 @@ const REASONING_LEVEL_DESCRIPTIONS: [(&str, &str); 6] = [
 ];
 const FAST_SERVICE_TIER_ID: &str = "priority";
 const FAST_SPEED_TIER_ID: &str = "fast";
+/// Ultrafast 是 Fast 之上的速度档。上游目录目前只声明 Fast，所以这一档由 Codey
+/// 本地合成。开放的判据是上游对 Fast 的描述：账号快照里只有 6.1 Sol 和 6 Astra
+/// 标成 “2x speed”，其余模型是 “1.5x speed”。客户端同时要求 `service_tiers`
+/// 里出现该档，只补 `additional_speed_tiers` 会被 Codex 判定为“未声明”并丢弃。
+const ULTRAFAST_SERVICE_TIER_ID: &str = "ultrafast";
+const ULTRAFAST_SPEED_TIER_ID: &str = "ultrafast";
+const ULTRAFAST_MODEL_SLUGS: [&str; 2] = ["gpt-6.1-sol", "gpt-6-astra"];
 const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
 /// Official account models Codey exposes. Upstream retires a model by dropping
 /// it from the Codex model cache, so a retired slug has to leave this list in
@@ -261,6 +268,9 @@ pub(crate) struct CatalogOverrides<'a> {
     pub(crate) contexts: &'a std::collections::BTreeMap<String, crate::config::ModelContextConfig>,
     pub(crate) reasoning_efforts:
         &'a std::collections::BTreeMap<String, Vec<crate::config::ModelReasoningEffort>>,
+    /// Route-qualified model id to native display name. Codex shows this field
+    /// in surfaces Codey cannot patch, so aliased ids must not read as raw ids.
+    pub(crate) display_names: &'a std::collections::BTreeMap<String, String>,
 }
 
 #[cfg(test)]
@@ -452,6 +462,15 @@ fn apply_overrides_to_models(models: &mut [Value], overrides: CatalogOverrides<'
                 .map(|(_, efforts)| efforts.as_slice())
         });
         apply_model_reasoning_efforts(model, declaration);
+        if let Some(display_name) = model.get("slug").and_then(Value::as_str).and_then(|slug| {
+            overrides
+                .display_names
+                .iter()
+                .find(|(key, _)| model_id::equal(key, slug))
+                .map(|(_, name)| name)
+        }) {
+            model["display_name"] = json!(display_name);
+        }
     }
     Ok(())
 }
@@ -689,11 +708,11 @@ fn render_catalog_for_provider(
         .collect::<Vec<_>>();
 
     for model in &mut catalog_models {
-        let declares_fast_support = declares_fast_speed_support(model);
         ensure_catalog_compatibility(model);
         expose_supported_model(model);
-        if declares_fast_support {
-            add_fast_speed_controls(model);
+        add_fast_speed_controls(model);
+        if supports_ultrafast_speed(model) {
+            add_ultrafast_speed_controls(model);
         }
     }
 
@@ -1163,7 +1182,6 @@ fn ordered_catalog_sources(home: &Path) -> Vec<PathBuf> {
 
 fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
     let mut catalogs = Vec::new();
-    let mut bundled_fast_model_slugs = HashSet::new();
     let mut last_error = None;
     let mut account_snapshot_models = None;
     for path in paths {
@@ -1198,12 +1216,6 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
     if let Some(value) = codey_runtime_core::model_suffix::bundled_model_catalog() {
         let models = official_models_from_value(&value);
         if !models.is_empty() {
-            bundled_fast_model_slugs.extend(models.iter().filter_map(|model| {
-                declares_fast_speed_support(model)
-                    .then(|| model.get("slug").and_then(Value::as_str))
-                    .flatten()
-                    .map(ToString::to_string)
-            }));
             catalogs.push(models);
         }
     }
@@ -1257,6 +1269,7 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
                     .unwrap_or(slug)
                     .to_string();
                 normalize_official_model(&mut model, slug, &display_name, seen.len() - 1);
+                add_fast_speed_controls(&mut model);
                 Some(model)
             })
             .collect::<Vec<_>>();
@@ -1287,10 +1300,11 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
             let fallbacks = matching_models;
             complete_reasoning_metadata(&mut model, &fallbacks);
             normalize_official_model(&mut model, slug, display_name, priority);
-            if bundled_fast_model_slugs.contains(*slug) {
-                add_fast_speed_controls(&mut model);
+            add_fast_speed_controls(&mut model);
+            if supports_ultrafast_speed(&model) {
+                add_ultrafast_speed_controls(&mut model);
             } else {
-                remove_fast_speed_controls(&mut model);
+                remove_ultrafast_speed_controls(&mut model);
             }
             Ok(model)
         })
@@ -2271,6 +2285,7 @@ fn expose_supported_model(model: &mut Value) {
     }
 }
 
+#[cfg(test)]
 fn declares_fast_speed_support(model: &Value) -> bool {
     model
         .get("service_tiers")
@@ -2326,16 +2341,77 @@ fn add_fast_speed_controls(model: &mut Value) {
     }
 }
 
-fn remove_fast_speed_controls(model: &mut Value) {
+/// 上游会为同一个模型下发多个 slug：`-wm` 是 Work 模式，`-priority` 是 Fast 档，
+/// `-ultrafast` 是预留的 Ultrafast 档。只认这几种后缀，免得把 `gpt-6-astra-max`
+/// 这类无关变体也当成同族。
+const SPEED_VARIANT_SUFFIXES: [&str; 3] = ["-wm", "-priority", "-ultrafast"];
+
+/// 只有上游标成 “2x speed” 的模型补 Ultrafast。路由前缀和后缀先归一化再比较，
+/// 否则 `route-x/gpt-6.1-sol` 和 `gpt-6.1-sol-wm` 都会漏掉。
+fn supports_ultrafast_speed(model: &Value) -> bool {
+    let slug = model.get("slug").and_then(Value::as_str).unwrap_or("");
+    let upstream = route_scoped_upstream_model_id(slug)
+        .trim()
+        .to_ascii_lowercase();
+    ULTRAFAST_MODEL_SLUGS.iter().any(|candidate| {
+        upstream.as_str() == *candidate
+            || SPEED_VARIANT_SUFFIXES.iter().any(|suffix| {
+                upstream
+                    .as_str()
+                    .strip_suffix(*suffix)
+                    .is_some_and(|base| base == *candidate)
+            })
+    })
+}
+
+fn ultrafast_service_tier() -> Value {
+    json!({
+        "id": ULTRAFAST_SERVICE_TIER_ID,
+        "name": "Ultrafast",
+        "description": "The fastest available responses for latency-sensitive work."
+    })
+}
+
+fn add_ultrafast_speed_controls(model: &mut Value) {
+    let service_tier = ultrafast_service_tier();
+    let service_tiers = model.get_mut("service_tiers").and_then(Value::as_array_mut);
+    if let Some(service_tiers) = service_tiers {
+        if !service_tiers
+            .iter()
+            .any(|tier| tier.get("id").and_then(Value::as_str) == Some(ULTRAFAST_SERVICE_TIER_ID))
+        {
+            service_tiers.push(service_tier);
+        }
+    } else {
+        model["service_tiers"] = json!([service_tier]);
+    }
+
+    let speed_tiers = model
+        .get_mut("additional_speed_tiers")
+        .and_then(Value::as_array_mut);
+    if let Some(speed_tiers) = speed_tiers {
+        if !speed_tiers
+            .iter()
+            .any(|tier| tier.as_str() == Some(ULTRAFAST_SPEED_TIER_ID))
+        {
+            speed_tiers.push(json!(ULTRAFAST_SPEED_TIER_ID));
+        }
+    } else {
+        model["additional_speed_tiers"] = json!([ULTRAFAST_SPEED_TIER_ID]);
+    }
+}
+
+fn remove_ultrafast_speed_controls(model: &mut Value) {
     if let Some(service_tiers) = model.get_mut("service_tiers").and_then(Value::as_array_mut) {
-        service_tiers
-            .retain(|tier| tier.get("id").and_then(Value::as_str) != Some(FAST_SERVICE_TIER_ID));
+        service_tiers.retain(|tier| {
+            tier.get("id").and_then(Value::as_str) != Some(ULTRAFAST_SERVICE_TIER_ID)
+        });
     }
     if let Some(speed_tiers) = model
         .get_mut("additional_speed_tiers")
         .and_then(Value::as_array_mut)
     {
-        speed_tiers.retain(|tier| tier.as_str() != Some(FAST_SPEED_TIER_ID));
+        speed_tiers.retain(|tier| tier.as_str() != Some(ULTRAFAST_SPEED_TIER_ID));
     }
 }
 
@@ -2447,6 +2523,9 @@ fn synthetic_model(
     ensure_catalog_compatibility(&mut model);
     clamp_reasoning_efforts(&mut model);
     add_fast_speed_controls(&mut model);
+    if supports_ultrafast_speed(&model) {
+        add_ultrafast_speed_controls(&mut model);
+    }
     model
 }
 
@@ -2592,6 +2671,7 @@ fn removing_context_override_restores_the_original_model_budget() {
                 plugin_contexts: &empty,
                 contexts: overrides,
                 reasoning_efforts: &Default::default(),
+                display_names: &Default::default(),
             },
         )
         .unwrap();
@@ -3213,6 +3293,163 @@ mod tests {
     }
 
     #[test]
+    fn account_snapshot_ultrafast_follows_the_two_x_fast_family() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+        let snapshot = json!({
+            "codey_account_snapshot": true,
+            "models": [
+                {
+                    "slug": "gpt-6.1-sol",
+                    "display_name": "GPT-6.1-Sol",
+                    "visibility": "list",
+                    "description": "GPT-6.1-Sol"
+                },
+                {
+                    "slug": "gpt-6-astra",
+                    "display_name": "GPT-6-Astra",
+                    "visibility": "list",
+                    "description": "GPT-6-Astra"
+                },
+                {
+                    "slug": "gpt-5.6-sol",
+                    "display_name": "GPT-5.6-Sol",
+                    "visibility": "list",
+                    "description": "GPT-5.6-Sol"
+                }
+            ]
+        });
+        fs::create_dir_all(home.path().join("model-catalogs")).unwrap();
+        fs::write(
+            home.path().join(DEBUG_CATALOG_RELATIVE_PATH),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        refresh_for_provider(home.path(), true, None, &[]).unwrap();
+
+        let catalog: Value = serde_json::from_slice(
+            &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
+        )
+        .unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        for slug in ["gpt-6.1-sol", "gpt-6-astra"] {
+            let Some(model) = models.iter().find(|model| model["slug"] == slug) else {
+                panic!("目录里缺少 {slug}");
+            };
+            // Fast 仍是第一档，Ultrafast 追加在它后面，选择器的默认顺序不变。
+            assert_eq!(model["service_tiers"][0]["id"], FAST_SERVICE_TIER_ID);
+            assert_native_fast(model);
+            assert_native_ultrafast(model);
+        }
+        // 上游只按 1.5x 声明 Fast 的模型不会被顺带升级。
+        let sol56 = models
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.6-sol")
+            .unwrap();
+        assert!(
+            !sol56["service_tiers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tier| tier["id"] == ULTRAFAST_SERVICE_TIER_ID)
+        );
+    }
+
+    #[test]
+    fn route_alias_for_six_one_sol_keeps_ultrafast_speed() {
+        let home = tempfile::tempdir().unwrap();
+        let mut cache = official_cache();
+        cache["models"].as_array_mut().unwrap().push(json!({
+            "slug": "gpt-6.1-sol",
+            "display_name": "GPT-6.1-Sol",
+            "visibility": "list",
+            "priority": 0,
+            "default_reasoning_level": "low",
+            "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}],
+            "service_tiers": [{"id": "priority"}],
+            "additional_speed_tiers": ["fast"]
+        }));
+        fs::write(
+            home.path().join("models_cache.json"),
+            serde_json::to_vec(&cache).unwrap(),
+        )
+        .unwrap();
+
+        let selection = vec!["route-x/gpt-6.1-sol".to_string()];
+        refresh_for_provider(home.path(), false, Some(&selection), &selection).unwrap();
+
+        let catalog: Value = serde_json::from_slice(
+            &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
+        )
+        .unwrap();
+        let alias = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["slug"] == "route-x/gpt-6.1-sol")
+            .unwrap();
+        assert_native_fast(alias);
+        assert_native_ultrafast(alias);
+    }
+
+    #[test]
+    fn ultrafast_speed_support_is_limited_to_the_two_x_fast_family() {
+        for slug in [
+            "gpt-6.1-sol",
+            "gpt-6.1-sol-wm",
+            "gpt-6.1-sol-priority",
+            "route-mu5dql1a/gpt-6.1-sol",
+            "my%20route/gpt-6.1-sol-wm",
+            "gpt-6-astra",
+            "gpt-6-astra-wm",
+            "codey-official-account-x/gpt-6-astra",
+        ] {
+            let model = json!({ "slug": slug });
+            assert!(supports_ultrafast_speed(&model), "{slug} 应支持 Ultrafast");
+        }
+        for slug in [
+            "gpt-5.6-sol",
+            "gpt-5.6-luna",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-6.1-sol2",
+            "gpt-6-astra2",
+            "route-x/gpt-6-astra-max",
+        ] {
+            let model = json!({ "slug": slug });
+            assert!(
+                !supports_ultrafast_speed(&model),
+                "{slug} 不应支持 Ultrafast"
+            );
+        }
+    }
+
+    #[test]
+    fn ultrafast_speed_controls_keep_fast_first_and_stay_idempotent() {
+        let mut model = json!({
+            "slug": "gpt-6.1-sol",
+            "service_tiers": [{ "id": FAST_SERVICE_TIER_ID, "name": "Fast" }],
+            "additional_speed_tiers": [FAST_SPEED_TIER_ID]
+        });
+        add_ultrafast_speed_controls(&mut model);
+        add_ultrafast_speed_controls(&mut model);
+
+        let tiers = model["service_tiers"].as_array().unwrap();
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(tiers[0]["id"], FAST_SERVICE_TIER_ID);
+        assert_eq!(tiers[1]["id"], ULTRAFAST_SERVICE_TIER_ID);
+        assert_eq!(
+            model["additional_speed_tiers"],
+            json!([FAST_SPEED_TIER_ID, ULTRAFAST_SPEED_TIER_ID])
+        );
+
+        remove_ultrafast_speed_controls(&mut model);
+        assert_eq!(model["service_tiers"].as_array().unwrap().len(), 1);
+        assert_eq!(model["additional_speed_tiers"], json!([FAST_SPEED_TIER_ID]));
+    }
+
+    #[test]
     fn account_snapshot_borrows_a_local_template_for_slugs_the_fallback_list_omits() {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
@@ -3417,6 +3654,7 @@ mod tests {
             plugin_contexts: &Default::default(),
             contexts: &contexts,
             reasoning_efforts: &efforts,
+            display_names: &Default::default(),
         };
         staged_catalog_refresh(staged.path(), &selected, overrides);
         refresh_for_provider_with_contexts(
@@ -3443,6 +3681,7 @@ mod tests {
                 plugin_contexts: &Default::default(),
                 contexts: &contexts,
                 reasoning_efforts: &no_efforts,
+                display_names: &Default::default(),
             },
         )
         .unwrap();
@@ -3450,6 +3689,70 @@ mod tests {
             fs::read(staged.path().join(relative_path())).unwrap(),
             fs::read(combined.path().join(relative_path())).unwrap()
         );
+    }
+
+    #[test]
+    fn route_display_names_replace_raw_route_ids_in_the_generated_catalog() {
+        // Codex renders this field in the model picker and the model-change
+        // divider; a route alias there reads as a long internal id.
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+        let selected = vec![
+            "route/gpt-5.6-sol".to_string(),
+            "route/custom-model".to_string(),
+        ];
+        let display_names = std::collections::BTreeMap::from([
+            (
+                "route/gpt-5.6-sol".to_string(),
+                "[ro] gpt-5.6-sol".to_string(),
+            ),
+            (
+                "route/custom-model".to_string(),
+                "[ro] custom-model".to_string(),
+            ),
+        ]);
+        refresh_for_provider_with_contexts(
+            home.path(),
+            false,
+            Some(&selected),
+            &selected,
+            CapabilityLists::default(),
+            CatalogOverrides {
+                plugin_contexts: &Default::default(),
+                contexts: &Default::default(),
+                reasoning_efforts: &Default::default(),
+                display_names: &display_names,
+            },
+            "",
+        )
+        .unwrap();
+        for model in read_runtime_catalog_models(home.path()).unwrap() {
+            let slug = model["slug"].as_str().unwrap();
+            assert_eq!(
+                model["display_name"].as_str().unwrap(),
+                display_names[slug].as_str(),
+                "unexpected display name for {slug}"
+            );
+        }
+        // Reusing the cached catalog must keep the same display names instead
+        // of restoring the raw route ids.
+        apply_catalog_overrides(
+            home.path(),
+            CatalogOverrides {
+                plugin_contexts: &Default::default(),
+                contexts: &Default::default(),
+                reasoning_efforts: &Default::default(),
+                display_names: &display_names,
+            },
+        )
+        .unwrap();
+        for model in read_runtime_catalog_models(home.path()).unwrap() {
+            let slug = model["slug"].as_str().unwrap();
+            assert_eq!(
+                model["display_name"].as_str().unwrap(),
+                display_names[slug].as_str()
+            );
+        }
     }
 
     #[test]
@@ -3481,6 +3784,7 @@ mod tests {
             plugin_contexts: &Default::default(),
             contexts: &contexts,
             reasoning_efforts: &efforts,
+            display_names: &Default::default(),
         };
         assert!(
             refresh_for_provider_with_contexts(
@@ -3534,6 +3838,7 @@ mod tests {
             plugin_contexts: &Default::default(),
             contexts: &contexts,
             reasoning_efforts: &efforts,
+            display_names: &Default::default(),
         };
         let mut staged_us = Vec::new();
         let mut combined_us = Vec::new();
@@ -3706,6 +4011,25 @@ mod tests {
             model["additional_speed_tiers"]
                 .as_array()
                 .is_some_and(|tiers| tiers.iter().any(|tier| tier == FAST_SPEED_TIER_ID))
+        );
+    }
+
+    fn assert_native_ultrafast(model: &Value) {
+        assert!(
+            model["service_tiers"].as_array().is_some_and(|tiers| tiers
+                .iter()
+                .any(|tier| tier["id"] == ULTRAFAST_SERVICE_TIER_ID)),
+            "{} 的 service_tiers 缺少 Ultrafast：{}",
+            model["slug"],
+            model["service_tiers"]
+        );
+        assert!(
+            model["additional_speed_tiers"]
+                .as_array()
+                .is_some_and(|tiers| tiers.iter().any(|tier| tier == ULTRAFAST_SPEED_TIER_ID)),
+            "{} 的 additional_speed_tiers 缺少 Ultrafast：{}",
+            model["slug"],
+            model["additional_speed_tiers"]
         );
     }
 
@@ -5913,6 +6237,7 @@ fn plugin_context_defaults_yield_to_users_and_restore_after_override_removal() {
             plugin_contexts: &plugin,
             contexts: &empty,
             reasoning_efforts: &reasoning,
+            display_names: &Default::default(),
         },
     )
     .unwrap();
@@ -5924,6 +6249,7 @@ fn plugin_context_defaults_yield_to_users_and_restore_after_override_removal() {
             plugin_contexts: &plugin,
             contexts: &user,
             reasoning_efforts: &reasoning,
+            display_names: &Default::default(),
         },
     )
     .unwrap();
@@ -5935,6 +6261,7 @@ fn plugin_context_defaults_yield_to_users_and_restore_after_override_removal() {
             plugin_contexts: &plugin,
             contexts: &empty,
             reasoning_efforts: &reasoning,
+            display_names: &Default::default(),
         },
     )
     .unwrap();

@@ -22,6 +22,7 @@ mod fs_util;
 mod hook_io;
 mod http_response;
 mod instance_lock;
+mod launch_proxy;
 mod launcher;
 mod local_router;
 mod maintenance_lock;

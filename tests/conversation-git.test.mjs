@@ -8,8 +8,16 @@ const source = readFileSync(new URL("../public/conversation-git.js", import.meta
 const flush = async () => { for (let i = 0; i < 15; i++) await Promise.resolve(); };
 const deferred = () => { let resolve; const promise = new Promise((done) => { resolve = done; }); return { promise, resolve }; };
 
-function harness({ enabled = true, visible = true, optimizer = true, status, preview, execute, now = () => Date.now() } = {}) {
+function harness({ enabled = true, visible = true, optimizer = true, status, preview, pushPreview, execute, now = () => Date.now() } = {}) {
   class Element extends FakeElementCore {
+    get classList() {
+      const classes = () => new Set((this.className || "").split(/\s+/).filter(Boolean));
+      return {
+        add: (...names) => { this.className = [...new Set([...classes(), ...names])].join(" "); },
+        remove: (...names) => { this.className = [...classes()].filter((name) => !names.includes(name)).join(" "); },
+        contains: (name) => classes().has(name),
+      };
+    }
     replaceChildren(...children) { [...this.children].forEach((child) => child.remove()); this.append(...children); }
     getBoundingClientRect() { return { left: 100, top: 600 }; }
     focus() { document.activeElement = this; }
@@ -24,15 +32,19 @@ function harness({ enabled = true, visible = true, optimizer = true, status, pre
   host.appendChild(anchor); document.body.appendChild(host);
   const optimize = new Element("button"); optimize.id = "codey-prompt-optimize-button";
   if (optimizer) host.appendChild(optimize);
-  const state = { sessionId: "session-a", enabled, visible };
+  const state = { sessionId: "session-a", enabled, visible, contextAvailable: true, targetAvailable: true };
   const window = new Element("window");
   window.innerWidth = 1200; window.innerHeight = 800;
-  window.__codeyPromptOptimize = { composerContext: () => ({ sessionId: state.sessionId, target: { host, anchor } }) };
+  window.location = { href: "https://codex.local/session-a" };
+  window.__codeyPromptOptimize = { composerContext: () => state.contextAvailable
+    ? { sessionId: state.sessionId, target: state.targetAvailable ? { host, anchor } : null } : null };
   const calls = [];
   window.__codexSessionDeleteBridge = async (path, payload) => {
     calls.push({ path, payload });
     if (path === "/settings/get") return { conversationGit: { enabled: state.enabled } };
     if (path.endsWith("_status")) return status ? status(payload) : { visible: state.visible, reason: "没有文件改动" };
+    if (path.endsWith("_cancel")) return { status: "cancelled" };
+    if (path.endsWith("_push_preview")) return pushPreview ? pushPreview(payload) : { remote: "origin", upstreamBranch: "main" };
     if (path.endsWith("_preview")) return preview ? preview(payload) : {
       token: "preview-token", files: ["owned.txt"], diff: "-old\n+new", message: "fix(conversation-git): 校验当前对话提交范围", branch: "main",
     };
@@ -55,7 +67,7 @@ function harness({ enabled = true, visible = true, optimizer = true, status, pre
     }
     await flush();
   };
-  vm.runInNewContext(source, { window, document,
+  vm.runInNewContext(source, { window, document, crypto: globalThis.crypto,
     Date: class extends Date { static now() { return now(); } },
     setTimeout: (fn, delay) => { const id = ++timerId; timers.set(id, { fn, delay }); return id; },
     clearTimeout: (id) => timers.delete(id), setInterval: (fn) => intervals.push(fn), console });
@@ -82,6 +94,108 @@ test("shows only enabled conversations with backend-confirmed Git changes beside
   }
 });
 
+test("keeps confirmed visibility through brief composer loss and blocks stale actions", async () => {
+  const env = harness(); await env.load();
+  const button = env.button();
+  env.state.contextAvailable = false;
+  env.mutate();
+  assert.equal(button.style.display, "inline-flex");
+  assert.equal(button.disabled, true);
+  assert.equal(env.window.__codeyConversationGit.snapshot().sessionId, "session-a");
+  await env.click(button);
+  assert.equal(env.calls.some((call) => call.path.endsWith("_preview")), false);
+  env.state.contextAvailable = true;
+  env.mutate(); await env.runTimers();
+  assert.equal(button.style.display, "inline-flex");
+  assert.equal(button.disabled, false);
+  assert.equal(env.timerDelays().includes(100), false);
+});
+
+test("restores the Git button when the native toolbar removes only the injected button", async () => {
+  const env = harness(); await env.load();
+  const button = env.button();
+  button.remove();
+  env.mutate([{ type: "childList", target: env.host, addedNodes: [], removedNodes: [button] }]);
+  assert.equal(env.button(), button);
+  assert.equal(button.style.display, "inline-flex");
+});
+
+test("keeps the button during temporary missing toolbar or conversation ID", async () => {
+  const env = harness(); await env.load();
+  env.state.targetAvailable = false;
+  env.mutate();
+  assert.equal(env.button().style.display, "inline-flex");
+  env.state.targetAvailable = true;
+  env.state.sessionId = null;
+  env.mutate();
+  assert.equal(env.button().style.display, "inline-flex");
+  env.state.sessionId = "session-a";
+  env.mutate(); await env.runTimers();
+  assert.equal(env.window.__codeyConversationGit.snapshot().visible, true);
+});
+
+test("a pending status result does not hide the button during toolbar rebuilding", async () => {
+  const pending = deferred();
+  let count = 0;
+  const env = harness({ status: () => ++count === 1 ? { visible: true } : pending.promise });
+  await env.load();
+  await env.tick();
+  env.state.targetAvailable = false;
+  env.mutate();
+  pending.resolve({ visible: true }); await flush();
+  assert.equal(env.button().style.display, "inline-flex");
+  assert.equal(env.button().disabled, true);
+  env.state.targetAvailable = true;
+  env.mutate();
+  assert.equal(env.button().disabled, false);
+});
+
+test("hides after persistent context loss or navigation to another route", async () => {
+  let now = 0;
+  const env = harness({ now: () => now }); await env.load();
+  env.state.contextAvailable = false;
+  env.mutate();
+  now = 1_001;
+  await env.runTimers();
+  assert.equal(env.button().style.display, "none");
+  assert.equal(env.window.__codeyConversationGit.snapshot().sessionId, null);
+  env.state.contextAvailable = true;
+  env.mutate(); await env.runTimers();
+  assert.equal(env.button().style.display, "inline-flex");
+  env.window.location.href = "https://codex.local/session-b";
+  env.state.contextAvailable = false;
+  env.mutate();
+  assert.equal(env.button().style.display, "none");
+});
+
+test("preserves recent visibility on query failure but hides confirmed absence", async () => {
+  let result = { visible: true };
+  const env = harness({ status: () => {
+    if (result instanceof Error) throw result;
+    return result;
+  } }); await env.load();
+  result = new Error("桥接暂时不可用");
+  await env.tick();
+  assert.equal(env.button().style.display, "inline-flex");
+  result = { visible: false, unavailable: true, reason: "读取会话暂时失败" };
+  await env.tick();
+  assert.equal(env.button().style.display, "inline-flex");
+  result = { visible: false, reason: "没有文件改动" };
+  await env.tick();
+  assert.equal(env.button().style.display, "none");
+});
+
+test("does not keep a failed query's visibility beyond the cache lifetime", async () => {
+  let now = 0, fail = false;
+  const env = harness({ now: () => now, status: () => {
+    if (fail) throw new Error("暂时失败");
+    return { visible: true };
+  } }); await env.load();
+  fail = true; now = 30_001;
+  await env.tick();
+  assert.equal(env.button().style.display, "none");
+});
+
 test("works when prompt optimization is disabled and requires preview confirmation before execution", async () => {
   const env = harness({ optimizer: false }); await env.load();
   await env.click(env.button());
@@ -98,6 +212,84 @@ test("works when prompt optimization is disabled and requires preview confirmati
   assert.equal(env.panel().querySelector("p").textContent, "当前对话文件已提交并推送");
 });
 
+test("cancels a pending preview and ignores its completion during a newer request", async () => {
+  const first = deferred(), second = deferred();
+  let count = 0;
+  const env = harness({ preview: () => ++count === 1 ? first.promise : second.promise });
+  await env.load(); await env.click(env.button());
+  const request = env.calls.find((call) => call.path.endsWith("_preview"));
+  await env.click(env.panel().querySelector("button"));
+  assert.equal(env.window.__codeyConversationGit.snapshot().busy, false);
+  assert.equal(env.panel(), null);
+  assert.equal(env.calls.find((call) => call.path.endsWith("_cancel")).payload.requestId, request.payload.requestId);
+  await env.click(env.button());
+  const current = env.panel();
+  first.resolve({ token: "old", files: ["old"], diff: "old", message: "fix: 旧预览" }); await flush();
+  assert.equal(env.panel(), current);
+  assert.equal(env.window.__codeyConversationGit.snapshot().busy, true);
+  second.resolve({ token: "new", files: ["new"], diff: "new", message: "fix: 新预览" }); await flush();
+  assert.equal(env.window.__codeyConversationGit.snapshot().busy, false);
+  assert.equal(env.panel().querySelector("pre").textContent, "fix: 新预览");
+});
+
+test("allows local commit while remote validation is pending without enabling push later", async () => {
+  const remote = deferred(), execution = deferred();
+  const env = harness({ preview: () => ({ token: "preview-token", files: ["owned.txt"], diff: "-old\n+new",
+    message: "fix: 本地预览", pushPending: true }), pushPreview: () => remote.promise, execute: () => execution.promise });
+  await env.load(); await env.click(env.button());
+  const buttons = env.panel().querySelectorAll("button");
+  const push = buttons.find((node) => node.textContent === "提交并推送");
+  const local = buttons.find((node) => node.textContent === "提交");
+  assert.equal(push.disabled, true);
+  assert.notEqual(local.disabled, true);
+  await env.click(push);
+  assert.equal(env.calls.some((call) => call.path.endsWith("_execute")), false);
+  await env.click(local);
+  remote.resolve({ remote: "origin", upstreamBranch: "main" }); await flush();
+  assert.equal(push.disabled, true);
+  assert.equal(env.calls.find((call) => call.path.endsWith("_execute")).payload.push, false);
+  execution.resolve({ status: "committed", commit: "abc", message: "已提交" }); await flush();
+  assert.equal(env.panel().querySelector("p").textContent, "已提交");
+});
+
+test("shows the checked remote and unpushed commits before enabling push", async () => {
+  const remote = deferred();
+  const env = harness({ preview: () => ({ token: "preview-token", files: ["owned.txt"], diff: "diff",
+    message: "fix: 本地预览", pushPending: true }), pushPreview: () => remote.promise });
+  await env.load(); await env.click(env.button());
+  const push = env.panel().querySelectorAll("button").find((node) => node.textContent === "提交并推送");
+  assert.equal(push.disabled, true);
+  remote.resolve({ remote: "origin", upstreamBranch: "main", unpushedCount: 1, unpushedCommits: ["abc fix: 先前提交"] }); await flush();
+  assert.equal(push.disabled, false);
+  assert.ok(env.panel().querySelectorAll("li").some((node) => node.textContent === "abc fix: 先前提交"));
+  await env.click(push);
+  assert.equal(env.calls.find((call) => call.path.endsWith("_execute")).payload.push, true);
+});
+
+test("keeps local commit available when remote validation fails", async () => {
+  const env = harness({ preview: () => ({ token: "preview-token", files: ["owned.txt"], diff: "diff",
+    message: "fix: 本地预览", pushPending: true }), pushPreview: () => ({ status: "failed", message: "远端检查超时" }) });
+  await env.load(); await env.click(env.button());
+  const push = env.panel().querySelectorAll("button").find((node) => node.textContent === "提交并推送");
+  assert.equal(push.disabled, true);
+  assert.ok(env.panel().querySelectorAll("p").some((node) => node.textContent.includes("远端检查超时")));
+  await env.click(env.panel().querySelectorAll("button").find((node) => node.textContent === "提交"));
+  assert.equal(env.calls.find((call) => call.path.endsWith("_execute")).payload.push, false);
+});
+
+test("closing a pending remote check cancels it and never executes a commit", async () => {
+  const pending = deferred();
+  const env = harness({ preview: () => ({ token: "preview-token", files: ["owned.txt"], diff: "diff",
+    message: "fix: 本地预览", pushPending: true }), pushPreview: () => pending.promise });
+  await env.load(); await env.click(env.button());
+  const check = env.calls.find((call) => call.path.endsWith("_push_preview"));
+  await env.click(env.panel().querySelectorAll("button").find((node) => node.textContent === "取消"));
+  assert.ok(env.calls.some((call) => call.path.endsWith("_cancel") && call.payload.requestId === check.payload.requestId));
+  pending.resolve({ remote: "origin", upstreamBranch: "main" }); await flush();
+  assert.equal(env.panel(), null);
+  assert.equal(env.calls.some((call) => call.path.endsWith("_execute")), false);
+});
+
 test("allows user to choose commit only without pushing", async () => {
   const env = harness(); await env.load();
   await env.click(env.button());
@@ -106,6 +298,36 @@ test("allows user to choose commit only without pushing", async () => {
   const execution = env.calls.find((call) => call.path.endsWith("_execute"));
   assert.equal(JSON.stringify(execution.payload), JSON.stringify({ sessionId: "session-a", token: "preview-token", push: false }));
   assert.equal(env.panel().querySelector("p").textContent, "当前对话文件已提交到本地仓库");
+});
+
+test("disables push with the backend reason and keeps commit only available", async () => {
+  const env = harness({ preview: () => ({ token: "preview-token", files: ["owned.txt"], diff: "-old\n+new",
+    message: "fix(conversation-git): 校验当前对话提交范围", branch: null, pushReason: "当前处于分离 HEAD，没有可推送的分支" }) });
+  await env.load(); await env.click(env.button());
+  assert.equal(env.panel().querySelector("strong").textContent, "提交到当前分离 HEAD");
+  assert.ok(env.panel().querySelectorAll("p").some((node) => node.textContent === "无法推送：当前处于分离 HEAD，没有可推送的分支"));
+  const buttons = env.panel().querySelectorAll("button");
+  const push = buttons.find((node) => node.textContent === "提交并推送");
+  const commitOnly = buttons.find((node) => node.textContent === "提交");
+  assert.equal(push.disabled, true);
+  assert.equal(env.document.activeElement, commitOnly);
+  await env.click(push);
+  assert.equal(env.calls.some((call) => call.path.endsWith("_execute")), false);
+  await env.click(commitOnly);
+  assert.equal(env.calls.find((call) => call.path.endsWith("_execute")).payload.push, false);
+});
+
+test("lists earlier unpushed commits that will be pushed together", async () => {
+  const env = harness({ preview: () => ({ token: "preview-token", files: ["owned.txt"], diff: "-old\n+new",
+    message: "fix(conversation-git): 校验当前对话提交范围", branch: "main", remote: "origin", upstreamBranch: "main",
+    unpushedCount: 2, unpushedCommits: ["abc1234 fix: 前一个提交", "def5678 feat: 后一个提交"] }) });
+  await env.load(); await env.click(env.button());
+  assert.ok(env.panel().querySelectorAll("p").some((node) => node.textContent === "提交并推送会同时推送此前未推送的 2 个提交"));
+  assert.deepEqual(env.panel().querySelectorAll("li").map((node) => node.textContent).slice(-2),
+    ["abc1234 fix: 前一个提交", "def5678 feat: 后一个提交"]);
+  const push = env.panel().querySelectorAll("button").find((node) => node.textContent === "提交并推送");
+  assert.equal(push.disabled, false);
+  assert.equal(env.document.activeElement, push);
 });
 
 test("opening an old conversation shows recovered changes without requiring a new edit", async () => {
@@ -245,7 +467,7 @@ test("resumes the current conversation check after an old preview finishes", asy
   assert.equal(env.window.__codeyConversationGit.snapshot().visible, true);
   pending.resolve({ token: "old", files: [], message: "旧对话", diff: "" }); await flush();
   assert.equal(env.panel(), null);
-  assert.equal(env.calls.at(-1).payload.sessionId, "session-b");
+  assert.equal(env.calls.filter((call) => call.path.endsWith("_status")).at(-1).payload.sessionId, "session-b");
   assert.equal(env.window.__codeyConversationGit.snapshot().visible, true);
 });
 

@@ -387,12 +387,9 @@ pub(crate) fn native_item_requires_http(item: &Value) -> bool {
             | "custom_tool_call"
             | "custom_tool_call_output",
         ) => false,
-        Some("reasoning") => {
-            item.get("encrypted_content")
-                .and_then(Value::as_str)
-                .is_some_and(|content| !content.is_empty())
-                || (!reasoning_item_has_text(item) && summary_replay_text(item).is_none())
-        }
+        // 完整密文与可见推理都可由原生 Responses 重放，不应仅因包含
+        // encrypted_content 就把后续请求固定为 HTTP。
+        Some("reasoning") => !replayable_reasoning_item(item),
         _ => true,
     }
 }
@@ -462,6 +459,9 @@ fn replayable_reasoning_item(item: &Value) -> bool {
 fn validate_native_tool_history(input: &[Value], restoring: bool) -> Result<()> {
     let mut calls = HashSet::new();
     for item in input {
+        if codey_summary_message(item)?.is_some() {
+            continue;
+        }
         let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
         // compaction_trigger is a request instruction, not a history reference.
         match kind {
@@ -502,7 +502,10 @@ fn validate_native_tool_history(input: &[Value], restoring: bool) -> Result<()> 
                 else {
                     continue;
                 };
-                if !calls.remove(&(call_kind, id)) {
+                // A yielded exec call can emit an initial result and later
+                // notifications with the same call_id. Retain its provenance
+                // for every output without changing or dropping any fragments.
+                if !calls.contains(&(call_kind, id)) {
                     anyhow::bail!(
                         "工具结果缺少对应的完整调用历史（{kind} call_id={id}{}），请重新发送完整上下文",
                         tool_name_label(item)
@@ -1211,10 +1214,31 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_reasoning_does_not_force_later_continuations_to_http() {
+        let owner = [1; 32];
+        let mut history = NativeResponsesHistory::default();
+        history.prepare(owner, &mut json!({"input":"task"}));
+        history.observe(&completed(
+            "resp-encrypted",
+            vec![json!({"type":"reasoning","encrypted_content":"ciphertext"})],
+        ));
+        let mut next = json!({"previous_response_id":"resp-encrypted","input":"next"});
+        history.prepare(owner, &mut next);
+        assert!(!history.requires_http());
+        assert!(history.restore(owner, &mut next).unwrap());
+        assert_eq!(next["input"][1]["encrypted_content"], "ciphertext");
+        history.observe(&completed("resp-next", vec![]));
+        history.prepare(
+            owner,
+            &mut json!({"previous_response_id":"resp-next","input":"later"}),
+        );
+        assert!(!history.requires_http());
+    }
+
+    #[test]
     fn completed_visible_reasoning_preserves_opaque_or_rejected_history() {
         let owner = [1; 32];
         for previous in [
-            Some(json!({"id":"encrypted","type":"reasoning","encrypted_content":"ciphertext"})),
             Some(json!({"id":"search","type":"web_search_call","status":"completed"})),
             None,
         ] {
@@ -1541,6 +1565,73 @@ mod tests {
     }
 
     #[test]
+    fn native_history_preserves_incremental_results_for_one_call() {
+        for custom in [false, true] {
+            let key = [1; 32];
+            let mut invocation = call(custom, "call-1");
+            invocation["name"] = json!("exec");
+            let mut outputs = vec![result(custom, "call-1")];
+            outputs[0]["output"] = json!("Script running with cell ID 58");
+            for sample in 1..=3 {
+                let mut output = result(custom, "call-1");
+                output["name"] = json!("exec");
+                output["output"] = json!(format!("sample {sample}"));
+                outputs.push(output);
+                if sample == 1 {
+                    outputs.push(call(custom, "call-2"));
+                    outputs.push(result(custom, "call-2"));
+                }
+            }
+            let mut input = vec![invocation.clone()];
+            input.extend(outputs.clone());
+            let mut complete = json!({"input":input});
+            let original = complete.clone();
+            let mut history = NativeResponsesHistory::default();
+            history.prepare(key, &mut complete);
+            assert!(!history.restore(key, &mut complete).unwrap());
+            assert_eq!(complete, original);
+
+            history.prepare(key, &mut json!({"input":"task"}));
+            history.observe(&completed("resp-call", vec![invocation.clone()]));
+            let mut next = json!({"previous_response_id":"resp-call","input":outputs});
+            history.prepare(key, &mut next);
+            assert!(history.restore(key, &mut next).unwrap());
+            let mut expected = vec![json!({"role":"user","content":"task"}), invocation];
+            expected.extend(outputs);
+            assert_eq!(next["input"], json!(expected));
+
+            // Later notifications may arrive after another model response.
+            history.observe(&completed("resp-samples", vec![]));
+            let late = result(custom, "call-1");
+            let mut next = json!({"previous_response_id":"resp-samples","input":[late.clone()]});
+            history.prepare(key, &mut next);
+            assert!(history.restore(key, &mut next).unwrap());
+            expected.push(late);
+            assert_eq!(next["input"], json!(expected));
+        }
+    }
+
+    #[test]
+    fn native_history_rejects_missing_mismatched_and_reused_calls() {
+        for custom in [false, true] {
+            for restoring in [false, true] {
+                for input in [
+                    vec![result(custom, "call-1"), call(custom, "call-1")],
+                    vec![call(custom, "call-1"), result(!custom, "call-1")],
+                    vec![call(custom, "call-1"), result(custom, "call-2")],
+                    vec![
+                        call(custom, "call-1"),
+                        result(custom, "call-1"),
+                        call(custom, "call-1"),
+                    ],
+                ] {
+                    assert!(validate_native_tool_history(&input, restoring).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn shared_native_history_is_scoped_and_expires_without_retaining_snapshots() {
         let cache = Arc::new(Mutex::new(NativeHistoryCache::default()));
         let headers = vec![("session-id".into(), "task-a".into())];
@@ -1766,7 +1857,11 @@ mod tests {
                 let mut restored = NativeResponsesHistory::with_cache(cache, &headers);
                 let mut next = json!({"previous_response_id":"resp-opaque","input":"next"});
                 restored.prepare(owner, &mut next);
-                assert!(restored.requires_http(), "{item}");
+                assert_eq!(
+                    restored.requires_http(),
+                    item["type"] != "reasoning",
+                    "{item}"
+                );
                 assert!(restored.restore_for_http(owner, &mut next, true).unwrap());
                 assert_eq!(next["input"][1], item);
                 assert!(next.get("previous_response_id").is_none());

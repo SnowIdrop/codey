@@ -103,6 +103,9 @@
   const taskListSectionHeadings = new Set(["task", "tasks", "recent", "recents", "任务", "最近"]);
   const threadRunningLossGraceMs = 2_000;
   const threadTimestampRefreshIntervalMs = 60_000;
+  // 桥接应答丢失（如注入重试期间桥接被重装）时不能永久占住 inFlight，
+  // 一次超时置失败后按常规周期重试即可。
+  const threadTimestampFetchTimeoutMs = 10_000;
   const completedTaskReconcileIntervalMs = 15_000;
   const threadTimestampBridgePath = "/session/timestamps";
   const maxPendingThreadTimestampRefs = 200;
@@ -1780,7 +1783,11 @@
     threadUpdatedAtFetchInFlight = true;
     try {
       const sessionIds = [...new Set(refs.map(({ sessionId }) => sessionId))];
-      const result = await callBridge(threadTimestampBridgePath, { sessionIds });
+      const result = await callBridge(
+        threadTimestampBridgePath,
+        { sessionIds },
+        { timeoutMs: threadTimestampFetchTimeoutMs },
+      );
       if (disposed) return;
       if (result?.status !== "ok" || !result.timestamps || typeof result.timestamps !== "object") {
         throw new Error(result?.message || "Codey thread timestamp bridge is unavailable");
@@ -2215,6 +2222,11 @@
 
   const sessionControllerLooksUsable = (controller, feature = "session") => {
     if (!controller) return false;
+    if (feature === "modelRouting") {
+      const client = controller.manager?.requestClient;
+      return client?.hostId === "local"
+        && ["enqueueRequest", "createRequest", "onResult"].every((method) => declaredMethod(client, method));
+    }
     if (feature === "usage" || feature === "mcpReload") return typeof controller.manager?.sendRequest === "function";
     if (feature === "reconcile") return sessionControllerCanReconcileCompletedConversation(controller);
     const methods = feature === "deleteMessages"
@@ -2225,7 +2237,7 @@
   };
 
   const capabilityProbes = new Map();
-  const capabilityLabels = { usage: "官方额度读取", mcpReload: "MCP 配置刷新", reconcile: "完成状态同步", deleteMessages: "消息删除", refresh: "会话列表刷新", session: "会话管理" };
+  const capabilityLabels = { usage: "官方额度读取", mcpReload: "MCP 配置刷新", reconcile: "完成状态同步", deleteMessages: "消息删除", modelRouting: "模型请求校验", refresh: "会话列表刷新", session: "会话管理" };
   const capabilityMessage = (feature) => `当前 Codex 暂不支持${capabilityLabels[feature] || "此功能"}，请稍后重试`;
   const pageCapabilities = Object.create(null);
   window.__codeyPageCapabilities = pageCapabilities;
@@ -2282,7 +2294,7 @@
         // 旧安装的迟到探测不能替换新安装已确认的接口。
         if (disposed) throw unavailableCapability(feature);
         const resolvers = [
-          feature === "deleteMessages" ? appServerManagerRegistryResolverFromModule(module) : null,
+          feature === "deleteMessages" || feature === "modelRouting" ? appServerManagerRegistryResolverFromModule(module) : null,
           appServerManagerResolverFromModule(module),
         ].filter(Boolean);
         for (const resolver of resolvers) {
@@ -2301,7 +2313,7 @@
         continue;
       }
     }
-    if (fallbackDispatcher && !requireCompletionReconcile && feature !== "usage" && feature !== "mcpReload" && feature !== "deleteMessages") {
+    if (fallbackDispatcher && !requireCompletionReconcile && feature !== "usage" && feature !== "mcpReload" && feature !== "deleteMessages" && feature !== "modelRouting") {
       window.__codeyCodexSignalDispatcher = fallbackDispatcher;
       const controller = legacySessionController(fallbackDispatcher);
       window.__codeyCodexSessionController = controller;
@@ -2323,7 +2335,9 @@
     const state = capabilityProbes.get(feature) || { failures: 0, retryAt: 0, pending: null };
     capabilityProbes.set(feature, state);
     if (state.pending) return state.pending;
-    if (Date.now() < state.retryAt) throw unavailableCapability(feature);
+    // modelRouting 的调用方只有请求入口校验，重试节奏由宿主注入流程控制；
+    // 这里套用指数退避会让一次早期探测失败冻结后续所有注入尝试。
+    if (feature !== "modelRouting" && Date.now() < state.retryAt) throw unavailableCapability(feature);
     const discover = () => discoverCodexSessionController(feature);
     // MCP 刷新由宿主 CDP 预算约束；5 秒发现上限会让慢机或尚未 hydrate 的
     // 页面在导入/启停后误报失败，只能重启 Codex。
@@ -2335,14 +2349,27 @@
       state.retryAt = 0;
       publishCapability(feature, true);
       return controller;
-    }, () => {
+    }, (error) => {
       state.failures += 1;
       state.retryAt = Date.now() + Math.min(30_000, 1_000 * 2 ** Math.min(state.failures - 1, 5));
-      throw unavailableCapability(feature);
+      const capabilityError = unavailableCapability(feature);
+      // 探测超时、资源导入失败等真实原因要带进抛出的错误里：capability 状态
+      // 对用户保持通用文案，但错误日志需要能区分结构漂移和探测失败。
+      const reason = String(error?.message || error || "");
+      if (reason && reason !== capabilityError.message) {
+        capabilityError.message = `${capabilityError.message}（${reason}）`;
+      }
+      throw capabilityError;
     }).finally(() => { state.pending = null; });
     return state.pending;
   };
   window.__codeyLoadCodexSessionController = loadCodexSessionController;
+  window.__codeyLoadCodexRequestClient = async () => (
+    (await loadCodexSessionController({ feature: "modelRouting" })).manager.requestClient
+  );
+  // Native macOS uses a frozen bridge. Install the request-client guard after
+  // these module/scope discovery helpers are available, including after reload.
+  void window.__codeyModelWhitelistPatch?.ensureRequestGate?.().catch(() => {});
 
   const loadCodexSignalDispatcher = async () => {
     const controller = await loadCodexSessionController();
@@ -2693,13 +2720,13 @@
   // the backend on its own.
   const sessionDeleteMenuItemId = "delete-thread";
 
-  const sidebarRowMenuItems = (row) => {
+  const sidebarRowMenuItems = async (row) => {
     const fiberKey = Object.keys(row).find((key) => key.startsWith("__reactFiber$"));
     for (let fiber = fiberKey ? row[fiberKey] : null; fiber; fiber = fiber.return) {
       const getItems = fiber.memoizedProps?.getItems;
       if (typeof getItems !== "function") continue;
       try {
-        const items = getItems();
+        const items = await getItems();
         if (Array.isArray(items)) return items;
       } catch {
         return null;
@@ -2718,21 +2745,17 @@
     return null;
   };
 
-  const openOfficialSessionDelete = (row) => {
-    const menuItem = findMenuItemById(sidebarRowMenuItems(row), sessionDeleteMenuItemId);
-    if (typeof menuItem?.onSelect === "function") {
-      menuItem.onSelect();
-      return true;
-    }
-    // Unknown Codex builds: let the row open its own context menu so deletion
-    // still runs through the official implementation.
-    if (typeof MouseEvent === "function" && typeof row.dispatchEvent === "function") {
-      row.dispatchEvent(new MouseEvent("contextmenu", {
-        bubbles: true,
-        cancelable: true,
-        composed: true,
-      }));
-      return true;
+  const openOfficialSessionDelete = async (row) => {
+    try {
+      const menuItem = findMenuItemById(await sidebarRowMenuItems(row), sessionDeleteMenuItemId);
+      if (disposed) return false;
+      if (typeof menuItem?.onSelect === "function" && !menuItem.disabled) {
+        await menuItem.onSelect();
+        return true;
+      }
+    } catch {
+      if (!disposed) showRuntimeToast("无法打开 Codex 永久删除确认，请重试", "error");
+      return false;
     }
     showRuntimeToast("当前 Codex 版本未提供永久删除入口", "error");
     return false;
@@ -2809,9 +2832,15 @@
       ["pointerdown", "mousedown", "mouseup", "touchstart"].forEach((eventName) => {
         button.addEventListener(eventName, stopSidebarActionEvent, true);
       });
-      button.addEventListener("click", (event) => {
+      button.addEventListener("click", async (event) => {
         stopSidebarActionEvent(event);
-        openOfficialSessionDelete(thread);
+        if (button.disabled) return;
+        button.disabled = true;
+        try {
+          await openOfficialSessionDelete(thread);
+        } finally {
+          button.disabled = false;
+        }
       }, true);
       placementTarget.insertAdjacentElement("afterend", button);
     });
