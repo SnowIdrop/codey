@@ -280,7 +280,8 @@ export type Confirmation = {
     | "discard-settings-changes"
     | "delete-notification-channel"
     | "delete-route"
-    | "delete-official-account";
+    | "delete-official-account"
+    | "set-default-official-account";
   title: string;
   description: string;
   releaseNotes?: string;

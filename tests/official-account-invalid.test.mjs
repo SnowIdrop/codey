@@ -23,8 +23,9 @@ test("失效账号卡片使用红色背景并显示失效标识", () => {
   assert.match(panel, /账号已失效/);
 });
 
-test("失效账号隐藏切换默认按钮，后端也拒绝切换", () => {
-  assert.match(panel, /\{!account\.isDefault && !account\.invalid && \(/);
+test("仅有效的非默认账号卡片提供切换交互，后端也拒绝失效账号切换", () => {
+  assert.match(panel, /const switchable = !account\.isDefault && !account\.invalid;/);
+  assert.match(panel, /\.\.\.\(switchable\s*\? \{[\s\S]*?role: "button",[\s\S]*?askSetDefault\(account\);[\s\S]*?onKeyDown:[\s\S]*?askSetDefault\(account\);[\s\S]*?: \{\}\)/);
   const setDefault = accountCommands.slice(
     accountCommands.indexOf("pub(super) async fn set_default_official_account"),
   );
