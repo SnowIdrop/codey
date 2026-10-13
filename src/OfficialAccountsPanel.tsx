@@ -252,9 +252,16 @@ export function OfficialAccountsPanel({
   const [manualOpen, setManualOpen] = useState(false);
   const [manualInput, setManualInput] = useState("");
   const [manualError, setManualError] = useState("");
+  // SIWC 二次授权与添加账号的登录共用轮询形态，但作用于既有账号。
+  const [siwcLogin, setSiwcLogin] = useState<(LoginStart & { accountId: string }) | null>(null);
+  const [siwcError, setSiwcError] = useState("");
+  const [siwcCopied, setSiwcCopied] = useState(false);
+  const [confirmSiwcAccount, setConfirmSiwcAccount] = useState<OfficialAccount | null>(null);
   const [confirmDefaultAccount, setConfirmDefaultAccount] = useState<OfficialAccount | null>(null);
   const loginRef = useRef<LoginStart | null>(null);
   loginRef.current = login;
+  const siwcLoginRef = useRef<(LoginStart & { accountId: string }) | null>(null);
+  siwcLoginRef.current = siwcLogin;
 
   const applyResult = useCallback(
     (result: OfficialAccountsResult) => {
@@ -392,6 +399,111 @@ export function OfficialAccountsPanel({
       if (timer) clearTimeout(timer);
     };
   }, [login, applyResult, onNotice]);
+
+  // Poll a pending SIWC authorization the same way as the add-account login.
+  useEffect(() => {
+    if (!siwcLogin) return;
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const poll = async () => {
+      if (!active) return;
+      try {
+        const result = await invoke<LoginPoll>("poll_official_account_siwc", { loginId: siwcLogin.loginId });
+        if (!active) return;
+        if (result.status === "wait") {
+          timer = setTimeout(() => void poll(), LOGIN_POLL_INTERVAL_MS);
+          return;
+        }
+        if (result.status === "ok") {
+          applyResult(result);
+          setSiwcLogin(null);
+          onNotice({
+            tone: result.warning ? "info" : "success",
+            text: result.warning ? `已启用官方直连；${result.warning}` : "已启用官方直连，对话将通过 OpenAI 官方通道调用订阅",
+          });
+          return;
+        }
+        setSiwcError(result.message || (result.status === "expired" ? "授权已过期，请重新开始" : "授权失败"));
+      } catch (error) {
+        if (!active) return;
+        setSiwcError(errorText(error));
+      }
+    };
+    void poll();
+    return () => {
+      active = false;
+      if (timer) clearTimeout(timer);
+    };
+  }, [siwcLogin, applyResult, onNotice]);
+
+  async function startSiwc(account: OfficialAccount) {
+    setPending(`siwc:${account.id}`);
+    setSiwcError("");
+    setSiwcCopied(false);
+    try {
+      const result = await invoke<LoginStart>("start_official_account_siwc", { accountId: account.id });
+      setSiwcLogin({ ...result, accountId: account.id });
+    } catch (error) {
+      onNotice({ tone: "error", text: errorText(error) });
+    } finally {
+      setPending(null);
+    }
+  }
+
+  async function closeSiwc() {
+    const current = siwcLoginRef.current;
+    setSiwcLogin(null);
+    setSiwcError("");
+    if (current) {
+      try {
+        await invoke("cancel_official_account_siwc", { loginId: current.loginId });
+      } catch {
+        // The session expires on its own; nothing to surface.
+      }
+    }
+  }
+
+  async function copySiwcUrl() {
+    if (!siwcLogin) return;
+    try {
+      await navigator.clipboard.writeText(siwcLogin.authUrl);
+      setSiwcCopied(true);
+    } catch {
+      setSiwcCopied(false);
+      onNotice({ tone: "info", text: "无法访问剪贴板，请手动复制授权链接" });
+    }
+  }
+
+  async function executeRemoveSiwc(account: OfficialAccount) {
+    setPending(`siwc-remove:${account.id}`);
+    try {
+      const result = await invoke<OfficialAccountsResult>("remove_official_account_siwc", { accountId: account.id });
+      applyResult(result);
+      onNotice({
+        tone: result.warning ? "info" : "success",
+        text: result.warning ? `已停用官方直连；${result.warning}` : "已停用官方直连，对话恢复默认通道",
+      });
+    } catch (error) {
+      onNotice({ tone: "error", text: errorText(error) });
+    } finally {
+      setPending(null);
+    }
+  }
+
+  function handleRemoveSiwc(account: OfficialAccount) {
+    const label = accountLabel(account);
+    if (onRequestConfirmation) {
+      onRequestConfirmation({
+        action: "disable-official-account-siwc",
+        title: `停用「${label}」的官方直连？`,
+        description: "将撤销授权并恢复默认通道；账号的额度查询与登录不受影响。",
+        confirmLabel: "停用直连",
+        run: () => void executeRemoveSiwc(account),
+      });
+      return;
+    }
+    setConfirmSiwcAccount(account);
+  }
 
   async function startLogin() {
     setPending("login");
@@ -619,6 +731,8 @@ export function OfficialAccountsPanel({
             const plan = formatPlan(planType);
             const usageLoading = Boolean(usagePending[account.id]);
             const usageSnapshot = usages[account.id] ?? null;
+            const siwcStatus = account.siwcStatus ?? "none";
+            const siwcBusy = pending === `siwc:${account.id}` || pending === `siwc-remove:${account.id}`;
             // 后端标记失效或额度查询刚发现凭据被拒时，额度行换成失效交互。
             const usageInvalid =
               Boolean(account.invalid) ||
@@ -629,6 +743,12 @@ export function OfficialAccountsPanel({
                 ? "官方已拒绝该账号的凭据，需要重新添加"
                 : account.invalidReason || usageSnapshot?.message || "账号凭据已失效";
             const switchable = !account.isDefault && !account.invalid;
+            const siwcTip =
+              siwcStatus === "active"
+                ? "官方直连已启用，对话走 OpenAI 官方通道；点击停用并撤销授权，恢复默认通道"
+                : siwcStatus === "invalid"
+                  ? `${account.siwcInvalidReason || "官方直连授权已失效"}，点击重新授权`
+                  : "通过 Sign in with ChatGPT 二次授权，对话走 OpenAI 官方通道；额度查询等继续使用现有登录";
             return (
               <li
                 key={account.id}
@@ -689,6 +809,28 @@ export function OfficialAccountsPanel({
                           <Badge variant="destructive" title={account.invalidReason}>
                             已失效
                           </Badge>
+                        )}
+                        {!account.invalid && (
+                          <Tooltip content={siwcTip}>
+                            <button
+                              type="button"
+                              className={`official-account-siwc-chip is-${siwcStatus}`}
+                              disabled={disabled || siwcBusy}
+                              aria-label={
+                                siwcStatus === "active"
+                                  ? "停用官方直连"
+                                  : siwcStatus === "invalid"
+                                    ? "重新授权官方直连"
+                                    : "启用官方直连"
+                              }
+                              onClick={() =>
+                                siwcStatus === "active" ? handleRemoveSiwc(account) : void startSiwc(account)
+                              }
+                            >
+                              <IconBrandOpenai size={11} className={siwcBusy ? "animate-spin" : undefined} aria-hidden="true" />
+                              <span>{siwcStatus === "invalid" ? "官方直连 · 已失效" : "官方直连"}</span>
+                            </button>
+                          </Tooltip>
                         )}
                         {!account.invalid && !usageInvalid && (
                           <Tooltip content={usageLoading ? "正在刷新额度…" : "刷新额度"}>
@@ -785,6 +927,39 @@ export function OfficialAccountsPanel({
         </DialogContent>
       </Dialog>
 
+      <Dialog open={siwcLogin !== null} onOpenChange={(open) => { if (!open) void closeSiwc(); }}>
+        <DialogContent className="official-login-dialog" container={popupContainer}>
+          <DialogHeader>
+            <DialogTitle>启用官方直连</DialogTitle>
+            <DialogDescription>
+              {siwcLogin?.browserOpened === false
+                ? "未能自动打开浏览器，请复制下方链接手动打开并完成授权。"
+                : "已在系统浏览器打开授权页。授权后将通过 OpenAI 官方通道调用你的 ChatGPT 订阅，完成后会自动回到这里。"}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="official-login-body">
+            <code className="official-login-url" title={siwcLogin?.authUrl}>{siwcLogin?.authUrl}</code>
+            {siwcError
+              ? <small className="official-accounts-error">{siwcError}</small>
+              : <small className="official-login-waiting">等待浏览器完成授权…（10 分钟内有效）</small>}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => void copySiwcUrl()}>
+              {siwcCopied ? "已复制" : "复制授权链接"}
+            </Button>
+            {siwcError ? (
+              <Button size="sm" onClick={() => {
+                const account = accountsRef.current.find((item) => item.id === siwcLogin?.accountId);
+                setSiwcLogin(null);
+                if (account) void startSiwc(account);
+              }}>重新开始</Button>
+            ) : (
+              <Button variant="secondary" size="sm" onClick={() => void closeSiwc()}>取消</Button>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={manualOpen} onOpenChange={(open) => { if (!open) closeManual(); }}>
         <DialogContent
           className="sm:w-[520px]"
@@ -846,6 +1021,34 @@ export function OfficialAccountsPanel({
               }}
             >
               设为默认
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={confirmSiwcAccount !== null} onOpenChange={(open) => { if (!open) setConfirmSiwcAccount(null); }}>
+        <DialogContent className="confirmation-dialog" container={popupContainer}>
+          <DialogHeader>
+            <DialogTitle>
+              {confirmSiwcAccount ? `停用「${accountLabel(confirmSiwcAccount)}」的官方直连？` : "停用官方直连？"}
+            </DialogTitle>
+            <DialogDescription>
+              将撤销授权并恢复默认通道；账号的额度查询与登录不受影响。
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmSiwcAccount(null)}>取消</Button>
+            <Button
+              variant="destructive"
+              disabled={disabled}
+              loading={confirmSiwcAccount ? pending === `siwc-remove:${confirmSiwcAccount.id}` : false}
+              onClick={() => {
+                const target = confirmSiwcAccount;
+                setConfirmSiwcAccount(null);
+                if (target) void executeRemoveSiwc(target);
+              }}
+            >
+              停用直连
             </Button>
           </DialogFooter>
         </DialogContent>

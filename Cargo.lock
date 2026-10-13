@@ -414,6 +414,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rfd",
+ "ring",
  "rusqlite",
  "rustls",
  "semver",

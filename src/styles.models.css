@@ -1425,6 +1425,67 @@
   white-space: nowrap;
 }
 
+/* SIWC 官方直连：状态标签本身就是开关，点击在启用/停用间切换。 */
+.official-account-siwc-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  box-sizing: border-box;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 0 7.5px;
+  height: 20px;
+  line-height: 18px;
+  border-radius: 9999px;
+  border: 1px dashed rgba(var(--codey-ink-rgb, 0, 0, 0), 0.22);
+  background: transparent;
+  color: var(--mac-text-secondary);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.official-account-siwc-chip:hover:not(:disabled) {
+  border-color: rgba(16, 163, 127, 0.45);
+  color: var(--codey-accent, #10a37f);
+}
+
+.official-account-siwc-chip.is-active {
+  border-style: solid;
+  border-color: rgba(16, 163, 127, 0.4);
+  background: rgba(16, 163, 127, 0.12);
+  color: var(--codey-accent, #10a37f);
+}
+
+.official-account-siwc-chip.is-invalid {
+  border-style: solid;
+  border-color: rgba(255, 59, 48, 0.35);
+  background: rgba(255, 59, 48, 0.08);
+  color: var(--codey-red, #d70015);
+}
+
+.official-account-siwc-chip:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+[data-theme="dark"] .official-account-siwc-chip {
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+[data-theme="dark"] .official-account-siwc-chip.is-active {
+  border-color: rgba(16, 163, 127, 0.5);
+  background: rgba(16, 163, 127, 0.16);
+}
+
+[data-theme="dark"] .official-account-siwc-chip.is-invalid {
+  border-color: rgba(255, 69, 58, 0.45);
+  background: rgba(255, 69, 58, 0.12);
+  color: #ff6961;
+}
+
 .official-account-usage-refresh-chip {
   display: inline-flex;
   align-items: center;

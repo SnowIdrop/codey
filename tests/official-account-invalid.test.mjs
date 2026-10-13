@@ -40,12 +40,15 @@ test("额度查询确认失效后重读列表，且不再请求官方接口", ()
   assert.match(store, /invalid_grant/);
 });
 
-test("源码约束：失效账号在刷新前返回，前端轮询包含失效分支", () => {
-  // 令牌刷新前直接返回本地记录，不再向官方令牌接口发请求。
+test("源码约束：失效账号跳过两类令牌刷新，前端轮询包含失效分支", () => {
+  const refreshTokens = accountCommands.match(/async fn refresh_official_account_tokens\([\s\S]*?\n\}/)?.[0];
+  assert.ok(refreshTokens, "应存在账号令牌刷新入口");
+  // 非默认且有效的账号才轮换 Codex 凭据，失效账号也跳过独立的直连凭据刷新。
   assert.match(
-    accountCommands,
-    /if record\.invalid\(\) \{\s*return Ok\(record\);\s*\}\s*let expected = record\.clone\(\);\s*let proxy = [^;]+;\s*match refresh_if_stale/,
+    refreshTokens,
+    /if !is_default \{[\s\S]*?if !record\.invalid\(\) \{\s*let expected = record\.clone\(\);\s*let proxy = [^;]+;\s*match refresh_if_stale_cached/,
   );
+  assert.match(refreshTokens, /if !record\.invalid\(\) && record\.siwc\.is_some\(\) \{\s*match refresh_siwc_if_stale/);
   const refresh = store.match(/pub async fn refresh_if_stale_cached\([\s\S]*?\n\}/)?.[0];
   assert.ok(refresh, "应存在生产使用的令牌刷新函数");
   assert.match(

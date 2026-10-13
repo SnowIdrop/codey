@@ -1590,6 +1590,7 @@ async fn official_web_search_declarations_keep_websocket_for_plain_continuations
             account_id: "test-account".into(),
             email: None,
             path: auth_path.clone(),
+            siwc_path: None,
             accepts_incoming_authorization: false,
         });
         *router.snapshot.write().unwrap() = Arc::new(snapshot);
@@ -1701,6 +1702,7 @@ async fn official_opaque_continuation_uses_http_with_complete_history() {
             account_id: "test-account".into(),
             email: None,
             path: auth_path,
+            siwc_path: None,
             accepts_incoming_authorization: false,
         });
         *router.snapshot.write().unwrap() = Arc::new(snapshot);
@@ -4083,12 +4085,14 @@ fn codex_login_route_outranks_stored_accounts_for_default_quota() {
         account_id: "test-default".into(),
         email: None,
         path: std::path::PathBuf::from("/codex/home/auth.json"),
+        siwc_path: None,
         accepts_incoming_authorization: true,
     };
     let idle = OfficialRouteAuth {
         account_id: "test-idle".into(),
         email: None,
         path: std::path::PathBuf::from("/codey/accounts/test-idle.json"),
+        siwc_path: None,
         accepts_incoming_authorization: false,
     };
     assert!(default_route_rank(Some(&login)) < default_route_rank(Some(&idle)));

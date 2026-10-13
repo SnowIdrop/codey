@@ -894,38 +894,65 @@ impl RouterServer {
                 .map_err(|message| (401, "plugin_account_unavailable", message));
         }
         if route.official_account {
-            let (auth_path, accepts_incoming_authorization) = match &route.official_auth {
-                Some(auth) => (auth.path.as_path(), auth.accepts_incoming_authorization),
-                None => (self.official_auth_path.as_path(), true),
-            };
-            let official_auth = resolve_official_upstream_auth(
-                request,
-                &self.bearer_token,
-                auth_path,
-                &self.official_auth_cache,
-                accepts_incoming_authorization,
-            )
-            .await
-            .ok_or_else(|| {
-                (
-                    401,
-                    "openai_auth_missing",
-                    "官方账号线路缺少 Codex OpenAI 登录态，请重新登录后重试".to_string(),
+            if let Some((siwc_path, account_id)) = route.official_auth.as_ref().and_then(|auth| {
+                auth.siwc_path
+                    .as_deref()
+                    .zip(Some(auth.account_id.as_str()))
+            }) {
+                // SIWC 直连平面：令牌来自账号的 SIWC 槽位，不接受下游自带的
+                // Codex 令牌；backend-api 专属头一律剥掉。
+                let siwc_auth = resolve_siwc_upstream_auth(
+                    siwc_path,
+                    account_id,
+                    &self.siwc_auth_cache,
+                    &self.client,
+                    &self.proxied_clients,
                 )
-            })?;
-            let value = HeaderValue::from_str(&official_auth.authorization).map_err(|_| {
-                (
-                    401,
-                    "openai_auth_invalid",
-                    "官方账号线路的 Codex OpenAI 登录态无效，请重新登录后重试".to_string(),
+                .await
+                .map_err(|error| (401, "siwc_auth_unavailable", format!("{error:#}")))?;
+                let value = HeaderValue::from_str(&siwc_auth.authorization).map_err(|_| {
+                    (
+                        401,
+                        "siwc_auth_invalid",
+                        "官方直连凭据无效，请在账号卡片重新授权".to_string(),
+                    )
+                })?;
+                headers.insert(AUTHORIZATION, value);
+                strip_siwc_forbidden_headers(&mut headers);
+            } else {
+                let (auth_path, accepts_incoming_authorization) = match &route.official_auth {
+                    Some(auth) => (auth.path.as_path(), auth.accepts_incoming_authorization),
+                    None => (self.official_auth_path.as_path(), true),
+                };
+                let official_auth = resolve_official_upstream_auth(
+                    request,
+                    &self.bearer_token,
+                    auth_path,
+                    &self.official_auth_cache,
+                    accepts_incoming_authorization,
                 )
-            })?;
-            headers.insert(AUTHORIZATION, value);
-            headers.remove(CHATGPT_ACCOUNT_ID_HEADER);
-            if let Some(account_id) = official_auth.account_id.as_deref()
-                && let Ok(value) = HeaderValue::from_str(account_id)
-            {
-                headers.insert(HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER), value);
+                .await
+                .ok_or_else(|| {
+                    (
+                        401,
+                        "openai_auth_missing",
+                        "官方账号线路缺少 Codex OpenAI 登录态，请重新登录后重试".to_string(),
+                    )
+                })?;
+                let value = HeaderValue::from_str(&official_auth.authorization).map_err(|_| {
+                    (
+                        401,
+                        "openai_auth_invalid",
+                        "官方账号线路的 Codex OpenAI 登录态无效，请重新登录后重试".to_string(),
+                    )
+                })?;
+                headers.insert(AUTHORIZATION, value);
+                headers.remove(CHATGPT_ACCOUNT_ID_HEADER);
+                if let Some(account_id) = official_auth.account_id.as_deref()
+                    && let Ok(value) = HeaderValue::from_str(account_id)
+                {
+                    headers.insert(HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER), value);
+                }
             }
         }
         Ok(headers)
@@ -2257,6 +2284,15 @@ impl RouterServer {
         } else {
             None
         };
+        // SIWC 直连只接受公开 Responses 字段：续接状态、采样参数和托管工具
+        // 在这里剥掉。净化改写正文就必须整段重编码，透传字节里残留的字段
+        // 不能再发出去。
+        if resolved.route.uses_siwc()
+            && sanitize_siwc_responses_request(&mut upstream_body)
+        {
+            body_mutated = true;
+            encoded_body = None;
+        }
         let upstream_stream_requested = upstream_body
             .get("stream")
             .and_then(Value::as_bool)
@@ -2506,6 +2542,11 @@ impl RouterServer {
             if compacting && !native_compaction {
                 return write_gateway_compaction_http_error(downstream, preloaded_error_body.as_deref().unwrap_or_default(), &resolved.route).await;
             }
+            observe_siwc_upstream_rejection(
+                &resolved.route,
+                upstream_status,
+                preloaded_error_body.as_deref().unwrap_or_default(),
+            );
             return write_upstream_http_error(
                 downstream,
                 UpstreamHttpErrorResponse {
@@ -2536,6 +2577,7 @@ impl RouterServer {
                         if compacting && !native_compaction {
                             return write_gateway_compaction_http_error(downstream, &body, &resolved.route).await;
                         }
+                        observe_siwc_upstream_rejection(&resolved.route, upstream_status, &body);
                         write_upstream_http_error(
                             downstream,
                             UpstreamHttpErrorResponse {

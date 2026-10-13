@@ -115,6 +115,7 @@ fn test_server(config: &CodeyConfig) -> RouterServer {
         official_auth_path: PathBuf::from("/nonexistent/codey-lifecycle-test-auth"),
         account_usage_cache: Arc::default(),
         official_auth_cache: Arc::default(),
+        siwc_auth_cache: Arc::default(),
         request_log: Arc::new(RouteRequestLogController::new()),
     }
 }

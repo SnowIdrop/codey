@@ -140,6 +140,8 @@ pub struct AppState {
     /// startup waits overlap.
     official_account_probe_prewarm: Mutex<Option<OfficialAccountProbePrewarm>>,
     official_account_logins: Mutex<crate::official_accounts::LoginSessions>,
+    /// SIWC 授权会话与 Codex 登录共用同一回调端口，两边同时只允许一条进行。
+    official_siwc_logins: Mutex<crate::official_accounts::SiwcLoginSessions>,
     /// 令牌刷新按账号串行执行。多个请求同时轮换同一个 refresh token 会让
     /// 先写回的凭据立刻失效。
     official_account_refresh_lock: Mutex<()>,
@@ -266,6 +268,7 @@ impl Default for AppState {
             wechat_claw_login_http_client: std::sync::OnceLock::new(),
             official_account_probe_prewarm: Mutex::new(None),
             official_account_logins: Mutex::new(crate::official_accounts::LoginSessions::default()),
+            official_siwc_logins: Mutex::new(crate::official_accounts::SiwcLoginSessions::default()),
             official_account_refresh_lock: Mutex::new(()),
             account_usage_cache: Arc::new(Mutex::new(account_usage::AccountUsageCaches::default())),
             runtime: Mutex::new(None),
@@ -1149,6 +1152,10 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         | "import_official_account_credential"
         | "set_default_official_account"
         | "remove_official_account"
+        | "start_official_account_siwc"
+        | "poll_official_account_siwc"
+        | "cancel_official_account_siwc"
+        | "remove_official_account_siwc"
         | "save_official_account_route_settings" => {
             official_accounts::invoke(state, command, &args).await
         }
@@ -1975,6 +1982,23 @@ pub(crate) fn install_plugin_route_handler(state: Arc<AppState>) {
                 .map_err(|error| error.to_string())
         })
     }));
+    let weak = Arc::downgrade(&state);
+    crate::official_accounts::set_siwc_invalidated_listener(Some(Arc::new(move |account_id| {
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        let Some(runtime) = state.runtime_handle.clone() else {
+            return;
+        };
+        runtime.spawn(async move {
+            official_accounts::refresh_official_routes_after_invalid_account(
+                &state,
+                "siwc_invalidation",
+                &account_id,
+            )
+            .await;
+        });
+    })));
     let state = Arc::clone(&state);
     crate::codey_plugins::set_route_handler(Arc::new(move |plugin_id, change| {
         let (route_id, changed) = apply_plugin_route_change(&state, plugin_id, change)?;

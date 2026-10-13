@@ -265,8 +265,8 @@ if (import.meta.env.DEV) {
       showAccountUsageInHeader: true,
     };
     let previewOfficialAccounts: OfficialAccount[] = [
-      { id: "acct_preview_1", email: "preview@example.com", planType: "pro", accountId: "acct_preview_1", addedAt: 1_757_000_000, isDefault: true },
-      { id: "acct_preview_2", email: "backup@example.com", planType: "plus", accountId: "acct_preview_2", addedAt: 1_757_100_000, isDefault: false, routeName: "备用官方线路", routeShortName: "备2" },
+      { id: "acct_preview_1", email: "preview@example.com", planType: "pro", accountId: "acct_preview_1", addedAt: 1_757_000_000, isDefault: true, siwcStatus: "active" },
+      { id: "acct_preview_2", email: "backup@example.com", planType: "plus", accountId: "acct_preview_2", addedAt: 1_757_100_000, isDefault: false, routeName: "备用官方线路", routeShortName: "备2", siwcStatus: "invalid", siwcInvalidReason: "官方直连授权已被撤销，需要重新授权" },
       // 预览失效账号：卡片标红、隐藏切换默认入口，额度显示失效原因。
       { id: "acct_preview_3", email: "blocked@example.com", planType: "plus", accountId: "acct_preview_3", addedAt: 1_757_200_000, isDefault: false, invalid: true, invalidReason: "官方已撤销该账号的登录凭据，需要重新添加账号" },
     ];
@@ -901,6 +901,35 @@ if (import.meta.env.DEV) {
         previewDeriveOfficialProfiles();
         const available = previewOfficialAccounts.some((account) => account.isDefault);
         return { status: "ok", accounts: previewOfficialAccounts, defaultAccountId: previewDefaultOfficialAccountId(), officialAccountAvailable: available, config: previewConfig, modelState: previewModelState, restartRequired: false, ...(removed?.isDefault && !available ? { warning: "当前没有默认官方账号，官方线路已停用" } : {}) };
+      }
+      if (command === "start_official_account_siwc") {
+        return { status: "wait", loginId: `preview-siwc-login-${args.accountId}`, authUrl: "https://auth.openai.com/api/accounts/authorize?client_id=dynamic_agent_client&state=preview", browserOpened: true };
+      }
+      if (command === "poll_official_account_siwc") {
+        previewOfficialLoginPolls += 1;
+        if (previewOfficialLoginPolls < 3) return { status: "wait" };
+        previewOfficialLoginPolls = 0;
+        const target = previewOfficialAccounts.find((account) => `preview-siwc-login-${account.id}` === args.loginId)
+          ?? previewOfficialAccounts.find((account) => account.siwcStatus === "invalid" || account.siwcStatus === "none" || !account.siwcStatus);
+        if (target) {
+          target.siwcStatus = "active";
+          delete target.siwcInvalidReason;
+        }
+        previewDeriveOfficialProfiles();
+        return { status: "ok", accounts: previewOfficialAccounts, defaultAccountId: previewDefaultOfficialAccountId(), officialAccountAvailable: true, config: previewConfig, modelState: previewModelState, restartRequired: false };
+      }
+      if (command === "cancel_official_account_siwc") {
+        previewOfficialLoginPolls = 0;
+        return { status: "ok" };
+      }
+      if (command === "remove_official_account_siwc") {
+        const target = previewOfficialAccounts.find((account) => account.id === args.accountId);
+        if (target) {
+          target.siwcStatus = "none";
+          delete target.siwcInvalidReason;
+        }
+        previewDeriveOfficialProfiles();
+        return { status: "ok", accounts: previewOfficialAccounts, defaultAccountId: previewDefaultOfficialAccountId(), officialAccountAvailable: true, config: previewConfig, modelState: previewModelState, restartRequired: false };
       }
       if (command === "save_official_account_route_settings") {
         const account = previewOfficialAccounts.find((item) => item.id === args.accountId);
