@@ -255,8 +255,11 @@ pub(super) async fn spawn_codex(
         misc_model,
         runtime_config_overrides,
     );
-    let mut runtime_arguments =
-        codex_runtime_arguments(options.gpu_launch_mode, !cfg!(target_os = "macos"), cfg!(windows));
+    let mut runtime_arguments = codex_runtime_arguments(
+        options.gpu_launch_mode,
+        !cfg!(target_os = "macos"),
+        cfg!(windows),
+    );
     if let Some(proxy) = options.launch_proxy {
         runtime_arguments.push(proxy.chromium_argument());
     }
@@ -775,10 +778,8 @@ pub(super) async fn spawn_codex(
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         let command = build_codex_command(app_dir, debug_port, &runtime_arguments);
-        let mut spawned = spawn_command(
-            command,
-            launch_proxy_environment.as_deref().unwrap_or(&[]),
-        )?;
+        let mut spawned =
+            spawn_command(command, launch_proxy_environment.as_deref().unwrap_or(&[]))?;
         spawned.performance_status = "ready".to_string();
         spawned.performance_detail = "Codex 启动成功".to_string();
         Ok(spawned)

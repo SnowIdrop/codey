@@ -3083,10 +3083,7 @@ mod tests {
             "socks5h://proxy.example.com:1080",
             "http://[::1]:7890",
         ] {
-            assert!(
-                validate_codex_launch_proxy(accepted).is_ok(),
-                "{accepted}"
-            );
+            assert!(validate_codex_launch_proxy(accepted).is_ok(), "{accepted}");
         }
         for rejected in [
             // Chromium 命令行代理不支持认证。
@@ -3105,10 +3102,7 @@ mod tests {
             "127.0.0.1:7890",
             "http://0.0.0.0:7890",
         ] {
-            assert!(
-                validate_codex_launch_proxy(rejected).is_err(),
-                "{rejected}"
-            );
+            assert!(validate_codex_launch_proxy(rejected).is_err(), "{rejected}");
         }
     }
 

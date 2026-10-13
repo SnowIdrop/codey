@@ -98,7 +98,9 @@ impl CodexLaunchProxy {
 
 /// 记录本次 Codey 启动的运行时代理；只对 Codey 拉起的进程生效。
 pub(crate) fn set_active(proxy: Option<CodexLaunchProxy>) {
-    *ACTIVE.write().unwrap_or_else(std::sync::PoisonError::into_inner) = proxy;
+    *ACTIVE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = proxy;
 }
 
 /// Codey 自己拉起的共享 app-server 继承同一份启动代理环境。共享实例
@@ -186,10 +188,7 @@ mod tests {
                 "https://proxy.example.com",
                 "--proxy-server=https://proxy.example.com:443",
             ),
-            (
-                "http://[::1]:7890",
-                "--proxy-server=http://[::1]:7890",
-            ),
+            ("http://[::1]:7890", "--proxy-server=http://[::1]:7890"),
         ] {
             let proxy = CodexLaunchProxy::resolve(input).unwrap().unwrap();
             assert_eq!(proxy.chromium_argument(), expected, "{input}");

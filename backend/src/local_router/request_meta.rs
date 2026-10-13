@@ -553,10 +553,7 @@ pub(crate) fn sanitize_siwc_responses_request(body: &mut Value) -> bool {
         .and_then(Value::as_str)
         .is_some_and(|kind| SIWC_BLOCKED_TOOL_TYPES.contains(&kind))
     {
-        object.insert(
-            "tool_choice".to_string(),
-            Value::String("auto".to_string()),
-        );
+        object.insert("tool_choice".to_string(), Value::String("auto".to_string()));
         changed = true;
     }
     if let Some(Value::Array(items)) = object.get_mut("input") {

@@ -459,8 +459,7 @@ pub(crate) async fn query_snapshot_at(
                 // 401 是凭据被官方明确拒绝，不能随历史快照吞掉：reason 透传给
                 // 调用方标失效，界面才不会一直定格在「上次成功数据」。
                 if error.downcast_ref::<AccountUsageUnauthorized>().is_some() {
-                    value["reason"] =
-                        Value::String(USAGE_REASON_CREDENTIAL_REJECTED.to_string());
+                    value["reason"] = Value::String(USAGE_REASON_CREDENTIAL_REJECTED.to_string());
                 }
                 value
             }
