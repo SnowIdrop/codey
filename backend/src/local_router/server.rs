@@ -99,28 +99,22 @@ impl RequestLogCatalog {
     }
 }
 
-/// 本地路由优先尝试的高位端口区间，用于避开常见开发服务的低位端口。
-/// 连续候选均不可用时由内核分配，实际端口可能在区间之外。
-pub(crate) const ROUTER_PORT_RANGE_START: u16 = 45_000;
-pub(crate) const ROUTER_PORT_RANGE_END: u16 = 55_000;
-/// 从随机起点最多连续探测多少个候选端口，全都不可用时回退由内核分配。
+/// 本地路由固定优先占用的端口，被占用才顺序向上探测。
+/// 连续候选均不可用时由内核分配，实际端口可能在该端口之后。
+pub(crate) const ROUTER_PORT_START: u16 = 26_958;
+/// 从起始端口最多连续探测多少个候选端口，全都不可用时回退由内核分配。
 pub(crate) const ROUTER_PORT_PROBES: u16 = 64;
 
-/// 在区间内从 `offset` 指定的端口开始顺序探测可用端口，候选被占用就换下一个。
+/// 从 `ROUTER_PORT_START` 开始顺序探测可用端口，候选被占用就换下一个。
 /// `bind` 成功即独占该端口，所以并发启动的多个实例不会拿到同一个端口。
-pub(crate) async fn bind_router_listener_from(offset: u32) -> Result<TcpListener> {
-    bind_router_listener_with(offset, TcpListener::bind).await
-}
-
-pub(super) async fn bind_router_listener_with<T, F, Fut>(offset: u32, mut bind: F) -> Result<T>
+pub(super) async fn bind_router_listener_with<T, F, Fut>(mut bind: F) -> Result<T>
 where
     F: FnMut(std::net::SocketAddrV4) -> Fut,
     Fut: std::future::Future<Output = std::io::Result<T>>,
 {
-    let span = u32::from(ROUTER_PORT_RANGE_END - ROUTER_PORT_RANGE_START) + 1;
     let mut occupied = Vec::new();
-    for step in 0..u32::from(ROUTER_PORT_PROBES) {
-        let port = ROUTER_PORT_RANGE_START + ((offset + step) % span) as u16;
+    for step in 0..ROUTER_PORT_PROBES {
+        let port = ROUTER_PORT_START + step;
         match bind(std::net::SocketAddrV4::new(
             std::net::Ipv4Addr::LOCALHOST,
             port,
@@ -131,12 +125,12 @@ where
             Err(error) => occupied.push((port, error)),
         }
     }
-    // 区间内连续候选都被占用时不能让路由起不来，退回到内核分配并留下诊断。
+    // 连续候选都被占用时不能让路由起不来，退回到内核分配并留下诊断。
     record_router_failure_nonblocking(
         "local_router_port_candidates_unavailable",
         "bind_local_router",
         format!(
-            "高位端口区间 {ROUTER_PORT_RANGE_START}-{ROUTER_PORT_RANGE_END} 内连续 {ROUTER_PORT_PROBES} 个候选端口均不可用，回退由内核分配端口"
+            "固定端口 {ROUTER_PORT_START} 起连续 {ROUTER_PORT_PROBES} 个候选端口均不可用，回退由内核分配端口"
         ),
         serde_json::json!({
             "probes": occupied
@@ -157,13 +151,8 @@ where
     .context("启动 Codey 本地路由失败")
 }
 
-/// 随机起点避免同一台机器上并发启动的实例都从同一个端口开始竞争。
 pub(crate) async fn bind_router_listener() -> Result<TcpListener> {
-    let seed = Uuid::new_v4();
-    let bytes = seed.as_bytes();
-    let span = u32::from(ROUTER_PORT_RANGE_END - ROUTER_PORT_RANGE_START) + 1;
-    let offset = u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) % span;
-    bind_router_listener_from(offset).await
+    bind_router_listener_with(TcpListener::bind).await
 }
 
 pub(crate) struct LocalRouter {

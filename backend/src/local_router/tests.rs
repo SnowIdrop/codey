@@ -12919,12 +12919,11 @@ async fn router_listener_binds_loopback_and_never_repeats_live_ports() {
 
 #[tokio::test]
 async fn an_occupied_candidate_port_is_skipped() {
-    // 模拟区间末尾被占用，确认探测回到起点，不依赖本机端口状态。
+    // 模拟首选端口被占用，确认探测顺序向上，不依赖本机端口状态。
     let mut attempted = Vec::new();
-    let offset = u32::from(ROUTER_PORT_RANGE_END - ROUTER_PORT_RANGE_START);
-    let port = bind_router_listener_with(offset, |address| {
+    let port = bind_router_listener_with(|address| {
         attempted.push(address.port());
-        std::future::ready(if address.port() == ROUTER_PORT_RANGE_END {
+        std::future::ready(if address.port() == ROUTER_PORT_START {
             Err(std::io::Error::from(std::io::ErrorKind::AddrInUse))
         } else {
             Ok(address.port())
@@ -12932,31 +12931,22 @@ async fn an_occupied_candidate_port_is_skipped() {
     })
     .await
     .unwrap();
-    assert_eq!(port, ROUTER_PORT_RANGE_START);
-    assert_eq!(
-        attempted,
-        vec![ROUTER_PORT_RANGE_END, ROUTER_PORT_RANGE_START]
-    );
+    assert_eq!(port, ROUTER_PORT_START + 1);
+    assert_eq!(attempted, vec![ROUTER_PORT_START, ROUTER_PORT_START + 1]);
 }
 
 #[tokio::test]
-async fn router_listener_uses_the_first_available_high_port() {
-    for offset in [
-        0,
-        123,
-        u32::from(ROUTER_PORT_RANGE_END - ROUTER_PORT_RANGE_START),
-    ] {
-        let mut attempted = Vec::new();
-        let port = bind_router_listener_with(offset, |address| {
-            assert_eq!(*address.ip(), std::net::Ipv4Addr::LOCALHOST);
-            attempted.push(address.port());
-            std::future::ready(Ok(address.port()))
-        })
-        .await
-        .unwrap();
-        assert_eq!(port, ROUTER_PORT_RANGE_START + offset as u16);
-        assert_eq!(attempted, vec![port]);
-    }
+async fn router_listener_prefers_the_fixed_port() {
+    let mut attempted = Vec::new();
+    let port = bind_router_listener_with(|address| {
+        assert_eq!(*address.ip(), std::net::Ipv4Addr::LOCALHOST);
+        attempted.push(address.port());
+        std::future::ready(Ok(address.port()))
+    })
+    .await
+    .unwrap();
+    assert_eq!(port, ROUTER_PORT_START);
+    assert_eq!(attempted, vec![ROUTER_PORT_START]);
 }
 
 #[tokio::test]
@@ -12966,7 +12956,7 @@ async fn router_listener_falls_back_after_all_candidates_fail() {
         std::io::ErrorKind::PermissionDenied,
     ] {
         let mut attempted = Vec::new();
-        let port = bind_router_listener_with(0, |address| {
+        let port = bind_router_listener_with(|address| {
             assert_eq!(*address.ip(), std::net::Ipv4Addr::LOCALHOST);
             attempted.push(address.port());
             std::future::ready(if address.port() == 0 {
@@ -12978,8 +12968,7 @@ async fn router_listener_falls_back_after_all_candidates_fail() {
         .await
         .unwrap();
         assert_eq!(port, 59_775);
-        let expected: Vec<_> = (ROUTER_PORT_RANGE_START
-            ..ROUTER_PORT_RANGE_START + ROUTER_PORT_PROBES)
+        let expected: Vec<_> = (ROUTER_PORT_START..ROUTER_PORT_START + ROUTER_PORT_PROBES)
             .chain(std::iter::once(0))
             .collect();
         assert_eq!(attempted, expected);
@@ -12989,7 +12978,7 @@ async fn router_listener_falls_back_after_all_candidates_fail() {
 #[tokio::test]
 async fn router_listener_reports_kernel_allocation_failure() {
     let mut attempts = 0;
-    let error = bind_router_listener_with::<u16, _, _>(0, |address| {
+    let error = bind_router_listener_with::<u16, _, _>(|address| {
         attempts += 1;
         std::future::ready(Err(std::io::Error::from(if address.port() == 0 {
             std::io::ErrorKind::PermissionDenied
