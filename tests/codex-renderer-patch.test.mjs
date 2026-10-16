@@ -5,241 +5,45 @@ import test from "node:test";
 import { loadStartupPatchTemplate } from "./helpers/startup-patch.mjs";
 
 test("an incompatible optional renderer patch never blocks the Codex module response", async () => {
-  const Module = process.getBuiltinModule("module");
-  const nativeLoad = Module._load;
-  const nativeJsExtension = Module._extensions[".js"];
-  let installedHandler = null;
-  class FakeEmitter {
-    constructor() {
-      this.listeners = new Map();
-    }
-
-    on(name, listener) {
-      const listeners = this.listeners.get(name) || [];
-      listeners.push({ listener, once: false });
-      this.listeners.set(name, listeners);
-      return this;
-    }
-
-    once(name, listener) {
-      const listeners = this.listeners.get(name) || [];
-      listeners.push({ listener, once: true });
-      this.listeners.set(name, listeners);
-      return this;
-    }
-
-    removeListener(name, listener) {
-      const listeners = this.listeners.get(name) || [];
-      this.listeners.set(
-        name,
-        listeners.filter((entry) => entry.listener !== listener),
-      );
-      return this;
-    }
-
-    emit(name, ...args) {
-      const listeners = [...(this.listeners.get(name) || [])];
-      this.listeners.set(
-        name,
-        listeners.filter((entry) => !entry.once),
-      );
-      listeners.forEach((entry) => entry.listener(...args));
-    }
-  }
-  class FakeWebContents extends FakeEmitter {
-    constructor() {
-      super();
-      this.currentUrl = "";
-      this.loadedUrls = [];
-      this.destroyed = false;
-      this.backgroundThrottling = [];
-    }
-
-    getURL() {
-      return this.currentUrl;
-    }
-
-    loadURL(url) {
-      this.currentUrl = url;
-      this.loadedUrls.push(url);
-      this.emit("did-start-navigation", {}, url);
-      return Promise.resolve();
-    }
-
-    setBackgroundThrottling(enabled) {
-      this.backgroundThrottling.push(enabled);
-    }
-  }
-  class FakeBrowserWindow extends FakeEmitter {
-    constructor(options = {}) {
-      super();
-      this.options = options;
-      this.webContents = new FakeWebContents();
-      this.destroyed = false;
-      this.destroyCalls = 0;
-    }
-
-    destroy() {
-      if (this.destroyed) return;
-      this.destroyed = true;
-      this.destroyCalls += 1;
-      this.webContents.destroyed = true;
-      this.webContents.emit("destroyed");
-      this.emit("closed");
-    }
-
-    isDestroyed() {
-      return this.destroyed;
-    }
-
-    loadURL(url) {
-      return this.webContents.loadURL(url);
-    }
-  }
-  const fakeElectron = {
-    app: { getVersion: () => "26.826.1724" },
-    BrowserWindow: FakeBrowserWindow,
-    protocol: {
-      handle(scheme, handler) {
-        assert.equal(scheme, "app");
-        installedHandler = handler;
-      },
-    },
-  };
-  const fakeAvatarOverlayNative = { createController: () => ({}) };
-  Module._load = function testElectronLoader(request) {
-    if (request === "electron") return fakeElectron;
-    if (request === "C:\\Codex\\avatar_overlay.node") {
-      return fakeAvatarOverlayNative;
-    }
-    return Reflect.apply(nativeLoad, this, arguments);
-  };
-
-  const nativeConsoleError = console.error;
-  const childProcess = process.getBuiltinModule("child_process");
-  const nativeSpawn = childProcess.spawn;
-  const nativeSpawnSync = childProcess.spawnSync;
-  const asyncLogSpawns = [];
-  const syncLogSpawns = [];
-  childProcess.spawn = (command, args, options) => {
-    const child = new FakeEmitter();
-    const stdin = new FakeEmitter();
-    const call = { command, args, options, input: null, encoding: null };
-    stdin.end = (input, encoding) => {
-      call.input = input;
-      call.encoding = encoding;
-      queueMicrotask(() => child.emit("exit", 0));
-    };
-    child.stdin = stdin;
-    child.kill = () => true;
-    child.unref = () => child;
-    asyncLogSpawns.push(call);
-    return child;
-  };
-  childProcess.spawnSync = (command, args, options) => {
-    syncLogSpawns.push({ command, args, options });
-    return { status: 0, stderr: "" };
-  };
+  const patchRecords = [];
   const patchErrors = [];
+  const nativePatchLog = globalThis.__codeyPatchLog;
+  const nativeConsoleError = console.error;
+  globalThis.__codeyPatchLog = (record) => {
+    patchRecords.push(JSON.parse(record));
+  };
   console.error = (...args) => {
     patchErrors.push(args);
   };
 
   try {
-    assert.equal(
-      (0, eval)(await loadStartupPatchTemplate({ disablePet: true, errorLoggerExecutable: "C:\\Codey\\codey.exe" })),
-      "codey-startup-patch-installed-v40",
-    );
-    const electron = Module._load("electron", undefined, false);
-    const petSurface = new electron.BrowserWindow({ title: "Pet Surface test" });
-    assert.equal(petSurface.destroyed, false);
-    const avatarOverlayWindow = new electron.BrowserWindow({
-      width: 356,
-      height: 320,
-      alwaysOnTop: true,
-      transparent: true,
-      focusable: false,
-      show: false,
-      frame: false,
-      skipTaskbar: true,
-      webPreferences: { backgroundThrottling: false },
-    });
-    assert.equal(avatarOverlayWindow.destroyed, false);
-    assert.equal(
-      avatarOverlayWindow.options.webPreferences.backgroundThrottling,
-      true,
-    );
-    avatarOverlayWindow.emit("show");
-    avatarOverlayWindow.emit("hide");
-    assert.deepEqual(
-      avatarOverlayWindow.webContents.backgroundThrottling,
-      [false, true],
-    );
-    assert.equal(
-      globalThis.__CODEY_CODEX_STARTUP_PATCH__.throttleHiddenAvatarOverlay,
-      true,
-    );
-    const overlaySource = [
-      "class AvatarOverlayManager{",
-      "async prewarm(e){",
-      "if(this.window!=null||this.openingWindowPromise!=null||this.isAppQuitting)return;",
-      "let t=this.windowVisibilitySequence,n=await this.ensureWindow(t);",
-      "n==null||t!==this.windowVisibilitySequence||this.positionWindow(n,e)}",
-      "async prewarm(){await this.get()}",
-      "}",
-    ].join("");
-    const patchedOverlay = globalThis.__CODEY_PATCH_CODEX_AVATAR_OVERLAY_PREWARM__(
-      overlaySource,
-    );
-    assert.match(patchedOverlay, /async prewarm\(e\)\{return;/);
-    assert.match(patchedOverlay, /async prewarm\(\)\{await this.get\(\)\}/);
-    assert.equal(petSurface.options.webPreferences, undefined);
-    assert.equal(
-      Module._load("C:\\Codex\\avatar_overlay.node", undefined, false),
-      fakeAvatarOverlayNative,
-    );
-    const routeWindow = new electron.BrowserWindow({ title: "Codex" });
-    await routeWindow.webContents.loadURL(
-      "app://-/index.html?initialRoute=%2Favatar-overlay",
-    );
-    assert.equal(routeWindow.destroyed, false);
-    assert.deepEqual(routeWindow.webContents.loadedUrls, [
-      "app://-/index.html?initialRoute=%2Favatar-overlay",
-    ]);
-    assert.equal(globalThis.__CODEY_CODEX_STARTUP_PATCH__.disablePet, true);
-    assert.equal(
-      Object.hasOwn(globalThis.__CODEY_CODEX_STARTUP_PATCH__, "petManagerSourceRemoved"),
-      false,
-    );
-    const upstreamHandler = async () =>
-      new Response(
-        [
-          "useHiddenModels:",
-          "availableModels:",
-          "includeUltraReasoningEffort",
-          "amazonBedrock",
-        ].join(" "),
-      );
-    electron.protocol.handle("app", upstreamHandler);
-    assert.equal(typeof installedHandler, "function");
+    (0, eval)(await loadStartupPatchTemplate({ disablePet: true }));
+    assert.equal(globalThis.__codeyRendererPatchInstalled, true);
+    // Fetch interception entry: patched text means the response is rewritten,
+    // null means the paused asset is fulfilled with its original body.
+    const patch = (url, source) =>
+      globalThis.__codeyRendererPatchEntry(url, source) ?? source;
 
-    const response = await installedHandler({
-      url: "app://-/assets/app-initial-new-codex-build.js",
-    });
-    assert.equal(response.ok, true);
-    assert.match(await response.text(), /useHiddenModels:/);
+    const incompatibleSource = [
+      "useHiddenModels:",
+      "availableModels:",
+      "includeUltraReasoningEffort",
+      "amazonBedrock",
+    ].join(" ");
+    const response = patch(
+      "app://-/assets/app-initial-new-codex-build.js",
+      incompatibleSource,
+    );
     // Each incompatible gate is skipped independently (and logged) instead of one
     // throw discarding every gate on the asset. The response is never blocked and
     // the source is returned unchanged when nothing matched.
+    assert.equal(response, incompatibleSource);
     assert.ok(patchErrors.length >= 1);
     for (const [message] of patchErrors) {
       assert.match(String(message), /incompatible Codex renderer patch/);
     }
-    assert.equal(syncLogSpawns.length, 0);
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(asyncLogSpawns.length, 1);
     assert.deepEqual(
-      JSON.parse(asyncLogSpawns[0].input).map(({ operation }) => operation),
+      patchRecords.map(({ operation }) => operation),
       [
         "renderer_patch:model allowlist",
         "renderer_patch:model visibility",
@@ -248,8 +52,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     // Every skipped gate must carry printable excerpts around its neighborhood
     // anchors so an incompatible field bundle can be adapted without access to
     // that exact build.
-    for (const record of JSON.parse(asyncLogSpawns[0].input)) {
-      assert.equal(record.versions.codex, "26.826.1724");
+    for (const record of patchRecords) {
       assert.equal(record.context.matchCount, 0);
       assert.ok(
         Array.isArray(record.context.excerpts) &&
@@ -263,20 +66,20 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       );
     }
 
-    const repeatedResponse = await installedHandler({
-      url: "app://-/assets/app-initial-new-codex-build.js",
-    });
-    assert.match(await repeatedResponse.text(), /useHiddenModels:/);
-    await new Promise((resolve) => setImmediate(resolve));
+    const repeatedResponse = patch(
+      "app://-/assets/app-initial-new-codex-build.js",
+      incompatibleSource,
+    );
+    assert.equal(repeatedResponse, incompatibleSource);
     assert.equal(
       patchErrors.length,
       2,
       "the same incompatible source must not rerun failed renderer gates",
     );
     assert.equal(
-      asyncLogSpawns.length,
-      1,
-      "the same incompatible source must not spawn another patch logger",
+      patchRecords.length,
+      2,
+      "the same incompatible source must not report the same gates again",
     );
 
     const currentRendererSource = [
@@ -297,14 +100,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "`composer.intelligenceDropdown.model.title`;",
       "`composer.intelligenceDropdown.model.rowLabel`;",
     ].join("");
-    electron.protocol.handle(
-      "app",
-      async () => new Response(currentRendererSource),
+    const patchedCurrentRendererSource = patch(
+      "app://-/assets/app-initial-current-codex-build.js",
+      currentRendererSource,
     );
-    const currentRendererResponse = await installedHandler({
-      url: "app://-/assets/app-initial-current-codex-build.js",
-    });
-    const patchedCurrentRendererSource = await currentRendererResponse.text();
     // The Fast control no longer depends on the current model exposing more
     // than one service tier. Only the draft guard survives.
     assert.match(
@@ -342,15 +141,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
         "OQ(`composer.toggleFastMode`,()=>{},{enabled:allowed&&!loading&&fastOption!=null});",
         "return show}",
       ].join("");
-      electron.protocol.handle(
-        "app",
-        async () => new Response(reorderedServiceTierControlSource),
+      const patchedReorderedServiceTierControlSource = patch(
+        `app://-/assets/app-initial-reordered-service-tier-control-${index}.js`,
+        reorderedServiceTierControlSource,
       );
-      const reorderedServiceTierControlResponse = await installedHandler({
-        url: `app://-/assets/app-initial-reordered-service-tier-control-${index}.js`,
-      });
-      const patchedReorderedServiceTierControlSource =
-        await reorderedServiceTierControlResponse.text();
       assert.match(
         patchedReorderedServiceTierControlSource,
         /show=(?:!0&&!draft|!draft&&!0|!draft)/,
@@ -387,14 +181,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "t[45]===ze?Be=t[46]:(Be={enabled:ze},t[45]=ze,t[46]=Be),",
       "U$(`composer.toggleFastMode`,Re,Be);",
     ].join("");
-    electron.protocol.handle(
-      "app",
-      async () => new Response(electron151ServiceTierSource),
+    const patchedElectron151Source = patch(
+      "app://-/assets/app-initial-electron151-service-tier.js",
+      electron151ServiceTierSource,
     );
-    const electron151Response = await installedHandler({
-      url: "app://-/assets/app-initial-electron151-service-tier.js",
-    });
-    const patchedElectron151Source = await electron151Response.text();
     assert.match(
       patchedElectron151Source,
       /De=!w&&!0/,
@@ -436,15 +226,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       scopedMemoizedGap,
       "OQ(`composer.toggleFastMode`,()=>{},{enabled:show});return show}",
     ].join("");
-    electron.protocol.handle(
-      "app",
-      async () => new Response(scopedServiceTierSource),
+    const patchedScopedServiceTierSource = patch(
+      "app://-/assets/app-initial-scoped-service-tier.js",
+      scopedServiceTierSource,
     );
-    const scopedServiceTierResponse = await installedHandler({
-      url: "app://-/assets/app-initial-scoped-service-tier.js",
-    });
-    const patchedScopedServiceTierSource =
-      await scopedServiceTierResponse.text();
     assert.match(
       patchedScopedServiceTierSource,
       /unrelated=!draft&&allowed&&settings\.availableOptions\.length>1/,
@@ -481,14 +266,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "return e.query.setData(rx,{authMethod:n,hostId:t},r),",
       "r.requirements?.featureRequirements?.fast_mode!==!1}",
     ].join("");
-    electron.protocol.handle(
-      "app",
-      async () => new Response(electron151EntitlementSource),
+    const patchedEntitlementSource = patch(
+      "app://-/assets/app-initial-electron151-entitlement.js",
+      electron151EntitlementSource,
     );
-    const entitlementResponse = await installedHandler({
-      url: "app://-/assets/app-initial-electron151-entitlement.js",
-    });
-    const patchedEntitlementSource = await entitlementResponse.text();
     assert.match(
       patchedEntitlementSource,
       /async function YHr\(e,t\)\{return!0\}/,
@@ -509,11 +290,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "let r=new CustomEvent(`codex-message-from-view`,{detail:e});",
       "t&&(r.__codexForwardedViaBridge=!0),window.dispatchEvent(r)}};",
     ].join("");
-    electron.protocol.handle("app", async () => new Response(routeBridgeSource));
-    const routeBridgeResponse = await installedHandler({
-      url: "app://-/assets/app-initial-route-bridge.js",
-    });
-    const patchedRouteBridgeSource = await routeBridgeResponse.text();
+    const patchedRouteBridgeSource = patch(
+      "app://-/assets/app-initial-route-bridge.js",
+      routeBridgeSource,
+    );
     assert.match(
       patchedRouteBridgeSource,
       /globalThis\.__codeyModelWhitelistPatch\?\.rewriteOutgoingMessage\?\.\(e\)\?\?e/,
@@ -585,11 +365,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "function Mjt(){return `critical`}function Ejt(){return `source`}",
       "const appServerPatchSignals=`AppServerRequestClient is missing a message dispatcher mcp_request_enqueued`;",
     ].join("");
-    electron.protocol.handle("app", async () => new Response(appServerRequestSource));
-    const appServerRequestResponse = await installedHandler({
-      url: "app://-/assets/app-initial-app-server-request-current-build.js",
-    });
-    const patchedAppServerRequestSource = await appServerRequestResponse.text();
+    const patchedAppServerRequestSource = patch(
+      "app://-/assets/app-initial-app-server-request-current-build.js",
+      appServerRequestSource,
+    );
     assert.match(
       patchedAppServerRequestSource,
       /__codeyModelWhitelistPatch\?\.rewriteOutgoingMessage/,
@@ -696,10 +475,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     // forwarder into app-shared-*.js. That chunk must stay in the patch filter
     // or the model-request source gate never installs and startup aborts at
     // the request-gate verification stage.
-    const sharedChunkResponse = await installedHandler({
-      url: "app://-/webview/assets/app-shared-8bd9d0399038.js",
-    });
-    const patchedSharedChunk = await sharedChunkResponse.text();
+    const patchedSharedChunk = patch(
+      "app://-/webview/assets/app-shared-8bd9d0399038.js",
+      appServerRequestSource,
+    );
     assert.match(
       patchedSharedChunk,
       /__codeyModelRequestSourceGateInstalled=true/,
@@ -709,10 +488,11 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       /__codeyAppServerRequestClients/,
     );
     // Assets outside the patch set must pass through untouched.
-    const unrelatedChunkResponse = await installedHandler({
-      url: "app://-/webview/assets/app-primary-6f60e9ac4103.js",
-    });
-    assert.equal(await unrelatedChunkResponse.text(), appServerRequestSource);
+    const unrelatedChunk = patch(
+      "app://-/webview/assets/app-primary-6f60e9ac4103.js",
+      appServerRequestSource,
+    );
+    assert.equal(unrelatedChunk, appServerRequestSource);
 
     const petSettingsSource = [
       "import{AvatarPreview as P,builtInPets as L}",
@@ -720,11 +500,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "const petSettingsId=`settings.appearance.pets.title`;",
       "function renderPetSettings(){return [P(),L.map(()=>1),petSettingsId]}",
     ].join("");
-    electron.protocol.handle("app", async () => new Response(petSettingsSource));
-    const petSettingsResponse = await installedHandler({
-      url: "app://-/assets/general-settings-current-build.js",
-    });
-    const patchedPetSettingsSource = await petSettingsResponse.text();
+    const patchedPetSettingsSource = patch(
+      "app://-/assets/general-settings-current-build.js",
+      petSettingsSource,
+    );
     assert.doesNotMatch(patchedPetSettingsSource, /codex-avatar-/);
     assert.match(
       patchedPetSettingsSource,
@@ -743,15 +522,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "import\"./codex-avatar-next-build.js\";",
       "const petSettingsId=`settings.pets.title`;",
     ].join("");
-    electron.protocol.handle(
-      "app",
-      async () => new Response(sideEffectPetSettingsSource),
+    const patchedSideEffectPetSettingsSource = patch(
+      "app://-/assets/pet-settings-next-build.js",
+      sideEffectPetSettingsSource,
     );
-    const sideEffectPetSettingsResponse = await installedHandler({
-      url: "app://-/assets/pet-settings-next-build.js",
-    });
-    const patchedSideEffectPetSettingsSource =
-      await sideEffectPetSettingsResponse.text();
     assert.doesNotMatch(patchedSideEffectPetSettingsSource, /codex-avatar-/);
     assert.match(
       patchedSideEffectPetSettingsSource,
@@ -768,12 +542,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "const miniSettingsId=`settings.mini.show`;",
       "function renderMiniSettings(){return [Rt(),Ht(),Yt(),miniSettingsId]}",
     ].join("\n");
-    electron.protocol.handle("app", async () => new Response(currentPetSettingsSource));
-    const currentPetSettingsResponse = await installedHandler({
-      url: "app://-/assets/pets-settings-route-551771c3ecb9.js",
-    });
-    const patchedCurrentPetSettingsSource =
-      await currentPetSettingsResponse.text();
+    const patchedCurrentPetSettingsSource = patch(
+      "app://-/assets/pets-settings-route-551771c3ecb9.js",
+      currentPetSettingsSource,
+    );
     assert.doesNotMatch(
       patchedCurrentPetSettingsSource,
       /(avatar-mascot-button|codex-pet-assets|use-avatar-options)-/,
@@ -796,12 +568,12 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "bb0:{if(r){p=r;break bb0}if(l===`SYSTEM`){p=d;break bb0}p=u}",
       "return {enabled:c,source:l,locale:p,english:f}}",
     ].join("");
-    electron.protocol.handle("app", async () => new Response(localePropsSource));
-    const localePropsResponse = await installedHandler({
-      url: "app://-/assets/app-initial-26903.js",
-    });
     // Codex owns the UI language, so its locale resolver must reach the renderer unchanged.
-    assert.equal(await localePropsResponse.text(), localePropsSource);
+    const localePropsResult = patch(
+      "app://-/assets/app-initial-26903.js",
+      localePropsSource,
+    );
+    assert.equal(localePropsResult, localePropsSource);
 
     const ownerDiscoverySource = [
       "async function maybeResume(Bm,f,n,t){",
@@ -812,14 +584,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "return owner}",
       "return null}",
     ].join("");
-    electron.protocol.handle(
-      "app",
-      async () => new Response(ownerDiscoverySource),
+    const patchedOwnerDiscoverySource = patch(
+      "app://-/assets/app-initial-BHB6SClA.js",
+      ownerDiscoverySource,
     );
-    const ownerDiscoveryResponse = await installedHandler({
-      url: "app://-/assets/app-initial-BHB6SClA.js",
-    });
-    const patchedOwnerDiscoverySource = await ownerDiscoveryResponse.text();
     assert.match(
       patchedOwnerDiscoverySource,
       /__CODEY_THREAD_OWNER_DISCOVERY_V2__/,
@@ -1006,14 +774,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "discardConversationFromCache(e){return this.productPolicy.runtimePolicy.isLocalConversationInProgress(this.conversation)&&this.inactiveThreadUnsubscriber.clearConversationStreamOwnership(e)}",
       "}",
     ].join("");
-    electron.protocol.handle(
-      "app",
-      async () => new Response(completedReconciliationSource),
+    const patchedCompletedReconciliationSource = patch(
+      "app://-/assets/app-initial-BHB6SClA.js",
+      completedReconciliationSource,
     );
-    const completedReconciliationResponse = await installedHandler({
-      url: "app://-/assets/app-initial-BHB6SClA.js",
-    });
-    const patchedCompletedReconciliationSource = await completedReconciliationResponse.text();
     assert.match(
       patchedCompletedReconciliationSource,
       /async codeyReconcileCompletedConversation\(/,
@@ -1113,15 +877,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "const rendererProcessCpuPercentAvg=true;",
       "function unrelated(){return beginCpuSampling()}",
     ].join("");
-    electron.protocol.handle(
-      "app",
-      async () => new Response(interactionPerformanceSource),
+    const patchedInteractionPerformance = patch(
+      "app://-/assets/app-initial-BHB6SClA.js",
+      interactionPerformanceSource,
     );
-    const interactionPerformanceResponse = await installedHandler({
-      url: "app://-/assets/app-initial-BHB6SClA.js",
-    });
-    const patchedInteractionPerformance =
-      await interactionPerformanceResponse.text();
     assert.match(patchedInteractionPerformance, /cpuSampling:null/);
     assert.match(patchedInteractionPerformance, /ensureHeartbeat\(\)\{\}/);
     assert.doesNotMatch(
@@ -1146,12 +905,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     if (productionRendererAsset) {
       const productionSource = await readFile(productionRendererAsset, "utf8");
       const previousErrorCount = patchErrors.length;
-      electron.protocol.handle("app", async () => new Response(productionSource));
-      const productionResponse = await installedHandler({
-        url: "app://-/assets/app-initial-production-build.js",
-      });
-      const patchedProductionSource = await productionResponse.text();
-      await new Promise((resolve) => setImmediate(resolve));
+      const patchedProductionSource = patch(
+        "app://-/assets/app-initial-production-build.js",
+        productionSource,
+      );
       assert.notEqual(
         patchedProductionSource,
         productionSource,
@@ -1173,9 +930,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     }
   } finally {
     console.error = nativeConsoleError;
-    childProcess.spawn = nativeSpawn;
-    childProcess.spawnSync = nativeSpawnSync;
-    Module._load = nativeLoad;
-    Module._extensions[".js"] = nativeJsExtension;
+    if (nativePatchLog === undefined) {
+      delete globalThis.__codeyPatchLog;
+    } else {
+      globalThis.__codeyPatchLog = nativePatchLog;
+    }
   }
 });

@@ -362,10 +362,10 @@ pub fn reject_bridge_expression(request_id: &str, message: &str) -> anyhow::Resu
     ))
 }
 
-type ConnectedCdpSocket =
+pub type ConnectedCdpSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn connect_cdp_websocket(websocket_url: &str) -> anyhow::Result<ConnectedCdpSocket> {
+pub async fn connect_cdp_websocket(websocket_url: &str) -> anyhow::Result<ConnectedCdpSocket> {
     let candidates = cdp_websocket_connect_candidates(websocket_url);
     // 候选共享原来的连接总预算，避免回退把单轮代价翻倍后吃掉启动注入窗口。
     let attempt_timeout = cdp_connect_attempt_timeout(candidates.len());

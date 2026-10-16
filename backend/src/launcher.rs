@@ -285,8 +285,6 @@ pub struct CodeyRuntime {
     process_id: Option<u32>,
     #[cfg(unix)]
     process_group_id: Option<u32>,
-    #[cfg(target_os = "macos")]
-    inspector_argument: Option<String>,
     watchdog_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     watchdog_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     exit_watchdog_shutdown: Mutex<Option<oneshot::Sender<()>>>,
@@ -1159,14 +1157,9 @@ async fn stop_codex_processes(
     app_dir: &std::path::Path,
     process_id: Option<u32>,
     #[cfg(unix)] process_group_id: Option<u32>,
-    #[cfg(target_os = "macos")] inspector_argument: Option<&str>,
 ) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        if let Some(inspector_argument) = inspector_argument {
-            return stop_macos_codex(inspector_argument, app_dir, process_id, process_group_id)
-                .await;
-        }
         terminate_unix_codex_processes(app_dir, process_id, process_group_id, None)
             .await
             .map(|_| ())
@@ -1257,8 +1250,6 @@ async fn inject_initial_renderer(
         spawned.process_id,
         #[cfg(unix)]
         spawned.process_group_id,
-        #[cfg(target_os = "macos")]
-        spawned.inspector_argument.as_deref(),
     )
     .await
     {
@@ -2238,8 +2229,6 @@ impl CodeyRuntime {
         };
         stage_timings.mark("spawnAndInjectMs");
         stage_timings.report();
-        #[cfg(target_os = "macos")]
-        let inspector_argument = spawned.inspector_argument.clone();
         let process_id = spawned.process_id;
         let RuntimeWatchers {
             injection_statuses,
@@ -2281,8 +2270,6 @@ impl CodeyRuntime {
                 process_id,
                 #[cfg(unix)]
                 process_group_id: spawned.process_group_id,
-                #[cfg(target_os = "macos")]
-                inspector_argument,
                 watchdog_shutdown: Mutex::new(Some(watchdog_shutdown)),
                 watchdog_task: Mutex::new(Some(watchdog_task)),
                 exit_watchdog_shutdown: Mutex::new(Some(exit_watchdog_shutdown)),
@@ -2303,8 +2290,6 @@ impl CodeyRuntime {
                 self.process_id,
                 #[cfg(unix)]
                 self.process_group_id,
-                #[cfg(target_os = "macos")]
-                self.inspector_argument.as_deref(),
             ),
             restore_runtime_config_for_router_mode(
                 codex_home(),

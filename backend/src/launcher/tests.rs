@@ -778,7 +778,7 @@ fn macos_launch_forces_a_new_app_instance() {
     let command = build_fresh_macos_open_command(
         std::path::Path::new("/Applications/ChatGPT.app"),
         9229,
-        &["--inspect-brk=127.0.0.1:19321".to_string()],
+        &["--force-renderer-accessibility".to_string()],
     );
     assert_eq!(command.first().map(String::as_str), Some("open"));
     assert!(command.iter().any(|part| part == "-n"));
@@ -791,7 +791,7 @@ fn macos_launch_forces_a_new_app_instance() {
     assert!(
         command
             .iter()
-            .any(|part| part == "--inspect-brk=127.0.0.1:19321")
+            .any(|part| part == "--force-renderer-accessibility")
     );
 }
 
@@ -931,8 +931,6 @@ async fn runtime_stop_preserves_resources_on_failure_and_allows_retry() {
         child,
         process_id,
         process_group_id: process_id,
-        #[cfg(target_os = "macos")]
-        inspector_argument: None,
         watchdog_shutdown: Mutex::new(Some(watchdog_shutdown)),
         watchdog_task: Mutex::new(Some(watchdog_task)),
         exit_watchdog_shutdown: Mutex::new(Some(exit_shutdown)),
@@ -1006,9 +1004,8 @@ async fn runtime_stop_preserves_resources_on_failure_and_allows_retry() {
             stop_codex_processes(
                 &runtime.codex_app_path,
                 process_id,
+                #[cfg(unix)]
                 process_id,
-                #[cfg(target_os = "macos")]
-                None,
             ),
             async {
                 std::fs::write(config_path.join("invalid-child"), "config").map_err(Into::into)

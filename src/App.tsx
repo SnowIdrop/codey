@@ -24,8 +24,6 @@ import { UsageAnalysisPanel } from "./UsageAnalysisPanel";
 import { OperationsPanel } from "./OperationsPanel";
 import { CodeyPluginsSection } from "./CodeyPluginsSection";
 import { CodexExtensionsPage, type ExtensionTransport } from "./features/codex-extensions";
-import { canRepairMainProcessInjection, isMainProcessInjectionConfirmed } from "./runtimeStatusPresentation";
-import { repairOperationResult } from "./injectionRepair";
 import {
   getNotificationChannelDefinition,
 } from "./notifications";
@@ -169,7 +167,6 @@ export function App({
   const [busy, setBusy] = useState<string | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
   const [configRepairNotice, setConfigRepairNotice] = useState<{ tone: "info" | "success" | "error"; text: string } | null>(null);
-  const [injectionRepairRequested, setInjectionRepairRequested] = useState(false);
   const [systemSettingsOpen, setSystemSettingsOpen] = useState(false);
   const popupContainer = modalContainer ?? null;
   const noticeController = useAppNoticeController();
@@ -183,18 +180,7 @@ export function App({
   }, [restartStatusError, setNotice]);
 
   const provider = providerStatus?.provider;
-  const isBusy = busy !== null || (injectionRepairRequested && !restartStatusError);
-  useEffect(() => {
-    if (!injectionRepairRequested || status.restartInProgress) return;
-    setInjectionRepairRequested(false);
-    const confirmed = isMainProcessInjectionConfirmed(status);
-    setNotice({
-      tone: status.startupError || !confirmed ? "error" : "success",
-      text: status.startupError || (confirmed
-        ? "主进程注入已修复，Codex 已自动重启"
-        : "尚未确认主进程注入修复成功，请查看运行状态或失败提示"),
-    });
-  }, [injectionRepairRequested, status.restartInProgress, status.startupError, status.running, status.maintenance, setNotice]);
+  const isBusy = busy !== null;
   const configLoaded = config !== null;
   const setSubagentOptimization = useCallback((enabled: boolean) => {
     setConfig((current) =>
@@ -1126,25 +1112,6 @@ export function App({
     });
   }
 
-  async function repairMainProcessInjection() {
-    if (!config || restartStatusError || !canRepairMainProcessInjection(status)) return;
-    await runOperation("repair-main-process-injection", async () => {
-      if (dirty) await persist(config);
-      setNotice({ tone: "info", text: "正在退出 Codex 并修复主进程注入，成功后将自动重启…" });
-      try {
-        await withTimeout(invoke("repair_main_process_injection"), 10_000,
-          "修复请求暂未确认，请稍后重新查询状态");
-        setInjectionRepairRequested(true);
-      } catch (error) {
-        const result = repairOperationResult(error);
-        setNotice({ tone: result.tone, text: result.text });
-        // 退出客户端会断开内嵌页面连接；后端明确拒绝才不会开始修复。
-        if (!result.unconfirmed) return;
-      }
-      markRestartInProgress();
-    });
-  }
-
   function askRepairCodexConfig() {
     if (isBusy) return;
     setConfirmation({
@@ -1225,9 +1192,6 @@ export function App({
     () => void prepareComputerUse(),
   );
   const handleRestartCodex = useStableEvent(askRestartCodex);
-  const handleRepairMainProcessInjection = useStableEvent(
-    () => void repairMainProcessInjection(),
-  );
   const handleFooterUpdateClick = useStableEvent(() => void checkForUpdates());
   const handleConfigChange = useStableEvent(editConfig);
   const handleAddNotificationChannel = useStableEvent(addNotificationChannel);
@@ -1606,13 +1570,7 @@ export function App({
                 onRepairPluginMarketplace={handleRepairPluginMarketplace}
                 onPrepareComputerUse={handlePrepareComputerUse}
                 computerUseNotice={computerUseNotice}
-                onRepairMainProcessInjection={handleRepairMainProcessInjection}
-                onRepairCodexConfig={askRepairCodexConfig}
                 configRepairNotice={configRepairNotice}
-                injectionRepairing={injectionRepairRequested || busy === "repair-main-process-injection"}
-                onRestart={handleRestartCodex}
-                restartStatusUnknown={Boolean(restartStatusError)}
-                showRestartAction={!embedded}
               />
               <FeaturePolicyCard
                 config={config}

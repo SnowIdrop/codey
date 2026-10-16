@@ -614,23 +614,6 @@ pub(super) fn build_fresh_macos_open_command(
     command
 }
 
-#[cfg(target_os = "macos")]
-pub(super) async fn stop_macos_codex(
-    inspector_argument: &str,
-    app_dir: &std::path::Path,
-    process_id: Option<u32>,
-    process_group_id: Option<u32>,
-) -> Result<()> {
-    terminate_unix_codex_processes(
-        app_dir,
-        process_id,
-        process_group_id,
-        Some(inspector_argument),
-    )
-    .await
-    .map(|_| ())
-}
-
 #[cfg(unix)]
 pub(super) fn owned_unix_codex_process_ids(
     processes: &[crate::process_tree::UnixProcessInfo],

@@ -45,9 +45,8 @@ if (import.meta.env.DEV) {
         : new URLSearchParams(window.location.search).get("platform") === "linux"
           ? "linux"
           : "macos";
-    let previewInjectionMode = new URLSearchParams(window.location.search).get("injection") === "cli"
-      ? "cli" : "node_options";
-    let previewInjectionRepairUntil = 0;
+    let previewInjectionMode = new URLSearchParams(window.location.search).get("injection") === "none"
+      ? "" : "cli";
     const configRepairPreview = new URLSearchParams(window.location.search).get("configRepair");
     let previewConfigLoadFailed = configRepairPreview === "load-failure";
     const previewEndpoints = {
@@ -739,8 +738,6 @@ if (import.meta.env.DEV) {
         };
       }
       if (command === "runtime_status") {
-        const injectionRepairing = Date.now() < previewInjectionRepairUntil;
-        if (previewInjectionRepairUntil && !injectionRepairing) previewInjectionMode = "node_options";
         const activeNotificationChannelCount =
           previewConfig.webhook.channels.filter(
             (channel) =>
@@ -765,7 +762,7 @@ if (import.meta.env.DEV) {
             (account) => account.isDefault,
           ),
           restartRequired: false,
-          restartInProgress: injectionRepairing,
+          restartInProgress: false,
           activeProfileId: previewConfig.activeProfileId,
           activeProfileName:
             previewConfig.profiles.find(
@@ -1563,10 +1560,6 @@ if (import.meta.env.DEV) {
       }
       if (command === "restart_codey") {
         return { status: "restarting" };
-      }
-      if (command === "repair_main_process_injection") {
-        previewInjectionRepairUntil = Date.now() + 8_000;
-        return { status: "repairing" };
       }
       if (command === "repair_codex_config") {
         await new Promise((resolve) => setTimeout(resolve, 1800));
