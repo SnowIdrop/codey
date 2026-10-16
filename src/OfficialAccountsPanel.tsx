@@ -286,7 +286,8 @@ export function OfficialAccountsPanel({
   const accountsRef = useRef<OfficialAccount[]>([]);
   accountsRef.current = accounts ?? [];
 
-  const refreshUsage = useCallback(async (accountId: string, force: boolean) => {
+  const refreshUsage = useCallback(async (accountId: string, force: boolean, isCancelled: () => boolean = () => false) => {
+    if (isCancelled()) return;
     setUsagePending((current) => ({ ...current, [accountId]: (current[accountId] ?? 0) + 1 }));
     setUsages((current) => ({ ...current, [accountId]: current[accountId] ?? null }));
     try {
@@ -294,6 +295,7 @@ export function OfficialAccountsPanel({
         accountId,
         forceRefresh: force,
       });
+      if (isCancelled()) return;
       setUsages((current) => ({ ...current, [accountId]: snapshot }));
       // 后端确认账号失效后重算线路：卡片随即标红、隐藏切换默认入口，失效
       // 账号的线路同时从列表里移除。只在状态发生变化时重算一次，已标记失效的
@@ -306,9 +308,12 @@ export function OfficialAccountsPanel({
         void refreshRoutes();
       }
     } catch (error) {
+      if (isCancelled()) return;
       setUsages((current) => ({ ...current, [accountId]: { status: "error", message: errorText(error) } }));
     } finally {
-      setUsagePending((current) => ({ ...current, [accountId]: Math.max(0, (current[accountId] ?? 0) - 1) }));
+      if (!isCancelled()) {
+        setUsagePending((current) => ({ ...current, [accountId]: Math.max(0, (current[accountId] ?? 0) - 1) }));
+      }
     }
   }, [refreshRoutes]);
 
@@ -338,11 +343,12 @@ export function OfficialAccountsPanel({
           if (cancelled) return;
         }
         queried += 1;
-        await refreshUsage(account.id, false);
+        await refreshUsage(account.id, false, () => cancelled);
       }
     })();
     return () => {
       cancelled = true;
+      setUsagePending({});
     };
   }, [active, accountListKey, refreshUsage]);
 

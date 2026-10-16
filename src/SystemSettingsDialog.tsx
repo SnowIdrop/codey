@@ -1,4 +1,4 @@
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { Tabs } from "@heroui/react";
 import {
   IconCheck,
@@ -60,6 +60,13 @@ function SystemSettingsDialogComponent({
   const [machineNoCopyState, setMachineNoCopyState] = useState<
     "idle" | "copied" | "error"
   >("idle");
+  const machineNoCopyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pathCopyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => () => {
+    if (machineNoCopyTimer.current !== null) clearTimeout(machineNoCopyTimer.current);
+    if (pathCopyTimer.current !== null) clearTimeout(pathCopyTimer.current);
+  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -93,7 +100,11 @@ function SystemSettingsDialogComponent({
     } catch {
       setMachineNoCopyState("error");
     }
-    setTimeout(() => setMachineNoCopyState("idle"), 2000);
+    if (machineNoCopyTimer.current !== null) clearTimeout(machineNoCopyTimer.current);
+    machineNoCopyTimer.current = setTimeout(() => {
+      machineNoCopyTimer.current = null;
+      setMachineNoCopyState("idle");
+    }, 2000);
   };
 
   const resolvedCodexPath = codexAppPath || "/Applications/ChatGPT.app";
@@ -105,7 +116,11 @@ function SystemSettingsDialogComponent({
     try {
       await navigator.clipboard.writeText(resolvedCodexPath);
       setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      if (pathCopyTimer.current !== null) clearTimeout(pathCopyTimer.current);
+      pathCopyTimer.current = setTimeout(() => {
+        pathCopyTimer.current = null;
+        setCopied(false);
+      }, 2000);
     } catch {
       // 忽略写入剪贴板异常
     }
