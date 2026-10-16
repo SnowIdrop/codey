@@ -1,18 +1,23 @@
 import type React from "react";
-import { useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { Alert, CloseButton, Drawer, Pagination, Spinner, Table } from "@heroui/react";
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { Alert, CloseButton, Drawer, Pagination, Spinner } from "@heroui/react";
 import { UNSAFE_PortalProvider } from "react-aria";
 import {
   IconAlertTriangle,
+  IconArchive,
+  IconArrowDown,
+  IconArrowUp,
+  IconBulb,
   IconChartBar,
   IconCheck,
   IconChevronDown,
+  IconChevronRight,
   IconChevronUp,
   IconCopy,
+  IconCornerDownRight,
   IconDatabaseOff,
   IconHierarchy,
   IconLoader2,
-  IconQuestionMark,
   IconRefresh,
   IconSearch,
   IconTrash,
@@ -161,16 +166,16 @@ type RequestLogDialogProps = {
   catalog: RequestLogCatalog;
   container: HTMLElement | null;
   opened: boolean;
-  onClose: () => void;
   standalone?: boolean;
 };
 
-const statusOptions = [
-  { label: "全部状态", value: "all" },
-  { label: "成功", value: "succeeded" },
-  { label: "失败", value: "failed" },
-  { label: "未完成", value: "incomplete" },
-  { label: "已中断", value: "cancelled" },
+// 分段筛选的状态选项：色点与列表里判定 pill 的语义一致，「全部」不带色点——它表示没有判定。
+const statusSegmentOptions = [
+  { label: "全部", value: "all", tone: "" },
+  { label: "成功", value: "succeeded", tone: "is-success" },
+  { label: "失败", value: "failed", tone: "is-danger" },
+  { label: "未完成", value: "incomplete", tone: "is-warning" },
+  { label: "中断", value: "cancelled", tone: "is-muted" },
 ];
 
 const protocolOptions = [
@@ -211,51 +216,29 @@ function PortalScope({ container, children }: { container: HTMLElement | null | 
   return <UNSAFE_PortalProvider getContainer={getContainer}>{children}</UNSAFE_PortalProvider>;
 }
 
-type RequestLogTableColumn<Row> = { title: string; width: number; render: (record: Row) => React.ReactNode };
-type RequestLogTableRow = { key: string; item: RouteRequestLogItem; cells: React.ReactNode[] };
-const REQUEST_LOG_TABLE_COLUMNS: RequestLogTableColumn<RequestLogTableRow>[] = [
-  { title: "时间 / 标识", width: 240, render: (record) => record.cells[0] },
-  { title: "供应商 / 上游", width: 180, render: (record) => record.cells[1] },
-  { title: "模型 / 思考", width: 250, render: (record) => record.cells[2] },
-  { title: "上游协议", width: 96, render: (record) => record.cells[3] },
-  { title: "状态", width: 120, render: (record) => record.cells[4] },
-  { title: "耗时", width: 150, render: (record) => record.cells[5] },
-  { title: "Token 用量", width: 230, render: (record) => record.cells[6] },
-  { title: "缓存 Token", width: 130, render: (record) => record.cells[7] },
-];
+const REQUEST_LOG_STREAM_COLUMNS = [
+  { id: "time", title: "时间" },
+  { id: "status", title: "状态" },
+  { id: "provider", title: "供应商 / 上游" },
+  { id: "model", title: "模型" },
+  { id: "protocol", title: "协议" },
+  { id: "latency", title: "耗时" },
+  { id: "tokens", title: "Token 用量" },
+  { id: "cache", title: "缓存" },
+] as const;
 
-function RequestLogTable({ columns, rows = [], onRowAction }: {
-  columns: RequestLogTableColumn<RequestLogTableRow>[];
-  rows?: RequestLogTableRow[];
-  onRowAction: (key: string) => void;
-}) {
+// 表头是行的兄弟节点而非行的一部分：列表自身纵向滚动，表头吸顶不动，
+// 两者只共享同一份列宽模板，横向滚动时仍保持对齐。
+function RequestLogStreamHeader() {
   return (
-    <Table className="request-log-table" variant="secondary">
-      <Table.ScrollContainer className="overflow-auto">
-        <Table.Content
-          aria-label="请求日志"
-          className="min-w-[1400px]"
-          onRowAction={(key) => onRowAction(String(key))}
-        >
-          <Table.Header>
-            {columns.map((column, index) => (
-              <Table.Column key={column.title} isRowHeader={index === 0} style={{ width: column.width, minWidth: column.width }}>
-                {column.title}
-              </Table.Column>
-            ))}
-          </Table.Header>
-          <Table.Body items={rows}>
-            {(record) => (
-              <Table.Row id={record.key} textValue={record.item.requestId} aria-label={`查看请求详情：${record.item.requestId}`}>
-                {columns.map((column) => (
-                  <Table.Cell key={column.title}>{column.render(record)}</Table.Cell>
-                ))}
-              </Table.Row>
-            )}
-          </Table.Body>
-        </Table.Content>
-      </Table.ScrollContainer>
-    </Table>
+    <div className="request-log-stream-header">
+      {REQUEST_LOG_STREAM_COLUMNS.map((column) => (
+        <span key={column.id} className={`request-log-th request-log-th-${column.id}`}>
+          {column.title}
+        </span>
+      ))}
+      <span className="request-log-th request-log-th-chevron" />
+    </div>
   );
 }
 
@@ -330,21 +313,162 @@ function optionalFilter(value: string) {
 function formatDuration(value?: number | null) {
   if (value == null || !Number.isFinite(value)) return "—";
   if (value < 1_000) return `${Math.round(value).toLocaleString()} ms`;
-  return `${(value / 1_000).toFixed(value < 10_000 ? 2 : 1)} s`;
+  if (value < 60_000) return `${(value / 1_000).toFixed(value < 10_000 ? 2 : 1)} s`;
+  // 超过一分钟换成 Xm Ys 免脑内换算；超过一小时进位为 Xh Ym。
+  const totalSec = Math.round(value / 1_000);
+  if (totalSec < 3_600) return `${Math.floor(totalSec / 60)}m ${totalSec % 60}s`;
+  return `${Math.floor(totalSec / 3_600)}h ${Math.floor((totalSec % 3_600) / 60)}m`;
 }
 
 function formatTokens(value?: number | null) {
   return value == null ? "—" : value.toLocaleString();
 }
 
-function formatCacheHitRate(input?: number | null, cached?: number | null) {
-  if (input == null || cached == null || !Number.isFinite(input) || !Number.isFinite(cached) || input <= 0 || cached < 0 || cached > input) return "—";
-  return `${(cached / input * 100).toFixed(1)}%`;
+// 缓存命中率色阶取 0–100 的数值，供 pill 的 OKLCH 混色用；无法计算时为空。
+function cacheRateValue(input?: number | null, cached?: number | null) {
+  if (input == null || cached == null || !Number.isFinite(input) || !Number.isFinite(cached) || input <= 0 || cached < 0 || cached > input) return null;
+  return Math.min(100, Math.max(0, (cached / input) * 100));
+}
+
+// 上游回报的输入总量包含缓存读写：把缓存部分拆出去后才是实际付费的新鲜输入。
+function freshInputTokens(input?: number | null, cached?: number | null, cacheWrite?: number | null) {
+  if (input == null || !Number.isFinite(input)) return null;
+  return Math.max(0, input - (cached ?? 0) - (cacheWrite ?? 0));
+}
+
+// 限定选择器的首段是编码后的线路 ID，供应商列已经给出线路名，模型列只显示上游模型。
+function displayModelName(model: string, providerKeys: ReadonlySet<string>) {
+  const slash = model.indexOf("/");
+  if (slash <= 0) return model;
+  const qualifier = model.slice(0, slash).trim();
+  const rest = model.slice(slash + 1).trim();
+  if (!rest || !qualifier) return model;
+  let decoded = qualifier;
+  try {
+    decoded = decodeURIComponent(qualifier);
+  } catch {
+    // 编码不完整时按原样比对。
+  }
+  return providerKeys.has(qualifier) || providerKeys.has(decoded) ? rest : model;
+}
+
+// 单元格悬浮明细：标签-读数两列，总量行与明细之间留一条分隔线。
+function LogCellDetail({
+  title,
+  rows,
+  total,
+}: {
+  title: string;
+  rows: Array<[label: string, value: string]>;
+  total?: [label: string, value: string];
+}) {
+  return (
+    <span className="request-log-cell-detail">
+      <span className="request-log-cell-detail-title">{title}</span>
+      {rows.map(([label, value]) => (
+        <span key={label} className="request-log-cell-detail-row">
+          <span>{label}</span>
+          <span className="request-log-cell-detail-value">{value}</span>
+        </span>
+      ))}
+      {total ? (
+        <span className="request-log-cell-detail-row request-log-cell-detail-total">
+          <span>{total[0]}</span>
+          <span className="request-log-cell-detail-value">{total[1]}</span>
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
+// 延迟按固定阈值分四档着色：首字 10s/30s/60s，总耗时 60s/180s/300s。
+function latencySeverity(ms: number | null | undefined, thresholds: readonly [number, number, number]) {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return "none";
+  if (ms >= thresholds[2]) return "critical";
+  if (ms >= thresholds[1]) return "slow";
+  if (ms >= thresholds[0]) return "warn";
+  return "good";
+}
+
+// 与读数分档同一份语义色，供耗时格的渐变健康竖条取色。
+const latencySeverityColor: Record<string, string> = {
+  none: "var(--codey-subtle, #8e8e93)",
+  good: "var(--codey-green, #047857)",
+  warn: "var(--codey-amber, #b45309)",
+  slow: "color-mix(in oklch, var(--codey-amber, #b45309) 55%, var(--codey-red, #b91c1c))",
+  critical: "var(--codey-red, #b91c1c)",
+};
+
+// 上游常回报带日期或快照后缀的同型变体（如 -20250929），与真正换了型号区分开。
+function normalizeModelVariant(model: string) {
+  return model.trim().toLowerCase()
+    .replace(/-latest$/, "")
+    .replace(/-\d{4}-\d{2}-\d{2}$/, "")
+    .replace(/-\d{8}$/, "");
+}
+
+const requestLogDayFormatter = new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit" });
+const requestLogTimeFormatter = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+const requestLogWindowFormatter = new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
+
+// 列表里的时间按扫读距离裁剪：当天的记录只留时分秒，更早的补上月日，完整时间留在悬浮提示。
+function formatRequestLogTime(timestampUnixMs: number) {
+  const date = new Date(timestampUnixMs);
+  if (!Number.isFinite(date.getTime())) return "—";
+  const now = new Date();
+  const sameDay = date.getFullYear() === now.getFullYear() && date.getMonth() === now.getMonth() && date.getDate() === now.getDate();
+  return sameDay
+    ? requestLogTimeFormatter.format(date)
+    : `${requestLogDayFormatter.format(date)} ${requestLogTimeFormatter.format(date)}`;
+}
+
+/** `<time dateTime>` 只接受合法 ISO 时间；时间戳缺失或超出范围时省略该属性，
+ * 而不是抛出 RangeError 打断整行渲染。 */
+function isoTimestampOrUndefined(timestampUnixMs: number) {
+  const date = new Date(timestampUnixMs);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
+}
+
+// 页头的时间窗口：和筛选条件一致的「起点 — 终点」读法。
+function formatRequestLogWindow(fromUnixMs: number, toUnixMs: number) {
+  if (!Number.isFinite(fromUnixMs) || !Number.isFinite(toUnixMs)) return "";
+  return `${requestLogWindowFormatter.format(new Date(fromUnixMs))} — ${requestLogWindowFormatter.format(new Date(toUnixMs))}`;
+}
+
+// 记录侧对短回复（<100 Token）和过短生成窗口不落速度值，避免失真；
+// 行内仍按「首包后耗时」给出估算读数（≈ 前缀与正式值区分），真正缺数据才显示 —。
+function outputSpeedEstimate(item: RouteRequestLogItem) {
+  const output = item.outputTokens;
+  const pre = item.routerPreUpstreamMs;
+  const firstByte = item.upstreamFirstByteMs;
+  if (output == null || !Number.isFinite(output) || output <= 0) return null;
+  if (pre == null || firstByte == null || !Number.isFinite(pre) || !Number.isFinite(firstByte)) return null;
+  const generationMs = item.totalDurationMs - pre - firstByte;
+  if (!Number.isFinite(generationMs) || generationMs <= 0) return null;
+  return output * 1_000 / generationMs;
+}
+
+// 估算也算不出时，「—」读数用悬浮说明缺数缘由。
+function outputSpeedUnavailableReason(item: RouteRequestLogItem): string {
+  const output = item.outputTokens;
+  if (output == null || !Number.isFinite(output)) return "上游未回报输出 Token，无法计算速度";
+  const pre = item.routerPreUpstreamMs;
+  const firstByte = item.upstreamFirstByteMs;
+  if (pre == null || firstByte == null || !Number.isFinite(pre) || !Number.isFinite(firstByte)) {
+    return "缺少上游计时，无法圈定生成窗口";
+  }
+  return "首包后的生成窗口异常，无法计算速度";
+}
+
+/** 输出速度的数值部分；未知、非有限或非正样本一律视为没有可比读数。 */
+function formatTokensPerSecondValue(value?: number | null) {
+  if (value == null || !Number.isFinite(value) || value <= 0) return null;
+  return value.toFixed(1);
 }
 
 function formatTokensPerSecond(value?: number | null) {
-  if (value == null || !Number.isFinite(value) || value <= 0) return "—";
-  return `${value.toFixed(1)} tok/s`;
+  const text = formatTokensPerSecondValue(value);
+  return text ? `${text} tok/s` : "—";
 }
 
 // 日志只保留请求体的形态摘要，这里把形态和项数还原成可读文字。
@@ -486,8 +610,15 @@ function setCopiedId(id: string | null) {
   }
 }
 
+type CopyIdKind = "request" | "session";
+type CopyIdOptions = ({ kind: CopyIdKind; label?: string } | { kind?: never; label: string }) & {
+  subtext?: string;
+  copiedKey?: string;
+};
+
 function CopyIdButton({
   id,
+  kind,
   label,
   "aria-label": ariaLabel,
   className,
@@ -496,12 +627,13 @@ function CopyIdButton({
   onCopy,
 }: {
   id: string;
+  kind: CopyIdKind;
   label: string;
   "aria-label"?: string;
   className: string;
   iconClassName: string;
   title: string;
-  onCopy: (id: string, copiedKey: string) => void;
+  onCopy: (id: string, options: CopyIdOptions) => void;
 }) {
   // 已复制标记按按钮实例区分：相同 ID 出现在多行时，只有被点击的那个显示「已复制」。
   const copiedKey = useId();
@@ -514,7 +646,11 @@ function CopyIdButton({
       aria-label={ariaLabel ?? label}
       className={className}
       title={title}
-      onClick={() => onCopy(id, copiedKey)}
+      onClick={(event) => {
+        // 复制是留在列表里的操作：不能让它冒泡成行激活、把详情抽屉盖在上面。
+        event.stopPropagation();
+        onCopy(id, { kind, copiedKey });
+      }}
     >
       <span className="truncate select-all">{copied ? "已复制" : id}</span>
       {copied ? (
@@ -540,280 +676,436 @@ function requestLogProviderLabel(item: RouteRequestLogItem, profiles: RequestLog
   return item.providerName || item.provider || "—";
 }
 
-function buildRequestLogRow(
-  item: RouteRequestLogItem,
-  providerLabel: string,
-  officialAccountLabel: (accountId?: string | null) => string,
-  handleCopyId: (requestId: string, options?: { label?: string; subtext?: string; copiedKey?: string }) => void,
-): RequestLogTableRow {
-   const presentation = statusPresentation[item.status] ?? { label: item.status || "未知", variant: "secondary" as const };
-   const hasUpstreamError = [item.statusCode, item.upstreamStatusCode].some((statusCode) => statusCode != null && (statusCode < 200 || statusCode >= 300));
-   const upstreamErrorSummary = item.upstreamErrorSummary || item.errorCode || "上游未提供具体错误信息";
-   const upstreamErrorPreview = upstreamErrorSummary.length > 512
-     ? `${upstreamErrorSummary.slice(0, 512)}…（完整内容见详情）`
-     : upstreamErrorSummary;
-   const usageUnavailable = usageUnavailablePresentation(item.usageUnavailableReason);
-   const cacheHitRate = formatCacheHitRate(item.inputTokens, item.cachedInputTokens);
-   const cancellation = cancellationPresentation(item);
-   const reasoning = reasoningLabel(item);
-   const displayedTtft = item.downstreamFirstContentMs ?? item.ttftMs;
-   const timingTitle = item.downstreamFirstContentMs == null
-     ? `首字耗时 (旧指标，上游首包): ${formatDuration(item.ttftMs)}`
-     : `端到端首内容: ${formatDuration(item.downstreamFirstContentMs)} · 路由前置: ${formatDuration(item.routerPreUpstreamMs)} · 上游首包: ${formatDuration(item.upstreamFirstByteMs)}`;
-   // 请求模型是 Codey 发往上游的模型；实际模型是上游响应里回报的模型。
-   const sentModel = (item.model ?? "").trim() || item.requestedModel.trim();
-   const upstreamModel = (item.upstreamResponseModel ?? "").trim();
-   const upstreamModelDiffers = Boolean(upstreamModel) && !modelIdsEqual(upstreamModel, sentModel);
-return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
-                          <div className="grid min-w-0 gap-0.5">
-                            <span className="whitespace-nowrap font-mono text-[11px] font-medium leading-4 text-[var(--codey-text,#1d1d1f)]">
-                              {formatTimestamp(item.timestampUnixMs)}
-                            </span>
-                            <div className="request-log-kv">
-                              <span className="request-log-kv-label">请求</span>
-                              <CopyIdButton
-                                id={item.requestId}
-                                label={`复制请求 ID：${item.requestId}`}
-                                aria-label={`复制请求 ID：${item.requestId}`}
-                                className="group h-auto min-h-0 min-w-0 flex-1 justify-start gap-1 rounded-md px-0.5 font-mono text-[10px] font-normal text-[var(--codey-subtle,#8e8e93)] transition-colors hover:text-[var(--codey-text,#1d1d1f)] [&_svg]:size-[11px]"
-                                iconClassName="shrink-0 opacity-0 transition-opacity group-hover:opacity-100"
-                                title={`请求 ID: ${item.requestId}（点击复制）`}
-                                onCopy={(id, copiedKey) => handleCopyId(id, { copiedKey })}
-                              />
-                            </div>
-                            <div className="request-log-kv">
-                              <span className="request-log-kv-label">会话</span>
-                              {item.codexSessionId ? (
-                                <CopyIdButton
-                                  id={item.codexSessionId}
-                                  label={`复制${item.codexSessionIsParent ? "父会话" : "会话"} ID：${item.codexSessionId}`}
-                                  className="group h-auto min-h-0 min-w-0 justify-start gap-1 rounded-md px-0.5 font-mono text-[10px] font-normal text-[var(--codey-subtle,#8e8e93)] transition-colors hover:text-[var(--codey-text,#1d1d1f)] [&_svg]:size-[11px]"
-                                  iconClassName="shrink-0 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
-                                  title={`${item.codexSessionIsParent ? "父会话" : "会话"} ID: ${item.codexSessionId}（点击复制）`}
-                                  onCopy={(id, copiedKey) => handleCopyId(id, { copiedKey })}
-                                />
-                              ) : (
-                                <span className="text-[var(--codey-subtle,#8e8e93)]">—</span>
-                              )}
-                              {item.codexSessionId && item.codexSessionIsParent ? (
-                                <span
-                                  className="request-log-parent-tag"
-                                  title="该 ID 为父会话 ID"
-                                >
-                                  <IconHierarchy size={10} aria-hidden="true" />
-                                  父
-                                </span>
-                              ) : null}
-                            </div>
-                          </div>
-                        </div>,
-                        <div>
-                          <div className="grid min-w-32 max-w-56 gap-0.5">
-                            <div className="flex min-w-0 items-center gap-1">
-                              {item.officialAccountId ? (
-                                <span
-                                  className="request-log-official-tag"
-                                  title="官方账号"
-                                >
-                                  官
-                                </span>
-                              ) : null}
-                              <strong
-                                className="truncate font-medium text-[var(--codey-text,#1d1d1f)]"
-                                title={providerLabel}
-                              >
-                                {providerLabel}
-                              </strong>
-                            </div>
-                            {item.officialAccountId ? (
-                              <span
-                                className="truncate text-[10px] text-[var(--codey-text-soft,#48484a)]"
-                                title={`官方账号：${officialAccountLabel(item.officialAccountId)}`}
-                              >
-                                {officialAccountLabel(item.officialAccountId)}
-                              </span>
-                            ) : null}
-                            {!item.officialAccountId && item.upstreamAuthority ? (
-                              <span
-                                className="truncate font-mono text-[10px] text-[var(--codey-subtle,#8e8e93)]"
-                                title={`上游: ${item.upstreamAuthority}`}
-                              >
-                                {item.upstreamAuthority}
-                              </span>
-                            ) : null}
-                          </div>
-                        </div>,
-<div className="grid min-w-32 max-w-56 gap-0.5">
-                          <div className="flex min-w-0 items-center gap-1.5">
-                            <span
-                              className="truncate font-medium text-[var(--codey-text,#1d1d1f)]"
-                              title={sentModel ? `请求模型（发往上游）：${sentModel}` : undefined}
-                            >
-                              {sentModel || "—"}
-                            </span>
-                            {reasoning !== "—" ? (
-                              <span
-                                className={`request-log-meta-tag ${reasoningTagClass(reasoning)}`}
-                                title={`思考强度：${reasoning}`}
-                              >
-                                {reasoning}
-                              </span>
-                            ) : null}
-                          </div>
-                          {upstreamModelDiffers ? (
-                            <span
-                              className="flex min-w-0 items-center gap-1 text-[10px] text-[var(--codey-subtle,#8e8e93)]"
-                              title={`上游实际使用模型：${upstreamModel}`}
-                            >
-                              <span className="shrink-0">实际</span>
-                              <span className="truncate">{upstreamModel}</span>
-                            </span>
-                          ) : null}
-                        </div>,
-<div>
-                          <Badge
-                            variant="secondary"
-                            className={`request-log-protocol ${protocolTagClass(item.upstreamTransport)}`}
-                          >
-                            {item.upstreamTransport === "http_sse" ? "SSE" : (item.upstreamTransport || "—").toUpperCase()}
-                          </Badge>
-                        </div>,
-<div>
-                          <div className="grid min-w-20 gap-1">
-                            <div className="flex items-center gap-1">
-                              <Badge variant={presentation.variant} className="request-log-status">
-                                {presentation.label}
-                              </Badge>
-                              {hasUpstreamError ? (
-                                <Tooltip
-                                  content={(
-                                    <span className="block max-w-[420px] break-words whitespace-normal">
-                                      {upstreamErrorPreview}
-                                    </span>
-                                  )}
-                                  position="top"
-                                >
-                                  <Button
-                                    size="xs"
-                                    variant="ghost"
-                                    aria-label="查看上游错误信息"
-                                  >
-                                    <IconQuestionMark size={12} aria-hidden="true" />
-                                  </Button>
-                                </Tooltip>
-                              ) : null}
-                              {cancellation ? (
-                                <Tooltip
-                                  content={(
-                                    <span className="block max-w-[420px] break-words whitespace-normal">
-                                      {cancellation.message}
-                                    </span>
-                                  )}
-                                  position="top"
-                                >
-                                  <Button
-                                    size="xs"
-                                    variant="ghost"
-                                    aria-label={`查看中断原因：${cancellation.message}`}
-                                  >
-                                    <IconQuestionMark size={12} aria-hidden="true" />
-                                  </Button>
-                                </Tooltip>
-                              ) : null}
-                            </div>
-                            {item.statusCode != null || item.errorCode || cancellation ? (
-                              <small className="whitespace-nowrap font-mono text-[10px] text-[var(--codey-subtle,#8e8e93)]">
-                                {item.statusCode != null
-                                  ? `HTTP ${item.statusCode}`
-                                  : cancellation?.label || item.errorCode}
-                                {cancellation && item.statusCode != null
-                                  ? ` · ${cancellation.label}`
-                                  : null}
-                              </small>
-                            ) : null}
-                          </div>
-                        </div>,
-<div className="whitespace-nowrap">
-                          <div className="grid gap-0.5">
-                            <div
-                              className="request-log-kv"
-                              title={timingTitle}
-                            >
-                              <span className="request-log-kv-label">首字</span>
-                              <span className="request-log-kv-value font-medium text-[var(--codey-text,#1d1d1f)]">
-                                {formatDuration(displayedTtft)}
-                              </span>
-                            </div>
-                            <div
-                              className="request-log-kv"
-                              title={`总耗时: ${formatDuration(item.totalDurationMs)}`}
-                            >
-                              <span className="request-log-kv-label">总用时</span>
-                              <span className="request-log-kv-value text-[var(--codey-text-soft,#48484a)]">
-                                {formatDuration(item.totalDurationMs)}
-                              </span>
-                            </div>
-                            <div className="request-log-kv" title="全部输出 Token（含思考）除以上游首包后的响应时间；计时不完整或输出样本不足时未知">
-                              <span className="request-log-kv-label">速度</span>
-                              <span className="request-log-kv-value text-[var(--codey-text-soft,#48484a)]">
-                                {formatTokensPerSecond(item.outputTokensPerSecond)}
-                              </span>
-                            </div>
-                          </div>
-                        </div>,
-<div className="grid gap-0.5 whitespace-nowrap">
-                          <div className="request-log-kv">
-                            <span className="request-log-kv-label">总计</span>
-                          {item.totalTokens == null ? (
-                            <div className="flex min-w-20 items-center gap-1">
-                              <span className="text-[10px] font-medium text-[var(--codey-subtle,#8e8e93)]">
-                                {usageUnavailable.label}
-                              </span>
-                              <Tooltip
-                                content={(
-                                  <span className="block max-w-[360px] whitespace-normal">
-                                    {usageUnavailable.message}
-                                  </span>
-                                )}
-                                position="top"
-                              >
-                                <Button
-                                  size="xs"
-                                  variant="ghost"
-                                  aria-label={`Token 使用量不可用：${usageUnavailable.message}`}
-                                >
-                                  <IconQuestionMark size={12} aria-hidden="true" />
-                                </Button>
-                              </Tooltip>
-                            </div>
-                          ) : (
-                            <strong className="request-log-kv-value font-semibold text-[var(--codey-text,#1d1d1f)]">{formatTokens(item.totalTokens)}</strong>
-                          )}
-                          </div>
-                          <div className="request-log-kv text-[var(--codey-muted,#6e6e73)]">
-                            <span className="request-log-kv-label">输入</span>
-                            <span className="request-log-kv-value request-log-kv-value--fixed">{formatTokens(item.inputTokens)}</span>
-                            <span className="request-log-kv-label">输出</span>
-                            <span className="request-log-kv-value">{formatTokens(item.outputTokens)}</span>
-                          </div>
-                          <div className="request-log-kv text-[var(--codey-muted,#6e6e73)]">
-                            <span className="request-log-kv-label">推理</span>
-                            <span className="request-log-kv-value">{formatTokens(item.reasoningOutputTokens)}</span>
-                          </div>
-                        </div>,
-<div className="grid gap-0.5 whitespace-nowrap" title="缓存命中率 = 缓存输入 Token / 输入 Token；未上报或无法计算时显示 —">
-                          <strong className="request-log-kv-value font-semibold text-[var(--codey-text,#1d1d1f)]">{formatTokens(item.cachedInputTokens)}</strong>
-                          <span className="text-[11px] leading-4 text-[var(--codey-muted,#6e6e73)]">
-                            {cacheHitRate === "—" ? "—" : `${cacheHitRate} 命中`}
-                          </span>
-                        </div>] }
-}
+// 非模型调用的旁路请求（压缩、图像、被拒请求等）在模型名旁给一个种类标记。
+const requestKindLabels: Record<string, string> = {
+  responses_compact: "压缩",
+  responses_compact_v2: "压缩 v2",
+  images_generations: "图像",
+  models: "模型列表",
+  http_rejected: "拒绝",
+};
+
+const statusPillTone: Record<string, string> = {
+  succeeded: "is-success",
+  failed: "is-danger",
+  incomplete: "is-warning",
+  cancelled: "is-muted",
+};
+
+const RequestLogRow = memo(function RequestLogRow({
+  item,
+  providerLabel,
+  officialAccountLabel,
+  providerKeys,
+  selected,
+  onOpen,
+  onCopyId,
+}: {
+  item: RouteRequestLogItem;
+  providerLabel: string;
+  officialAccountLabel: (accountId?: string | null) => string;
+  providerKeys: ReadonlySet<string>;
+  selected: boolean;
+  onOpen: (item: RouteRequestLogItem) => void;
+  onCopyId: (requestId: string, options: CopyIdOptions) => void;
+}) {
+  const presentation = statusPresentation[item.status] ?? { label: item.status || "未知", variant: "secondary" as const };
+  const hasUpstreamError = [item.statusCode, item.upstreamStatusCode].some((statusCode) => statusCode != null && (statusCode < 200 || statusCode >= 300));
+  const upstreamErrorSummary = item.upstreamErrorSummary || item.errorCode || "上游未提供具体错误信息";
+  const upstreamErrorPreview = upstreamErrorSummary.length > 512
+    ? `${upstreamErrorSummary.slice(0, 512)}…（完整内容见详情）`
+    : upstreamErrorSummary;
+  const usageUnavailable = usageUnavailablePresentation(item.usageUnavailableReason);
+  const cacheRate = cacheRateValue(item.inputTokens, item.cachedInputTokens);
+  const cancellation = cancellationPresentation(item);
+  const reasoning = reasoningLabel(item);
+  const displayedTtft = item.downstreamFirstContentMs ?? item.ttftMs;
+  // 模型链分三级：客户端的请求模型是主读数，网关映射后的发送模型与上游
+  // 响应回报的模型在与上一级不同时各挂一行路由标记；显示时剥掉线路限定前缀。
+  const requestedModelText = item.requestedModel.trim();
+  const sentModelRaw = (item.model ?? "").trim();
+  const returnedModelRaw = (item.upstreamResponseModel ?? "").trim();
+  const primaryModel = displayModelName(requestedModelText || sentModelRaw, providerKeys);
+  const sentDisplay = displayModelName(sentModelRaw, providerKeys);
+  const returnedDisplay = displayModelName(returnedModelRaw, providerKeys);
+  const mappedModel = sentDisplay && primaryModel && !modelIdsEqual(sentDisplay, primaryModel)
+    ? sentDisplay
+    : "";
+  const returnedShown = returnedDisplay
+    && !modelIdsEqual(returnedDisplay, mappedModel || sentDisplay || primaryModel)
+    ? returnedDisplay
+    : "";
+  // 回报模型与发送模型只差快照/日期后缀时按变体弱化显示，警示色留给真正换型的不一致。
+  const returnedIsVariant = Boolean(returnedShown)
+    && normalizeModelVariant(returnedDisplay) === normalizeModelVariant(mappedModel || sentDisplay || primaryModel);
+  const statusDetail = hasUpstreamError ? upstreamErrorPreview : cancellation?.message ?? null;
+  const kindLabel = item.requestKind === "responses" ? null : requestKindLabels[item.requestKind] ?? item.requestKind;
+  // 与统计区共用同一份数值格式化，避免两处对未知值给出不同结论。
+  const tpsText = formatTokensPerSecondValue(item.outputTokensPerSecond);
+  const tpsEstimateText = tpsText ? null : formatTokensPerSecondValue(outputSpeedEstimate(item));
+  const speedTitle = tpsText
+    ? undefined
+    : tpsEstimateText
+      ? "按首包后耗时估算：输出 <100 Token 或窗口过短的请求不落统计值"
+      : outputSpeedUnavailableReason(item);
+
+  // 只有挂提示的 pill 需要可聚焦：键盘与触屏用户才拿得到错误/中断详情。
+  const renderStatusPill = (focusable: boolean) => (
+    <span
+      className={`request-log-result ${statusPillTone[item.status] ?? "is-muted"}`}
+      tabIndex={focusable ? 0 : undefined}
+    >
+      <i className="request-log-result-dot" aria-hidden="true" />
+      {presentation.label}
+    </span>
+  );
+
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      className={`request-log-row${selected ? " is-selected" : ""}`}
+      onClick={(event) => {
+        // 行内控件（复制按钮、提示触发器）自己处理点击，不能再激活整行；
+        // 行本身是 role=button，不能放进排除选择器里。
+        if (
+          event.target instanceof Element
+          && event.target.closest("button, a, input, [data-log-row-control]")
+        ) {
+          return;
+        }
+        onOpen(item);
+      }}
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) return;
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onOpen(item);
+        }
+      }}
+    >
+      {/* 时间：主行是扫读用的短时间，请求与会话 ID 收进等宽子行 */}
+      <div className="request-log-cell request-log-cell-time">
+        <time
+          className="request-log-time"
+          dateTime={isoTimestampOrUndefined(item.timestampUnixMs)}
+          title={formatTimestamp(item.timestampUnixMs)}
+        >
+          {formatRequestLogTime(item.timestampUnixMs)}
+        </time>
+        <span className="request-log-id-line">
+          <span className="request-log-id-label">请求</span>
+          <CopyIdButton
+            id={item.requestId}
+            kind="request"
+            label={`复制请求 ID：${item.requestId}`}
+            aria-label={`复制请求 ID：${item.requestId}`}
+            className="request-log-id"
+            iconClassName="request-log-id-icon"
+            title={`请求 ID: ${item.requestId}（点击复制）`}
+            onCopy={onCopyId}
+          />
+        </span>
+        <span className="request-log-id-line">
+          <span className="request-log-id-label">会话</span>
+          {item.codexSessionId ? (
+            <CopyIdButton
+              id={item.codexSessionId}
+              kind="session"
+              label={`复制${item.codexSessionIsParent ? "父会话" : "会话"} ID：${item.codexSessionId}`}
+              className="request-log-id"
+              iconClassName="request-log-id-icon"
+              title={`${item.codexSessionIsParent ? "父会话" : "会话"} ID: ${item.codexSessionId}（点击复制）`}
+              onCopy={onCopyId}
+            />
+          ) : (
+            <span className="request-log-none">—</span>
+          )}
+          {item.codexSessionId && item.codexSessionIsParent ? (
+            <span className="request-log-parent-tag" title="该 ID 为父会话 ID">
+              <IconHierarchy size={10} aria-hidden="true" />
+              父
+            </span>
+          ) : null}
+        </span>
+      </div>
+
+      {/* 状态：带色点的判定 pill，出错或中断时 pill 自身就是详情提示的触发器 */}
+      <div className="request-log-cell request-log-cell-status">
+        {statusDetail ? (
+          <Tooltip
+            content={(
+              <span className="block max-w-[420px] break-words whitespace-normal">
+                {statusDetail}
+              </span>
+            )}
+            position="top"
+          >
+            {renderStatusPill(true)}
+          </Tooltip>
+        ) : renderStatusPill(false)}
+        {item.statusCode != null || item.errorCode || cancellation ? (
+          <span className="request-log-status-sub">
+            {item.statusCode != null
+              ? `HTTP ${item.statusCode}`
+              : cancellation?.label || item.errorCode}
+            {cancellation && item.statusCode != null
+              ? ` · ${cancellation.label}`
+              : null}
+          </span>
+        ) : null}
+      </div>
+
+      {/* 供应商：官方线路带「官」标，副行是账号或上游域名 */}
+      <div className="request-log-cell request-log-cell-provider">
+        <span className="request-log-provider-main">
+          {item.officialAccountId ? (
+            <span className="request-log-official-tag" title="官方账号">官</span>
+          ) : null}
+          <strong className="request-log-provider-name" title={providerLabel}>
+            {providerLabel}
+          </strong>
+        </span>
+        {item.officialAccountId ? (
+          <span
+            className="request-log-provider-sub"
+            title={`官方账号：${officialAccountLabel(item.officialAccountId)}`}
+          >
+            {officialAccountLabel(item.officialAccountId)}
+          </span>
+        ) : item.upstreamAuthority ? (
+          <span
+            className="request-log-provider-sub font-mono"
+            title={`上游: ${item.upstreamAuthority}`}
+          >
+            {item.upstreamAuthority}
+          </span>
+        ) : null}
+      </div>
+
+      {/* 模型：主行是请求模型与标记，映射/回报不一致时各挂一条路由副行 */}
+      <div className="request-log-cell request-log-cell-model">
+        <span className="request-log-model-main">
+          <strong
+            className="request-log-model-name"
+            title={requestedModelText || sentModelRaw ? `请求模型：${requestedModelText || sentModelRaw}` : undefined}
+          >
+            {primaryModel || "—"}
+          </strong>
+        </span>
+        {kindLabel || item.subagent || reasoning !== "—" ? (
+          <span className="request-log-model-tags">
+            {kindLabel ? (
+              <span className="request-log-kind-tag">{kindLabel}</span>
+            ) : null}
+            {item.subagent ? (
+              <span className="request-log-subagent-tag" title="子代理请求">子</span>
+            ) : null}
+            {reasoning !== "—" ? (
+              <span
+                className={`request-log-meta-tag ${reasoningTagClass(reasoning)}`}
+                title={`思考强度：${reasoning}`}
+              >
+                <IconBulb size={9} aria-hidden="true" />
+                {reasoning}
+              </span>
+            ) : null}
+          </span>
+        ) : null}
+        {mappedModel ? (
+          <span
+            className="request-log-model-route is-mapped"
+            title={`网关映射后发送给上游的模型：${sentModelRaw}`}
+          >
+            <IconCornerDownRight size={11} className="shrink-0" aria-hidden="true" />
+            <span className="truncate">{mappedModel}</span>
+          </span>
+        ) : null}
+        {returnedShown ? (
+          <span
+            className={`request-log-model-route ${returnedIsVariant ? "is-variant" : "is-returned"}`}
+            title={returnedIsVariant
+              ? `上游回报的同型快照变体：${returnedModelRaw}`
+              : `上游响应回报的模型与发送不一致：${returnedModelRaw}`}
+          >
+            <IconCornerDownRight size={11} className="shrink-0" aria-hidden="true" />
+            <span className="truncate">{returnedShown}</span>
+          </span>
+        ) : null}
+      </div>
+
+      {/* 上游协议 */}
+      <div className="request-log-cell request-log-cell-protocol">
+        <Badge
+          variant="secondary"
+          className={`request-log-protocol ${protocolTagClass(item.upstreamTransport)}`}
+        >
+          {item.upstreamTransport === "http_sse" ? "SSE" : (item.upstreamTransport || "—").toUpperCase()}
+        </Badge>
+      </div>
+
+      {/* 耗时：左侧竖条上半随首字档、下半随总耗时档，纵向扫读即见健康度；
+          读数三行收首字/总耗时/输出速度；悬浮给出各阶段明细 */}
+      <div className="request-log-cell request-log-cell-latency">
+        <Tooltip
+          content={(
+            <LogCellDetail
+              title="延迟明细"
+              rows={([
+                ["排队等待", item.queueDelayMs],
+                ["路由前置", item.routerPreUpstreamMs],
+                ["上游首包", item.upstreamFirstByteMs],
+                ["上游响应头", item.upstreamHeaderMs],
+                [item.downstreamFirstContentMs != null ? "端到端首字" : "首字", displayedTtft],
+              ] as Array<[string, number | null | undefined]>)
+                .filter(([, ms]) => ms != null && Number.isFinite(ms))
+                .map(([label, ms]) => [label, formatDuration(ms)] as [string, string])}
+              total={["总耗时", formatDuration(item.totalDurationMs)]}
+            />
+          )}
+        >
+          <span className="request-log-latency-wrap" tabIndex={0}>
+            <i
+              className="request-log-latency-bar"
+              style={{
+                "--bar-top": latencySeverityColor[latencySeverity(
+                  displayedTtft ?? item.totalDurationMs, [10_000, 30_000, 60_000],
+                )],
+                "--bar-bottom": latencySeverityColor[latencySeverity(item.totalDurationMs, [60_000, 180_000, 300_000])],
+              } as React.CSSProperties}
+              aria-hidden="true"
+            />
+            <span className="request-log-latency-grid">
+              <span className="request-log-latency-label">首字</span>
+              <span className={`request-log-latency-value request-log-sev-${latencySeverity(displayedTtft, [10_000, 30_000, 60_000])}`}>
+                {formatDuration(displayedTtft)}
+              </span>
+              <span className="request-log-latency-label">总耗时</span>
+              <span className={`request-log-latency-value request-log-sev-${latencySeverity(item.totalDurationMs, [60_000, 180_000, 300_000])}`}>
+                {formatDuration(item.totalDurationMs)}
+              </span>
+              <span
+                className="request-log-latency-label"
+                title="全部输出 Token（含思考）除以上游首包后的响应时间；计时不完整或输出样本不足时未知"
+              >
+                速度
+              </span>
+              <span
+                className="request-log-latency-value"
+                title={speedTitle}
+              >
+                {tpsText ? `${tpsText} tok/s` : tpsEstimateText ? `≈${tpsEstimateText} tok/s` : "—"}
+              </span>
+            </span>
+          </span>
+        </Tooltip>
+      </div>
+
+      {/* Token：新鲜输入与输出是第一读数，缓存读写与思考量收进副行 */}
+      <div className="request-log-cell request-log-cell-tokens">
+        {item.totalTokens == null ? (
+          <Tooltip
+            content={(
+              <span className="block max-w-[360px] whitespace-normal">
+                {usageUnavailable.message}
+              </span>
+            )}
+            position="top"
+          >
+            <span className="request-log-usage-none" tabIndex={0}>
+              {usageUnavailable.label}
+            </span>
+          </Tooltip>
+        ) : (
+          <Tooltip
+            className="request-log-token-tip"
+            content={(
+              <LogCellDetail
+                title="Token 明细"
+                rows={([
+                  ["新鲜输入", freshInputTokens(item.inputTokens, item.cachedInputTokens, item.cacheCreationInputTokens)],
+                  ["缓存读取", item.cachedInputTokens],
+                  ["缓存写入", item.cacheCreationInputTokens],
+                  ["输出", item.outputTokens],
+                  ["其中思考输出", item.reasoningOutputTokens],
+                ] as Array<[string, number | null | undefined]>)
+                  .filter(([, tokens]) => tokens != null && Number.isFinite(tokens))
+                  .map(([label, tokens]) => [label, formatTokens(tokens)] as [string, string])}
+                total={["总 Token", formatTokens(item.totalTokens)]}
+              />
+            )}
+          >
+            <span className="request-log-token-grid" tabIndex={0}>
+            <span
+              className="request-log-token-in"
+              title={`新鲜输入 Token（上报输入减去缓存读写）：${formatTokens(freshInputTokens(item.inputTokens, item.cachedInputTokens, item.cacheCreationInputTokens))}`}
+            >
+              <IconArrowDown size={10} aria-hidden="true" />
+              {formatTokens(freshInputTokens(item.inputTokens, item.cachedInputTokens, item.cacheCreationInputTokens))}
+            </span>
+            <span className="request-log-token-out" title={`输出 Token：${formatTokens(item.outputTokens)}`}>
+              <IconArrowUp size={10} aria-hidden="true" />
+              {formatTokens(item.outputTokens)}
+            </span>
+            {item.cachedInputTokens != null || item.cacheCreationInputTokens != null || item.reasoningOutputTokens != null ? (
+              <span className="request-log-token-extra">
+                {item.cachedInputTokens != null ? (
+                  <span title={`缓存读取 Token：${formatTokens(item.cachedInputTokens)}`}>
+                    <IconArchive size={9} aria-hidden="true" />
+                    {formatTokens(item.cachedInputTokens)}
+                  </span>
+                ) : null}
+                {item.cacheCreationInputTokens != null ? (
+                  <span title={`缓存写入 Token：${formatTokens(item.cacheCreationInputTokens)}`}>
+                    +{formatTokens(item.cacheCreationInputTokens)}
+                  </span>
+                ) : null}
+                {item.reasoningOutputTokens != null ? (
+                  <span
+                    className="request-log-tokens-reasoning"
+                    title={`思考输出 Token：${formatTokens(item.reasoningOutputTokens)}`}
+                  >
+                    <IconBulb size={10} aria-hidden="true" />
+                    {formatTokens(item.reasoningOutputTokens)}
+                  </span>
+                ) : null}
+              </span>
+            ) : null}
+            </span>
+          </Tooltip>
+        )}
+      </div>
+
+      {/* 缓存：命中率 pill 在琥珀与绿之间按数值混色，无数据时退回中性色 */}
+      <div className="request-log-cell request-log-cell-cache">
+        {cacheRate != null ? (
+          <Tooltip
+            content={`缓存命中率 ${cacheRate.toFixed(1)}% · 缓存 ${formatTokens(item.cachedInputTokens)} / 输入 ${formatTokens(item.inputTokens)} Token`}
+            position="top"
+          >
+            <span
+              className="request-log-cache-pill"
+              tabIndex={0}
+              style={{ "--cache-rate": `${cacheRate.toFixed(2)}%` } as React.CSSProperties}
+            >
+              <i className="request-log-cache-dot" aria-hidden="true" />
+              {cacheRate.toFixed(1)}%
+            </span>
+          </Tooltip>
+        ) : (
+          <span className="request-log-cache-pill is-empty" title="未记录缓存 Token">—</span>
+        )}
+      </div>
+
+      <IconChevronRight size={14} className="request-log-chevron" aria-hidden="true" />
+    </div>
+  );
+});
 
 export function RequestLogDialog({
   catalog,
   container,
   opened,
-  onClose: _onClose,
   standalone = false,
 }: RequestLogDialogProps) {
   const [searchInput, setSearchInput] = useState("");
@@ -891,7 +1183,7 @@ export function RequestLogDialog({
   const modelsTask = useRef(Promise.resolve());
   const clearInFlight = useRef(false);
 
-  const handleCopyId = useCallback((requestId: string, options?: { label?: string; subtext?: string; copiedKey?: string }) => {
+  const handleCopyId = useCallback((requestId: string, options: CopyIdOptions) => {
     if (!navigator.clipboard) return;
     void navigator.clipboard.writeText(requestId).then(
       () => {
@@ -899,8 +1191,7 @@ export function RequestLogDialog({
         if (copyToastTimer.current) {
           window.clearTimeout(copyToastTimer.current);
         }
-        const isSession = requestId.includes("-") || (requestId.length === 36 && !requestId.startsWith("req_"));
-        const defaultLabel = isSession ? "会话 ID" : "请求 ID";
+        const defaultLabel = options.kind === "session" ? "会话 ID" : "请求 ID";
         const label = options?.label || defaultLabel;
         setCopyToast({
           text: `已复制${label}`,
@@ -946,6 +1237,18 @@ export function RequestLogDialog({
       { label: "全部供应商", value: "all" },
       ...[...providers].map(([value, label]) => ({ label, value })),
     ];
+  }, [catalog.profiles]);
+
+  // 限定选择器 `线路/模型` 的首段是这些 provider id（编码后同形）；用于展示时剥离。
+  const providerKeySet = useMemo(() => {
+    const keys = new Set<string>();
+    for (const profile of catalog.profiles) {
+      for (const key of [profile.sourceProviderId, profile.id]) {
+        const trimmed = key?.trim();
+        if (trimmed) keys.add(trimmed);
+      }
+    }
+    return keys;
   }, [catalog.profiles]);
 
   // 独立托管的日志页只拿到配置本身，启动期能力标志可能缺失；存储账号的官方
@@ -998,9 +1301,9 @@ export function RequestLogDialog({
       { label: "全部模型", value: "all" },
       ...[...models]
         .sort((left, right) => left.localeCompare(right))
-        .map((value) => ({ label: value, value })),
+        .map((value) => ({ label: displayModelName(value, providerKeySet), value })),
     ];
-  }, [usedModels, result?.items, model]);
+  }, [usedModels, result?.items, model, providerKeySet]);
 
   useEffect(() => {
     if (!opened || !validRange) return;
@@ -1195,10 +1498,92 @@ export function RequestLogDialog({
     setPage(nextPage);
   };
 
-  const requestLogRows = useMemo(
-    () => (result?.items ?? []).map((item) => buildRequestLogRow(item, requestLogProviderLabel(item, catalog.profiles), officialAccountLabel, handleCopyId)),
-    [result?.items, catalog.profiles, officialAccountLabel, handleCopyId],
-  );
+  const searchModeLabel = searchMode === "requestId" ? "请求 ID" : searchMode === "sessionId" ? "会话 ID" : "关键词";
+  const filterChips: Array<{ key: string; label: string; onRemove: () => void }> = [];
+  if (search) {
+    filterChips.push({
+      key: "search",
+      label: `${searchModeLabel}：${search}`,
+      onRemove: () => {
+        setSearchInput("");
+        setSearch("");
+        resetPagination();
+      },
+    });
+  }
+  if (timeRange !== "24h") {
+    const timeLabel = timeRange === "custom"
+      ? "自定义"
+      : timeRange === "7d" ? "最近 7 天" : "最近 30 天";
+    filterChips.push({
+      key: "time",
+      label: `时间：${timeLabel}`,
+      onRemove: () => {
+        setTimeRange("24h");
+        resetPagination();
+      },
+    });
+  }
+  if (provider !== "all") {
+    filterChips.push({
+      key: "provider",
+      label: `供应商：${providerOptions.find((option) => option.value === provider)?.label ?? provider}`,
+      onRemove: () => {
+        setProvider("all");
+        resetPagination();
+      },
+    });
+  }
+  if (officialAccount !== "all") {
+    filterChips.push({
+      key: "officialAccount",
+      label: `官方账号：${officialAccountLabel(officialAccount)}`,
+      onRemove: () => {
+        setOfficialAccount("all");
+        resetPagination();
+      },
+    });
+  }
+  if (model !== "all") {
+    filterChips.push({
+      key: "model",
+      label: `模型：${displayModelName(model, providerKeySet)}`,
+      onRemove: () => {
+        setModel("all");
+        resetPagination();
+      },
+    });
+  }
+  if (status !== "all") {
+    filterChips.push({
+      key: "status",
+      label: `状态：${statusPresentation[status]?.label ?? status}`,
+      onRemove: () => {
+        setStatus("all");
+        resetPagination();
+      },
+    });
+  }
+  if (protocol !== "all") {
+    filterChips.push({
+      key: "protocol",
+      label: `协议：${protocolOptions.find((option) => option.value === protocol)?.label ?? protocol}`,
+      onRemove: () => {
+        setProtocol("all");
+        resetPagination();
+      },
+    });
+  }
+  if (requestKind !== "all") {
+    filterChips.push({
+      key: "requestKind",
+      label: `类型：${requestKindLabels[requestKind] ?? requestKind}`,
+      onRemove: () => {
+        setRequestKind("all");
+        resetPagination();
+      },
+    });
+  }
 
   if (!opened) return null;
 
@@ -1207,7 +1592,13 @@ export function RequestLogDialog({
       <style>{requestLogStyles}</style>
       <div className="request-log-header">
         <div className="request-log-heading">
-          <div><p className="request-log-eyebrow">CODEY / 内置路由</p><h1>请求日志</h1></div>
+          <div>
+            <p className="request-log-eyebrow">CODEY / 内置路由</p>
+            <h1>请求日志</h1>
+            {validRange ? (
+              <p className="request-log-window">{formatRequestLogWindow(fromUnixMs, toUnixMs)}</p>
+            ) : null}
+          </div>
           {health ? (
             <div
               role={healthWarning ? "alert" : "status"}
@@ -1327,6 +1718,53 @@ export function RequestLogDialog({
               />
             </div>
 
+            <div
+              className="request-log-segmented"
+              role="radiogroup"
+              aria-label="按状态筛选请求日志"
+              onKeyDown={(event) => {
+                // 单选组的键盘契约：方向键在选项间移动并同时选中，Tab 只进入一次。
+                const step = event.key === "ArrowRight" || event.key === "ArrowDown"
+                  ? 1
+                  : event.key === "ArrowLeft" || event.key === "ArrowUp"
+                    ? -1
+                    : 0;
+                if (step === 0) return;
+                const currentIndex = statusSegmentOptions.findIndex((option) => option.value === status);
+                const nextIndex = Math.min(
+                  statusSegmentOptions.length - 1,
+                  Math.max(0, (currentIndex < 0 ? 0 : currentIndex) + step),
+                );
+                const nextOption = statusSegmentOptions[nextIndex];
+                if (!nextOption || nextOption.value === status) return;
+                event.preventDefault();
+                setStatus(nextOption.value);
+                resetPagination();
+                event.currentTarget
+                  .querySelectorAll<HTMLButtonElement>("[role='radio']")
+                  .item(nextIndex)
+                  ?.focus();
+              }}
+            >
+              {statusSegmentOptions.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  role="radio"
+                  aria-checked={status === option.value}
+                  tabIndex={status === option.value ? 0 : -1}
+                  className={`request-log-segment${status === option.value ? " is-active" : ""}`}
+                  onClick={() => {
+                    setStatus(option.value);
+                    resetPagination();
+                  }}
+                >
+                  {option.tone ? <i className={`request-log-result-dot ${option.tone}`} aria-hidden="true" /> : null}
+                  {option.label}
+                </button>
+              ))}
+            </div>
+
             <Select
               aria-label="请求日志时间范围"
               className="w-36 shrink-0"
@@ -1342,7 +1780,9 @@ export function RequestLogDialog({
                 resetPagination();
               }}
             />
+          </div>
 
+          <div className="request-log-filter-facets">
             <Select
               aria-label="按供应商筛选请求日志"
               className="w-32 shrink-0"
@@ -1378,17 +1818,6 @@ export function RequestLogDialog({
               }}
               onChange={(value) => {
                 setModel(String(value ?? "all"));
-                resetPagination();
-              }}
-            />
-
-            <Select
-              aria-label="按状态筛选请求日志"
-              className="w-24 shrink-0"
-              optionList={statusOptions}
-              value={status}
-              onChange={(value) => {
-                setStatus(String(value ?? "all"));
                 resetPagination();
               }}
             />
@@ -1464,6 +1893,31 @@ export function RequestLogDialog({
                   }}
                 />
               </label>
+            </div>
+          ) : null}
+
+          {filterChips.length > 0 ? (
+            <div className="request-log-chips" aria-label="当前生效的筛选条件">
+              {filterChips.map((chip) => (
+                <span key={chip.key} className="request-log-chip">
+                  <span className="request-log-chip-text">{chip.label}</span>
+                  <button
+                    type="button"
+                    className="request-log-chip-remove"
+                    aria-label={`移除筛选：${chip.label}`}
+                    onClick={chip.onRemove}
+                  >
+                    <IconX size={11} aria-hidden="true" />
+                  </button>
+                </span>
+              ))}
+              <button
+                type="button"
+                className="request-log-chips-clear"
+                onClick={resetFilters}
+              >
+                全部清除
+              </button>
             </div>
           ) : null}
         </div>
@@ -1806,15 +2260,30 @@ export function RequestLogDialog({
               </div>
             </div>
           ) : (
-            <div className={`min-h-0 flex-1 overflow-auto ${loading && result ? "opacity-75 transition-opacity" : ""}`} aria-busy={loading}>
-              <RequestLogTable
-                columns={REQUEST_LOG_TABLE_COLUMNS}
-                rows={requestLogRows}
-                onRowAction={(key) => {
-                  const record = result?.items.find((item) => `${item.timestampUnixMs}:${item.requestId}` === key);
-                  if (record) setSelectedItem(record);
-                }}
-              />
+            <div
+              className={`request-log-stream ${loading && result ? "is-refreshing" : ""}`}
+              aria-busy={loading}
+              aria-label="请求日志记录"
+            >
+              <RequestLogStreamHeader />
+              <div className="request-log-stream-body">
+                {result?.items.map((item) => (
+                  <RequestLogRow
+                    key={`${item.timestampUnixMs}:${item.requestId}`}
+                    item={item}
+                    providerLabel={requestLogProviderLabel(item, catalog.profiles)}
+                    officialAccountLabel={officialAccountLabel}
+                    providerKeys={providerKeySet}
+                    selected={
+                      selectedItem != null
+                      && selectedItem.requestId === item.requestId
+                      && selectedItem.timestampUnixMs === item.timestampUnixMs
+                    }
+                    onOpen={setSelectedItem}
+                    onCopyId={handleCopyId}
+                  />
+                ))}
+              </div>
             </div>
           )}
 
@@ -2224,7 +2693,7 @@ export function RequestLogDialog({
                         <button
                           type="button"
                           className="text-blue-600 dark:text-blue-400 hover:text-blue-700 ml-1 cursor-pointer"
-                          onClick={() => handleCopyId(selectedItem.codexSessionId!, { label: selectedItem.codexSessionIsParent ? "父会话 ID" : "会话 ID" })}
+                          onClick={() => handleCopyId(selectedItem.codexSessionId!, { kind: "session", label: selectedItem.codexSessionIsParent ? "父会话 ID" : "会话 ID" })}
                         >
                           复制
                         </button>

@@ -155,9 +155,11 @@ const RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
 const RESPONSES_WEBSOCKET_PATHS: [&str; 2] = ["/v1/responses", "/responses"];
 const REQUEST_LOG_PAGE_PATH: &str = "/codey/request-logs";
 const REQUEST_LOG_SCRIPT_PATH: &str = "/codey/request-logs.js";
+const REQUEST_LOG_ICON_PATH: &str = "/codey/request-logs-icon.png";
+const REQUEST_LOG_ICON: &[u8] = include_bytes!("../../icons/favicon.png");
 const REQUEST_LOG_PAGE: &str = r#"<!doctype html>
 <html lang="zh-CN">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codey 请求日志</title></head>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="/codey/request-logs-icon.png"><title>Codey 请求日志</title></head>
 <body><div id="root"></div><script src="/codey/request-logs.js"></script></body>
 </html>"#;
 #[cfg(not(test))]

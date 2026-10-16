@@ -141,6 +141,10 @@ impl RouterServer {
             .await?;
             return Ok(());
         }
+        if pending.request.method == "GET" && pending.request.path == REQUEST_LOG_ICON_PATH {
+            write_static_response(&mut stream, "image/png", REQUEST_LOG_ICON).await?;
+            return Ok(());
+        }
         if !self.authorized(&pending.request) {
             self.record_rejected_request(
                 &pending.request,
