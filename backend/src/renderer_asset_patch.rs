@@ -14,6 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
@@ -316,18 +317,42 @@ enum SessionCommand {
     },
     /// 只要求把命令发出去：放行暂停资产时不需要结果，走这条路径就可以不 spawn
     /// 任务、也不在 pending 表里留条目。
-    CdpFireAndForget {
-        method: &'static str,
-        params: Value,
-    },
+    CdpFireAndForget { method: &'static str, params: Value },
 }
 
-/// 注入侧持有的补丁会话句柄；`Weak` 缓存或 pump 结束后由下一次安装重建。
+/// 会话内资产拦截计数。每个暂停任务在独立任务里跑，用原子计数而不是
+/// 通道回报，泵退出时也不会有未回收的尾账。
+#[derive(Default)]
+struct PatchSessionCounters {
+    /// requestPaused 总数：非零本身就证明 Fetch 在该构建上能拦到资产流。
+    paused: AtomicU64,
+    /// 真正跑过补丁入口求值的候选数。
+    evaluated: AtomicU64,
+    /// 改写后以 fulfillRequest 送回的资产数。
+    patched: AtomicU64,
+    /// 候选资产被原样放行的次数：求值失败、补丁返回 null 或 fulfill 失败。
+    skipped: AtomicU64,
+}
+
+/// 补丁会话的拦截统计快照。`entry_documents` 是会话建立后观察到的入口文档
+/// 暂停次数——为 0 说明该构建的资产流根本没经过 Fetch 通道。
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PatchSessionStats {
+    pub(crate) paused_requests: u64,
+    pub(crate) evaluated_assets: u64,
+    pub(crate) patched_assets: u64,
+    pub(crate) skipped_assets: u64,
+    pub(crate) entry_documents: u64,
+}
+
+/// 注入侧持有的补丁会话句柄；泵退出后由下一次安装重建。
 pub(crate) struct RendererAssetPatchSession {
     websocket_url: Arc<str>,
     command_tx: mpsc::UnboundedSender<SessionCommand>,
     bootstrap_epoch: watch::Sender<u64>,
     main_context: watch::Sender<Option<u64>>,
+    counters: Arc<PatchSessionCounters>,
     pump: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -476,6 +501,26 @@ impl RendererAssetPatchSession {
             .expect("covered target registry poisoned")
             .insert(self.websocket_url.to_string());
     }
+
+    fn stats(&self) -> PatchSessionStats {
+        PatchSessionStats {
+            paused_requests: self.counters.paused.load(Ordering::Relaxed),
+            evaluated_assets: self.counters.evaluated.load(Ordering::Relaxed),
+            patched_assets: self.counters.patched.load(Ordering::Relaxed),
+            skipped_assets: self.counters.skipped.load(Ordering::Relaxed),
+            entry_documents: *self.bootstrap_epoch.borrow(),
+        }
+    }
+}
+
+/// 查询某 renderer target 补丁会话的拦截统计。会话缺失或已退出返回 None：
+/// 「没有会话」与「会话没拦到资产」在降级诊断里是两种不同的故障。
+pub(crate) fn session_stats(websocket_url: &str) -> Option<PatchSessionStats> {
+    patch_sessions()
+        .lock()
+        .expect("patch session registry poisoned")
+        .get(websocket_url)
+        .map(|session| session.stats())
 }
 
 /// 找到或建立这个 renderer target 的补丁会话。
@@ -512,6 +557,7 @@ pub(crate) async fn install_renderer_asset_patch(
     let session = Arc::new(RendererAssetPatchSession {
         websocket_url: Arc::from(websocket_url),
         command_tx: command_tx.clone(),
+        counters: Arc::new(PatchSessionCounters::default()),
         bootstrap_epoch: bootstrap_epoch_tx.clone(),
         main_context: main_context_tx.clone(),
         pump: Mutex::new(None),
@@ -532,6 +578,7 @@ pub(crate) async fn install_renderer_asset_patch(
         bootstrap_epoch_tx,
         install_script,
         evaluator,
+        counters: session.counters.clone(),
     }));
     session.install_pump(pump);
 
@@ -672,6 +719,7 @@ struct PatchPumpArgs {
     install_script: Arc<str>,
     /// 辅助页求值器：连接惰性建立，找不到辅助 target 时退回被拦页上下文。
     evaluator: Arc<PatchEvaluator>,
+    counters: Arc<PatchSessionCounters>,
 }
 
 /// 泵退出时清理共享状态：pending 一律以失败收尾，「已覆盖」标记作废——后续
@@ -690,6 +738,7 @@ async fn run_patch_pump(args: PatchPumpArgs) {
         bootstrap_epoch_tx,
         install_script,
         evaluator,
+        counters,
     } = args;
     let mut contexts: HashMap<u64, ContextInfo> = HashMap::new();
     let mut inflight = tokio::task::JoinSet::new();
@@ -752,6 +801,7 @@ async fn run_patch_pump(args: PatchPumpArgs) {
                                     command_tx: &command_tx,
                                     install_script: &install_script,
                                     evaluator: &evaluator,
+                                    counters: &counters,
                                     inflight: &mut inflight,
                                 },
                             );
@@ -825,6 +875,7 @@ struct PatchEventState<'a> {
     command_tx: &'a mpsc::UnboundedSender<SessionCommand>,
     install_script: &'a Arc<str>,
     evaluator: &'a Arc<PatchEvaluator>,
+    counters: &'a Arc<PatchSessionCounters>,
     inflight: &'a mut tokio::task::JoinSet<()>,
 }
 
@@ -837,6 +888,7 @@ fn handle_patch_event(value: &Value, state: &mut PatchEventState<'_>) {
         command_tx,
         install_script,
         evaluator,
+        counters,
         inflight,
     } = state;
     let Some(method) = value.get("method").and_then(Value::as_str) else {
@@ -845,6 +897,7 @@ fn handle_patch_event(value: &Value, state: &mut PatchEventState<'_>) {
     let params = value.get("params").cloned().unwrap_or_else(|| json!({}));
     match method {
         "Fetch.requestPaused" => {
+            counters.paused.fetch_add(1, Ordering::Relaxed);
             let url = params
                 .get("request")
                 .and_then(|request| request.get("url"))
@@ -869,13 +922,22 @@ fn handle_patch_event(value: &Value, state: &mut PatchEventState<'_>) {
             let command_tx = command_tx.clone();
             let install_script = install_script.clone();
             let evaluator = evaluator.clone();
+            let counters = counters.clone();
             if inflight.len() < MAX_CONCURRENT_PAUSES {
                 inflight.spawn(async move {
-                    process_paused_asset(command_tx, context_rx, install_script, evaluator, params)
-                        .await;
+                    process_paused_asset(
+                        command_tx,
+                        context_rx,
+                        install_script,
+                        evaluator,
+                        counters,
+                        params,
+                    )
+                    .await;
                 });
             } else {
                 // 背压：并发满时仍要回应，直接放行比挂在浏览器侧安全。
+                counters.skipped.fetch_add(1, Ordering::Relaxed);
                 if let Some(request_id) = params.get("requestId").and_then(Value::as_str) {
                     enqueue_continue_request(&command_tx, request_id);
                 }
@@ -1005,10 +1067,7 @@ fn is_patch_candidate_url(url: &str) -> bool {
 
 /// 放行一个暂停的请求：命令入队即返回，不需要等待 CDP 响应。放行失败也不影响
 /// 会话，泵退出时待处理的暂停会以失败收尾。
-fn enqueue_continue_request(
-    command_tx: &mpsc::UnboundedSender<SessionCommand>,
-    request_id: &str,
-) {
+fn enqueue_continue_request(command_tx: &mpsc::UnboundedSender<SessionCommand>, request_id: &str) {
     let _ = command_tx.send(SessionCommand::CdpFireAndForget {
         method: "Fetch.continueRequest",
         params: json!({ "requestId": request_id }),
@@ -1041,8 +1100,10 @@ async fn process_paused_asset(
     mut context_rx: watch::Receiver<Option<u64>>,
     install_script: Arc<str>,
     evaluator: Arc<PatchEvaluator>,
+    counters: Arc<PatchSessionCounters>,
     params: Value,
 ) {
+    use std::sync::atomic::Ordering::Relaxed;
     let Some(request_id) = params
         .get("requestId")
         .and_then(Value::as_str)
@@ -1060,6 +1121,10 @@ async fn process_paused_asset(
         enqueue_continue_request(command_tx, &request_id);
     };
 
+    let skip = |counters: &PatchSessionCounters| {
+        counters.skipped.fetch_add(1, Relaxed);
+        continue_request(&command_tx);
+    };
     let body = match send_command_via(
         &command_tx,
         "Fetch.getResponseBody",
@@ -1070,7 +1135,7 @@ async fn process_paused_asset(
         Ok(value) => value,
         Err(error) => {
             log_patch_skip(&url, format!("getResponseBody: {error:#}"));
-            continue_request(&command_tx);
+            skip(&counters);
             return;
         }
     };
@@ -1092,10 +1157,11 @@ async fn process_paused_asset(
         raw_body.as_bytes().to_vec()
     };
     let Ok(source) = String::from_utf8(decoded) else {
-        continue_request(&command_tx);
+        skip(&counters);
         return;
     };
 
+    counters.evaluated.fetch_add(1, Relaxed);
     // 优先在辅助页的稳定上下文里求值；没有辅助 target 或求值失败时退回被
     // 拦页自己的上下文。
     let patched = match evaluator.evaluate(&url, &source).await {
@@ -1116,14 +1182,14 @@ async fn process_paused_asset(
                         &url,
                         format!("patch evaluate: {error:#}; evaluator: {evaluator_error:#}"),
                     );
-                    continue_request(&command_tx);
+                    skip(&counters);
                     return;
                 }
             }
         }
     };
     let Some(patched) = patched else {
-        continue_request(&command_tx);
+        skip(&counters);
         return;
     };
 
@@ -1151,7 +1217,9 @@ async fn process_paused_asset(
     .await;
     if let Err(error) = fulfill {
         log_patch_skip(&url, format!("fulfillRequest: {error:#}"));
-        continue_request(&command_tx);
+        skip(&counters);
+    } else {
+        counters.patched.fetch_add(1, Relaxed);
     }
 }
 

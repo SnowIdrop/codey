@@ -1137,12 +1137,18 @@ async fn verify_injection(
             // 页面持续应答却长期拿不到 request client：按降级完成注入。
             // 页面侧补丁或会话工具之后若就位，gate 仍会自行装上；当前则让
             // CLI 包装层的 stdin 改写继续承担模型路由。
+            // 附上补丁会话的拦截统计：pausedRequests/entryDocuments 为零说明
+            // Fetch 在该构建上根本没拦到资产流，与「补丁落地但探测不到
+            // client」是两种不同故障。
             let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
                 "cdp.request_gate_degraded",
                 serde_json::json!({
                     "targetId": bridge.target_id,
                     "reinstall": verdict.reinstall,
                     "message": message,
+                    "patchSession": crate::renderer_asset_patch::session_stats(
+                        bridge.websocket_url.as_ref()
+                    ),
                 }),
             );
         } else {
