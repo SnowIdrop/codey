@@ -2,8 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -194,28 +193,21 @@ impl RuntimeConfigLock {
         let file = options.open(&lock_path).with_context(|| {
             format!("打开 Codey Codex 运行时配置锁失败：{}", lock_path.display())
         })?;
-        let started = Instant::now();
-        loop {
-            match fs2::FileExt::try_lock_exclusive(&file) {
-                Ok(()) => return Ok(Self { file }),
-                Err(error) if crate::fs_util::file_lock_is_contended(&error) => {
-                    let elapsed = started.elapsed();
-                    if elapsed >= timeout {
-                        bail!(
-                            "等待 Codey Codex 运行时配置锁超过 {} 毫秒：{}",
-                            timeout.as_millis(),
-                            lock_path.display()
-                        );
-                    }
-                    thread::sleep(RUNTIME_CONFIG_LOCK_RETRY.min(timeout.saturating_sub(elapsed)));
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("获取 Codey Codex 运行时配置锁失败：{}", lock_path.display())
-                    });
-                }
-            }
-        }
+        crate::fs_util::acquire_exclusive_lock_with_timeout(
+            &file,
+            &lock_path,
+            timeout,
+            RUNTIME_CONFIG_LOCK_RETRY,
+            || {
+                format!(
+                    "等待 Codey Codex 运行时配置锁超过 {} 毫秒：{}",
+                    timeout.as_millis(),
+                    lock_path.display()
+                )
+            },
+            || format!("获取 Codey Codex 运行时配置锁失败：{}", lock_path.display()),
+        )?;
+        Ok(Self { file })
     }
 }
 

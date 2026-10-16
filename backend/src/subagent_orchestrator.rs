@@ -2,8 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
@@ -179,27 +178,20 @@ impl LedgerStore {
             .write(true)
             .open(&lock_path)
             .with_context(|| format!("打开 Codey 子代理编排账本锁失败：{}", lock_path.display()))?;
-        let lock_started = Instant::now();
-        loop {
-            match lock.try_lock_exclusive() {
-                Ok(()) => break,
-                Err(error) if crate::fs_util::file_lock_is_contended(&error) => {
-                    if lock_started.elapsed() >= Duration::from_millis(LEDGER_LOCK_TIMEOUT_MILLIS) {
-                        anyhow::bail!(
-                            "获取 Codey 子代理编排账本锁超时（{} ms）：{}",
-                            LEDGER_LOCK_TIMEOUT_MILLIS,
-                            lock_path.display()
-                        );
-                    }
-                    thread::sleep(Duration::from_millis(LEDGER_LOCK_RETRY_MILLIS));
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("获取 Codey 子代理编排账本锁失败：{}", lock_path.display())
-                    });
-                }
-            }
-        }
+        crate::fs_util::acquire_exclusive_lock_with_timeout(
+            &lock,
+            &lock_path,
+            Duration::from_millis(LEDGER_LOCK_TIMEOUT_MILLIS),
+            Duration::from_millis(LEDGER_LOCK_RETRY_MILLIS),
+            || {
+                format!(
+                    "获取 Codey 子代理编排账本锁超时（{} ms）：{}",
+                    LEDGER_LOCK_TIMEOUT_MILLIS,
+                    lock_path.display()
+                )
+            },
+            || format!("获取 Codey 子代理编排账本锁失败：{}", lock_path.display()),
+        )?;
         cleanup_stale_ledger_temps(&session_dir)?;
         Ok(Self {
             lock,
