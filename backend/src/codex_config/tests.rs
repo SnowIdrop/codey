@@ -1,7 +1,7 @@
 use super::*;
 use crate::codex_config_guidance::{
-    CODEY_FASTCTX_GUIDANCE, CODEY_FASTCTX_GUIDANCE_VERSIONS, codey_fastctx_guidance_for_namespace,
-    remove_codey_fastctx_guidance,
+    CODEY_FASTCTX_GUIDANCE, CODEY_FASTCTX_GUIDANCE_VERSIONS, SUBAGENT_GUIDANCE_VERSIONS,
+    codey_fastctx_guidance_for_namespace, remove_codey_fastctx_guidance,
 };
 const LEGACY_GLOBAL_PROVIDER_ID: &str = "codey_global";
 
@@ -1187,7 +1187,7 @@ fn legacy_unregistered_role_requires_restart_without_mutating_runtime_assets() {
 }
 
 #[test]
-fn invalid_dynamic_role_template_preserves_applied_files_lease_and_policy() {
+fn stale_role_template_source_is_repaired_instead_of_failing_the_reconcile() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let marker = temp.path().join("state/codex-lease.json");
@@ -1197,100 +1197,22 @@ fn invalid_dynamic_role_template_preserves_applied_files_lease_and_policy() {
     };
     dynamic_role_runtime_fixture(&home, &marker, &config);
     let constraints = marker.with_file_name(CODEY_CONSTRAINTS_DIR);
-    let original_lease = fs::read(&marker).unwrap();
     let (policy_path, pending) = crate::subagent_gate::runtime_subagent_policy_paths(&home);
-    let original_policy = fs::read(&policy_path).unwrap();
     let role = crate::config::SUBAGENT_ROLE_WORKER;
-    let role_path = runtime_agent_path(&constraints, role);
-    let original_file = fs::read(&role_path).unwrap();
+    let source_path = constraints
+        .join(CODEY_SUBAGENT_SOURCES_DIR)
+        .join(format!("{role}.toml"));
+    // A truncated or stale template used to abort the whole reconcile and left
+    // that role permanently unable to upgrade. It is now simply rebuilt.
+    fs::write(&source_path, "invalid = [").unwrap();
     config.subagent_roles.get_mut(role).unwrap().enabled = false;
-    fs::write(
-        constraints
-            .join(CODEY_SUBAGENT_SOURCES_DIR)
-            .join(format!("{role}.toml")),
-        "invalid = [",
-    )
-    .unwrap();
-    assert!(reconcile_runtime_subagent_roles_at(&config, &marker).is_err());
-    assert_eq!(fs::read(&marker).unwrap(), original_lease);
-    assert_eq!(fs::read(policy_path).unwrap(), original_policy);
-    assert_eq!(fs::read(role_path).unwrap(), original_file);
+    reconcile_runtime_subagent_roles_at(&config, &marker).unwrap();
+    assert_eq!(
+        fs::read_to_string(&source_path).unwrap(),
+        subagent_source_config(role).unwrap()
+    );
+    assert!(policy_path.exists());
     assert!(!pending.exists());
-}
-
-#[test]
-fn runtime_guidance_keeps_analysis_roles_available_for_authorized_writes() {
-    let mut configured = crate::config::default_subagent_roles();
-    configured
-        .get_mut(crate::config::SUBAGENT_ROLE_WORKER)
-        .unwrap()
-        .enabled = false;
-    configured
-        .get_mut(crate::config::SUBAGENT_ROLE_VISUAL_WORKER)
-        .unwrap()
-        .enabled = false;
-    configured
-        .get_mut(crate::config::SUBAGENT_ROLE_DEFAULT)
-        .unwrap()
-        .enabled = false;
-    let runtime_roles = runtime_subagent_roles(
-        Some(&configured),
-        DEFAULT_SUBAGENT_MODEL,
-        DEFAULT_SUBAGENT_REASONING_EFFORT,
-    );
-
-    let instructions = runtime_root_instructions_for_roles("BASE", &runtime_roles);
-    assert!(instructions.contains("BASE"));
-    assert_eq!(instructions, "BASE");
-    assert_eq!(
-        runtime_root_instructions_for_roles(
-            &format!("BASE\n\n{NO_WRITABLE_SUBAGENT_GUIDANCE}"),
-            &runtime_roles
-        ),
-        "BASE"
-    );
-
-    let writable_roles = runtime_subagent_roles(
-        Some(&crate::config::default_subagent_roles()),
-        DEFAULT_SUBAGENT_MODEL,
-        DEFAULT_SUBAGENT_REASONING_EFFORT,
-    );
-    assert_eq!(
-        runtime_root_instructions_for_roles("BASE", &writable_roles),
-        "BASE"
-    );
-}
-
-#[test]
-fn runtime_guidance_upgrades_owned_defaults_without_overwriting_custom_sources() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("instructions.md");
-    for (current, versions) in [
-        (SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS),
-        (CODEY_FASTCTX_GUIDANCE, CODEY_FASTCTX_GUIDANCE_VERSIONS),
-        (
-            ROOT_AGENT_COLLABORATION_USAGE_HINT,
-            ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS,
-        ),
-    ] {
-        for version in versions {
-            let original = format!("\n{version}\n");
-            fs::write(&path, &original).unwrap();
-            assert_eq!(
-                read_or_create_versioned_constraint_file(&path, current, versions).unwrap(),
-                current
-            );
-            assert_eq!(fs::read_to_string(&path).unwrap(), original);
-
-            let customized = format!("{version}\n\n用户自定义要求");
-            fs::write(&path, &customized).unwrap();
-            assert_eq!(
-                read_or_create_versioned_constraint_file(&path, current, versions).unwrap(),
-                customized
-            );
-            assert_eq!(fs::read_to_string(&path).unwrap(), customized);
-        }
-    }
 }
 
 #[test]
@@ -1311,8 +1233,10 @@ fn isolated_prompt_sources_migrate_historical_defaults_and_preserve_user_guidanc
         ),
     ] {
         let path = temp.path().join(name);
-        fs::write(&path, versions.last().unwrap()).unwrap();
-        sources.push(read_or_create_versioned_constraint_file(&path, current, versions).unwrap());
+        rebuild_constraint_file(&path, current).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), current);
+        sources.push(current.to_string());
+        assert!(!versions.is_empty());
     }
     let mut document = parse_document(
         r#"[features.multi_agent_v2]
@@ -1400,7 +1324,6 @@ fn runtime_analysis_agents_share_tools_and_keep_task_boundaries() {
         .find(|plan| plan.registration.role == crate::config::SUBAGENT_ROLE_QUICK_SCAN)
         .unwrap();
     let quick_scan = String::from_utf8(quick_scan.contents.clone()).unwrap();
-    assert!(!quick_scan.contains(READ_ONLY_AGENT_WRITE_GUARD));
     assert!(quick_scan.contains("sandbox_mode = \"workspace-write\""));
     assert!(quick_scan.contains("按本次任务授权使用所需工具"));
 
@@ -1409,14 +1332,13 @@ fn runtime_analysis_agents_share_tools_and_keep_task_boundaries() {
         .find(|plan| plan.registration.role == crate::config::SUBAGENT_ROLE_WORKER)
         .unwrap();
     let worker = String::from_utf8(worker.contents.clone()).unwrap();
-    assert!(!worker.contains(READ_ONLY_AGENT_WRITE_GUARD));
+    assert!(worker.contains("逻辑开发子代理"));
 
     let default_agent = plans
         .iter()
         .find(|plan| plan.registration.role == crate::config::SUBAGENT_ROLE_DEFAULT)
         .unwrap();
     let default_agent = String::from_utf8(default_agent.contents.clone()).unwrap();
-    assert!(!default_agent.contains(READ_ONLY_AGENT_WRITE_GUARD));
     assert!(default_agent.contains("sandbox_mode = \"workspace-write\""));
 }
 
@@ -1448,23 +1370,26 @@ fn runtime_agents_select_compaction_from_their_own_model() {
 }
 
 #[test]
-fn runtime_analysis_templates_upgrade_owned_defaults_and_preserve_custom_sources() {
-    for role in [
-        "codey_quick_scan",
-        "codey_deep_research",
-        "codey_visual_analysis",
-    ] {
+fn runtime_agent_sources_are_rebuilt_from_the_current_definitions() {
+    for role in crate::config::SUBAGENT_ROLE_IDS {
         let temp = tempfile::tempdir().unwrap();
         let constraints_dir = temp.path().join("codex-constraints");
-        let source_path = constraints_dir
-            .join(CODEY_SUBAGENT_SOURCES_DIR)
-            .join(format!("{role}.toml"));
+        let source_path = if role == SUBAGENT_ROLE_DEFAULT {
+            constraints_dir.join(CODEY_SUBAGENT_SOURCE_FILE)
+        } else {
+            constraints_dir
+                .join(CODEY_SUBAGENT_SOURCES_DIR)
+                .join(format!("{role}.toml"))
+        };
         fs::create_dir_all(source_path.parent().unwrap()).unwrap();
-        let [current, previous] = subagent_source_config_versions(role).unwrap();
-        fs::write(&source_path, previous).unwrap();
+        // A stale or hand-edited source file cannot survive a rebuild: the
+        // file is Codey's own asset, so its content always tracks the template.
+        fs::write(&source_path, "stale = \"hand edited\"\n").unwrap();
         let roles = crate::config::default_subagent_roles();
         let plans = plan_runtime_agent_files(&constraints_dir, &roles, None, None).unwrap();
-        assert_eq!(fs::read_to_string(&source_path).unwrap(), previous);
+
+        let current = subagent_source_config(role).unwrap();
+        assert_eq!(fs::read_to_string(&source_path).unwrap(), current, "{role}");
         let plan = plans
             .iter()
             .find(|plan| plan.registration.role == role)
@@ -1473,13 +1398,18 @@ fn runtime_analysis_templates_upgrade_owned_defaults_and_preserve_custom_sources
         assert_eq!(rendered["sandbox_mode"].as_str(), Some("workspace-write"));
         assert_eq!(
             rendered["description"].as_str(),
-            parse_document(current).unwrap()["description"].as_str()
+            parse_document(current).unwrap()["description"].as_str(),
+            "{role}"
         );
 
-        let customized = format!("{previous}\n# User customization\n");
-        fs::write(&source_path, &customized).unwrap();
+        // An already-current source file is left untouched rather than rewritten.
+        let stable = fs::metadata(&source_path).unwrap();
         plan_runtime_agent_files(&constraints_dir, &roles, None, None).unwrap();
-        assert_eq!(fs::read_to_string(&source_path).unwrap(), customized);
+        assert_eq!(fs::read_to_string(&source_path).unwrap(), current, "{role}");
+        assert_eq!(
+            fs::metadata(&source_path).unwrap().modified().unwrap(),
+            stable.modified().unwrap()
+        );
     }
 }
 
@@ -4050,6 +3980,8 @@ wire_api = "responses"
     assert!(!marker.exists());
     fs::write(home.join("config.toml"), original_config).unwrap();
 
+    // Codey-owned constraint files are rebuilt from the current definitions;
+    // hand-edited or stale content there does not carry into the runtime.
     fs::write(
         constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE),
         "CUSTOM ROOT CONSTRAINT",
@@ -4067,10 +3999,7 @@ wire_api = "responses"
     .unwrap();
     fs::write(
         constraints_dir.join(CODEY_SUBAGENT_SOURCE_FILE),
-        r#"name = "default"
-description = "Custom editable subagent"
-developer_instructions = "CUSTOM SUBAGENT CONSTRAINT"
-"#,
+        "stale = \"hand edited\"\n",
     )
     .unwrap();
 
@@ -4086,6 +4015,14 @@ developer_instructions = "CUSTOM SUBAGENT CONSTRAINT"
         &backup_root,
     )
     .unwrap();
+    assert_eq!(
+        fs::read_to_string(constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE)).unwrap(),
+        SUBAGENT_GUIDANCE
+    );
+    assert_eq!(
+        fs::read_to_string(constraints_dir.join(CODEY_COLLABORATION_HINT_FILE)).unwrap(),
+        ROOT_AGENT_COLLABORATION_USAGE_HINT
+    );
     let developer_override = reapplied
         .runtime_config_overrides
         .iter()
@@ -4096,10 +4033,10 @@ developer_instructions = "CUSTOM SUBAGENT CONSTRAINT"
     let developer_instructions = developer_override["developer_instructions"]
         .as_str()
         .unwrap();
-    assert!(developer_instructions.contains("CUSTOM ROOT CONSTRAINT"));
-    assert!(developer_instructions.contains("CUSTOM FASTCTX CONSTRAINT"));
-    assert!(!developer_instructions.contains(SUBAGENT_GUIDANCE));
-    assert!(!developer_instructions.contains(CODEY_FASTCTX_GUIDANCE));
+    // Injected text is trimmed, so compare against the trimmed guidance.
+    assert!(developer_instructions.contains(SUBAGENT_GUIDANCE.trim()));
+    assert!(developer_instructions.contains(CODEY_FASTCTX_GUIDANCE));
+    assert!(!developer_instructions.contains("CUSTOM ROOT CONSTRAINT"));
     let collaboration_override = reapplied
         .runtime_config_overrides
         .iter()
@@ -4109,12 +4046,13 @@ developer_instructions = "CUSTOM SUBAGENT CONSTRAINT"
         .unwrap();
     assert_eq!(
         collaboration_override["features"]["multi_agent_v2"]["root_agent_usage_hint_text"].as_str(),
-        Some("CUSTOM COLLABORATION HINT")
+        Some(ROOT_AGENT_COLLABORATION_USAGE_HINT)
     );
     let runtime_agent =
         fs::read_to_string(constraints_dir.join(CODEY_RUNTIME_DEFAULT_AGENT_FILE)).unwrap();
-    assert!(runtime_agent.contains("CUSTOM SUBAGENT CONSTRAINT"));
-    assert!(runtime_agent.contains("CUSTOM FASTCTX CONSTRAINT"));
+    assert!(runtime_agent.contains("通用子代理"));
+    assert!(runtime_agent.contains(CODEY_FASTCTX_GUIDANCE));
+    assert!(!runtime_agent.contains("CUSTOM SUBAGENT CONSTRAINT"));
     assert!(restore_runtime_config_at(&home, &marker, true).unwrap());
 }
 
