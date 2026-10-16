@@ -13231,6 +13231,23 @@ async fn router_listener_falls_back_after_all_candidates_fail() {
     }
 }
 
+#[test]
+fn router_token_persists_across_router_starts() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("router-token");
+
+    let first = load_or_create_router_token_at(&path);
+    assert!(first.starts_with("codey-router-"));
+    // 重启再次读取时沿用同一个令牌，旧日志页面刷新后仍能通过鉴权。
+    assert_eq!(load_or_create_router_token_at(&path), first);
+    // 内容损坏时生成并写回新令牌，不阻塞路由启动。
+    std::fs::write(&path, b"garbage").unwrap();
+    let regenerated = load_or_create_router_token_at(&path);
+    assert!(regenerated.starts_with("codey-router-"));
+    assert_ne!(regenerated, first);
+    assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), regenerated);
+}
+
 #[tokio::test]
 async fn router_listener_reports_kernel_allocation_failure() {
     let mut attempts = 0;

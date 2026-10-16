@@ -155,6 +155,37 @@ pub(crate) async fn bind_router_listener() -> Result<TcpListener> {
     bind_router_listener_with(TcpListener::bind).await
 }
 
+/// 路由访问令牌持久化在应用状态目录下，重启后沿用同一个令牌，
+/// 已打开的日志页面刷新后仍能通过鉴权。
+fn router_token_path() -> PathBuf {
+    codey_runtime_core::paths::default_app_state_dir().join("router-token")
+}
+
+/// 读取或生成路由令牌：已有持久化令牌沿用，文件缺失或内容损坏时生成新令牌
+/// 并尽量写回；写盘失败退回本次启动的临时令牌，不阻塞路由启动。
+fn load_or_create_router_token() -> String {
+    load_or_create_router_token_at(&router_token_path())
+}
+
+pub(super) fn load_or_create_router_token_at(path: &Path) -> String {
+    if let Ok(bytes) = crate::fs_util::read_bounded(path, 256) {
+        let token = String::from_utf8_lossy(&bytes).trim().to_string();
+        if token.starts_with("codey-router-") {
+            return token;
+        }
+    }
+    let token = format!("codey-router-{}", Uuid::new_v4());
+    if let Err(error) = crate::fs_util::atomic_write_private_with_parent(path, token.as_bytes()) {
+        record_router_failure_nonblocking(
+            "router_token_persist_failed",
+            "persist_router_token",
+            format!("{error:#}"),
+            serde_json::json!({ "path": path.display().to_string() }),
+        );
+    }
+    token
+}
+
 pub(crate) struct LocalRouter {
     pub(crate) endpoint: RuntimeRouterEndpoint,
     pub(crate) snapshot: Arc<RwLock<Arc<RouterSnapshot>>>,
@@ -200,7 +231,7 @@ impl LocalRouter {
             .local_addr()
             .context("读取 Codey 本地路由监听地址失败")?
             .port();
-        let token = format!("codey-router-{}", Uuid::new_v4());
+        let token = load_or_create_router_token();
         let endpoint = RuntimeRouterEndpoint {
             base_url: format!("http://127.0.0.1:{port}/v1"),
             token,
