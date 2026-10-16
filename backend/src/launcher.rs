@@ -75,6 +75,9 @@ const CDP_WATCHDOG_INCONCLUSIVE_LIMIT: u8 = 6;
 // A completely unresponsive endpoint is a stronger signal than a busy page,
 // so it must rebuild sooner.
 const _: () = assert!(CDP_WATCHDOG_UNRESPONSIVE_THRESHOLD < CDP_WATCHDOG_INCONCLUSIVE_LIMIT);
+// 每轮重装内部已自带整段发现阶段重试预算：连续这么多轮仍摸不到可注入
+// 页面时，调试端口就是随旧进程消失了，再重试只是在刷同样的超时。
+const CDP_WATCHDOG_ENDPOINT_LOSS_LIMIT: u8 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InjectionHealth {
@@ -1316,6 +1319,10 @@ fn spawn_injection_watchdog(
         let mut target = injected_target;
         let mut failure_counters = InjectionFailureCounters::default();
         let mut reported_health: Option<InjectionHealth> = None;
+        // 连续停在目标枚举/选择阶段的重装轮数：Codex 在托管外重启（自更新、
+        // 单实例交接等）会带走调试端口，此后任何页面侧重试都不可能恢复，
+        // 到达阈值后把集成标记为停用并退出看门狗，不再无限烧重试。
+        let mut endpoint_losses: u8 = 0;
         'watchdog: loop {
             tokio::select! {
                 biased;
@@ -1389,6 +1396,9 @@ fn spawn_injection_watchdog(
                 );
                 reported_health = Some(health);
             }
+            if health == InjectionHealth::Healthy {
+                endpoint_losses = 0;
+            }
             if !watchdog_should_reinject(&mut failure_counters, health) {
                 continue;
             }
@@ -1419,8 +1429,10 @@ fn spawn_injection_watchdog(
                     *watchdog_websocket_url.write().await = next_websocket_url;
                     previous.close().await;
                     failure_counters = InjectionFailureCounters::default();
+                    endpoint_losses = 0;
                 }
                 Err(error) => {
+                    let endpoint_unreachable = error.debug_endpoint_unreachable();
                     let error_message = format!("{error:#}");
                     error_log::record_failure_with_metadata_async(
                         "injection_failed",
@@ -1433,6 +1445,7 @@ fn spawn_injection_watchdog(
                         serde_json::json!({
                             "debugPort": debug_port,
                             "lastError": error.detail(),
+                            "debugEndpointUnreachable": endpoint_unreachable,
                         }),
                     )
                     .await;
@@ -1440,6 +1453,26 @@ fn spawn_injection_watchdog(
                         .statuses_with_error(format!("脚本重新注入失败：{error_message}"));
                     eprintln!("Codey CDP bridge 恢复失败：{error_message}");
                     failure_counters = InjectionFailureCounters::after_failed_reinjection();
+                    endpoint_losses = if endpoint_unreachable {
+                        endpoint_losses.saturating_add(1)
+                    } else {
+                        0
+                    };
+                    if endpoint_losses >= CDP_WATCHDOG_ENDPOINT_LOSS_LIMIT {
+                        // 调试端口随旧进程消失后不会回来：继续探测只是反复
+                        // 制造同样的超时。把状态固定为停用说明；用户经 Codey
+                        // 重新拉起 Codex 时会走全新的注入与看门狗。
+                        *watchdog_statuses.write().await = watchdog_scripts
+                            .statuses_with_error("Codex 已在 Codey 之外重启，集成已停用；通过 Codey 重新启动 Codex 后恢复");
+                        let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+                            "bridge.injection_disabled",
+                            serde_json::json!({
+                                "debugPort": debug_port,
+                                "consecutiveEndpointLosses": endpoint_losses,
+                            }),
+                        );
+                        break 'watchdog;
+                    }
                 }
             }
         }

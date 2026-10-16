@@ -64,7 +64,7 @@ const MAX_INJECTION_DETAIL_CHARS: usize = 2000;
 static SETTINGS_OVERLAY_LOAD_SCRIPT: OnceLock<Arc<str>> = OnceLock::new();
 static SESSION_TOOLS_LOAD_SCRIPT: OnceLock<Arc<str>> = OnceLock::new();
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[repr(u8)]
 enum InjectionPhase {
     DiscoverTargets,
@@ -199,6 +199,11 @@ pub struct InjectedTarget {
 pub struct InjectionRetryFailure {
     error: anyhow::Error,
     detail: Option<String>,
+    /// 重试终止时所处的阶段：一直停在发现阶段意味着调试端点本身已不可达，
+    /// 看门狗据此把「页面修不好」与「Codex 已在托管外重启」分开处理。
+    final_phase: InjectionPhase,
+    /// 进入过桥接安装及之后阶段的失败轮数：非零说明端点曾经可达。
+    reached_bridge_stage: u32,
 }
 
 impl InjectionRetryFailure {
@@ -210,6 +215,13 @@ impl InjectionRetryFailure {
     /// 排查需要这条原始信息，调用方把它写进错误日志上下文。
     pub fn detail(&self) -> Option<&str> {
         self.detail.as_deref()
+    }
+
+    /// 整轮重试都停在枚举/选择目标阶段：调试端口已随旧进程消失，或当前
+    /// 进程里没有任何可注入页面——在这条会话上继续重试不可能恢复。
+    /// 只要有一轮摸到过桥接阶段就说明端点活着，不再适用。
+    pub fn debug_endpoint_unreachable(&self) -> bool {
+        self.final_phase.is_discovery() && self.reached_bridge_stage == 0
     }
 }
 
@@ -578,12 +590,17 @@ pub async fn retry_inject_with_scripts(
                 stats.report(source, "injected", started.elapsed(), None);
                 return Ok(target);
             }
-            Ok(AttemptOutcome::Retry { error, retained, request_gate_unready }) => {
+            Ok(AttemptOutcome::Retry {
+                error,
+                retained,
+                request_gate_unready,
+            }) => {
                 retained_bridge = retained;
                 let current_phase = InjectionPhase::from_raw(phase.load(Ordering::Acquire));
                 let failure_cost = attempt_started.elapsed();
                 stats.record_failure(current_phase, failure_cost);
-                if matches!(current_phase, InjectionPhase::VerifyRequestGate) && request_gate_unready
+                if matches!(current_phase, InjectionPhase::VerifyRequestGate)
+                    && request_gate_unready
                 {
                     gate_not_ready_count += 1;
                     gate_not_ready_since.get_or_insert(attempt_started);
@@ -639,6 +656,8 @@ pub async fn retry_inject_with_scripts(
     Err(InjectionRetryFailure {
         error: last_error,
         detail: previous_detail,
+        final_phase: InjectionPhase::from_raw(phase.load(Ordering::Acquire)),
+        reached_bridge_stage: stats.bridge_failures(),
     })
 }
 
@@ -2011,6 +2030,24 @@ assert.equal(nextPage.window.attempts, 1);
                 .unwrap()
                 .ready
         );
+    }
+
+    #[test]
+    fn endpoint_unreachable_only_when_no_attempt_reached_the_bridge() {
+        let failure = |phase: InjectionPhase, reached_bridge_stage: u32| InjectionRetryFailure {
+            error: anyhow::anyhow!("x"),
+            detail: None,
+            final_phase: phase,
+            reached_bridge_stage,
+        };
+        // 调试端口死掉：每轮都停在发现阶段。
+        assert!(failure(InjectionPhase::DiscoverTargets, 0).debug_endpoint_unreachable());
+        assert!(failure(InjectionPhase::SelectTarget, 0).debug_endpoint_unreachable());
+        // 有一轮摸到过桥接阶段——端点当时活着，不算托管外重启。
+        assert!(!failure(InjectionPhase::DiscoverTargets, 1).debug_endpoint_unreachable());
+        // 最后一轮卡在桥接安装（端点还活着只是会话坏了）同样不适用。
+        assert!(!failure(InjectionPhase::InstallBridge, 1).debug_endpoint_unreachable());
+        assert!(!failure(InjectionPhase::VerifyRequestGate, 2).debug_endpoint_unreachable());
     }
 
     #[test]
