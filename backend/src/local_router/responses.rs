@@ -2207,6 +2207,38 @@ impl RouterServer {
                         .await;
                 }
             }
+            // `generate` 是 Responses WebSocket 的传输层字段:false 表示预热
+            // 请求,只暂存上下文换取续接用的 response_id,不要求产出内容。
+            // HTTP Responses 不认识该参数,剥掉再发又会把预热变成一次真实
+            // 生成,所以回退 HTTP 时由本地应答空响应;其他取值只剥除字段。
+            // 应答的 response_id 沿用上游形态:已暂存的历史记在这个 id 下,
+            // 客户端续接时由原生历史展开;resp_codey_ 前缀会误触发旧线路
+            // 历史恢复,不能用。
+            match upstream_body
+                .as_object_mut()
+                .and_then(|object| object.remove("generate"))
+            {
+                Some(Value::Bool(false)) => {
+                    let model = upstream_body
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .unwrap_or(resolved.upstream_model.as_str());
+                    let response = json!({
+                        "id": format!("resp_{}", Uuid::new_v4().simple()),
+                        "object": "response",
+                        "status": "completed",
+                        "model": model,
+                        "output": [],
+                        "usage": {"input_tokens":0,"output_tokens":0,"total_tokens":0},
+                    });
+                    return downstream.write_json(200, &response).await;
+                }
+                Some(_) => {
+                    body_mutated = true;
+                    encoded_body = None;
+                }
+                None => {}
+            }
             // A failed/reconnected WebSocket can restore full history after the
             // first normalization pass. Validate and normalize the exact body
             // that will be sent through the HTTP fallback as well.
