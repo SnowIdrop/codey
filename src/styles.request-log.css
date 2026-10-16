@@ -6,22 +6,19 @@
   color: var(--codey-text, #242629);
   font-size: 13px;
 }
-.request-log-header, .request-log-heading, .request-log-actions,
-.request-log-overview-heading, .request-log-results-heading {
+.request-log-overview-heading {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   flex-shrink: 0;
 }
-.request-log-heading { justify-content: flex-start; flex-wrap: wrap; gap: 10px; }
-.request-log-eyebrow { margin: 0 0 2px; color: var(--codey-muted, #73767d); font-size: 10px; letter-spacing: .08em; }
-.request-log-heading h1 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -.03em; line-height: 1.25; }
-.request-log-actions { gap: 8px; }
 
 /* 筛选与概览直接落在画布上，不再叠加边框卡片，减少层层嵌套的盒感。 */
 .request-log-filters { flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; }
 .request-log-filter-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 12px; }
+/* 记录状态与页面操作收进筛选行右端，不再单独占用页头。 */
+.request-log-meta { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; margin-left: auto; }
 .request-log-search { display: flex; gap: 6px; align-items: center; flex: 1 1 280px; min-width: 240px; max-width: 480px; }
 
 .request-log-overview { flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; }
@@ -54,19 +51,32 @@
 .request-log-analytics-section { min-width: 0; display: flex; flex-direction: column; }
 .request-log-analytics-title { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 0 2px 6px; }
 .request-log-analytics-scroll { max-height: 144px; overflow: auto; border: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), .06); border-radius: 6px; }
+/* 统计表：HeroUI Table 覆写密度——小字号、紧凑行距、表头吸顶。 */
+.request-log-analytics-table { font-size: 11px; }
+.request-log-analytics-thead { position: sticky; top: 0; z-index: 1; }
+.request-log-analytics-th {
+  height: auto;
+  padding: 6px 10px;
+  font-size: 10px;
+  font-weight: 500;
+  white-space: nowrap;
+  text-align: left;
+}
+.request-log-analytics-th::after { content: none; }
+.request-log-analytics-td { padding: 4px 10px; }
 
 .request-log-results { min-height: 220px; }
-.request-log-results-heading { padding: 9px 14px; border-bottom: 1px solid var(--codey-border, #e7e8eb); }
-.request-log-results-heading strong { font-weight: 600; }
-.request-log-results-heading strong span { margin-left: 7px; border-radius: 5px; padding: 1px 6px; background: var(--codey-surface-sunken, #f0f1f3); color: var(--codey-muted, #666b73); font-size: 11px; font-weight: 500; }
-.request-log-results-heading > span { color: var(--codey-muted, #73767d); font-size: 11px; }
 
-/* 页头时间窗口：与筛选条件一致的窗口读数。 */
-.request-log-window {
-  margin: 3px 0 0;
+/* 筛选范围内的记录总数：收在筛选行右端的元数据区，读数安静但始终可见。 */
+.request-log-total {
   font-size: 11px;
-  color: var(--codey-subtle, #8e8e93);
+  color: var(--codey-muted, #6e6e73);
+  white-space: nowrap;
+}
+.request-log-total strong {
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
+  color: var(--codey-text, #1d1d1f);
 }
 
 /* 分段状态筛选：与列表判定 pill 共用色点词汇。 */
@@ -119,10 +129,8 @@
 .request-log-filter-facets { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 
 /* 生效筛选 chips：每条 chip 可单独移除，避免逐个回退下拉框。 */
-.request-log-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.request-log-chips { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 6px; }
 .request-log-chip {
-  display: inline-flex;
-  align-items: center;
   gap: 4px;
   max-width: 280px;
   padding: 2px 4px 2px 8px;
@@ -134,23 +142,6 @@
   color: var(--codey-text-soft, #48484a);
 }
 .request-log-chip-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.request-log-chip-remove {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  flex-shrink: 0;
-  border: 0;
-  border-radius: 4px;
-  cursor: pointer;
-  background: transparent;
-  color: var(--codey-subtle, #8e8e93);
-}
-.request-log-chip-remove:hover {
-  background: rgba(var(--codey-ink-rgb, 0, 0, 0), .06);
-  color: var(--codey-text, #1d1d1f);
-}
 .request-log-chips-clear {
   border: 0;
   background: transparent;
@@ -163,80 +154,89 @@
 .request-log-chips-clear:hover { text-decoration: underline; }
 
 /* ── 请求流 ─────────────────────────────────────────────────────────────
-   流式行：表头与每行共享同一份列模板，容器宽于最小宽度时 fr 列同步伸展，
-   窄于最小宽度时整体横向滚动。容器查询在更窄时把行折叠成三行堆叠记录。 */
+   HeroUI Table：ScrollContainer 承担横向滚动与容器查询，表头（thead）吸顶；
+   table-layout:fixed 取表头单元格宽度为列宽，标识列全部固定像素，耗时/
+   用量/缓存三个读数列平分剩余宽度——宽屏下供应商与模型也不会被拉成
+   大片空白。容器查询在更窄时把行折叠成三行堆叠记录。 */
 .request-log-stream {
-  --reqlog-cols: minmax(148px, 176px) 96px minmax(140px, 1.1fr) minmax(190px, 1.5fr) 74px 152px 170px 104px 14px;
-  --reqlog-gap: 14px;
   --reqlog-pad: 14px;
-  --reqlog-min: 1248px;
+  --reqlog-min: 1350px;
   container-type: inline-size;
   container-name: reqlog;
   min-height: 0;
   flex: 1;
-  overflow: auto;
-  position: relative;
+  grid-template-rows: minmax(0, 1fr);
 }
 .request-log-stream.is-refreshing { opacity: .75; transition: opacity .15s ease; }
-.request-log-stream-header {
-  display: grid;
-  grid-template-columns: var(--reqlog-cols);
-  gap: var(--reqlog-gap);
-  align-items: center;
-  width: 100%;
+.request-log-stream-scroll { min-height: 0; overflow: auto; }
+.request-log-table {
   min-width: var(--reqlog-min);
-  height: 34px;
-  padding: 0 var(--reqlog-pad);
+  table-layout: fixed;
+  font-size: 12px;
+  color: var(--codey-text, #1d1d1f);
+}
+.request-log-stream-header {
   position: sticky;
   top: 0;
   z-index: 3;
   background: var(--codey-surface-muted, #fafafb);
-  border-bottom: 1px solid var(--codey-border, #e7e8eb);
   font-size: 11px;
   font-weight: 600;
   color: var(--codey-muted, #6e6e73);
   letter-spacing: .02em;
   user-select: none;
 }
-.request-log-th { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.request-log-th {
+  height: 34px;
+  padding: 0 7px;
+  border-bottom: 1px solid var(--codey-border, #e7e8eb);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.request-log-th::after { content: none; }
+.request-log-th:first-child { padding-left: var(--reqlog-pad); }
+.request-log-th:last-child { padding-right: var(--reqlog-pad); }
 /* 数字列右对齐，指标在表格右侧收成一条整齐的读数列。 */
 .request-log-th-latency,
 .request-log-th-tokens,
-.request-log-th-cache { text-align: right; }
+.request-log-th-cache,
 .request-log-th-chevron { text-align: right; }
-.request-log-stream-body { width: 100%; min-width: var(--reqlog-min); }
+/* 徽章列居中：协议与思考强度的胶囊在窄列里对中排布。 */
+.request-log-th-protocol,
+.request-log-th-effort { text-align: center; }
+/* 列宽模板：标识列按需取固定像素；耗时/用量/缓存不设宽，三列平分
+   剩余宽度，读数仍靠右钉齐。 */
+.request-log-th-time { width: 300px; }
+.request-log-th-status { width: 120px; }
+.request-log-th-provider { width: 200px; }
+.request-log-th-protocol { width: 88px; }
+.request-log-th-model { width: 210px; }
+.request-log-th-effort { width: 100px; }
+.request-log-th-chevron { width: 30px; }
 .request-log-row {
-  display: grid;
-  grid-template-columns: var(--reqlog-cols);
-  gap: var(--reqlog-gap);
-  align-items: center;
-  width: 100%;
-  min-height: 62px;
-  padding: 10px var(--reqlog-pad);
-  border-bottom: 1px solid var(--codey-border-subtle, rgba(0, 0, 0, .05));
+  height: 62px;
   cursor: pointer;
-  position: relative;
   transition: background-color .12s ease;
+}
+.request-log-td {
+  padding: 10px 7px;
+  height: auto;
+  background: transparent;
+  border-bottom: 1px solid var(--codey-border-subtle, rgba(0, 0, 0, .05));
+  vertical-align: middle;
   font-size: 12px;
   color: var(--codey-text, #1d1d1f);
 }
-.request-log-row:last-child { border-bottom: 0; }
+.request-log-td:first-child { padding-left: var(--reqlog-pad); }
+.request-log-td:last-child { padding-right: var(--reqlog-pad); }
+.request-log-row:last-child .request-log-td { border-bottom: 0; }
 @media (hover: hover) {
   .request-log-row:hover { background: var(--codey-surface-muted, #fafafc); }
 }
 .request-log-row.is-selected { background: var(--codey-surface-muted, #fafafc); }
-.request-log-row.is-selected::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  width: 3px;
-  background: var(--codey-blue, #007aff);
-}
-.request-log-row:focus-visible {
-  outline: 2px solid var(--codey-blue, #007aff);
-  outline-offset: -2px;
+.request-log-row.is-selected .request-log-td:first-child {
+  box-shadow: inset 3px 0 0 0 var(--codey-blue, #007aff);
 }
 .request-log-cell {
   min-width: 0;
@@ -247,7 +247,11 @@
 }
 .request-log-cell-latency,
 .request-log-cell-tokens,
-.request-log-cell-cache { align-items: flex-end; }
+.request-log-cell-cache,
+.request-log-cell-chevron { align-items: flex-end; }
+/* 思考强度列：胶囊包裹读数居中，长预算值截断后由悬浮提示兜底。 */
+.request-log-cell-effort { align-items: center; }
+.request-log-cell-effort .request-log-meta-tag { max-width: 100%; overflow: hidden; }
 /* 偶数行淡底：宽表里的横向视线引导，悬停与选中仍覆盖其上。 */
 .request-log-row:nth-child(even) { background: var(--codey-surface-muted, #fafafc); }
 @media (hover: hover) {
@@ -257,6 +261,12 @@
 .request-log-row.is-selected:nth-child(even) { background: rgba(var(--codey-ink-rgb, 0, 0, 0), .05); }
 
 /* 时间列：扫读时间 + 等宽 ID 子行，复制图标悬浮出现。 */
+.request-log-time-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
 .request-log-time {
   font-size: 12.5px;
   font-weight: 500;
@@ -366,7 +376,7 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* 模型名下的标记行：类别/子代理/思考强度等元数据胶囊，收在主读数下一行。 */
+/* 模型名下的标记行：请求类别等元数据胶囊，收在主读数下一行。 */
 .request-log-model-tags {
   display: flex;
   flex-wrap: wrap;
@@ -374,8 +384,7 @@
   gap: 4px;
   min-width: 0;
 }
-.request-log-kind-tag,
-.request-log-subagent-tag {
+.request-log-kind-tag {
   flex-shrink: 0;
   border-radius: 999px;
   padding: 0.5px 7px;
@@ -389,9 +398,22 @@
   color: var(--codey-muted, #61666e);
 }
 .request-log-subagent-tag {
-  background: var(--codey-purple-soft, #fbf2ff);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  border-radius: 4px;
+  padding: 0 4.5px;
+  height: 16px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: .02em;
+  white-space: nowrap;
+  cursor: default;
   color: var(--codey-purple, #7e22ce);
-  border-color: var(--codey-purple-border, #e9d5ff);
+  background: color-mix(in oklch, var(--codey-purple, #af52de) 12%, transparent);
+  border: 1px solid color-mix(in oklch, var(--codey-purple, #af52de) 28%, transparent);
 }
 /* 模型路由副行：映射后的发送模型用蓝箭头，上游回报的模型用琥珀箭头。 */
 .request-log-model-route {
@@ -527,8 +549,31 @@
   margin-top: 2px;
 }
 
-/* 缓存列：pill 颜色在琥珀与绿之间按命中率混色，低命中率不是失败所以不碰红。 */
-.request-log-cell-cache { align-items: flex-start; gap: 3px; }
+/* 缓存列：读取缓存与命中率上下两行对齐，按命中率混色。 */
+.request-log-cell-cache { align-items: flex-end; gap: 3px; }
+.request-log-cache-grid {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
+  cursor: help;
+}
+.request-log-cache-read {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-family: var(--codey-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--codey-text, #1d1d1f);
+  line-height: 1.3;
+  white-space: nowrap;
+}
+.request-log-cache-read svg {
+  color: var(--codey-muted, #6e6e73);
+  flex-shrink: 0;
+}
 .request-log-cache-pill {
   --cache-hue: color-mix(in oklch, var(--codey-green) var(--cache-rate, 0%), var(--codey-amber));
   display: inline-flex;
@@ -551,11 +596,12 @@
 
 .request-log-chevron { color: var(--codey-subtle, #8e8e93); justify-self: end; flex-shrink: 0; }
 
-/* 窄容器下的堆叠记录：双事实单元格用 display:contents 拆开，
+/* 窄容器下的堆叠记录：表格退化为块级，单元格用 display:contents 拆开，
    伪元素换行使每条记录稳定成三行——模型与判定、供应商与用量、时间与耗时。 */
 @container reqlog (max-width: 780px) {
   .request-log-stream-header { display: none; }
-  .request-log-stream-body { min-width: 0; }
+  .request-log-table { display: block; min-width: 0; }
+  .request-log-stream-body { display: block; min-width: 0; }
   .request-log-row {
     display: flex;
     flex-wrap: wrap;
@@ -563,9 +609,13 @@
     column-gap: 10px;
     row-gap: 5px;
     min-width: 100%;
-    min-height: 0;
+    height: auto;
     padding: 11px 14px;
+    border-bottom: 1px solid var(--codey-border-subtle, rgba(0, 0, 0, .05));
   }
+  .request-log-td { display: contents; }
+  .request-log-row.is-selected { box-shadow: inset 3px 0 0 0 var(--codey-blue, #007aff); }
+  .request-log-row.is-selected .request-log-td:first-child { box-shadow: none; }
   .request-log-cell { flex-direction: row; align-items: baseline; gap: 6px; }
   .request-log-cell-time,
   .request-log-cell-model,
@@ -574,6 +624,8 @@
   /* 第一行：模型与思考档位为主，判定靠右。 */
   .request-log-model-main { order: 10; flex: 0 1 auto; min-width: 0; overflow: hidden; }
   .request-log-model-tags { order: 12; }
+  .request-log-cell-effort { order: 14; }
+  .request-log-cell-effort:has(> .request-log-none) { display: none; }
   .request-log-model-route { display: none; }
   .request-log-cell-status { order: 15; margin-left: auto; }
   .request-log-cell-model::after { content: ""; order: 18; flex: 0 0 100%; height: 0; }
@@ -585,47 +637,54 @@
   .request-log-cell-tokens::after { content: ""; order: 45; flex: 0 0 100%; height: 0; }
 
   /* 第三行：时间、协议与耗时块收进一行安静的元数据。 */
-  .request-log-time { order: 50; font-size: 11px; font-weight: 400; color: var(--codey-muted, #6e6e73); }
+  .request-log-time-row { order: 50; }
+  .request-log-time { font-size: 11px; font-weight: 400; color: var(--codey-muted, #6e6e73); }
   .request-log-id-line { display: none; }
   .request-log-cell-protocol { order: 52; }
   .request-log-cell-latency { order: 55; margin-left: auto; }
 
   /* 折叠掉次要的列与装饰，细节都在详情抽屉里。 */
   .request-log-cell-cache,
-  .request-log-chevron,
+  .request-log-cell-chevron,
   .request-log-status-sub { display: none; }
 }
 
 .request-log-protocol {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
+  min-width: 36px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 5px;
+  font-family: var(--codey-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 10px;
   font-weight: 600;
   letter-spacing: .04em;
-  border-radius: 4px;
-  padding: 1.5px 6px;
-  font-size: 10px;
-  line-height: 1.3;
+  line-height: 1;
+  white-space: nowrap;
   border: 1px solid transparent;
+  box-shadow: 0 1px 2px rgba(var(--codey-ink-rgb, 0, 0, 0), .02);
 }
 .request-log-protocol-http {
-  background: var(--codey-blue-soft, #eff6ff);
-  color: var(--codey-blue, #1d4ed8);
-  border-color: var(--codey-blue-border, #bfdbfe);
+  background: color-mix(in oklch, var(--codey-blue, #007aff) 10%, transparent);
+  color: var(--codey-blue, #007aff);
+  border-color: color-mix(in oklch, var(--codey-blue, #007aff) 26%, transparent);
 }
 .request-log-protocol-sse {
-  background: var(--codey-green-soft, #ecfdf5);
+  background: color-mix(in oklch, var(--codey-green, #34c759) 10%, transparent);
   color: var(--codey-green, #047857);
-  border-color: var(--codey-green-border, #a7f3d0);
+  border-color: color-mix(in oklch, var(--codey-green, #34c759) 26%, transparent);
 }
 .request-log-protocol-ws {
-  background: var(--codey-purple-soft, #faf5ff);
+  background: color-mix(in oklch, var(--codey-purple, #af52de) 10%, transparent);
   color: var(--codey-purple, #7e22ce);
-  border-color: var(--codey-purple-border, #e9d5ff);
+  border-color: color-mix(in oklch, var(--codey-purple, #af52de) 26%, transparent);
 }
 .request-log-protocol-grpc {
-  background: var(--codey-amber-soft, #fff7ed);
-  color: var(--codey-amber, #c2410c);
-  border-color: var(--codey-amber-border, #fed7aa);
+  background: color-mix(in oklch, var(--codey-amber, #ff9500) 10%, transparent);
+  color: var(--codey-amber, #b45309);
+  border-color: color-mix(in oklch, var(--codey-amber, #ff9500) 26%, transparent);
 }
 .request-log-protocol-default {
   background: var(--codey-surface-sunken, #f1f2f4);
@@ -741,16 +800,11 @@
 }
 @media (max-width: 600px) {
   .request-log-workspace { overflow: auto; }
-  .request-log-header { align-items: flex-start; flex-direction: column; gap: 10px; }
-  .request-log-heading { width: 100%; justify-content: space-between; gap: 8px; }
-  .request-log-heading h1 { font-size: 19px; }
-  .request-log-actions { width: 100%; }
-  .request-log-actions .button { flex: 1; }
+  .request-log-meta { flex-basis: 100%; }
   .request-log-search { flex-basis: 100%; max-width: 100%; }
   .request-log-overview-heading { flex-wrap: wrap; gap: 6px; }
   .request-log-overview-heading > div { flex-wrap: wrap; }
   .request-log-results { flex: 1 0 360px; }
-  .request-log-results-heading > span { max-width: 140px; text-align: right; }
   .request-log-pagination nav { display: flex; flex-wrap: wrap; gap: 4px; }
   .request-log-detail > div:first-child { padding: 16px; flex-wrap: wrap; gap: 12px; }
   .request-log-detail > div:nth-child(2) { padding: 16px; }

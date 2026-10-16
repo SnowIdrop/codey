@@ -227,7 +227,7 @@ test("request log viewer uses a full-screen server-paginated searchable table", 
   assert.match(viewer, /\{ label: "按官方账号统计", value: "official_account" \}/);
   assert.match(viewer, /official_account: "官方账号"/);
   assert.match(viewer, /官方账号：\$\{officialAccountLabel\(item\.officialAccountId\)\}/);
-  assert.match(viewer, />\s*官\s*<\/span>/);
+  assert.match(viewer, /<Chip[^>]*title="官方账号"[^>]*>\s*官\s*<\/Chip>/);
   assert.doesNotMatch(viewer, />官方账号<\/span>/);
   // 独立页面拿不到启动期能力标志，存在官方线路时仍要读取账号列表。
   assert.match(viewer, /profile\.officialAccount \|\| Boolean\(profile\.officialAccountId\)/);
@@ -242,10 +242,10 @@ test("request log viewer uses a full-screen server-paginated searchable table", 
   assert.match(styles, /\.request-log-protocol-ws/);
   assert.match(styles, /\.request-log-pagination \.pagination[\s\S]*width:\s*auto/);
   assert.match(viewer, /<Drawer[\s\S]*onOpenChange=\{[^}]*setSelectedItem\(null\)/);
-  assert.match(viewer, /role="button"[\s\S]{0,400}?onClick=\{\(event\) => \{[\s\S]{0,400}?onOpen\(item\)/);
-  // 行内控件不再冒泡成行激活：复制按钮自己阻断冒泡，行侧再按目标过滤一次。
-  assert.match(viewer, /event\.stopPropagation\(\)/);
-  assert.match(viewer, /closest\("button, a, input, \[data-log-row-control\]"\)/);
+  assert.match(viewer, /<Table\.Row[\s\S]*?onAction=\{\(\) => onOpen\(item\)\}/);
+  // Table 行通过 onAction 打开详情，复制按钮仍阻断点击冒泡。
+  assert.doesNotMatch(viewer, /<Table\.Row[^>]*onClick=/);
+  assert.match(viewer, /function CopyIdButton\([\s\S]*?onClick=\{\(event\) => \{[\s\S]*?event\.stopPropagation\(\);\s*onCopy\(id, \{ kind, copiedKey \}\)/);
   assert.match(viewer, /aria-label=\{`复制请求 ID：\$\{item\.requestId\}`\}/);
   assert.match(viewer, /cursorMode: true/);
   assert.match(viewer, /nextResult\.nextCursor/);
