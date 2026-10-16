@@ -990,10 +990,7 @@ fn model_is_hidden(model: &Value) -> bool {
     model.get("visibility").and_then(Value::as_str) == Some("hide")
 }
 
-fn instruction_template_for<'a>(
-    slug: &str,
-    templates: &'a [Value],
-) -> Option<&'a Value> {
+fn instruction_template_for<'a>(slug: &str, templates: &'a [Value]) -> Option<&'a Value> {
     let same_slug = templates.iter().find(|model| {
         model
             .get("slug")

@@ -215,10 +215,7 @@ pub(super) fn gate_synthetic_native_web_search(
     gate_cached_native_web_search(model, allowed_model_keys);
 }
 
-fn gate_cached_native_web_search(
-    model: &mut Value,
-    allowed_model_keys: &HashSet<String>,
-) {
+fn gate_cached_native_web_search(model: &mut Value, allowed_model_keys: &HashSet<String>) {
     let allowed = model
         .get("slug")
         .and_then(Value::as_str)
