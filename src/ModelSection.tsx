@@ -5,6 +5,7 @@ import {
   IconArchive,
   IconBolt,
   IconChartDonut,
+  IconClipboard,
   IconCpu,
   IconEdit as Edit,
   IconEye,
@@ -46,6 +47,7 @@ import {
   PasswordInput,
   Select,
   Switch,
+  TextArea,
   Tooltip,
 } from "./components/ui";
 import { modelIdsEqual, modelKey, moveModelId, uniqueModelIds } from "./modelIds";
@@ -64,6 +66,11 @@ import {
   validateThirdPartyRouteShortName,
 } from "./routeShortNames";
 import { validateOutboundApiUrl, validateOutboundProxyUrl } from "./urlValidation";
+import {
+  parseNewApiConnectionInfo,
+  suggestRouteNamesFromUrl,
+  type NewApiConnectionInfo,
+} from "./routeConnectionImport";
 import { invoke } from "./api";
 import { listOfficialAccounts, rememberOfficialAccounts } from "./officialAccountsRequests";
 import { readHostTheme } from "./overlayTheme";
@@ -272,7 +279,19 @@ function ModelSectionComponent({
     useState<OfficialRouteSettingsDraft | null>(null);
   const [officialDialogScope, setOfficialDialogScope] =
     useState<OfficialRouteDialogScope | null>(null);
+  // 「快速导入」粘贴面板与一次性状态；新建第三方线路时可用。
+  const [routeImportOpen, setRouteImportOpen] = useState(false);
+  const [routeImportText, setRouteImportText] = useState("");
+  const [routeImportError, setRouteImportError] = useState("");
+  const [routeImportApplied, setRouteImportApplied] = useState(false);
   const routeConfigReadOnly = !config.localRouterEnabled;
+
+  const resetRouteImport = useCallback(() => {
+    setRouteImportOpen(false);
+    setRouteImportText("");
+    setRouteImportError("");
+    setRouteImportApplied(false);
+  }, []);
 
   useEffect(() => {
     if (!routeConfigReadOnly) return;
@@ -281,7 +300,8 @@ function ModelSectionComponent({
     setOfficialRouteDraft(null);
     setOfficialDialogScope(null);
     setRouteApiKeyVisible(false);
-  }, [routeConfigReadOnly]);
+    resetRouteImport();
+  }, [resetRouteImport, routeConfigReadOnly]);
 
   // 官方线路的线路名、短名称、网关和代理保存在所属账号记录里，保存入口在线路卡片上。
   const refreshOfficialAccounts = useCallback(async () => {
@@ -493,6 +513,7 @@ function ModelSectionComponent({
     setHeaderError("");
     setOfficialModelDraft([]);
     setOfficialDialogScope(null);
+    resetRouteImport();
     setRouteDialogOpen(true);
   };
   const openRouteDialog = (
@@ -532,6 +553,7 @@ function ModelSectionComponent({
       setOfficialModelContextDraft({});
     }
     setOfficialDialogScope(official ? officialScope : null);
+    resetRouteImport();
     setRouteDialogOpen(true);
   };
   const updateRouteDraft = (patch: Partial<Profile>) => {
@@ -539,6 +561,71 @@ function ModelSectionComponent({
   };
   const updateOfficialRouteDraft = (patch: Partial<OfficialRouteSettingsDraft>) => {
     setOfficialRouteDraft((current) => current ? { ...current, ...patch } : current);
+  };
+  // 解析成功即写入草稿；空缺的线路名和短名称按连接地址补建议值。
+  const applyRouteConnectionInfo = (info: NewApiConnectionInfo) => {
+    const suggestions = suggestRouteNamesFromUrl(
+      info.url,
+      MAX_ROUTE_NAME_CHARACTERS,
+      MAX_ROUTE_SHORT_NAME_CHARACTERS,
+    );
+    setRouteDraft((current) => {
+      if (!current) return current;
+      const suggestedShortName =
+        suggestions.shortName &&
+        !validateThirdPartyRouteShortName(
+          suggestions.shortName,
+          config.profiles,
+          current.id,
+        )
+          ? suggestions.shortName
+          : "";
+      return {
+        ...current,
+        baseUrl: info.url,
+        apiKey: info.key,
+        name: current.name || suggestions.name,
+        shortName: current.shortName || suggestedShortName,
+      };
+    });
+    setRouteImportOpen(false);
+    setRouteImportText("");
+    setRouteImportError("");
+    setRouteImportApplied(true);
+  };
+  // 优先读剪贴板，命中连接信息直接填入；读不到或不匹配时展开手动粘贴面板。
+  const handleRouteQuickImport = async () => {
+    if (routeImportOpen) {
+      setRouteImportOpen(false);
+      return;
+    }
+    setRouteImportApplied(false);
+    let clipboardText: string | null = null;
+    try {
+      clipboardText = await navigator.clipboard.readText();
+    } catch {
+      clipboardText = null;
+    }
+    const info = parseNewApiConnectionInfo(clipboardText);
+    if (info) {
+      applyRouteConnectionInfo(info);
+      return;
+    }
+    setRouteImportError(
+      clipboardText?.trim()
+        ? "剪贴板内容不是有效的 New API 连接信息，请手动粘贴"
+        : "",
+    );
+    setRouteImportOpen(true);
+  };
+  const handleRouteImportTextChange = (value: string) => {
+    setRouteImportText(value);
+    const info = parseNewApiConnectionInfo(value);
+    if (info) {
+      applyRouteConnectionInfo(info);
+    } else {
+      setRouteImportError(value.trim() ? "不是有效的 New API 连接信息" : "");
+    }
   };
   const openHeadersDialog = (profile: Profile) => {
     setHeaderDialogProfile(profile);
@@ -652,6 +739,11 @@ function ModelSectionComponent({
     : undefined;
   const draftOfficialAccountLabel =
     displayedEmail(draftOfficialAccount) || draftOfficialAccount?.id || "";
+  const isNewRouteDraft = Boolean(
+    routeDraft &&
+    routeDraft.authMode !== "officialAccount" &&
+    !config.profiles.some((profile) => profile.id === routeDraft.id),
+  );
 
   const preferredProfile =
     config.profiles.find((profile) => profile.id === config.activeProfileId) ??
@@ -1275,6 +1367,7 @@ function ModelSectionComponent({
               setOfficialRouteDraft(null);
               setOfficialDialogScope(null);
               setRouteApiKeyVisible(false);
+              resetRouteImport();
             }
           }
         }}
@@ -1301,6 +1394,20 @@ function ModelSectionComponent({
                       ? "编辑线路"
                       : "新增线路"}
                 </DialogTitle>
+                {isNewRouteDraft && (
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    className="ml-auto shrink-0"
+                    disabled={isBusy}
+                    title="粘贴 New API「复制连接串」内容，自动填入 URL 与 Key"
+                    aria-expanded={routeImportOpen}
+                    onClick={() => void handleRouteQuickImport()}
+                  >
+                    <IconClipboard size={13} aria-hidden="true" />
+                    <span>快速导入</span>
+                  </Button>
+                )}
               </div>
               <DialogDescription>
                 {routeDraft.authMode === "officialAccount"
@@ -1539,6 +1646,46 @@ function ModelSectionComponent({
               </div>
             ) : (
               <div className="route-editor-form">
+                {isNewRouteDraft && routeImportOpen && (
+                  <div className="route-import-panel">
+                    <label className="route-field">
+                      <span>New API 连接信息</span>
+                      <TextArea
+                        aria-label="New API 连接信息"
+                        aria-invalid={Boolean(routeImportError)}
+                        aria-describedby={
+                          routeImportError ? "route-import-error" : "route-import-hint"
+                        }
+                        value={routeImportText}
+                        disabled={isBusy}
+                        rows={2}
+                        autoFocus
+                        className="route-import-input font-mono text-xs"
+                        placeholder='{"_type":"newapi_channel_conn","key":"sk-…","url":"https://api.example.com"}'
+                        onChange={(event) => handleRouteImportTextChange(event.target.value)}
+                      />
+                      {routeImportError ? (
+                        <small
+                          id="route-import-error"
+                          className="text-[var(--codey-red,#d70015)]"
+                          role="alert"
+                        >
+                          {routeImportError}
+                        </small>
+                      ) : (
+                        <small id="route-import-hint" className="route-field-hint">
+                          粘贴 New API 令牌的「复制连接串」内容，识别后自动填入 URL 与 Key
+                        </small>
+                      )}
+                    </label>
+                  </div>
+                )}
+                {isNewRouteDraft && routeImportApplied && (
+                  <div className="route-import-status" role="status">
+                    <Check size={13} aria-hidden="true" />
+                    <span>已从连接信息填入 URL 与 Key，确认短名称后保存</span>
+                  </div>
+                )}
                 <div className="route-editor-row route-editor-row-names">
                   <label className="route-field">
                     <span>短名称 {REQUIRED_FIELD_MARKER}</span>
@@ -1905,6 +2052,7 @@ function ModelSectionComponent({
                   setOfficialDialogScope(null);
                   setRouteValidationAttempted(false);
                   setRouteApiKeyVisible(false);
+                  resetRouteImport();
                 }}
               >
                 取消
