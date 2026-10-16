@@ -278,7 +278,7 @@ test("preview saving blank official long names survives derivation and missing s
 test("the route-name limit is shared by the renderer and the official account command", async () => {
   const [settings, backendConfig, officialAccounts] = await Promise.all([
     readFile(new URL("../src/officialRouteSettings.ts", import.meta.url), "utf8"),
-    readFile(new URL("../backend/src/config.rs", import.meta.url), "utf8"),
+    readFile(new URL("../backend/src/config/types.rs", import.meta.url), "utf8"),
     readFile(
       new URL("../backend/src/commands/official_accounts.rs", import.meta.url),
       "utf8",
