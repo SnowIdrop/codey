@@ -594,28 +594,34 @@ impl CliWrapperReadiness {
             marker,
         };
         readiness.mark(CliWrapperMarkerStatus::Launching, None);
-        let stream = match connect() {
-            Ok(stream) => Some(stream),
-            Err(error) => {
-                // 端口被拒绝说明启动器已不再监听（例如 app-server 重启），属正常情况。
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_none_or(|error| error.kind() != std::io::ErrorKind::ConnectionRefused)
-                {
-                    crate::error_log::record_failure(
-                        "compatibility_fallback",
-                        "connect_cli_wrapper_handshake",
-                        format!("{error:#}"),
-                        serde_json::json!({ "markerPresent": readiness.marker.is_some() }),
-                    );
+        let tcp_available = handshake_tcp_channel_available();
+        let stream = if tcp_available {
+            match connect() {
+                Ok(stream) => Some(stream),
+                Err(error) => {
+                    // 端口被拒绝说明启动器已不再监听（例如 app-server 重启），属正常情况。
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_none_or(|error| error.kind() != std::io::ErrorKind::ConnectionRefused)
+                    {
+                        crate::error_log::record_failure(
+                            "compatibility_fallback",
+                            "connect_cli_wrapper_handshake",
+                            format!("{error:#}"),
+                            serde_json::json!({ "markerPresent": readiness.marker.is_some() }),
+                        );
+                    }
+                    None
                 }
-                None
             }
+        } else {
+            None
         };
         let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
             "launcher.cli_wrapper_handshake_connect",
             serde_json::json!({
                 "connected": stream.is_some(),
+                "tcpChannelAvailable": tcp_available,
                 "elapsedMs": started.elapsed().as_millis(),
             }),
         );
@@ -660,6 +666,48 @@ impl CliWrapperReadiness {
     fn executed(self) {
         self.mark_executed();
     }
+}
+
+/// Windows 打包（MSIX/商店版）Codex 派生的子进程继承 AppContainer 令牌：
+/// 回环 TCP 出站被网络隔离拦死，握手注定烧满连接预算后超时，且每次启动
+/// 都往错误日志记一条假失败。检测到自己跑在 AppContainer 里就跳过 TCP
+/// 通道，汇报只剩 marker 文件——文件写不受这条隔离影响。
+#[cfg(windows)]
+fn handshake_tcp_channel_available() -> bool {
+    !running_in_app_container()
+}
+
+#[cfg(all(not(windows), any(target_os = "macos", test)))]
+fn handshake_tcp_channel_available() -> bool {
+    true
+}
+
+#[cfg(windows)]
+fn running_in_app_container() -> bool {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TokenIsAppContainer};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = HANDLE::default();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
+        return false;
+    }
+    // 让 OwnedHandle 负责关闭；查不到令牌信息时按非隔离进程处理，不影响握手。
+    let token = unsafe { OwnedHandle::from_raw_handle(token.0) };
+    let mut value = 0u32;
+    let mut returned = 0u32;
+    unsafe {
+        GetTokenInformation(
+            HANDLE(token.as_raw_handle()),
+            TokenIsAppContainer,
+            Some((&mut value as *mut u32).cast()),
+            std::mem::size_of::<u32>() as u32,
+            &mut returned,
+        )
+    }
+    .is_ok()
+        && value != 0
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
