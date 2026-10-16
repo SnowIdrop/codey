@@ -21,6 +21,7 @@ mod fs_util;
 mod hook_io;
 mod http_response;
 mod launch_proxy;
+mod launch_proxy_relay;
 mod launcher;
 mod local_router;
 mod maintenance_lock;

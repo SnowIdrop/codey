@@ -87,7 +87,7 @@ fn upstream_proxy_urls_validate_scheme_and_host() {
 }
 
 #[test]
-fn codex_launch_proxy_rejects_credentials_paths_and_portless_socks() {
+fn codex_launch_proxy_rejects_paths_and_portless_socks_but_allows_credentials() {
     for accepted in [
         "http://127.0.0.1:7890",
         "https://proxy.example.com:8443",
@@ -95,14 +95,14 @@ fn codex_launch_proxy_rejects_credentials_paths_and_portless_socks() {
         "socks5://127.0.0.1:1080",
         "socks5h://proxy.example.com:1080",
         "http://[::1]:7890",
+        // 凭据交给本地认证中继，不交给 Chromium 命令行。
+        "http://user:pass@proxy.example.com:8080",
+        "socks5://user@127.0.0.1:1080",
     ] {
         assert!(validate_codex_launch_proxy(accepted).is_ok(), "{accepted}");
     }
     for rejected in [
-        // Chromium 命令行代理不支持认证。
-        "http://user:pass@proxy.example.com:8080",
-        "socks5://user@127.0.0.1:1080",
-        // 只允许协议、地址和端口；非特殊协议的 path 解析为空串。
+        // 只允许协议、地址、端口和认证信息；非特殊协议的 path 解析为空串。
         "http://127.0.0.1:7890/v1",
         "socks5://127.0.0.1:1080/v1",
         "http://127.0.0.1:7890?x=1",
@@ -110,6 +110,8 @@ fn codex_launch_proxy_rejects_credentials_paths_and_portless_socks() {
         // Chromium 需要 host:port，SOCKS 不能省略端口。
         "socks5://127.0.0.1",
         "socks5h://proxy.example.com",
+        // RFC 1929 的用户名和密码各限 255 字节。
+        &format!("socks5://{}@127.0.0.1:1080", "u".repeat(256)),
         // 通用约束沿用线路上游代理。
         "ftp://proxy.example.com:21",
         "127.0.0.1:7890",

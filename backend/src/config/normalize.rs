@@ -129,19 +129,27 @@ pub(crate) fn validate_outbound_proxy_url(value: &str, label: &str) -> Result<()
     Ok(())
 }
 
-/// 校验 Codex 启动代理地址。
+/// Codex 启动代理地址。除线路上游代理的通用要求外，这里叠加更严的约束：
+/// 只允许协议、地址、端口和认证信息；SOCKS 地址必须显式端口，其
+/// RFC 1929 凭据限长 255 字节。凭据不会交给 Chromium 命令行，启动时由
+/// 本地认证中继注入上游。
 pub(crate) fn validate_codex_launch_proxy(value: &str) -> Result<(), String> {
     validate_outbound_proxy_url(value, "Codex 启动代理")?;
     let url = reqwest::Url::parse(value).expect("启动代理地址已通过校验");
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("Codex 启动代理不能包含用户名或密码；Chromium 命令行代理不支持认证".into());
-    }
     // 非特殊协议（socks5/socks5h）解析出的 path 是空串而非 "/"。
     if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
-        return Err("Codex 启动代理只能包含协议、地址和端口".into());
+        return Err("Codex 启动代理只能包含协议、地址、端口和认证信息".into());
     }
-    if matches!(url.scheme(), "socks5" | "socks5h") && url.port().is_none() {
-        return Err("Codex 启动代理的 SOCKS 地址必须带端口".into());
+    if matches!(url.scheme(), "socks5" | "socks5h") {
+        if url.port().is_none() {
+            return Err("Codex 启动代理的 SOCKS 地址必须带端口".into());
+        }
+        let username = percent_encoding::percent_decode_str(url.username()).collect::<Vec<u8>>();
+        let password = percent_encoding::percent_decode_str(url.password().unwrap_or_default())
+            .collect::<Vec<u8>>();
+        if crate::launch_proxy_relay::socks_credentials_too_long(&username, &password) {
+            return Err("Codex 启动代理的 SOCKS 用户名或密码不能超过 255 字节".into());
+        }
     }
     Ok(())
 }

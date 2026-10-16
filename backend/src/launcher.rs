@@ -1845,7 +1845,11 @@ async fn spawn_and_inject_runtime(
     runtime_config_overrides: &[String],
 ) -> Result<SpawnedRenderer> {
     let spawn_inject_started = Instant::now();
-    let launch_proxy = crate::launch_proxy::CodexLaunchProxy::resolve(&config.codex_launch_proxy)?;
+    let launch_proxy =
+        match crate::launch_proxy::CodexLaunchProxy::resolve(&config.codex_launch_proxy)? {
+            Some(plan) => Some(plan.start().await?),
+            None => None,
+        };
     let mut spawned = match spawn_codex(
         &mut storage.app_dir,
         patch.debug_port,
