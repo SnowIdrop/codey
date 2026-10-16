@@ -7644,6 +7644,117 @@ fn streaming_waits_for_a_complete_declared_function_name() {
     assert_eq!(second[1]["delta"], "{}");
 }
 
+#[tokio::test]
+async fn streaming_finish_preserves_buffered_function_call_and_continuation_history() {
+    for incomplete_reason in [None, Some("max_output_tokens")] {
+        let mut request = json!({
+            "model":"provider-model",
+            "input":[{"role":"user","content":"read the file"}],
+            "tools":[{"type":"function","name":"read_file","parameters":{"type":"object"}}]
+        });
+        let converted = responses_to_chat_completions_request(&request).unwrap();
+        let (socket, mut peer) = local_websocket_pair().await;
+        let mut downstream = WebSocketResponsesDownstream::new(socket);
+        assert!(
+            !downstream
+                .prepare_adapted_response_context(&mut request)
+                .unwrap()
+        );
+        let mut stream = ResponsesSseState::new("provider-model", &converted.tool_bridge);
+        stream.start(&mut downstream).await.unwrap();
+        let events = stream
+            .tool_delta(
+                0,
+                Some("call-buffered-read"),
+                Some("read"),
+                Some("{\"path\":\"a.txt\"}"),
+                None,
+            )
+            .unwrap();
+        assert!(events.is_empty());
+        stream
+            .finish(&mut downstream, None, incomplete_reason)
+            .await
+            .unwrap();
+
+        let mut received = Vec::new();
+        let terminal = loop {
+            let message = tokio::time::timeout(Duration::from_secs(2), peer.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let WebSocketMessage::Text(text) = message else {
+                panic!("expected downstream JSON text frame");
+            };
+            let event: Value = serde_json::from_str(text.as_str()).unwrap();
+            let terminal = responses_event_is_terminal(&event);
+            received.push(event);
+            if terminal {
+                break received.last().unwrap();
+            }
+        };
+        assert_eq!(
+            terminal["type"],
+            if incomplete_reason.is_some() {
+                "response.incomplete"
+            } else {
+                "response.completed"
+            }
+        );
+        let output = terminal["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        let call = &output[0];
+        assert_eq!(call["type"], "function_call");
+        assert_eq!(call["name"], "read");
+        assert_eq!(call["call_id"], "call-buffered-read");
+        assert_eq!(call["arguments"], "{\"path\":\"a.txt\"}");
+        for kind in ["response.output_item.added", "response.output_item.done"] {
+            let items = received
+                .iter()
+                .filter(|event| event["type"] == kind)
+                .collect::<Vec<_>>();
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0]["output_index"], 0);
+            assert_eq!(items[0]["item"]["id"], call["id"]);
+            assert_eq!(items[0]["item"]["call_id"], call["call_id"]);
+        }
+        assert_eq!(
+            downstream.adapted_history.last.as_ref().unwrap().1.last(),
+            Some(call)
+        );
+
+        let mut continuation = json!({
+            "model":"provider-model",
+            "previous_response_id":terminal["response"]["id"],
+            "tools":request["tools"],
+            "input":[{
+                "type":"function_call_output",
+                "call_id":"call-buffered-read",
+                "output":"file contents"
+            }]
+        });
+        assert!(
+            downstream
+                .prepare_adapted_response_context(&mut continuation)
+                .unwrap()
+        );
+        let chat = responses_to_chat_completions_request(&continuation).unwrap();
+        let messages = chat.body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call-buffered-read");
+        assert_eq!(messages[1]["tool_calls"][0]["function"]["name"], "read");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(
+            messages[2]["tool_call_id"],
+            messages[1]["tool_calls"][0]["id"]
+        );
+        assert_eq!(messages[2]["content"], "file contents");
+    }
+}
+
 #[test]
 fn request_log_adapters_preserve_cache_write_usage_and_missing_values() {
     for writes in [None, Some(0_u64), Some(7)] {
