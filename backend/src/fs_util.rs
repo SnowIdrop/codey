@@ -58,7 +58,7 @@ pub(crate) fn acquire_exclusive_lock_with_timeout(
                 }
                 std::thread::sleep(retry.min(timeout.saturating_sub(elapsed)));
             }
-            Err(error) => return Err(error).with_context(|| lock_err_msg()),
+            Err(error) => return Err(error).with_context(&lock_err_msg),
         }
     }
 }
