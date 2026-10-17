@@ -320,12 +320,10 @@ async fn run_early_attach_prefetch(
                         };
                         if payload.get("method").and_then(Value::as_str)
                             == Some("Target.attachedToTarget")
-                        {
-                            if let Some(result) =
+                            && let Some(result) =
                                 handle_attached(&mut arm, debug_port, &payload).await
-                            {
-                                return Some(result);
-                            }
+                        {
+                            return Some(result);
                         }
                     }
                     Some(Ok(_)) => {}
@@ -415,9 +413,7 @@ async fn handle_attached(
         }),
     );
     if primary && waiting {
-        let Some(arm) = arm.take() else {
-            return None;
-        };
+        let arm = arm.take()?;
         // 先把自动挂载关掉再交还写端：晚到的窗口不再被暂停，resume 之后
         // 这条浏览器会话只为当前持有服务。本构建的 setAutoAttach 要求
         // waitForDebuggerOnStart 必填，关闭时也要带上。

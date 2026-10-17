@@ -1225,6 +1225,7 @@ struct RuntimeConfigRestoreContext<'a> {
     local_router_enabled: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn inject_initial_renderer(
     debug_port: u16,
     handler: codey_runtime_core::bridge::BridgeHandler,

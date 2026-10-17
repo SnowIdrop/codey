@@ -369,7 +369,7 @@ pub fn resolve_codex_app_dir_with_saved_checked(
         for path in &paths {
             validate_codex_app_dir(path)?;
         }
-        return finish_automatic_discovery(paths, diagnostics);
+        finish_automatic_discovery(paths, diagnostics)
     }
     #[cfg(not(windows))]
     Ok(resolve_codex_app_dir(None))

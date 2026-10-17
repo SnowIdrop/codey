@@ -730,6 +730,7 @@ pub fn selection_state(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn selection_state_with_manual_models(
     home: &Path,
     official_provider: bool,
