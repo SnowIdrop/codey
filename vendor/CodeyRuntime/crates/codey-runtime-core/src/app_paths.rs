@@ -2575,9 +2575,17 @@ mod tests {
 
         // A third-party launcher must not turn its own directory into the Codex app.
         assert_eq!(install_dir_from_selected_file(&third_party, true), None);
+        // Windows keeps rejecting the directory on its own: even when the
+        // selected-file sibling check is relaxed, the directory candidate
+        // still has no Codex launcher to start.
+        let expected = if cfg!(windows) {
+            None
+        } else {
+            Some(app_dir.as_path())
+        };
         assert_eq!(
             install_dir_from_selected_file(&third_party, false).as_deref(),
-            Some(app_dir.as_path())
+            expected
         );
 
         std::fs::write(app_dir.join("Codex.exe"), []).unwrap();

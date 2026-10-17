@@ -249,9 +249,23 @@ async fn startup_fallback_removes_search_from_a_stale_chat_route_catalog() {
     let home = tempfile::tempdir().unwrap();
     let path = home.path().join(model_catalog::relative_path());
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    #[cfg(windows)]
+    let catalog_runtime = {
+        let executable = home.path().join("Codex.exe");
+        std::fs::write(&executable, b"fake runtime").unwrap();
+        executable
+    };
+    #[cfg(not(windows))]
+    let catalog_runtime = home.path().to_path_buf();
+    let runtime_metadata = std::fs::metadata(&catalog_runtime).unwrap();
     std::fs::write(
         &path,
         serde_json::to_vec_pretty(&serde_json::json!({
+            "codey_runtime_source": {
+                "path": catalog_runtime.canonicalize().unwrap(),
+                "len": runtime_metadata.len(),
+                "modified": runtime_metadata.modified().unwrap(),
+            },
             "models": [{
                 "slug": "route-chat/gpt-5.6-sol",
                 "display_name": "Chat / GPT-5.6-Sol",

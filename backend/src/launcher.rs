@@ -518,7 +518,17 @@ async fn resolve_configured_codex_app_dir(config: &CodeyConfig) -> Result<PathBu
             .map(|path| refresh_windows_packaged_app_dir(&path))
             .transpose()?;
         let app_dir =
-            resolve_codex_app_dir_with_saved_checked(configured_app_path.as_deref(), None)?;
+            resolve_codex_app_dir_with_saved_checked(configured_app_path.as_deref(), None)
+                .map_err(|error| {
+                    // Surface the configured-path failure in the same wording the
+                    // settings page shows, while keeping the underlying diagnostic as
+                    // context for logs and stderr.
+                    if configured_app_path_is_empty {
+                        error
+                    } else {
+                        error.context(CODEX_APP_PATH_INVALID_ERROR)
+                    }
+                })?;
         if let Some(app_dir) = app_dir.as_deref() {
             error_log::refresh_codex_app_version(Some(app_dir), None);
         }
