@@ -2130,8 +2130,50 @@
   };
   window.__codeyAppServerManagerRegistryResolverFromModule = appServerManagerRegistryResolverFromModule;
 
+  const appServerManagerRegistryResolverFromSource = (source, module) => {
+    // 新版不再导出注册表类，但仍导出它读取的两个状态定义。只解析同一
+    // 原生查找表达式的引用，不执行源码，也不依赖压缩后的变量名。
+    const lookups = [...String(source).matchAll(/getForHostId\s*\(\s*([$A-Z_a-z][$\w]*)\s*\)\s*\{\s*return\s+this\.scope\.get\(\s*([$A-Z_a-z][$\w]*)\s*\)\.includes\(\s*\1\s*\)\s*\?\s*this\.scope\.get\(\s*([$A-Z_a-z][$\w]*)\s*,\s*\1\s*\)\s*:\s*null\s*;?\s*\}/g)];
+    const bindings = [...new Set(lookups.map((match) => `${match[2]},${match[3]}`))];
+    if (bindings.length !== 1) return null;
+    const exports = [...String(source).matchAll(/\bexport\s*\{([^{}]+)\}/g)].at(-1);
+    if (!exports) return null;
+    const names = exports[1].split(",").map((entry) => (
+      entry.trim().match(/^([$A-Z_a-z][$\w]*)(?:\s+as\s+([$A-Z_a-z][$\w]*))?$/)
+    )).filter(Boolean);
+    const resolve = (name) => {
+      const values = [...new Set(names.filter((entry) => entry[1] === name)
+        .map((entry) => module?.[entry[2] || entry[1]]))];
+      return values.length === 1 && values[0] && typeof values[0] === "object"
+        ? values[0] : null;
+    };
+    const [hosts, managers] = bindings[0].split(",").map(resolve);
+    if (!hosts || !managers || hosts === managers) return null;
+    return (scope, hostId) => {
+      const registeredHosts = scope.get(hosts);
+      return Array.isArray(registeredHosts) && registeredHosts.includes(hostId)
+        ? scope.get(managers, hostId) : null;
+    };
+  };
+  window.__codeyAppServerManagerRegistryResolverFromSource = appServerManagerRegistryResolverFromSource;
+
+  const managerSourceResolvers = new WeakMap();
+  const loadManagerSourceResolver = async (url, module) => {
+    if (managerSourceResolvers.has(module)) return managerSourceResolvers.get(module);
+    // 只读取客户端自身已加载的资产；能力探测不依赖 Debugger 改写权限。
+    if (new URL(url).protocol !== "app:") return null;
+    const fetchAsset = typeof window.fetch === "function" ? window.fetch.bind(window) : null;
+    if (!fetchAsset) return null;
+    const response = await fetchAsset(url);
+    if (!response?.ok || typeof response.text !== "function") return null;
+    const resolver = appServerManagerRegistryResolverFromSource(await response.text(), module);
+    if (resolver) managerSourceResolvers.set(module, resolver);
+    return resolver;
+  };
+
   const messageDeletionMethods = {
     async prepare(conversationId) {
+      if (!isLocalMessageDeletionManager(this)) throw unavailableCapability("deleteMessages");
       const conversation = this.getConversation(conversationId);
       const history = conversation?.turnHistory;
       if (
@@ -2155,6 +2197,7 @@
       await this.sendRequest("thread/unsubscribe", { threadId: conversationId });
     },
     finish(conversationId, messageIds) {
+      if (!isLocalMessageDeletionManager(this)) throw unavailableCapability("deleteMessages");
       const selected = new Set(messageIds);
       this.updateConversationState(conversationId, (conversation) => {
         if (selected.size) {
@@ -2186,11 +2229,16 @@
     },
   };
   const isLocalMessageDeletionManager = (manager) => {
-    if (!["getHostId", "getConversation", "getStreamRole", "sendRequest", "updateConversationState"]
-      .every((name) => declaredMethod(manager, name))) return false;
-    const unsubscriber = Object.getOwnPropertyDescriptor(manager, "inactiveThreadUnsubscriber")?.value;
-    return Boolean(declaredMethod(unsubscriber, "clearConversationStreamOwnership"))
-      && manager.getHostId() === "local";
+    try {
+      if (!manager || manager.disposed === true
+        || !["getHostId", "getConversation", "getStreamRole", "sendRequest", "updateConversationState"]
+          .every((name) => declaredMethod(manager, name))) return false;
+      const unsubscriber = Object.getOwnPropertyDescriptor(manager, "inactiveThreadUnsubscriber")?.value;
+      return Boolean(declaredMethod(unsubscriber, "clearConversationStreamOwnership"))
+        && declaredMethod(manager, "getHostId").call(manager) === "local";
+    } catch {
+      return false;
+    }
   };
 
   const managerSessionController = (manager) => {
@@ -2206,6 +2254,17 @@
         ? (payload) => manager.codeyReconcileCompletedConversation(payload)
         : null,
     };
+  };
+
+  const registeredMessageDeletionController = (feature) => {
+    if (feature !== "deleteMessages") return null;
+    try {
+      const registry = globalThis.__codeyAppServerManagers;
+      const manager = registry instanceof Map ? registry.get("local") : null;
+      return isLocalMessageDeletionManager(manager) ? managerSessionController(manager) : null;
+    } catch {
+      return null;
+    }
   };
 
   const sessionControllerLooksUsable = (controller, feature = "session") => {
@@ -2250,6 +2309,11 @@
 
   const discoverCodexSessionController = async (feature) => {
     if (disposed) throw unavailableCapability(feature);
+    const registered = registeredMessageDeletionController(feature);
+    if (registered) {
+      window.__codeyCodexSessionController = registered;
+      return registered;
+    }
     const requireCompletionReconcile = feature === "reconcile";
     // Rebuild wrappers so methods added by a late renderer patch become usable.
     if (window.__codeyCodexSessionController?.manager) {
@@ -2272,6 +2336,11 @@
           : await import(url);
         // 旧安装的迟到探测不能替换新安装已确认的接口。
         if (disposed) throw unavailableCapability(feature);
+        const registered = registeredMessageDeletionController(feature);
+        if (registered) {
+          window.__codeyCodexSessionController = registered;
+          return registered;
+        }
         const resolvers = [
           feature === "deleteMessages" || feature === "modelRouting" ? appServerManagerRegistryResolverFromModule(module) : null,
           appServerManagerResolverFromModule(module),
@@ -2285,6 +2354,17 @@
             return controller;
           }
           window.__codeyCodexSessionController ||= controller;
+        }
+        if (feature === "deleteMessages") {
+          const resolver = await loadManagerSourceResolver(url, module);
+          if (disposed) throw unavailableCapability(feature);
+          const registered = registeredMessageDeletionController(feature);
+          const manager = !registered && resolver ? appServerManagerFromReact(resolver) : null;
+          const controller = registered || (manager && managerSessionController(manager));
+          if (sessionControllerLooksUsable(controller, feature)) {
+            window.__codeyCodexSessionController = controller;
+            return controller;
+          }
         }
         fallbackDispatcher ||= signalDispatcherFromModule(module, namedSignalAsset);
       } catch (error) {
@@ -2304,7 +2384,9 @@
     if (requireCompletionReconcile) feature = "reconcile";
     if (disposed) throw unavailableCapability(feature);
     const cached = window.__codeyCodexSessionController;
-    const current = cached?.manager ? managerSessionController(cached.manager) : cached;
+    // 新管理器可能在此前探测失败后才登记，必须先于缓存和失败退避检查。
+    const current = registeredMessageDeletionController(feature)
+      || (cached?.manager ? managerSessionController(cached.manager) : cached);
     if (sessionControllerLooksUsable(current, feature)) {
       window.__codeyCodexSessionController = current;
       capabilityProbes.delete(feature);
@@ -2324,11 +2406,21 @@
       ? Promise.resolve().then(discover)
       : waitForNativeSessionOperation(discover)).then((controller) => {
       if (disposed) throw unavailableCapability(feature);
+      controller = registeredMessageDeletionController(feature) || controller;
+      window.__codeyCodexSessionController = controller;
       state.failures = 0;
       state.retryAt = 0;
       publishCapability(feature, true);
       return controller;
     }, (error) => {
+      const registered = !disposed && registeredMessageDeletionController(feature);
+      if (registered) {
+        window.__codeyCodexSessionController = registered;
+        state.failures = 0;
+        state.retryAt = 0;
+        publishCapability(feature, true);
+        return registered;
+      }
       state.failures += 1;
       state.retryAt = Date.now() + Math.min(30_000, 1_000 * 2 ** Math.min(state.failures - 1, 5));
       const capabilityError = unavailableCapability(feature);

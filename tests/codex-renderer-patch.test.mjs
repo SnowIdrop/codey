@@ -935,10 +935,12 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       /function unrelated\(\)\{return beginCpuSampling\(\)\}/,
     );
 
-    // Only the first (fully incompatible) bundle logged skips — two gates whose
-    // anchors were present but whose shapes did not match. The interaction
-    // bundle patched cleanly, so no further skips were logged.
-    assert.equal(patchErrors.length, 2);
+    // 首个不兼容模块触发两项跳过；上面的精简完成态 fixture 未提供
+    // threadStore 委托读取，只跳过管理器登记，完成态补丁仍正常执行。
+    assert.equal(patchErrors.length, 3);
+    assert.deepEqual(patchRecords.slice(2).map(({ operation }) => operation), [
+      "renderer_patch:app server manager registry",
+    ]);
 
     const productionRendererAsset = process.env.CODEY_RENDERER_ASSET;
     if (productionRendererAsset) {

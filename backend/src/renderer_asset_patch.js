@@ -309,6 +309,19 @@
   const patchCodexRendererAsset = (source) => {
     let patched = source;
     let nativeCustomProviderModelAccess = false;
+    if (!source.includes("/*codey-app-server-manager-registry*/")
+      && source.includes("inactiveThreadUnsubscriber.clearConversationStreamOwnership")
+      && source.includes("getStreamRole(")
+      && source.includes("updateConversationState(")) {
+      // 在原生管理器被读取时登记真实实例，避免依赖模块导出名和 React 结构。
+      // 登记失败不得影响原生读取，也不允许已销毁实例覆盖新管理器。
+      patched = replaceUniqueRendererGate(
+        patched,
+        /getConversation\(([$A-Z_a-z][$\w]*)\)\{return this\.threadStore\.getConversation\(\1\)\}/g,
+        (_match, id) => `getConversation(${id}){/*codey-app-server-manager-registry*/try{if(this.disposed!==true&&this.getHostId()===\`local\`){let __codeyManagers=globalThis.__codeyAppServerManagers;if(__codeyManagers==null)globalThis.__codeyAppServerManagers=__codeyManagers=new Map;if(__codeyManagers instanceof Map)__codeyManagers.set(\`local\`,this)}}catch{}return this.threadStore.getConversation(${id})}`,
+        "app server manager registry",
+      );
+    }
     if (
       source.includes("codex-message-from-view")
       && source.includes("sendMessageFromView")
