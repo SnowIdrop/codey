@@ -2106,6 +2106,16 @@
     return null;
   };
 
+  // 新版 Codex 把 AppServerManager 解析器放在 app-shared 里，app-initial
+  // 只剩单参辅助函数；保留原有优先级，只在 app-initial 无法解析时下沉。
+  const managerAssetPriority = (url) => (
+    url.includes("app-initial-")
+      ? 3
+      : url.includes("app-shared-")
+        ? 2
+        : Number(url.includes("app-server-manager-signals-"))
+  );
+
   const appServerManagerRegistryResolverFromModule = (module) => {
     const lookups = [...new Set(Object.values(module || {}))].flatMap((candidate) => {
       if (typeof candidate !== "function") return [];
@@ -2251,15 +2261,6 @@
     let fallbackDispatcher = typeof window.__codeyCodexSignalDispatcher === "function"
       ? window.__codeyCodexSignalDispatcher
       : null;
-    // 新版 Codex 把 AppServerManager 解析器放在 app-shared 里，app-initial
-    // 只剩单参辅助函数；保留原有优先级，只在 app-initial 无法解析时下沉。
-    const managerAssetPriority = (url) => (
-      url.includes("app-initial-")
-        ? 3
-        : url.includes("app-shared-")
-          ? 2
-          : Number(url.includes("app-server-manager-signals-"))
-    );
     const urls = (await discoverCodexAppAssetUrls())
       .sort((left, right) => managerAssetPriority(right) - managerAssetPriority(left));
     if (disposed) throw unavailableCapability(feature);
@@ -2345,6 +2346,88 @@
   window.__codeyLoadCodexRequestClient = async () => (
     (await loadCodexSessionController({ feature: "modelRouting" })).manager.requestClient
   );
+
+  // 模块级快路径：DI scope 是模块导出的单例，app 初始化（约 React 挂载前
+  // 几秒）就填充完毕——scope + registry 直接给出 manager.requestClient，
+  // 不必遍历 React fiber 等组件挂载。任一环节缺失即抛错，由调用方回落。
+  const appServerScopeLike = (scope) => (
+    !!scope
+    && typeof scope === "object"
+    && typeof scope.get === "function"
+    && typeof scope.set === "function"
+    && typeof scope.watch === "function"
+    && typeof scope.when === "function"
+    && typeof scope.query === "function"
+  );
+  const appServerScopeFromModule = (module) => {
+    for (const value of Object.values(module || {})) {
+      if (!value || typeof value !== "object") continue;
+      const scope = value.scope;
+      if (appServerScopeLike(scope)) return scope;
+      // 诊断：mQt 存在但 scope 还没到 DI 形态时，记录原始类型与前几帧状态。
+      if (module.mQt === value) {
+        window.__codeyModuleClientProbe ||= {};
+        window.__codeyModuleClientProbe.mQtScopeRaw = scope === null
+          ? "null" : typeof scope;
+      }
+    }
+    return null;
+  };
+
+  let moduleClientUrls = null;
+  window.__codeyLoadCodexRequestClientFromModule = async () => {
+    const probe = (window.__codeyModuleClientProbe ||= { attempts: 0 });
+    probe.attempts += 1;
+    if (!moduleClientUrls) {
+      const discovered = (await discoverCodexAppAssetUrls())
+        .sort((left, right) => managerAssetPriority(right) - managerAssetPriority(left));
+      // 文档解析早期脚本标签可能还没挂进 DOM：空结果不缓存，下一轮重新发现。
+      if (discovered.length) moduleClientUrls = discovered;
+      if (probe.urlsN == null) probe.urlsN = moduleClientUrls?.length ?? 0;
+    }
+    for (const url of moduleClientUrls || []) {
+      try {
+        const module = typeof window.__codeyImportCodexAsset === "function"
+          ? await window.__codeyImportCodexAsset(url)
+          : await import(url);
+        if (disposed) throw unavailableCapability("modelRouting");
+        if (probe.importedMs == null) {
+          probe.importedMs = Math.round(performance.now());
+          probe.importedUrl = url.split("/").pop();
+        }
+        const scope = appServerScopeFromModule(module);
+        const lookup = appServerManagerRegistryResolverFromModule(module);
+        if (scope && probe.scopeSeenMs == null) {
+          probe.scopeSeenMs = Math.round(performance.now());
+        }
+        if (!scope || !lookup) {
+          if (probe.scopeNullMs == null) {
+            probe.scopeNullMs = Math.round(performance.now());
+            probe.scopeNullUrl = url.split("/").pop();
+            probe.lookupFound = !!lookup;
+          }
+          continue;
+        }
+        const client = lookup(scope, "local")?.requestClient;
+        if (
+          client?.hostId === "local"
+          && ["enqueueRequest", "createRequest", "onResult"].every(
+            (method) => declaredMethod(client, method),
+          )
+        ) {
+          if (probe.clientSeenMs == null) {
+            probe.clientSeenMs = Math.round(performance.now());
+          }
+          return client;
+        }
+      } catch (error) {
+        if (disposed) throw error;
+        probe.lastError = String(error).slice(0, 200);
+        continue;
+      }
+    }
+    throw unavailableCapability("modelRouting");
+  };
   // Native macOS uses a frozen bridge. Install the request-client guard after
   // these module/scope discovery helpers are available, including after reload.
   void window.__codeyModelWhitelistPatch?.ensureRequestGate?.().catch(() => {});

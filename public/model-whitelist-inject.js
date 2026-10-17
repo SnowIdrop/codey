@@ -3119,10 +3119,8 @@
 
   let requestGatePending = null;
   const requestGateRestorers = [];
-  const installRequestClientGate = (client) => {
-    if (disposed) throw new Error("模型请求校验已重新加载");
-    if (!client || client.hostId !== "local") throw new Error("未找到本机模型请求入口");
-    const prototype = Object.getPrototypeOf(client);
+  // 门禁只改 prototype：实例与类共享同一原型，描述符与替换逻辑完全一致。
+  const installRequestClientGateOnPrototype = (prototype) => {
     const methods = ["enqueueRequest", "createRequest", "onResult"];
     const descriptors = methods.map((name) => Object.getOwnPropertyDescriptor(prototype, name));
     if (descriptors.some((descriptor) => !descriptor?.writable || typeof descriptor.value !== "function")) {
@@ -3166,8 +3164,14 @@
         if (prototype[name] === replacements[index]) Object.defineProperty(prototype, name, descriptors[index]);
       });
     });
-    (window.__codeyAppServerRequestClients ||= new Map()).set(client.hostId, client);
     return true;
+  };
+  const installRequestClientGate = (client) => {
+    if (disposed) throw new Error("模型请求校验已重新加载");
+    if (!client || client.hostId !== "local") throw new Error("未找到本机模型请求入口");
+    const installed = installRequestClientGateOnPrototype(Object.getPrototypeOf(client));
+    if (installed) (window.__codeyAppServerRequestClients ||= new Map()).set(client.hostId, client);
+    return installed;
   };
   const ensureRequestGate = () => {
     if (disposed) return Promise.reject(new Error("模型请求校验已重新加载"));
@@ -3177,6 +3181,20 @@
     requestGatePending = Promise.resolve().then(async () => {
       const knownClient = window.__codeyAppServerRequestClients?.get?.("local");
       if (knownClient) return installRequestClientGate(knownClient);
+      // 模块级快路径：DI scope/registry 在 chunk 求值与 app 初始化后即可达，
+      // 实测约 3.5s 就能拿到 requestClient，比 React 遍历早 ~3s；未就绪或
+      // 结构缺失时抛错回落到既有路径。
+      if (typeof window.__codeyLoadCodexRequestClientFromModule === "function") {
+        try {
+          const client = await window.__codeyLoadCodexRequestClientFromModule();
+          if (disposed) throw new Error("模型请求校验已重新加载");
+          const installed = installRequestClientGate(client);
+          window.__codeyModelRequestModuleGateInstalled = true;
+          return installed;
+        } catch (error) {
+          if (disposed) throw error;
+        }
+      }
       if (typeof window.__codeyLoadCodexRequestClient !== "function"
         && typeof window.__codexSessionDeleteBridge === "function") {
         await window.__codexSessionDeleteBridge("/internal/codey/session-tools/load", {}, { timeoutMs: 20_000 });

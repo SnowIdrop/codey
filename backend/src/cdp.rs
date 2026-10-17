@@ -40,6 +40,9 @@ fn should_degrade_request_gate(not_ready_count: u32, not_ready_for: Option<Durat
     not_ready_count >= REQUEST_GATE_DEGRADE_MIN_FAILURES
         && not_ready_for.is_some_and(|elapsed| elapsed >= REQUEST_GATE_DEGRADE_AFTER)
 }
+/// 校验 evaluate 的 CDP 层超时：页内等待最多跑满降级预算，外加页面被挂起等
+/// 开销余量；超时按桥不可用处理，走整轮重装而不是无限等下去。
+const REQUEST_GATE_VERIFY_EVALUATE_TIMEOUT: Duration = Duration::from_secs(20);
 const SESSION_TOOLS_INJECT_TIMEOUT: Duration = Duration::from_secs(8);
 const MCP_RELOAD_EVALUATE_TIMEOUT: Duration = Duration::from_secs(20);
 const CODEY_BRIDGE_SCRIPT: &str = include_str!("../../dist-overlay/inject/codey-bridge.js");
@@ -957,36 +960,113 @@ struct VerifyFailure {
 }
 
 /// 校验脚本返回 JSON 而不是抛异常：页面侧能分清「还没就绪」与「补丁根本没
-/// 装上」，宿主据此决定轮询还是重装。
+/// 装上」，宿主据此决定轮询还是重装。waitedMs/polls/sourceGate 是页内等待的
+/// 运行画像：门禁通常要等 Codex 自己把 request client 建好，逐次 evaluate +
+/// 指数退避只会放大检出延迟，所以等待被放进单次 evaluate 里完成。
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RequestGateVerdict {
     ready: bool,
     #[serde(default)]
     reinstall: bool,
     message: Option<String>,
+    #[serde(default)]
+    waited_ms: u64,
+    #[serde(default)]
+    polls: u32,
+    #[serde(default)]
+    source_gate: bool,
+    #[serde(default)]
+    module_gate: bool,
 }
 
+/// 页内等待的默认预算与降级阈值一致：等待耗尽即视为「页面持续应答却长期拿不
+/// 到 request client」，宿主据此直接降级。测试或诊断可用
+/// `window.__codeyRequestGateWaitMs` 缩短。
+const REQUEST_GATE_WAIT_BUDGET_MS: u64 = REQUEST_GATE_DEGRADE_AFTER.as_millis() as u64;
+/// 单次 ensureRequestGate 调用的页内上限：会话工具加载与模块探测各有自己的
+/// 预算，卡住的调用不拖累整轮等待的终止判定。
+const REQUEST_GATE_POLL_STEP_MS: u64 = 200;
+const REQUEST_GATE_POLL_CALL_MS: u64 = 2_000;
+
 // Runtime.evaluate 未开 returnByValue 时只有原始类型回传 value，判定结果
-// 必须用 JSON 字符串承载，与注入状态快照同一约定。
-const REQUEST_GATE_VERIFY_SCRIPT: &str = r#"(async () => {
-  const verdict = (ready, reinstall, message) => JSON.stringify({ ready, reinstall, message });
-  const patch = window.__codeyModelWhitelistPatch;
-  if (!patch || typeof patch.ensureRequestGate !== "function") {
-    return verdict(false, true, "模型请求补丁未注入");
-  }
-  try {
-    if (await patch.ensureRequestGate() !== true) {
-      return verdict(false, false, "模型请求校验未就绪");
+// 必须用 JSON 字符串承载，与注入状态快照同一约定。预算等数值由宿主注入，
+// 页面默认值与降级阈值由 request_gate_verify_script() 统一保持同步。
+const REQUEST_GATE_VERIFY_SCRIPT_TEMPLATE: &str = r#"(async () => {
+  const started = Date.now();
+  const overrideBudget = Number(window.__codeyRequestGateWaitMs);
+  const budgetMs = Number.isFinite(overrideBudget) && overrideBudget >= 0
+    ? Math.min(overrideBudget, 60_000)
+    : __CODEY_GATE_BUDGET_MS__;
+  const deadline = started + budgetMs;
+  let polls = 0;
+  let lastMessage = "";
+  const verdict = (ready, reinstall, message) => JSON.stringify({
+    ready, reinstall, message,
+    waitedMs: Date.now() - started,
+    polls,
+    sourceGate: window.__codeyModelRequestSourceGateInstalled === true,
+    moduleGate: window.__codeyModelRequestModuleGateInstalled === true,
+  });
+  for (;;) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      return verdict(false, false, lastMessage || "模型请求校验未就绪");
     }
-  } catch (error) {
-    return verdict(
-      false,
-      window.__codeyModelWhitelistPatch !== patch,
-      String((error && error.message) || error || "模型请求校验失败"),
-    );
+    const patch = window.__codeyModelWhitelistPatch;
+    if (!patch || typeof patch.ensureRequestGate !== "function") {
+      return verdict(false, true, "模型请求补丁未注入");
+    }
+    polls += 1;
+    const timedOut = Symbol("timeout");
+    const outcome = await Promise.race([
+      Promise.resolve().then(() => patch.ensureRequestGate()).then(
+        (ready) => ({ ready }),
+        (error) => ({ error }),
+      ),
+      new Promise((resolve) => setTimeout(
+        () => resolve(timedOut),
+        Math.min(__CODEY_GATE_CALL_MS__, remaining),
+      )),
+    ]);
+    if (outcome === timedOut) {
+      // 单次调用超时不覆盖已拿到的真实失败原因——耗尽预算时诊断更需要后者。
+      lastMessage = lastMessage || "模型请求校验探测超时";
+    } else if (outcome.error !== undefined) {
+      lastMessage = String(
+        (outcome.error && outcome.error.message) || outcome.error || "模型请求校验失败",
+      );
+      // 等待期间补丁对象被脚本重放替换：旧实例只会持续拒绝，必须整轮重装。
+      if (window.__codeyModelWhitelistPatch !== patch) {
+        return verdict(false, true, lastMessage);
+      }
+    } else if (outcome.ready === true) {
+      return verdict(true, false, "");
+    } else {
+      lastMessage = "模型请求校验未就绪";
+    }
+    await new Promise((resolve) => setTimeout(
+      resolve,
+      Math.min(__CODEY_GATE_STEP_MS__, Math.max(0, deadline - Date.now())),
+    ));
   }
-  return verdict(true, false, "");
 })()"#;
+
+fn request_gate_verify_script() -> String {
+    REQUEST_GATE_VERIFY_SCRIPT_TEMPLATE
+        .replace(
+            "__CODEY_GATE_BUDGET_MS__",
+            &REQUEST_GATE_WAIT_BUDGET_MS.to_string(),
+        )
+        .replace(
+            "__CODEY_GATE_CALL_MS__",
+            &REQUEST_GATE_POLL_CALL_MS.to_string(),
+        )
+        .replace(
+            "__CODEY_GATE_STEP_MS__",
+            &REQUEST_GATE_POLL_STEP_MS.to_string(),
+        )
+}
 
 enum AttemptOutcome {
     Injected(InjectedTarget),
@@ -1154,13 +1234,14 @@ async fn verify_injection(
     degrade_request_gate: bool,
 ) -> std::result::Result<Arc<[InjectionScriptStatus]>, VerifyFailure> {
     // 请求入口 gate 由渲染资产补丁（源码级）或会话工具（运行时遍历）安装；
-    // 两者都缺失时按页面侧裁决继续轮询，超过降级预算后放行本轮注入。
+    // 两者都缺失时按页面侧裁决继续轮询，超过降级预算后放行本轮注入。校验脚本
+    // 自身在页面内有界等待，一次等待耗尽预算即等价于旧版「连续多轮不就绪」。
     phase.store(InjectionPhase::VerifyRequestGate as u8, Ordering::Release);
     let response = codey_runtime_core::bridge::evaluate_script_with_await_promise_timeout(
         &bridge.websocket_url,
-        REQUEST_GATE_VERIFY_SCRIPT,
+        &request_gate_verify_script(),
         true,
-        Duration::from_secs(20),
+        REQUEST_GATE_VERIFY_EVALUATE_TIMEOUT,
     )
     .await
     .map_err(|error| VerifyFailure {
@@ -1182,12 +1263,33 @@ async fn verify_injection(
             request_gate_unready: false,
             error: anyhow::anyhow!("模型请求校验未通过：校验结果反序列化失败（{error}）"),
         })?;
-    if !verdict.ready {
+    if verdict.ready {
+        // 成功路径的画像与补丁会话统计一并落盘：sourceGate/moduleGate 区分源
+        // 码补丁、模块级 DI 直取与 React 遍历三条就绪路径，entryDocuments 区分
+        // 覆盖重载是否发生，是后续启动优化「省掉的是哪一段」的依据。
+        let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+            "cdp.request_gate_ready",
+            serde_json::json!({
+                "targetId": bridge.target_id,
+                "waitedMs": verdict.waited_ms,
+                "polls": verdict.polls,
+                "sourceGate": verdict.source_gate,
+                "moduleGate": verdict.module_gate,
+                "patchSession": crate::renderer_asset_patch::session_stats(
+                    bridge.websocket_url.as_ref()
+                ),
+            }),
+        );
+    } else {
         let message = verdict
             .message
             .filter(|message| !message.is_empty())
             .unwrap_or_else(|| "模型请求校验未就绪".to_string());
-        if degrade_request_gate {
+        // 页内等待耗尽预算等价于「页面持续应答却长期拿不到 client」；重装裁决
+        // 永远走整轮重建，不参与降级。
+        let in_page_wait_exhausted =
+            !verdict.reinstall && verdict.waited_ms >= REQUEST_GATE_WAIT_BUDGET_MS;
+        if !verdict.reinstall && (degrade_request_gate || in_page_wait_exhausted) {
             // 页面持续应答却长期拿不到 request client：按降级完成注入。
             // 页面侧补丁或会话工具之后若就位，gate 仍会自行装上；当前则让
             // CLI 包装层的 stdin 改写继续承担模型路由。
@@ -1200,6 +1302,8 @@ async fn verify_injection(
                     "targetId": bridge.target_id,
                     "reinstall": verdict.reinstall,
                     "message": message,
+                    "waitedMs": verdict.waited_ms,
+                    "polls": verdict.polls,
                     "patchSession": crate::renderer_asset_patch::session_stats(
                         bridge.websocket_url.as_ref()
                     ),
@@ -2135,8 +2239,11 @@ assert.equal(nextPage.window.attempts, 1);
 const assert = require('node:assert/strict');
 const vm = require('node:vm');
 const script = JSON.parse(process.argv[1]);
-const run = async (patch) => {
-  const context = vm.createContext({ window: {}, console });
+const run = async (patch, waitMs = 40) => {
+  // 脚本在页内自轮询：vm 里补 setTimeout，并用 __codeyRequestGateWaitMs 把
+  // 等待预算压到几十毫秒，避免测试干等真实降级预算。
+  const context = vm.createContext({ window: {}, console, setTimeout });
+  context.window.__codeyRequestGateWaitMs = waitMs;
   context.window.__codeyModelWhitelistPatch = patch;
   // 判定以 JSON 字符串返回（Runtime.evaluate 未开 returnByValue 时对象不回传）。
   return JSON.parse(await vm.runInContext(script, context));
@@ -2148,15 +2255,26 @@ const run = async (patch) => {
     assert.equal(verdict.ready, false);
     assert.equal(verdict.reinstall, true);
   }
-  assert.equal((await run({ ensureRequestGate: () => Promise.resolve(true) })).ready, true);
-  // Codex 尚未就绪：保留桥接继续轮询。
+  const ready = await run({ ensureRequestGate: () => Promise.resolve(true) });
+  assert.equal(ready.ready, true);
+  assert.equal(ready.polls, 1);
+  // 门禁在等待窗口内就绪：页内检出即返回，不必等宿主下一轮探测。
+  let calls = 0;
+  const lateReady = await run({
+    ensureRequestGate: () => Promise.resolve(++calls >= 2),
+  }, 5_000);
+  assert.equal(lateReady.ready, true);
+  assert.equal(lateReady.polls, 2);
+  // Codex 尚未就绪：页内等满预算后交回不就绪裁决，由宿主决定重试或降级。
   const notReady = { ensureRequestGate: () => Promise.reject(new Error("当前 Codex 暂不支持模型请求校验")) };
   const polled = await run(notReady);
   assert.equal(polled.ready, false);
   assert.equal(polled.reinstall, false);
   assert.equal(polled.message, "当前 Codex 暂不支持模型请求校验");
+  assert.ok(polled.waitedMs >= 40);
   // 校验等待期间补丁被脚本重放替换：旧实例的失败必须按重装处理。
-  const context = vm.createContext({ window: {}, console });
+  const context = vm.createContext({ window: {}, console, setTimeout });
+  context.window.__codeyRequestGateWaitMs = 40;
   context.window.__codeyModelWhitelistPatch = {
     ensureRequestGate: () => Promise.reject(new Error("模型请求校验已重新加载")),
   };
@@ -2169,7 +2287,7 @@ const run = async (patch) => {
             .args([
                 "-e",
                 harness,
-                &serde_json::to_string(REQUEST_GATE_VERIFY_SCRIPT).unwrap(),
+                &serde_json::to_string(&request_gate_verify_script()).unwrap(),
             ])
             .output()
             .expect("Node should run the request-gate verify script harness");
