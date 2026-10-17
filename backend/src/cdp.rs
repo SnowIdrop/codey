@@ -410,10 +410,13 @@ pub fn prepare_injection_scripts(
             "额度状态兼容",
             QUOTA_UNLOCK_SCRIPT,
             r#"(() => {
-              const status = window.__codeyQuotaUnlock?.status?.();
+              const helper = window.__codeyQuotaUnlock;
+              const status = helper?.status?.();
               if (!status) return "";
+              if (typeof helper.allowsLocalSend !== "function")
+                return { effective: false, detail: "本机第三方模型发送额度判断未就绪" };
               return status.enabled === true
-                ? { effective: true, detail: `额度状态兼容已处理 ${status.sanitized ?? 0} 次` }
+                ? { effective: true, detail: "本机第三方模型发送额度判断已启用" }
                 : { effective: false, inactive: true, detail: "额度状态兼容已关闭" };
             })()"#
                 .to_string(),

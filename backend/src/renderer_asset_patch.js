@@ -322,6 +322,20 @@
         "app server manager registry",
       );
     }
+    if (source.includes("codexComposerAdapter.CodexComposerAdapter.interruptThreadError")
+      && !source.includes("/*codey-local-quota-gate*/")) {
+      // 只改变 Codex 本机发送按钮的额度条件。保留共享额度状态、官方警告
+      // 和其他禁用条件；每次渲染读取当前模型，避免模型切换后复用旧判断。
+      patched = replaceUniqueRendererGate(
+        patched,
+        /let\{agentMode:[^;]{0,1024}?(?<mode>[$A-Z_a-z][$\w]*)\.settings\.model===`gpt-reserve`[^;]{0,1024}?,(?<quota>[$A-Z_a-z][$\w]*)=[$A-Z_a-z][$\w]*\((?<host>[$A-Z_a-z][$\w]*)===`local`&&[$A-Z_a-z][$\w]*\)(?=,[\s\S]{0,10000}?activeCollaborationMode:\k<mode>,[\s\S]{0,2000}?resolvedHostId:\k<host>,[\s\S]{0,10000}?let (?<disabled>[$A-Z_a-z][$\w]*)=[^;]{0,512}?\|\|\k<quota>,[\s\S]{0,6000}?submitDisabled:\k<disabled>,)/g,
+        (...args) => {
+          const { host, mode } = args.at(-1);
+          return `${args[0]}&&/*codey-local-quota-gate*/(()=>{try{return globalThis.__codeyQuotaUnlock?.allowsLocalSend?.({hostId:${host},model:${mode}.settings.model})!==true}catch{return true}})()`;
+        },
+        "local third-party composer quota",
+      );
+    }
     if (
       source.includes("codex-message-from-view")
       && source.includes("sendMessageFromView")
