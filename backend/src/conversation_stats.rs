@@ -1,10 +1,5 @@
-//! 会话级实时统计注册表。
-//!
-//! 页面注入脚本通过 bridge 查询当前可见对话的累计 Token、缓存命中和最近输出
-//! 速度。数据来自本地路由的请求日志探针：无论请求日志是否落盘，每个经过路
-//! 由、携带 Codex 会话标识的请求都会在这里按会话聚合，因此重新对话（新的
-//! 会话 id）和切换会话天然隔离；切模型时同一会话的最近一次速度随新请求覆
-//! 盖，不会继续展示旧模型的值。
+//! 会话统计：原生 rollout 提供持久化累计，路由探针提供本次运行期间的请求信息。
+//! 两种累计不可相加；找不到原生累计时，返回明确标注范围的运行期数据。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,6 +8,12 @@ use std::sync::{Mutex, MutexGuard};
 use serde::Serialize;
 
 use crate::route_request_log::RouteRequestLogEntry;
+
+#[path = "conversation_stats_activity.rs"]
+mod activity;
+#[path = "conversation_stats_history.rs"]
+mod history;
+pub(crate) use history::snapshot_with_history;
 
 /// 单会话状态条口径只统计正式生成请求（Responses create）；压缩等其他请求
 /// 仍会计入 Token 累计，但不刷新速度与请求计数。
@@ -26,20 +27,41 @@ pub(crate) struct ConversationStatsSnapshot {
     /// 最近一次完成请求实际使用的模型；上游未回报时回退请求模型。
     pub model: Option<String>,
     /// 正式生成请求完成数（含失败）。
-    pub requests: u64,
-    /// 仍在途的请求数，用于页面区分“生成中”与静止状态。
-    pub in_flight: u32,
+    pub requests: Option<u64>,
+    /// 仍在途的请求数，用于页面区分生成中与静止状态。
+    pub in_flight: Option<u32>,
     /// 最近一次正式请求的完成状态：succeeded/failed/incomplete/cancelled。
     pub last_status: Option<String>,
-    /// 最近一次正式请求的输出速度（Token/s），口径与请求日志一致。
+    /// 正式请求的输出速度（Token/s），来源、范围与记录时间由 speed 字段明确。
     pub output_tokens_per_second: Option<f64>,
+    pub speed_source: Option<&'static str>,
+    pub speed_scope: Option<&'static str>,
+    pub speed_recorded_at_unix_ms: Option<u64>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
     pub cache_write_input_tokens: Option<u64>,
     /// 累计总 Token；仅统计上游实际回报的值，未回报不计入。
-    pub total_tokens: u64,
+    pub total_tokens: Option<u64>,
     pub updated_at_unix_ms: u64,
+    pub usage_source: &'static str,
+    pub usage_scope: &'static str,
+    pub requests_scope: Option<&'static str>,
+    pub turn_count: Option<u64>,
+    pub step_count: Option<u64>,
+    pub model_duration_ms: Option<u64>,
+    pub tool_duration_ms: Option<u64>,
+    pub average_ttft_ms: Option<f64>,
+    pub activity_source: Option<&'static str>,
+    pub activity_scope: Option<&'static str>,
+    pub step_source: Option<&'static str>,
+    pub step_scope: Option<&'static str>,
+    pub timing_source: Option<&'static str>,
+    pub timing_scope: Option<&'static str>,
+    pub tool_timing_source: Option<&'static str>,
+    pub tool_timing_scope: Option<&'static str>,
+    pub timing_request_count: Option<u64>,
+    pub ttft_sample_count: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -58,9 +80,14 @@ struct SessionStats {
     cache_write_input_tokens: u64,
     cache_write_known: bool,
     total_tokens: u64,
+    total_known: bool,
     /// 单调淘汰序号；系统时钟粒度不足以区分连续写入时仍保证淘汰稳定。
     touched_seq: u64,
     updated_at_unix_ms: u64,
+    model_duration_ms: u64,
+    timing_request_count: u64,
+    ttft_total_ms: u64,
+    ttft_sample_count: u64,
 }
 
 #[derive(Debug, Default)]
@@ -78,7 +105,11 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// 页面 DOM 与请求头里的本地会话标识可能带 `local:` 前缀，两边统一剥掉，
 /// 避免同一会话前后缀不一致时统计落空。
 fn normalize_session_id(value: &str) -> &str {
-    value.trim().strip_prefix("local:").unwrap_or(value.trim())
+    value
+        .trim()
+        .strip_prefix("local:")
+        .unwrap_or(value.trim())
+        .trim()
 }
 
 impl ConversationStatsRegistry {
@@ -92,6 +123,10 @@ impl ConversationStatsRegistry {
         let mut sessions = lock_unpoisoned(&self.sessions);
         let stats = sessions.entry(session_id.to_string()).or_default();
         stats.in_flight = stats.in_flight.saturating_add(1);
+        stats.output_tokens_per_second = None;
+        stats.model = None;
+        stats.last_status = None;
+        stats.updated_at_unix_ms = 0;
         stats.touched_seq = touched_seq;
         evict_overflow(&mut sessions);
     }
@@ -110,18 +145,20 @@ impl ConversationStatsRegistry {
         let stats = sessions.entry(session_id.to_string()).or_default();
         stats.in_flight = stats.in_flight.saturating_sub(1);
         stats.touched_seq = touched_seq;
-        stats.updated_at_unix_ms = entry.timestamp_unix_ms;
-        if let Some(model) = entry
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|model| !model.is_empty())
-            .or_else(|| {
-                let requested = entry.requested_model.trim();
-                (!requested.is_empty()).then_some(requested)
-            })
-        {
-            stats.model = Some(model.to_string());
+        let own_generation =
+            entry.request_kind == CONVERSATION_REQUEST_KIND && !entry.codex_session_is_parent;
+        if own_generation {
+            stats.updated_at_unix_ms = entry.timestamp_unix_ms;
+            stats.model = entry
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .or_else(|| {
+                    let requested = entry.requested_model.trim();
+                    (!requested.is_empty()).then_some(requested)
+                })
+                .map(str::to_string);
         }
         let usage = &entry.token_usage;
         if let Some(value) = usage.input_tokens {
@@ -149,13 +186,27 @@ impl ConversationStatsRegistry {
                 });
         if let Some(value) = total {
             stats.total_tokens = stats.total_tokens.saturating_add(value);
+            stats.total_known = true;
         }
-        if entry.request_kind == CONVERSATION_REQUEST_KIND {
+        if own_generation {
             stats.requests = stats.requests.saturating_add(1);
-            stats.last_status = Some(entry.status.as_str().to_string());
-            if let Some(tps) = entry.output_tokens_per_second {
-                stats.output_tokens_per_second = Some(tps);
+            if let Some(duration) = entry
+                .router_pre_upstream_ms
+                .and_then(|pre| entry.total_duration_ms.checked_sub(pre))
+            {
+                stats.model_duration_ms = stats.model_duration_ms.saturating_add(duration);
+                stats.timing_request_count = stats.timing_request_count.saturating_add(1);
             }
+            // first-byte 可能只是 SSE 心跳，只有实际首条内容计时才是 TTFT。
+            if let Some(ttft) = entry
+                .downstream_first_content_ms
+                .filter(|v| *v <= entry.total_duration_ms)
+            {
+                stats.ttft_total_ms = stats.ttft_total_ms.saturating_add(ttft);
+                stats.ttft_sample_count = stats.ttft_sample_count.saturating_add(1);
+            }
+            stats.last_status = Some(entry.status.as_str().to_string());
+            stats.output_tokens_per_second = entry.output_tokens_per_second;
         }
         evict_overflow(&mut sessions);
     }
@@ -171,18 +222,39 @@ impl ConversationStatsRegistry {
         stats.touched_seq = touched_seq;
         Some(ConversationStatsSnapshot {
             model: stats.model.clone(),
-            requests: stats.requests,
-            in_flight: stats.in_flight,
+            requests: Some(stats.requests),
+            in_flight: Some(stats.in_flight),
             last_status: stats.last_status.clone(),
             output_tokens_per_second: stats.output_tokens_per_second,
+            speed_source: stats.output_tokens_per_second.map(|_| "runtime"),
+            speed_scope: stats.output_tokens_per_second.map(|_| "latest_request"),
+            speed_recorded_at_unix_ms: stats
+                .output_tokens_per_second
+                .map(|_| stats.updated_at_unix_ms),
             input_tokens: stats.input_known.then_some(stats.input_tokens),
             output_tokens: stats.output_known.then_some(stats.output_tokens),
             cached_input_tokens: stats.cached_known.then_some(stats.cached_input_tokens),
             cache_write_input_tokens: stats
                 .cache_write_known
                 .then_some(stats.cache_write_input_tokens),
-            total_tokens: stats.total_tokens,
+            total_tokens: stats.total_known.then_some(stats.total_tokens),
             updated_at_unix_ms: stats.updated_at_unix_ms,
+            usage_source: "runtime",
+            usage_scope: "runtime",
+            requests_scope: Some("runtime"),
+            step_count: Some(stats.requests),
+            activity_source: Some("runtime"),
+            activity_scope: Some("runtime"),
+            step_source: Some("runtime"),
+            step_scope: Some("runtime"),
+            model_duration_ms: (stats.timing_request_count > 0).then_some(stats.model_duration_ms),
+            average_ttft_ms: (stats.ttft_sample_count > 0)
+                .then(|| stats.ttft_total_ms as f64 / stats.ttft_sample_count as f64),
+            timing_source: Some("runtime"),
+            timing_scope: Some("runtime"),
+            timing_request_count: Some(stats.timing_request_count),
+            ttft_sample_count: Some(stats.ttft_sample_count),
+            ..Default::default()
         })
     }
 }
@@ -281,19 +353,19 @@ mod tests {
         registry.finish_request(&sample_entry(Some("thread-a"), "responses_compact"));
 
         let a = registry.snapshot("thread-a").unwrap();
-        assert_eq!(a.in_flight, 0);
-        assert_eq!(a.requests, 1);
+        assert_eq!(a.in_flight, Some(0));
+        assert_eq!(a.requests, Some(1));
         assert_eq!(a.model.as_deref(), Some("gpt-5"));
         assert_eq!(a.input_tokens, Some(2_000));
         assert_eq!(a.output_tokens, Some(400));
         assert_eq!(a.cached_input_tokens, Some(1_200));
         assert_eq!(a.cache_write_input_tokens, Some(100));
-        assert_eq!(a.total_tokens, 2_400);
+        assert_eq!(a.total_tokens, Some(2_400));
         assert_eq!(a.output_tokens_per_second, Some(87.5));
 
         let b = registry.snapshot("thread-b").unwrap();
-        assert_eq!(b.in_flight, 1);
-        assert_eq!(b.requests, 0);
+        assert_eq!(b.in_flight, Some(1));
+        assert_eq!(b.requests, Some(0));
         assert!(registry.snapshot("thread-c").is_none());
     }
 
@@ -312,10 +384,10 @@ mod tests {
         entry.output_tokens_per_second = None;
         registry.finish_request(&entry);
         let snapshot = registry.snapshot("thread-a").unwrap();
-        assert_eq!(snapshot.requests, 1);
+        assert_eq!(snapshot.requests, Some(1));
         assert_eq!(snapshot.input_tokens, None);
         assert_eq!(snapshot.cached_input_tokens, None);
-        assert_eq!(snapshot.total_tokens, 0);
+        assert_eq!(snapshot.total_tokens, None);
         assert_eq!(snapshot.output_tokens_per_second, None);
     }
 
@@ -330,6 +402,64 @@ mod tests {
         let snapshot = registry.snapshot("thread-a").unwrap();
         assert_eq!(snapshot.model.as_deref(), Some("claude-sonnet"));
         assert_eq!(snapshot.output_tokens_per_second, Some(42.0));
+    }
+
+    #[test]
+    fn inherited_subagent_request_cannot_replace_parent_request_speed() {
+        let registry = ConversationStatsRegistry::default();
+        registry.finish_request(&sample_entry(Some("thread-a"), "responses"));
+        let mut child = sample_entry(Some("thread-a"), "responses");
+        child.codex_session_is_parent = true;
+        child.model = Some("child-model".into());
+        child.output_tokens_per_second = Some(500.0);
+        registry.finish_request(&child);
+        let snapshot = registry.snapshot("thread-a").unwrap();
+        assert_eq!(snapshot.requests, Some(1));
+        assert_eq!(snapshot.model.as_deref(), Some("gpt-5"));
+        assert_eq!(snapshot.output_tokens_per_second, Some(87.5));
+    }
+
+    #[test]
+    fn new_request_and_unreported_speed_clear_previous_speed() {
+        let registry = ConversationStatsRegistry::default();
+        registry.finish_request(&sample_entry(Some("thread-a"), "responses"));
+        registry.begin_request("thread-a");
+        let active = registry.snapshot("thread-a").unwrap();
+        assert_eq!(active.output_tokens_per_second, None);
+        assert_eq!(active.model, None);
+        assert_eq!(active.last_status, None);
+        assert_eq!(active.updated_at_unix_ms, 0);
+        let mut entry = sample_entry(Some("thread-a"), "responses");
+        entry.output_tokens_per_second = None;
+        entry.model = None;
+        entry.requested_model.clear();
+        registry.finish_request(&entry);
+        let snapshot = registry.snapshot("thread-a").unwrap();
+        assert_eq!(snapshot.output_tokens_per_second, None);
+        assert_eq!(snapshot.model, None);
+    }
+
+    #[test]
+    fn timing_uses_own_requests_and_actual_first_content_only() {
+        let registry = ConversationStatsRegistry::default();
+        let mut entry = sample_entry(Some("thread-a"), "responses");
+        entry.total_duration_ms = 1200;
+        entry.router_pre_upstream_ms = Some(200);
+        entry.downstream_first_content_ms = Some(300);
+        registry.finish_request(&entry);
+        entry.downstream_first_content_ms = None;
+        entry.ttft_ms = Some(1);
+        registry.finish_request(&entry);
+        entry.codex_session_is_parent = true;
+        registry.finish_request(&entry);
+        let snapshot = registry.snapshot("thread-a").unwrap();
+        assert_eq!(snapshot.step_count, Some(2));
+        assert_eq!(snapshot.turn_count, None);
+        assert_eq!(snapshot.model_duration_ms, Some(2000));
+        assert_eq!(snapshot.average_ttft_ms, Some(300.0));
+        assert_eq!(snapshot.timing_request_count, Some(2));
+        assert_eq!(snapshot.ttft_sample_count, Some(1));
+        assert_eq!(snapshot.tool_duration_ms, None);
     }
 
     #[test]

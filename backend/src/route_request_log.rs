@@ -2505,6 +2505,66 @@ impl SqliteSink {
     }
 }
 
+/// 从现有日志恢复最近一次具备有效生成计时的正式请求，不改变日志开关。
+/// 日志库跨 Codex home 共用，归属仅通过精确会话 UUID 确定。
+pub(crate) fn latest_session_recorded_speed(root: &Path, session_id: &str) -> Option<(f64, u64)> {
+    let path = root.join(SQLITE_FILE_NAME);
+    if !path.is_file() {
+        return None;
+    }
+    let connection = open_query_connection(&path).ok()?;
+    // 已有索引按会话和时间定位；旧库缺索引时不退化为周期性全库扫描。
+    let sql = format!(
+        "SELECT {OUTPUT_SPEED_SQL} AS speed, timestamp_unix_ms
+        FROM route_request_logs INDEXED BY idx_route_request_logs_session_time
+        WHERE codex_session_id IN (?1, ?2) AND request_kind = 'responses'
+          AND COALESCE(codex_session_is_parent, 0) = 0
+          AND ({OUTPUT_SPEED_SQL}) > 0
+        ORDER BY timestamp_unix_ms DESC, request_id DESC LIMIT 1"
+    );
+    connection
+        .query_row(
+            &sql,
+            params![session_id, format!("local:{session_id}")],
+            |row| Ok((row.get::<_, f64>(0)?, row.get::<_, u64>(1)?)),
+        )
+        .ok()
+        .filter(|(speed, _)| speed.is_finite() && *speed > 0.0)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SessionRecordedTiming {
+    pub requests: u64,
+    pub model_duration_ms: Option<u64>,
+    pub average_ttft_ms: Option<f64>,
+    pub timing_request_count: u64,
+    pub ttft_sample_count: u64,
+}
+
+/// 只统计保留的自身生成请求；缺失、采样或已清理的日志不补零，不宣称全会话覆盖。
+pub(crate) fn session_recorded_timing(root: &Path, session_id: &str) -> Option<SessionRecordedTiming> {
+    let path = root.join(SQLITE_FILE_NAME);
+    if !path.is_file() { return None; }
+    let connection = open_query_connection(&path).ok()?;
+    connection.query_row(
+        "SELECT COUNT(*),
+          SUM(CASE WHEN router_pre_upstream_ms >= 0 AND total_duration_ms >= router_pre_upstream_ms
+              THEN total_duration_ms - router_pre_upstream_ms END),
+          AVG(CASE WHEN downstream_first_content_ms >= 0 AND downstream_first_content_ms <= total_duration_ms
+              THEN downstream_first_content_ms END),
+          COUNT(CASE WHEN router_pre_upstream_ms >= 0 AND total_duration_ms >= router_pre_upstream_ms THEN 1 END),
+          COUNT(CASE WHEN downstream_first_content_ms >= 0 AND downstream_first_content_ms <= total_duration_ms THEN 1 END)
+         FROM route_request_logs INDEXED BY idx_route_request_logs_session_time
+         WHERE codex_session_id IN (?1, ?2) AND request_kind = 'responses'
+           AND COALESCE(codex_session_is_parent, 0) = 0",
+        params![session_id, format!("local:{session_id}")],
+        |row| Ok(SessionRecordedTiming {
+            requests: row.get(0)?, model_duration_ms: row.get(1)?, average_ttft_ms: row.get(2)?,
+            timing_request_count: row.get(3)?, ttft_sample_count: row.get(4)?,
+        }),
+    ).ok().filter(|value| value.requests > 0)
+}
+
 pub(crate) fn query_route_request_logs(
     root: &Path,
     backend: RouteRequestLogBackend,
@@ -4966,6 +5026,127 @@ mod tests {
             page.items[0].upstream_response_headers.as_deref(),
             Some("x-codex-turn-state: routed\nset-cookie: [REDACTED]")
         );
+    }
+
+    #[test]
+    fn session_recorded_speed_uses_latest_eligible_own_request_without_creating_logs() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            latest_session_recorded_speed(directory.path(), "thread-sample"),
+            None
+        );
+        let path = directory.path().join(SQLITE_FILE_NAME);
+        assert!(!path.exists());
+        let mut sink = SqliteSink::open(&path, 30).unwrap();
+        let mut own = sample_entry("own");
+        own.timestamp_unix_ms = 100;
+        own.codex_session_id = Some("thread-sample".into());
+        own.codex_session_is_parent = false;
+        own.request_kind = "responses".into();
+        own.token_usage.output_tokens = Some(200);
+        own.total_duration_ms = 1100;
+        own.router_pre_upstream_ms = Some(50);
+        own.upstream_first_byte_ms = Some(50);
+        let mut parent = own.clone();
+        parent.request_id = "parent".into();
+        parent.timestamp_unix_ms = 200;
+        parent.codex_session_is_parent = true;
+        let mut missing = own.clone();
+        missing.request_id = "missing".into();
+        missing.timestamp_unix_ms = 300;
+        missing.upstream_first_byte_ms = None;
+        let mut compact = own.clone();
+        compact.request_id = "compact".into();
+        compact.timestamp_unix_ms = 400;
+        compact.request_kind = "responses_compact".into();
+        sink.write_batch(&[
+            queued(own),
+            queued(parent),
+            queued(missing),
+            queued(compact),
+        ])
+        .unwrap();
+        sink.finish().unwrap();
+        drop(sink);
+        assert_eq!(
+            latest_session_recorded_speed(directory.path(), "thread-sample"),
+            Some((200.0, 100))
+        );
+        assert_eq!(
+            latest_session_recorded_speed(directory.path(), "foreign"),
+            None
+        );
+        // 关闭写入后依然只读历史；兼容日志内带 local: 前缀的会话归属。
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("UPDATE route_request_logs SET codex_session_id='local:thread-sample' WHERE request_id='own'", []).unwrap();
+        assert_eq!(
+            latest_session_recorded_speed(directory.path(), "thread-sample"),
+            Some((200.0, 100))
+        );
+        for invalid_output in [0, 99] {
+            conn.execute(
+                "UPDATE route_request_logs SET output_tokens=?1 WHERE request_id='own'",
+                [invalid_output],
+            )
+            .unwrap();
+            assert_eq!(
+                latest_session_recorded_speed(directory.path(), "thread-sample"),
+                None
+            );
+        }
+        conn.execute(
+            "UPDATE route_request_logs SET output_tokens=200 WHERE request_id='own'",
+            [],
+        )
+        .unwrap();
+        // 异常时间不提供速度。
+        conn.execute(
+            "UPDATE route_request_logs SET router_pre_upstream_ms=-1 WHERE request_id='own'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            latest_session_recorded_speed(directory.path(), "thread-sample"),
+            None
+        );
+    }
+
+    #[test]
+    fn session_recorded_timing_excludes_parent_compaction_and_missing_measurements() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(session_recorded_timing(directory.path(), "own").is_none());
+        assert!(!directory.path().join(SQLITE_FILE_NAME).exists());
+        let mut sink = SqliteSink::open(&directory.path().join(SQLITE_FILE_NAME), 30).unwrap();
+        let mut entry = sample_entry("first");
+        entry.codex_session_id = Some("own".into());
+        entry.codex_session_is_parent = false;
+        entry.request_kind = "responses".into();
+        entry.total_duration_ms = 1500;
+        entry.router_pre_upstream_ms = Some(500);
+        entry.downstream_first_content_ms = Some(600);
+        let mut missing = entry.clone(); missing.request_id = "missing".into();
+        missing.router_pre_upstream_ms = None; missing.downstream_first_content_ms = None;
+        missing.ttft_ms = Some(5);
+        let mut parent = entry.clone(); parent.request_id = "parent".into(); parent.codex_session_is_parent = true;
+        let mut compact = entry.clone(); compact.request_id = "compact".into(); compact.request_kind = "responses_compact".into();
+        let mut prefixed = entry.clone(); prefixed.request_id = "prefixed".into(); prefixed.codex_session_id = Some("local:own".into()); prefixed.downstream_first_content_ms = Some(800);
+        sink.write_batch(&[queued(entry), queued(missing), queued(parent), queued(compact), queued(prefixed)]).unwrap();
+        sink.finish().unwrap(); drop(sink);
+        let timing = session_recorded_timing(directory.path(), "own").unwrap();
+        assert_eq!(timing.requests, 3);
+        assert_eq!(timing.model_duration_ms, Some(2000));
+        assert_eq!(timing.average_ttft_ms, Some(700.0));
+        assert_eq!(timing.timing_request_count, 2);
+        assert_eq!(timing.ttft_sample_count, 2);
+        assert!(session_recorded_timing(directory.path(), "foreign").is_none());
+        // 旧库缺计时字段时只返回未知，不迁移、不创建字段，也不依赖当前日志开关。
+        let old = tempfile::tempdir().unwrap();
+        let connection = Connection::open(old.path().join(SQLITE_FILE_NAME)).unwrap();
+        connection.execute_batch("CREATE TABLE route_request_logs (codex_session_id TEXT, timestamp_unix_ms INTEGER);
+            CREATE INDEX idx_route_request_logs_session_time ON route_request_logs(codex_session_id, timestamp_unix_ms);").unwrap();
+        assert!(session_recorded_timing(old.path(), "own").is_none());
+        let columns: u64 = connection.query_row("SELECT COUNT(*) FROM pragma_table_info('route_request_logs')", [], |row| row.get(0)).unwrap();
+        assert_eq!(columns, 2);
     }
 
     #[test]

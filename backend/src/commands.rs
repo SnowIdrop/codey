@@ -458,8 +458,14 @@ impl AppState {
                     return json!({"status":"ok", "stats": null});
                 }
                 let runtime = self.runtime.lock().await.clone();
-                let stats =
+                let runtime_stats =
                     runtime.and_then(|runtime| runtime.conversation_stats_snapshot(&session_id));
+                let stats = crate::conversation_stats::snapshot_with_history(
+                    codex_home().to_path_buf(),
+                    session_id,
+                    runtime_stats,
+                )
+                .await;
                 json!({"status":"ok", "stats": stats})
             }
             "/session/model" => {
