@@ -1910,6 +1910,7 @@ fn selected_codex_app_path_requires_a_desktop_executable() {
 
     let executable = directory.path().join("Codex.exe");
     fs::write(&executable, []).unwrap();
+    write_codex_app_package(directory.path());
     assert_eq!(
         validate_codex_app_path(directory.path().to_str().unwrap()).unwrap(),
         directory.path()
@@ -1924,11 +1925,28 @@ fn selected_codex_app_path_accepts_a_custom_install_root() {
     let current = install_root.join("versions").join("current");
     fs::create_dir_all(&current).unwrap();
     fs::write(current.join("ChatGPT.exe"), []).unwrap();
+    write_codex_app_package(&current);
 
     assert_eq!(
         validate_codex_app_path(install_root.to_str().unwrap()).unwrap(),
         current
     );
+}
+
+#[cfg(windows)]
+fn write_codex_app_package(app_dir: &std::path::Path) {
+    let package_dir = app_dir.join("resources").join("app");
+    fs::create_dir_all(&package_dir).unwrap();
+    fs::write(
+        package_dir.join("package.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "name": "openai-codex-electron",
+            "productName": "Codex",
+            "version": "26.924.22138"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 }
 
 #[test]

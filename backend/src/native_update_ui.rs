@@ -307,7 +307,8 @@ mod update_note_tests {
 
     #[test]
     fn non_heading_hashes_and_attached_closing_hashes_are_preserved() {
-        let notes = "#tag\n##没有分隔空白\n####### 超过六级\n正文 # 井号\n## 标题###\n## C#\n## 标题 #标签";
+        let notes =
+            "#tag\n##没有分隔空白\n####### 超过六级\n正文 # 井号\n## 标题###\n## C#\n## 标题 #标签";
         assert_eq!(
             format_update_notes(notes),
             "\n\n更新说明：\n#tag\n##没有分隔空白\n####### 超过六级\n正文 # 井号\n标题###\nC#\n标题 #标签"
