@@ -42,8 +42,8 @@ pub async fn save_default_model(
     let config = save_config_to_store(state, config).await?;
     *state.config.write().await = config.clone();
     let public_config = redacted_config(&config);
+    let hot_reload = ModelHotReloadOutcome::queued(state, false);
     drop(_config_write_guard);
-    let hot_reload = hot_reload_runtime_models(state).await;
     let restart_required = runtime_config_requires_restart(state, &config).await;
     Ok(hot_reload.add_to_response(json!({
         "status":"ok",
@@ -198,13 +198,13 @@ pub async fn save_official_route_models(
         account_override_warning = Some(format!("线路代理未能写入官方账号记录：{error}"));
     }
     *state.config.write().await = config.clone();
+    let queued_hot_reload = ModelHotReloadOutcome::queued(state, true);
     drop(_config_write_guard);
     timings.mark("saveConfigMs");
     let (mut response, subagent_hot_reload) = if saved_account_id.is_some() {
         let refresh = refresh_official_route_after_account_change(state).await?;
         timings.mark("modelDeliveryMs");
-        let config = state.config.read().await.clone();
-        let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
+        let subagent_hot_reload = SubagentHotReloadOutcome::default();
         timings.mark("subagentReloadMs");
         let mut response = refresh;
         if let Some(object) = response.as_object_mut() {
@@ -216,9 +216,9 @@ pub async fn save_official_route_models(
         }
         (response, subagent_hot_reload)
     } else {
-        let hot_reload = hot_reload_runtime_models(state).await;
+        let hot_reload = queued_hot_reload;
         timings.mark("modelDeliveryMs");
-        let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
+        let subagent_hot_reload = SubagentHotReloadOutcome::default();
         timings.mark("subagentReloadMs");
         let restart_required = runtime_config_requires_restart(state, &config).await;
         (

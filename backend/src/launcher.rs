@@ -1592,11 +1592,12 @@ impl StartupStageTimings {
 fn spawn_initial_storage_guards(
     home: &std::path::Path,
     config: &CodeyConfig,
+    trace_guard_state: Arc<trace_log_guard::TraceLogGuardState>,
 ) -> InitialStorageGuards {
     let trace_guard_home = home.to_path_buf();
     let disable_trace_log_writes = config.disable_trace_log_writes;
     let trace = tokio::task::spawn_blocking(move || {
-        trace_log_guard::configure(&trace_guard_home, disable_trace_log_writes)
+        trace_guard_state.configure(&trace_guard_home, disable_trace_log_writes)
     });
     let protect_crashpad_pending = config.protect_crashpad_pending;
     let crashpad = tokio::task::spawn_blocking(move || {
@@ -2178,6 +2179,7 @@ impl CodeyRuntime {
         config: &CodeyConfig,
         handler: codey_runtime_core::bridge::BridgeHandler,
         trace_log_write_protection_active: &AtomicBool,
+        trace_guard_state: Arc<trace_log_guard::TraceLogGuardState>,
         crashpad_pending_stats: CrashpadPendingStatsHandle,
         account_usage_cache: Arc<tokio::sync::Mutex<crate::account_usage::AccountUsageCaches>>,
     ) -> Result<(Self, oneshot::Receiver<()>)> {
@@ -2208,7 +2210,7 @@ impl CodeyRuntime {
             validate_startup_router_provider(home).await?;
         }
         stage_timings.mark("validateRouterProviderMs");
-        let initial_storage_guards = spawn_initial_storage_guards(home, config);
+        let initial_storage_guards = spawn_initial_storage_guards(home, config, trace_guard_state);
         let (storage, startup_catalog) = prepare_startup_storage(
             home,
             config,

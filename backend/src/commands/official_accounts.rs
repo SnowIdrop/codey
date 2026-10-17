@@ -8,9 +8,9 @@ use serde_json::{Value, json};
 
 use super::{
     AppState, LaunchOfficialAccountStatus, argument, current_model_state_async, error_log,
-    hot_reload_runtime_models, official_account_available_for_usage, open_system_browser,
-    optional_argument, prepare_routes_for_current_launch, query_official_account_usage,
-    redacted_config, runtime_config_requires_restart, save_config_to_store, string_argument,
+    official_account_available_for_usage, open_system_browser, optional_argument,
+    prepare_routes_for_current_launch, query_official_account_usage, redacted_config,
+    runtime_config_requires_restart, save_config_to_store, string_argument,
 };
 use crate::codex_config::codex_home;
 use crate::config::{
@@ -922,9 +922,14 @@ pub(crate) async fn refresh_official_route_after_account_change(
     state: &Arc<AppState>,
 ) -> Result<Value, String> {
     let prepare_error = prepare_routes_for_current_launch(state).await.err();
-    let config = state.config.read().await.clone();
+    let (config, hot_reload) = {
+        let _commit = state.config_write_lock.lock().await;
+        (
+            state.config.read().await.clone(),
+            super::models::ModelHotReloadOutcome::queued(state, true),
+        )
+    };
     let model_state = current_model_state_async(&config).await?;
-    let hot_reload = hot_reload_runtime_models(state).await;
     let restart_required = runtime_config_requires_restart(state, &config).await;
     let store = state.official_accounts();
     let accounts = tokio::task::spawn_blocking(move || accounts_payload(&store))

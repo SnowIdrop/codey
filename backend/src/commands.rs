@@ -9,6 +9,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+mod config_apply;
 mod config_repair;
 mod diagnostics;
 mod extensions;
@@ -42,7 +43,7 @@ use models::{
     validate_deleted_third_party_models, validate_manual_model_selection,
 };
 use models::{
-    current_model_state_async, current_provider_status_async, hot_reload_runtime_models,
+    current_model_state_async, current_provider_status_async,
     native_web_search_capability_requires_restart, official_route_snapshots_for_runtime,
     reconcile_subagent_models_for_mode, runtime_renderer_model_catalog,
     runtime_supports_current_routes_for_hot_reload, sync_current_third_party_provider_state,
@@ -121,7 +122,7 @@ pub struct AppState {
     pub config: RwLock<CodeyConfig>,
     config_write_lock: Mutex<()>,
     provider_model_sync_lock: Mutex<()>,
-    plugin_route_reload_lock: Mutex<()>,
+    config_apply: BlockingMutex<config_apply::ApplyQueue>,
     model_delivery_lock: Mutex<()>,
     /// Captured when the state is created on the Codey runtime. Plugin route
     /// changes arrive on plugin threads, which cannot see that runtime via
@@ -150,6 +151,9 @@ pub struct AppState {
     runtime_operation: Mutex<()>,
     diagnostic_storage_operation: Mutex<()>,
     trace_log_write_protection_active: AtomicBool,
+    trace_log_guard_state: Arc<trace_log_guard::TraceLogGuardState>,
+    #[cfg(test)]
+    slow_apply_test: slow_apply_tests::TestHooks,
     pub crashpad_pending_stats: CrashpadPendingStatsHandle,
     pub startup_error: RwLock<Option<String>>,
     /// Kept apart from `startup_error`, which each launch overwrites and hot
@@ -254,7 +258,7 @@ impl Default for AppState {
             config: RwLock::new(config),
             config_write_lock: Mutex::new(()),
             provider_model_sync_lock: Mutex::new(()),
-            plugin_route_reload_lock: Mutex::new(()),
+            config_apply: BlockingMutex::new(config_apply::ApplyQueue::default()),
             model_delivery_lock: Mutex::new(()),
             runtime_handle: tokio::runtime::Handle::try_current().ok(),
             http_client: reqwest::Client::builder()
@@ -275,6 +279,9 @@ impl Default for AppState {
             runtime_operation: Mutex::new(()),
             diagnostic_storage_operation: Mutex::new(()),
             trace_log_write_protection_active: AtomicBool::new(false),
+            trace_log_guard_state: Arc::new(trace_log_guard::TraceLogGuardState::default()),
+            #[cfg(test)]
+            slow_apply_test: slow_apply_tests::TestHooks::default(),
             crashpad_pending_stats: CrashpadPendingStatsHandle::idle(protect_crashpad_pending),
             startup_error: RwLock::new(None),
             config_load_error,
@@ -1663,12 +1670,15 @@ async fn save_codey_config_input(
 ) -> Result<Value, String> {
     let saved = {
         let _config_write_guard = state.config_write_lock.lock().await;
-        save_codey_config_locked(state, config_input).await
+        let mut saved = save_codey_config_locked(state, config_input).await?;
+        saved.config_apply = config_apply::enqueue(state, saved.reconcile_subagent_config);
+        Ok::<_, String>(saved)
     }?;
     finish_codey_config_save(state, saved).await
 }
 
 struct SavedCodeyConfig {
+    config_apply: Value,
     config: CodeyConfig,
     reconcile_subagent_config: bool,
     fast_context_tools_status: FastContextToolsStatus,
@@ -1915,69 +1925,19 @@ async fn save_codey_config_locked(
     let reconcile_subagent_config = should_reconcile_runtime_subagent_config(&previous, &config);
     config.settings_revision = previous.settings_revision.saturating_add(1);
     let trace_guard_changed = config.disable_trace_log_writes != previous.disable_trace_log_writes;
-    let _diagnostic_operation = if trace_guard_changed {
-        Some(state.diagnostic_storage_operation.lock().await)
-    } else {
-        None
-    };
-    let trace_guard_report = if trace_guard_changed {
-        let home = codex_home().to_path_buf();
-        let disable_writes = config.disable_trace_log_writes;
-        match configure_trace_log_guard(home.clone(), disable_writes).await {
-            Ok(report) => Some(report),
-            Err(error) => {
-                let error =
-                    rollback_trace_log_guard(home, previous.disable_trace_log_writes, error).await;
-                state
-                    .trace_log_write_protection_active
-                    .store(false, Ordering::Release);
-                error_log::record_failure(
-                    "patch_failed",
-                    "configure_trace_log_guard",
-                    error.clone(),
-                    json!({
-                        "disabled": disable_writes,
-                        "source": "save_codey_config",
-                    }),
-                );
-                return Err(error);
-            }
-        }
-    } else {
-        None
-    };
-    let config = match save_config_to_store(state, config).await {
-        Ok(config) => config,
-        Err(error) => {
-            if trace_guard_changed {
-                let error = rollback_trace_log_guard(
-                    codex_home().to_path_buf(),
-                    previous.disable_trace_log_writes,
-                    error,
-                )
-                .await;
-                state
-                    .trace_log_write_protection_active
-                    .store(false, Ordering::Release);
-                return Err(error);
-            }
-            return Err(error);
-        }
-    };
+    let config = save_config_to_store(state, config).await?;
     *state.config.write().await = config.clone();
+    if trace_guard_changed {
+        config_apply::request_trace_apply(state);
+    }
     if previous.codey_update_policy != config.codey_update_policy {
         *state.available_update.write().await = None;
         if let Ok(mut cache) = state.update_candidate_cache.try_lock() {
             *cache = None;
         }
     }
-    if let Some(report) = trace_guard_report {
-        state.trace_log_write_protection_active.store(
-            report.protection_active(config.disable_trace_log_writes),
-            Ordering::Release,
-        );
-    }
     Ok(SavedCodeyConfig {
+        config_apply: Value::Null,
         config,
         reconcile_subagent_config,
         fast_context_tools_status,
@@ -2023,16 +1983,13 @@ pub(crate) fn install_plugin_route_handler(state: Arc<AppState>) {
     })));
     let state = Arc::clone(&state);
     crate::codey_plugins::set_route_handler(Arc::new(move |plugin_id, change| {
-        let (route_id, changed) = apply_plugin_route_change(&state, plugin_id, change)?;
-        if changed {
-            schedule_plugin_route_hot_reload(&state);
-        }
+        let (route_id, _) = apply_plugin_route_change(&state, plugin_id, change)?;
         Ok(route_id)
     }));
 }
 
 fn apply_plugin_route_change(
-    state: &AppState,
+    state: &Arc<AppState>,
     plugin_id: &str,
     change: crate::codey_plugins::RouteChange,
 ) -> Result<(Option<String>, bool), String> {
@@ -2065,45 +2022,8 @@ fn apply_plugin_route_change(
         .persist(next)
         .map_err(|error| format!("{error:#}"))?;
     *state.config.blocking_write() = stored;
+    config_apply::enqueue(state, true);
     Ok((route_id, true))
-}
-
-/// Plugin routes change on plugin-management threads rather than inside a
-/// save command, so the running router and Codex model list are updated
-/// afterwards. Reloads run one at a time and read the config inside the lock,
-/// so a burst of changes settles on the latest one.
-fn schedule_plugin_route_hot_reload(state: &Arc<AppState>) {
-    let Some(runtime) = state.runtime_handle.clone() else {
-        record_plugin_route_hot_reload_failure(
-            "插件线路已保存，但没有可用的 Codey 运行时来热更新，重启 Codex 后生效".to_string(),
-        );
-        return;
-    };
-    let state = Arc::clone(state);
-    runtime.spawn(async move {
-        let _serial = state.plugin_route_reload_lock.lock().await;
-        if let Some(error) = hot_reload_runtime_models(&state).await.error {
-            record_plugin_route_hot_reload_failure(error);
-        }
-        let config = state.config.read().await.clone();
-        if config.subagent_optimization {
-            let outcome = hot_reload_runtime_subagent_config(&state, &config).await;
-            if outcome.requires_restart()
-                && let Some(error) = outcome.error()
-            {
-                record_plugin_route_hot_reload_failure(error.to_string());
-            }
-        }
-    });
-}
-
-fn record_plugin_route_hot_reload_failure(error: String) {
-    error_log::record_failure(
-        "plugin_route_hot_reload_failed",
-        "hot_reload_plugin_routes",
-        error,
-        json!({}),
-    );
 }
 
 fn merge_profile_secrets(
@@ -2226,61 +2146,32 @@ fn embedded_fast_context_tools_enabled(requested: bool, status: &FastContextTool
 async fn configure_trace_log_guard(
     home: PathBuf,
     disable_writes: bool,
+    guard: Arc<trace_log_guard::TraceLogGuardState>,
 ) -> Result<trace_log_guard::TraceLogGuardReport, String> {
-    tokio::task::spawn_blocking(move || trace_log_guard::configure(&home, disable_writes))
+    tokio::task::spawn_blocking(move || guard.configure(&home, disable_writes))
         .await
         .map_err(|error| format!("Trace 日志保护切换任务异常退出：{error}"))?
         .map_err(|error| error.to_string())
-}
-
-async fn rollback_trace_log_guard(
-    home: PathBuf,
-    previous_disable_writes: bool,
-    primary_error: String,
-) -> String {
-    match configure_trace_log_guard(home, previous_disable_writes).await {
-        Ok(_) => primary_error,
-        Err(rollback_error) => {
-            error_log::record_failure(
-                "restore_failed",
-                "rollback_trace_log_guard",
-                rollback_error.clone(),
-                json!({
-                    "disabled": previous_disable_writes,
-                    "source": "save_codey_config",
-                }),
-            );
-            format!("{primary_error}；回滚 Trace 日志保护也失败：{rollback_error}")
-        }
-    }
 }
 
 async fn finish_codey_config_save(
     state: &Arc<AppState>,
     saved: SavedCodeyConfig,
 ) -> Result<Value, String> {
-    sync_waiting_webhook_watcher(state).await;
-    sync_wechat_claw_service(state).await;
-    if let Some(runtime) = state.runtime.lock().await.clone() {
-        runtime.set_crashpad_pending_protection(saved.config.protect_crashpad_pending);
-    }
-    schedule_crashpad_pending_refresh(state, saved.config.protect_crashpad_pending);
     let model_state = current_model_state_async(&saved.config).await?;
-    let model_hot_reload = hot_reload_runtime_models(state).await;
-    let route_request_log_hot_reload = hot_reload_runtime_request_log(state, &saved.config).await;
-    let subagent_hot_reload = if saved.reconcile_subagent_config {
-        hot_reload_runtime_subagent_config(state, &saved.config).await
-    } else {
-        SubagentHotReloadOutcome::default()
+    let restart_required = runtime_config_requires_restart(state, &saved.config).await;
+    let provider_status = current_provider_status_async(&saved.config).await?;
+    let model_hot_reload = models::ModelHotReloadOutcome {
+        config_apply: Some(saved.config_apply),
+        ..Default::default()
     };
-    let restart_required = subagent_hot_reload.requires_restart()
-        || runtime_config_requires_restart(state, &saved.config).await;
-    let subagent_config_hot_reloaded = subagent_hot_reload.reloaded();
-    let subagent_config_repaired = subagent_hot_reload.repaired();
+    let route_request_log_hot_reload = RouteRequestLogHotReloadOutcome::default();
+    let subagent_hot_reload = SubagentHotReloadOutcome::default();
+    let subagent_config_hot_reloaded = false;
+    let subagent_config_repaired = false;
     let subagent_config_health = subagent_hot_reload.health();
     let subagent_config_repair_reasons = subagent_hot_reload.repair_reasons();
     let subagent_config_hot_reload_error = subagent_hot_reload.error();
-    let provider_status = current_provider_status_async(&saved.config).await?;
     let public_config = redacted_config(&saved.config);
     Ok(model_hot_reload.add_to_response(json!({
         "status":"ok",
@@ -2355,12 +2246,11 @@ impl RouteRequestLogHotReloadOutcome {
     }
 }
 
-async fn hot_reload_runtime_request_log(
+async fn hot_reload_runtime_request_log_locked(
     state: &Arc<AppState>,
     config: &CodeyConfig,
 ) -> RouteRequestLogHotReloadOutcome {
     let desired = config.route_request_log.clone();
-    let _runtime_operation = state.runtime_operation.lock().await;
     let _config_commit_guard = state.config_write_lock.lock().await;
     let current_config = state.config.read().await.clone();
     if current_config.route_request_log != desired
@@ -2392,7 +2282,37 @@ async fn hot_reload_runtime_request_log(
         );
     }
 
-    match runtime.reconfigure_request_log(&desired).await {
+    drop(_config_commit_guard);
+    #[cfg(test)]
+    if let Some(gate) = &state.slow_apply_test.request_log {
+        gate.wait().await;
+    }
+    let result = runtime.reconfigure_request_log(&desired).await;
+    let _config_commit_guard = state.config_write_lock.lock().await;
+    let latest = state.config.read().await;
+    let same_runtime = state
+        .runtime
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &runtime));
+    if latest.route_request_log != desired
+        || latest.local_router_enabled != config.local_router_enabled
+        || !subagent_hot_reload_commit_is_current(
+            state.is_shutting_down(),
+            state.restart_in_progress.load(Ordering::Acquire),
+            runtime_generation,
+            state.runtime_generation.load(Ordering::Acquire),
+            same_runtime,
+            true,
+            state.startup_error.read().await.is_some(),
+        )
+    {
+        return RouteRequestLogHotReloadOutcome::superseded(
+            "请求日志热更新期间配置或运行时已变化；等待最新配置应用",
+        );
+    }
+    match result {
         Ok(Some(RouteRequestLogReconfigure::Unchanged)) => RouteRequestLogHotReloadOutcome {
             status: RouteRequestLogHotReloadStatus::Unchanged,
             error: None,
@@ -2600,14 +2520,26 @@ pub(super) async fn hot_reload_runtime_subagent_config(
     state: &Arc<AppState>,
     config: &CodeyConfig,
 ) -> SubagentHotReloadOutcome {
+    let _runtime_operation = state.runtime_operation.lock().await;
+    let outcome = hot_reload_runtime_subagent_config_locked(state, config).await;
+    if outcome.status == SubagentHotReloadStatus::Superseded {
+        let _commit = state.config_write_lock.lock().await;
+        config_apply::enqueue(state, true);
+    }
+    outcome
+}
+
+async fn hot_reload_runtime_subagent_config_locked(
+    state: &Arc<AppState>,
+    config: &CodeyConfig,
+) -> SubagentHotReloadOutcome {
     let desired_config = RuntimeSubagentConfig::from_config(config);
 
     // All code that needs both locks follows the lifecycle -> config order.
     // Restart already holds the lifecycle lock while launch may synchronize and
     // persist provider state, so taking the config lock first here would allow a
-    // save/restart lock inversion. Holding both locks across reconciliation still
-    // prevents an older save from committing role files after a newer config.
-    let _runtime_operation = state.runtime_operation.lock().await;
+    // save/restart lock inversion. Release the config lock during disk work;
+    // the lifecycle lock serializes deliveries and the queue follows newer saves.
     let _config_commit_guard = state.config_write_lock.lock().await;
     let current_config = state.config.read().await.clone();
     let config_matches = current_config.subagent_optimization
@@ -2651,16 +2583,26 @@ pub(super) async fn hot_reload_runtime_subagent_config(
         Ok(config) => config,
         Err(error) => return SubagentHotReloadOutcome::failed(format!("{error:#}")),
     };
-    let result =
-        tokio::task::spawn_blocking(move || reconcile_runtime_subagent_roles(&runtime_config))
-            .await
-            .map_err(|error| anyhow::anyhow!("子代理运行时文件更新任务异常退出：{error}"))
-            .and_then(std::convert::identity);
+    drop(_config_commit_guard);
+    #[cfg(test)]
+    let reconcile_override = state.slow_apply_test.subagents.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(reconcile) = reconcile_override {
+            return reconcile(&runtime_config);
+        }
+        reconcile_runtime_subagent_roles(&runtime_config)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("子代理运行时文件更新任务异常退出：{error}"))
+    .and_then(std::convert::identity);
     match result {
         Ok(report) => {
-            if !report.repaired && !applied_config_changed {
-                return SubagentHotReloadOutcome::unchanged();
-            }
+            let _config_commit_guard = state.config_write_lock.lock().await;
+            let latest_config = state.config.read().await.clone();
+            let config_matches = latest_config.subagent_optimization
+                && RuntimeSubagentConfig::from_config(&latest_config) == desired_config
+                && latest_config.fast_context_tools == config.fast_context_tools;
             let current_runtime = state.runtime.lock().await.clone();
             let same_runtime = current_runtime
                 .as_ref()
@@ -2676,9 +2618,12 @@ pub(super) async fn hot_reload_runtime_subagent_config(
                 config_matches,
                 has_startup_error,
             ) {
-                return SubagentHotReloadOutcome::failed(
-                    "Codex 运行时在子代理配置热更新期间发生变化；需要重启以重新建立可信运行配置",
+                return SubagentHotReloadOutcome::superseded(
+                    "子代理热更新期间配置或运行时已变化；等待最新配置应用",
                 );
+            }
+            if !report.repaired && !applied_config_changed {
+                return SubagentHotReloadOutcome::unchanged();
             }
             runtime.mark_subagent_config_applied(&current_config).await;
             SubagentHotReloadOutcome::applied(
@@ -2710,6 +2655,9 @@ pub(super) async fn hot_reload_runtime_subagent_config(
 
 #[cfg(test)]
 mod subagent_hot_reload_commit_tests;
+
+#[cfg(test)]
+mod slow_apply_tests;
 
 fn redacted_config(config: &CodeyConfig) -> CodeyConfig {
     let mut public = config.clone();

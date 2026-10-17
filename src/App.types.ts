@@ -215,6 +215,7 @@ export type OfficialAccount = {
 };
 
 export type OfficialAccountsResult = {
+  configApply?: ConfigApplyStatus | null;
   accounts?: OfficialAccount[];
   accountId?: string;
   defaultAccountId?: string | null;
@@ -227,7 +228,14 @@ export type OfficialAccountsResult = {
   warning?: string;
 };
 
+export type ConfigApplyStatus = {
+  revision: number;
+  state: "pending" | "applied" | "restart_required" | "failed" | "saved";
+  error?: string | null;
+};
+
 export type RuntimeStatus = {
+  configApply?: ConfigApplyStatus | null;
   running: boolean;
   remoteCompaction?: {
     configured: boolean;
