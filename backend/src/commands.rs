@@ -10,7 +10,6 @@ use std::sync::{
 use std::time::Duration;
 
 mod config_repair;
-mod conversation_git;
 mod diagnostics;
 mod extensions;
 mod models;
@@ -1169,11 +1168,6 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             Ok(text) => optimize_prompt_command(state, text).await,
             Err(error) => Err(error),
         },
-        "conversation_git_status"
-        | "conversation_git_preview"
-        | "conversation_git_execute"
-        | "conversation_git_push_preview"
-        | "conversation_git_cancel" => conversation_git::invoke(state, command, &args).await,
         "test_prompt_optimization" => {
             match optional_argument::<PromptOptimizationConfig>(&args, "config") {
                 Ok(draft) => test_prompt_optimization_command(state, draft).await,
@@ -1815,8 +1809,6 @@ async fn save_codey_config_locked(
         .merge_redacted_secrets(&previous.prompt_optimization);
     config_input.prompt_optimization.validate()?;
     config.prompt_optimization = config_input.prompt_optimization;
-    config_input.conversation_git.validate()?;
-    config.conversation_git = config_input.conversation_git;
     config.codex_app_path = config_input.codex_app_path;
     config.user_scripts = config_input.user_scripts;
     config.disable_trace_log_writes = config_input.disable_trace_log_writes;
@@ -3058,7 +3050,6 @@ pub(super) fn config_requires_restart_with_route_status(
         || applied.gpu_launch_mode != current.gpu_launch_mode
         || applied.codex_launch_proxy != current.codex_launch_proxy
         || applied.fast_context_tools != current.fast_context_tools
-        || applied.conversation_git.enabled != current.conversation_git.enabled
         || applied.subagent_optimization != current.subagent_optimization
         || !applied
             .misc_model

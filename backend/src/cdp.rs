@@ -57,7 +57,6 @@ pub(crate) const SETTINGS_OVERLAY_SCRIPT: &str =
 const PLUGIN_MARKETPLACE_FIX_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/plugin-marketplace-fix.js");
 const PROMPT_OPTIMIZE_SCRIPT: &str = include_str!("../../dist-overlay/inject/prompt-optimize.js");
-const CONVERSATION_GIT_SCRIPT: &str = include_str!("../../dist-overlay/inject/conversation-git.js");
 const MAX_INJECTION_ERROR_CHARS: usize = 500;
 // 面向用户的是归类后的摘要；完整错误链只进诊断与错误日志，单独给一个更大预算。
 const MAX_INJECTION_DETAIL_CHARS: usize = 2000;
@@ -388,16 +387,6 @@ pub fn prepare_injection_scripts(
                 : { effective: false, inactive: true, detail: "提示词优化已关闭" };
             })()"#
                 .to_string(),
-            Feature,
-        ),
-        (
-            "conversation-git",
-            "对话 Git 提交增强",
-            CONVERSATION_GIT_SCRIPT,
-            r#"window.__codeyConversationGit?.snapshot?.().ready === true
-              ? (window.__codeyConversationGit.snapshot().enabled
-                ? "对话 Git 提交入口已就绪"
-                : { effective: false, inactive: true, detail: "对话 Git 提交增强已关闭" }) : """#.to_string(),
             Feature,
         ),
     ];
@@ -2551,13 +2540,7 @@ const run = async (patch) => {
         assert!(prepared.scripts[1].contains("window.userScriptRan = true;"));
         assert!(prepared.scripts[1].contains(r#"status = "executed""#));
         assert!(prepared.scripts[1].contains("用户脚本 1 injection failed"));
-        assert_eq!(prepared.descriptors.len(), 11);
-        assert!(
-            prepared
-                .descriptors
-                .iter()
-                .any(|descriptor| descriptor.id == "conversation-git")
-        );
+        assert_eq!(prepared.descriptors.len(), 10);
         let user_script = prepared
             .descriptors
             .iter()

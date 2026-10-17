@@ -272,7 +272,6 @@ impl CodeyConfig {
         }
         self.webhook.normalize();
         self.prompt_optimization.normalize();
-        self.conversation_git.model = self.conversation_git.model.trim().to_string();
         self.codex_launch_proxy = self.codex_launch_proxy.trim().to_string();
         self
     }

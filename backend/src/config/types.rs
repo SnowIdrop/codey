@@ -645,8 +645,6 @@ pub struct CodeyConfig {
     #[serde(default)]
     pub prompt_optimization: PromptOptimizationConfig,
     #[serde(default)]
-    pub conversation_git: crate::conversation_git::ConversationGitConfig,
-    #[serde(default)]
     pub codex_app_path: String,
     #[serde(default)]
     pub user_scripts: Vec<String>,
@@ -836,7 +834,6 @@ impl Default for CodeyConfig {
             profiles: vec![profile],
             webhook: WebhookConfig::default(),
             prompt_optimization: PromptOptimizationConfig::default(),
-            conversation_git: crate::conversation_git::ConversationGitConfig::default(),
             codex_app_path: String::new(),
             user_scripts: Vec::new(),
             selected_models_by_provider: BTreeMap::new(),

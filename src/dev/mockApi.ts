@@ -220,7 +220,6 @@ if (import.meta.env.DEV) {
         upstreamProtocol: "openaiResponses",
         instruction: "",
       },
-      conversationGit: { enabled: false, model: "" },
       codexAppPath: "/Applications/ChatGPT.app",
       userScripts: [],
       selectedModelsByProvider: {

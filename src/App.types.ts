@@ -115,7 +115,6 @@ export type Config = {
   initialRouteImportCompleted: boolean;
   webhook: { channels: NotificationChannel[] };
   promptOptimization: PromptOptimizationConfig;
-  conversationGit: { enabled: boolean; model: string };
   codexAppPath: string;
   userScripts: string[];
   selectedModelsByProvider: Record<string, string[]>;
