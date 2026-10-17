@@ -2079,6 +2079,18 @@ impl CodeyRuntime {
         self.local_router.as_ref().map(LocalRouter::endpoint)
     }
 
+    /// 页面状态条按当前可见会话 id 查询的实时统计；本地路由未启动时返回 None。
+    pub(crate) fn conversation_stats_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::conversation_stats::ConversationStatsSnapshot> {
+        self.local_router
+            .as_ref()?
+            .request_log
+            .session_stats()
+            .snapshot(session_id)
+    }
+
     pub async fn applied_subagent_config(&self) -> Arc<RuntimeSubagentConfig> {
         Arc::clone(&*self.applied_subagent_config.read().await)
     }

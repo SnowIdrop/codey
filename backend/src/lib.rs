@@ -10,6 +10,7 @@ mod codey_plugins;
 mod commands;
 mod computer_use;
 mod config;
+mod conversation_stats;
 mod crashpad_pending_guard;
 #[cfg(windows)]
 mod desktop_instance;

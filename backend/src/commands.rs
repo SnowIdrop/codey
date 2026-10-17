@@ -432,6 +432,16 @@ impl AppState {
                 self.session_scan_wake.notify_one();
                 json!({"status":"ok"})
             }
+            "/session/stats" => {
+                let session_id = bridge_string(&payload, "sessionId");
+                if session_id.is_empty() {
+                    return json!({"status":"ok", "stats": null});
+                }
+                let runtime = self.runtime.lock().await.clone();
+                let stats =
+                    runtime.and_then(|runtime| runtime.conversation_stats_snapshot(&session_id));
+                json!({"status":"ok", "stats": stats})
+            }
             "/session/titles" => cache_session_titles(self, &payload).await,
             "/session/timestamps" => {
                 let session_ids =

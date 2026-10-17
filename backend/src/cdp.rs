@@ -57,6 +57,8 @@ pub(crate) const SETTINGS_OVERLAY_SCRIPT: &str =
 const PLUGIN_MARKETPLACE_FIX_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/plugin-marketplace-fix.js");
 const PROMPT_OPTIMIZE_SCRIPT: &str = include_str!("../../dist-overlay/inject/prompt-optimize.js");
+const CONVERSATION_STATS_SCRIPT: &str =
+    include_str!("../../dist-overlay/inject/conversation-stats-inject.js");
 const MAX_INJECTION_ERROR_CHARS: usize = 500;
 // 面向用户的是归类后的摘要；完整错误链只进诊断与错误日志，单独给一个更大预算。
 const MAX_INJECTION_DETAIL_CHARS: usize = 2000;
@@ -363,6 +365,15 @@ pub fn prepare_injection_scripts(
             Internal,
         ),
         (
+            "conversation-stats",
+            "会话状态条",
+            CONVERSATION_STATS_SCRIPT,
+            r#"window.__codeyConversationStats?.installed === true
+              ? "会话状态条已就绪" : """#
+                .to_string(),
+            Internal,
+        ),
+        (
             "plugin-marketplace-compatibility",
             "插件市场兼容",
             PLUGIN_MARKETPLACE_FIX_SCRIPT,
@@ -415,6 +426,7 @@ pub fn prepare_injection_scripts(
             + QUOTA_UNLOCK_SCRIPT.len()
             + PLUGIN_MARKETPLACE_FIX_SCRIPT.len()
             + PROMPT_OPTIMIZE_SCRIPT.len()
+            + CONVERSATION_STATS_SCRIPT.len()
             + 4096,
     );
     let mut descriptors = Vec::with_capacity(builtin_scripts.len() + user_scripts.len());
@@ -2540,7 +2552,7 @@ const run = async (patch) => {
         assert!(prepared.scripts[1].contains("window.userScriptRan = true;"));
         assert!(prepared.scripts[1].contains(r#"status = "executed""#));
         assert!(prepared.scripts[1].contains("用户脚本 1 injection failed"));
-        assert_eq!(prepared.descriptors.len(), 10);
+        assert_eq!(prepared.descriptors.len(), 11);
         let user_script = prepared
             .descriptors
             .iter()

@@ -209,7 +209,7 @@ pub(crate) enum RequestStatus {
 }
 
 impl RequestStatus {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
@@ -777,12 +777,15 @@ impl RouteRequestLogStats {
 
 #[derive(Clone)]
 pub(crate) struct RouteRequestLogProducer {
-    sender: SyncSender<QueuedEntry>,
+    /// 落盘 producer 持有 writer 队列；会话统计 producer 为 None，只向
+    /// `session_stats` 注册表写聚合结果。
+    sender: Option<SyncSender<QueuedEntry>>,
     accepting: Arc<AtomicBool>,
     submitting: Arc<AtomicU64>,
     sample_rate_per_million: u32,
     sample_sequence: Arc<AtomicU64>,
     stats: Arc<RouteRequestLogStats>,
+    session_stats: Option<Arc<crate::conversation_stats::ConversationStatsRegistry>>,
 }
 
 impl RouteRequestLogProducer {
@@ -796,9 +799,17 @@ impl RouteRequestLogProducer {
             self.stats.dropped_closed.fetch_add(1, Ordering::Relaxed);
             return None;
         }
+        // 纯统计 producer 不关心无会话标识的请求（如模型列表），直接短路，
+        // 让这些请求保持与日志关闭时相同的零开销路径。
+        if self.sender.is_none() && start.codex_session_id.is_none() {
+            return None;
+        }
         if !self.should_sample() {
             self.stats.sampled_out.fetch_add(1, Ordering::Relaxed);
             return None;
+        }
+        if let (Some(registry), Some(session_id)) = (&self.session_stats, start.codex_session_id) {
+            registry.begin_request(session_id);
         }
         let request_id = bounded_string(start.request_id);
         let entry = PendingEntry {
@@ -882,10 +893,18 @@ impl RouteRequestLogProducer {
     }
 
     fn submit(&self, entry: RouteRequestLogEntry) {
+        // 会话统计先于队列开关检查记录：writer 停收时收尾请求仍会走 submit，
+        // 必须结清在途计数，否则页面会一直显示“生成中”。
+        if let Some(registry) = &self.session_stats {
+            registry.finish_request(&entry);
+        }
         if !self.accepting.load(Ordering::Acquire) {
             self.stats.dropped_closed.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        let Some(sender) = &self.sender else {
+            return;
+        };
         self.submitting.fetch_add(1, Ordering::AcqRel);
         if !self.accepting.load(Ordering::Acquire) {
             self.submitting.fetch_sub(1, Ordering::AcqRel);
@@ -896,7 +915,7 @@ impl RouteRequestLogProducer {
             entry,
             enqueued_at: Instant::now(),
         };
-        let result = self.sender.try_send(queued);
+        let result = sender.try_send(queued);
         self.submitting.fetch_sub(1, Ordering::AcqRel);
         match result {
             Ok(()) => {
@@ -1072,12 +1091,13 @@ impl RouteRequestLogProbe {
     pub(crate) fn detached_test_probe() -> Self {
         let (sender, _receiver) = mpsc::sync_channel(1);
         RouteRequestLogProducer {
-            sender,
+            sender: Some(sender),
             accepting: Arc::new(AtomicBool::new(true)),
             submitting: Arc::new(AtomicU64::new(0)),
             sample_rate_per_million: 1_000_000,
             sample_sequence: Arc::new(AtomicU64::new(0)),
             stats: Arc::new(RouteRequestLogStats::default()),
+            session_stats: None,
         }
         .begin(RouteRequestLogStart {
             request_id: "test-probe",
@@ -1558,6 +1578,10 @@ impl Drop for RouteRequestLogGuard {
 
 pub(crate) struct RouteRequestLogController {
     active: ArcSwapOption<RouteRequestLogProducer>,
+    /// 常驻的会话统计 producer：请求日志关闭或重配置空窗期内仍负责采集
+    /// 会话级 Token/缓存/速度，probe 开销与日志开启时相同。
+    stats_producer: Arc<RouteRequestLogProducer>,
+    session_stats: Arc<crate::conversation_stats::ConversationStatsRegistry>,
     state: AsyncMutex<RouteRequestLogControllerState>,
     root: PathBuf,
 }
@@ -1581,8 +1605,20 @@ impl RouteRequestLogController {
     }
 
     pub(crate) fn with_root(root: PathBuf) -> Self {
+        let session_stats =
+            Arc::new(crate::conversation_stats::ConversationStatsRegistry::default());
         Self {
             active: ArcSwapOption::empty(),
+            stats_producer: Arc::new(RouteRequestLogProducer {
+                sender: None,
+                accepting: Arc::new(AtomicBool::new(true)),
+                submitting: Arc::new(AtomicU64::new(0)),
+                sample_rate_per_million: PARTS_PER_MILLION as u32,
+                sample_sequence: Arc::new(AtomicU64::new(0)),
+                stats: Arc::new(RouteRequestLogStats::default()),
+                session_stats: Some(Arc::clone(&session_stats)),
+            }),
+            session_stats,
             state: AsyncMutex::new(RouteRequestLogControllerState::default()),
             root,
         }
@@ -1592,14 +1628,24 @@ impl RouteRequestLogController {
         &self.root
     }
 
-    /// The disabled fast path is a single atomic load. The start closure is
-    /// deliberately lazy so extracting optional observation fields is skipped
-    /// entirely while logging is off.
+    pub(crate) fn session_stats(
+        &self,
+    ) -> Arc<crate::conversation_stats::ConversationStatsRegistry> {
+        Arc::clone(&self.session_stats)
+    }
+
+    /// The disabled fast path is a single atomic load plus a session-id check
+    /// inside the stats-only producer. The start closure is deliberately lazy
+    /// so extracting optional observation fields is skipped entirely while
+    /// logging is off.
     pub(crate) fn begin(
         &self,
         begin: impl FnOnce(&RouteRequestLogProducer) -> Option<RouteRequestLogProbe>,
     ) -> Option<RouteRequestLogProbe> {
-        let producer = self.active.load_full()?;
+        let producer = self
+            .active
+            .load_full()
+            .unwrap_or_else(|| Arc::clone(&self.stats_producer));
         begin(&producer)
     }
 
@@ -1641,8 +1687,9 @@ impl RouteRequestLogController {
 
         let worker_config = config.clone();
         let root = self.root.clone();
+        let session_stats = Arc::clone(&self.session_stats);
         let started = tokio::task::spawn_blocking(move || {
-            RouteRequestLogRuntime::start_at(&worker_config, root)
+            RouteRequestLogRuntime::start_at(&worker_config, root, session_stats)
         })
         .await
         .map_err(|error| anyhow::anyhow!("请求日志 writer 启动任务异常退出：{error}"))??
@@ -1693,8 +1740,9 @@ impl RouteRequestLogController {
         if desired_active {
             let worker_config = config.clone();
             let root = self.root.clone();
+            let session_stats = Arc::clone(&self.session_stats);
             match tokio::task::spawn_blocking(move || {
-                RouteRequestLogRuntime::start_at(&worker_config, root)
+                RouteRequestLogRuntime::start_at(&worker_config, root, session_stats)
             })
             .await
             {
@@ -1777,6 +1825,7 @@ impl RouteRequestLogRuntime {
     fn start_at(
         config: &RouteRequestLogConfig,
         root: PathBuf,
+        session_stats: Arc<crate::conversation_stats::ConversationStatsRegistry>,
     ) -> anyhow::Result<Option<(RouteRequestLogProducer, Self)>> {
         if !config.enabled || config.sample_rate_per_million == 0 {
             return Ok(None);
@@ -1787,12 +1836,13 @@ impl RouteRequestLogRuntime {
         let accepting = Arc::new(AtomicBool::new(true));
         let submitting = Arc::new(AtomicU64::new(0));
         let producer = RouteRequestLogProducer {
-            sender,
+            sender: Some(sender),
             accepting: Arc::clone(&accepting),
             submitting: Arc::clone(&submitting),
             sample_rate_per_million: config.sample_rate_per_million,
             sample_sequence: Arc::new(AtomicU64::new(0)),
             stats: Arc::clone(&stats),
+            session_stats: Some(session_stats),
         };
         let worker_config = WorkerConfig::new(config, root);
         let worker_stats = Arc::clone(&stats);
@@ -5384,16 +5434,22 @@ mod tests {
         let config = RouteRequestLogConfig::default();
         let directory = tempfile::tempdir().unwrap();
         assert!(
-            RouteRequestLogRuntime::start_at(&config, directory.path().to_path_buf())
-                .unwrap()
-                .is_none()
+            RouteRequestLogRuntime::start_at(
+                &config,
+                directory.path().to_path_buf(),
+                Arc::default()
+            )
+            .unwrap()
+            .is_none()
         );
     }
 
     #[test]
-    fn disabled_controller_skips_lazy_start_fields() {
+    fn disabled_controller_evaluates_start_but_skips_sessionless_requests() {
         let controller = RouteRequestLogController::with_root(PathBuf::new());
         let evaluated = AtomicBool::new(false);
+        // 落盘关闭时仍走会话统计 producer：闭包会求值，但无会话标识的请求
+        // 依旧短路，不产生 probe 开销。
         let probe = controller.begin(|producer| {
             evaluated.store(true, Ordering::Relaxed);
             producer.begin(RouteRequestLogStart {
@@ -5409,7 +5465,22 @@ mod tests {
             })
         });
         assert!(probe.is_none());
-        assert!(!evaluated.load(Ordering::Relaxed));
+        assert!(evaluated.load(Ordering::Relaxed));
+
+        let session_probe = controller.begin(|producer| {
+            producer.begin(RouteRequestLogStart {
+                request_id: "stats-only",
+                started_at: Instant::now(),
+                request_protocol: RequestProtocol::Http,
+                request_kind: "responses",
+                requested_model: "model",
+                reasoning_effort: None,
+                thinking_budget_tokens: None,
+                codex_session_id: Some("thread-stats"),
+                codex_session_is_parent: false,
+            })
+        });
+        assert!(session_probe.is_some());
     }
 
     #[tokio::test]
@@ -5447,7 +5518,23 @@ mod tests {
             controller.reconfigure(&disabled).await.unwrap(),
             RouteRequestLogReconfigure::Disabled
         );
-        assert!(controller.begin(|_| unreachable!()).is_none());
+        // 落盘停掉后 begin 仍落到纯统计 producer：闭包会执行，但无会话标识的
+        // 请求依旧拿不到 probe，也不会写进 SQLite。
+        assert!(
+            controller
+                .begin(|producer| producer.begin(RouteRequestLogStart {
+                    request_id: "after-disable",
+                    started_at: Instant::now(),
+                    request_protocol: RequestProtocol::Http,
+                    request_kind: "responses",
+                    requested_model: "model",
+                    reasoning_effort: None,
+                    thinking_budget_tokens: None,
+                    codex_session_id: None,
+                    codex_session_is_parent: false,
+                }))
+                .is_none()
+        );
         let connection = Connection::open(directory.path().join(SQLITE_FILE_NAME)).unwrap();
         let count: i64 = connection
             .query_row("SELECT COUNT(*) FROM route_request_logs", [], |row| {
@@ -5553,7 +5640,23 @@ mod tests {
             ..RouteRequestLogConfig::default()
         };
         assert!(controller.reconfigure(&config).await.is_err());
-        assert!(controller.begin(|_| unreachable!()).is_none());
+        // sink 启动失败不发布落盘 producer；会话统计 producer 仍兜底，但同样
+        // 只接受带会话标识的请求。
+        assert!(
+            controller
+                .begin(|producer| producer.begin(RouteRequestLogStart {
+                    request_id: "unpublished",
+                    started_at: Instant::now(),
+                    request_protocol: RequestProtocol::Http,
+                    request_kind: "responses",
+                    requested_model: "model",
+                    reasoning_effort: None,
+                    thinking_budget_tokens: None,
+                    codex_session_id: None,
+                    codex_session_is_parent: false,
+                }))
+                .is_none()
+        );
     }
 
     #[test]
@@ -5561,12 +5664,13 @@ mod tests {
         let (sender, _receiver) = mpsc::sync_channel(1);
         let stats = Arc::new(RouteRequestLogStats::default());
         let producer = RouteRequestLogProducer {
-            sender,
+            sender: Some(sender),
             accepting: Arc::new(AtomicBool::new(true)),
             submitting: Arc::new(AtomicU64::new(0)),
             sample_rate_per_million: 1_000_000,
             sample_sequence: Arc::new(AtomicU64::new(0)),
             stats: Arc::clone(&stats),
+            session_stats: None,
         };
         producer.submit(sample_entry("one"));
         producer.submit(sample_entry("two"));
@@ -5579,12 +5683,13 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(4);
         let stats = Arc::new(RouteRequestLogStats::default());
         let producer = RouteRequestLogProducer {
-            sender,
+            sender: Some(sender),
             accepting: Arc::new(AtomicBool::new(true)),
             submitting: Arc::new(AtomicU64::new(0)),
             sample_rate_per_million: 1_000_000,
             sample_sequence: Arc::new(AtomicU64::new(0)),
             stats,
+            session_stats: None,
         };
         let probe = producer
             .begin(RouteRequestLogStart {
@@ -5654,12 +5759,13 @@ mod tests {
     fn deferred_finish_waits_for_observer_and_still_submits_exactly_once() {
         let (sender, receiver) = mpsc::sync_channel(2);
         let producer = RouteRequestLogProducer {
-            sender,
+            sender: Some(sender),
             accepting: Arc::new(AtomicBool::new(true)),
             submitting: Arc::new(AtomicU64::new(0)),
             sample_rate_per_million: 1_000_000,
             sample_sequence: Arc::new(AtomicU64::new(0)),
             stats: Arc::new(RouteRequestLogStats::default()),
+            session_stats: None,
         };
         let probe = producer
             .begin(RouteRequestLogStart {
@@ -5706,12 +5812,13 @@ mod tests {
     fn synthetic_response_created_does_not_set_ttft() {
         let (sender, receiver) = mpsc::sync_channel(1);
         let producer = RouteRequestLogProducer {
-            sender,
+            sender: Some(sender),
             accepting: Arc::new(AtomicBool::new(true)),
             submitting: Arc::new(AtomicU64::new(0)),
             sample_rate_per_million: 1_000_000,
             sample_sequence: Arc::new(AtomicU64::new(0)),
             stats: Arc::new(RouteRequestLogStats::default()),
+            session_stats: None,
         };
         let probe = producer
             .begin(RouteRequestLogStart {
@@ -5739,12 +5846,13 @@ mod tests {
     fn retry_updates_effective_transport_without_resetting_ttft_origin() {
         let (sender, receiver) = mpsc::sync_channel(1);
         let producer = RouteRequestLogProducer {
-            sender,
+            sender: Some(sender),
             accepting: Arc::new(AtomicBool::new(true)),
             submitting: Arc::new(AtomicU64::new(0)),
             sample_rate_per_million: 1_000_000,
             sample_sequence: Arc::new(AtomicU64::new(0)),
             stats: Arc::new(RouteRequestLogStats::default()),
+            session_stats: None,
         };
         let probe = producer
             .begin(RouteRequestLogStart {
@@ -5777,12 +5885,13 @@ mod tests {
     fn unavailable_usage_has_an_explicit_reason() {
         let (sender, receiver) = mpsc::sync_channel(1);
         let producer = RouteRequestLogProducer {
-            sender,
+            sender: Some(sender),
             accepting: Arc::new(AtomicBool::new(true)),
             submitting: Arc::new(AtomicU64::new(0)),
             sample_rate_per_million: 1_000_000,
             sample_sequence: Arc::new(AtomicU64::new(0)),
             stats: Arc::new(RouteRequestLogStats::default()),
+            session_stats: None,
         };
         let probe = producer
             .begin(RouteRequestLogStart {
