@@ -893,7 +893,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "66");
+  assert.equal(patch.version, "67");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -5025,6 +5025,44 @@ test("composer trigger tracks exact route aliases, React updates and renamed rou
   runtime.patch.dispose();
   assert.equal(replacement.nodeValue, "gpt-6-astra");
 });
+
+for (const fallback of ["自定义", "Custom", "自訂"]) {
+  test(`composer trigger resolves ${fallback} from the exact official account selection`, async () => {
+    const first = subagentRouteModel;
+    const second = first.replace("d3265a21", "a3265a21");
+    const catalog = {
+      status: "ok", models: [first, second], default_model: first,
+      model_metadata: [first, second].map((model, index) => ({
+        model, display_name: `[官${index + 1}] gpt-6-luna`,
+        route_name: `官方账号${index + 1}`, route_provider_id: model.split("/")[0],
+        source_model: "gpt-6-luna",
+      })),
+    };
+    const body = new FakeElementCore("body", { connected: true });
+    const { trigger, textNode, effortNode, picker } = composerModelTrigger(body, `${fallback} · High`);
+    picker.model = second;
+    const unrelated = composerModelTrigger(body, fallback, { reactPicker: false });
+    const runtime = await loadPatch(catalog, [statsigClient()], { documentBody: body });
+    assert.equal(textNode.nodeValue, "[官2] gpt-6-luna · High");
+    assert.equal(effortNode.nodeValue, "极高");
+    assert.equal(unrelated.textNode.nodeValue, fallback);
+    picker.model = first;
+    await runtime.patch.setCatalog(catalog);
+    assert.equal(textNode.nodeValue, "[官1] gpt-6-luna · High");
+    textNode.nodeValue = `${fallback} · Low`;
+    runtime.dispatchObserverMutations(trigger, [{ type: "characterData", target: textNode }]);
+    assert.equal(textNode.nodeValue, "[官1] gpt-6-luna · Low");
+    picker.model = "unknown-model";
+    await runtime.patch.setCatalog(catalog);
+    assert.equal(textNode.nodeValue, `${fallback} · Low`, "unknown selection must retain its native label");
+    picker.model = second;
+    textNode.nodeValue = fallback;
+    runtime.dispatchObserverMutations(trigger, [{ type: "characterData", target: textNode }]);
+    assert.equal(textNode.nodeValue, "[官2] gpt-6-luna");
+    runtime.patch.dispose();
+    assert.equal(textNode.nodeValue, fallback);
+  });
+}
 
 test("composer trigger handles late catalogs and model changes from native labels", async () => {
   const body = new FakeElementCore("body", { connected: true });

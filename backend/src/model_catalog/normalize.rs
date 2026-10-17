@@ -1618,11 +1618,16 @@ fn synthetic_model(
     }
     model["slug"] = json!(model_id);
     model["display_name"] = json!(model_id);
-    model["description"] = json!("Third-party API model");
+    if !is_official_route_alias(model_id) {
+        model["description"] = json!("Third-party API model");
+        model["codey_source"] = json!("third_party");
+    } else if let Some(object) = model.as_object_mut() {
+        // 官方账号的线路别名沿用官方元数据，不能继承旧目录的第三方标记。
+        object.remove("codey_source");
+    }
     model["visibility"] = json!("list");
     model["priority"] = json!(1000 + index);
     model["supported_in_api"] = json!(true);
-    model["codey_source"] = json!("third_party");
     model["default_reasoning_level"] = json!(THIRD_PARTY_DEFAULT_REASONING_EFFORT);
     model["supported_reasoning_levels"] =
         third_party_reasoning_levels(template, preserve_source_runtime_metadata);

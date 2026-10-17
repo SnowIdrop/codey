@@ -2303,6 +2303,59 @@ fn cache_without_astra_keeps_existing_routes_and_requires_its_own_runtime_templa
 }
 
 #[test]
+fn mixed_catalog_preserves_official_account_alias_identity() {
+    let home = tempfile::tempdir().unwrap();
+    let mut cache = official_cache();
+    let source = cache["models"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|model| model["slug"] == "gpt-5.6-sol")
+        .unwrap();
+    source["description"] = json!("Official account model description");
+    let expected_instructions = model_instruction_source(source).unwrap().to_string();
+    fs::write(
+        home.path().join("models_cache.json"),
+        serde_json::to_vec(&cache).unwrap(),
+    )
+    .unwrap();
+
+    let first = crate::config::official_profile_id("acct-one");
+    let second = crate::config::official_profile_id("acct-two");
+    let selected = vec![
+        format!("{first}/gpt-5.6-sol"),
+        format!("{second}/gpt-5.6-sol"),
+        "relay/gpt-5.6-sol".to_string(),
+    ];
+    assert_eq!(
+        refresh_for_provider(home.path(), false, Some(&selected), &selected).unwrap(),
+        3
+    );
+    let catalog = read_catalog_value(&home.path().join(relative_path())).unwrap();
+    let models = catalog["models"].as_array().unwrap();
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model["slug"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        selected.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    for model in &models[..2] {
+        assert_eq!(model["description"], "Official account model description");
+        assert!(model.get("codey_source").is_none());
+    }
+    let third_party = &models[2];
+    assert_eq!(third_party["description"], "Third-party API model");
+    assert_eq!(third_party["codey_source"], "third_party");
+    for model in models {
+        assert_eq!(
+            model_instruction_source(model),
+            Some(expected_instructions.as_str())
+        );
+    }
+}
+
+#[test]
 fn official_route_aliases_without_a_local_runtime_template_are_dropped() {
     let home = tempfile::tempdir().unwrap();
     // One official model has no runtime instructions in this machine's

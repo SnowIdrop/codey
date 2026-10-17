@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "66";
+  const patchVersion = "67";
   const nativeSelectionOnly = window.__codeyNativeModelSelectionOnly === true;
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
@@ -1474,6 +1474,27 @@
     if (node.nodeValue === state.renderedText) node.nodeValue = state.nativeText;
   };
 
+  const modelPickerProps = (element) => {
+    let fiber = reactFiberKeys(element).map((key) => element[key]).find(Boolean);
+    for (let hops = 0; fiber && hops < 80; fiber = fiber.return, hops += 1) {
+      const props = fiber.memoizedProps;
+      if (typeof props?.model === "string" && Array.isArray(props.models)
+        && (Object.hasOwn(props, "onSelectModel") || Object.hasOwn(props, "onSelectServiceTier"))) {
+        return props;
+      }
+      if (props && Object.hasOwn(props, "conversationId") && Object.hasOwn(props, "hideLabel")) break;
+    }
+    return null;
+  };
+
+  const pickerFallbackText = (element, text) => {
+    const parts = /^(\s*)(Custom|自定义|自訂)(?=\s|·|$)([\s\S]*)$/i.exec(text);
+    if (!parts) return null;
+    const model = modelPickerProps(element)?.model;
+    if (typeof model !== "string" || !pickerModelText(model)) return null;
+    return { model, prefix: parts[1], nativeLabel: parts[2], suffix: parts[3], nativeText: text };
+  };
+
   const updateModelPickerTrigger = (element) => {
     const state = modelPickerTriggers.get(element);
     if (!state || disposed || !catalog.loaded || element.isConnected === false) return;
@@ -1484,18 +1505,27 @@
       state.nodes.delete(node);
     }
     for (const node of nodes) {
-      const text = node.nodeValue || "";
+      let text = node.nodeValue || "";
       let textState = state.nodes.get(node);
+      if (textState?.fallback && text === textState.renderedText
+        && modelPickerProps(element)?.model !== textState.model) {
+        restorePickerText(node, textState);
+        text = node.nodeValue || "";
+        textState = null;
+      }
       if (!textState || text !== textState.renderedText) {
         // Match the complete route alias, never an upstream name shared by
         // several routes. CSS ellipsis does not truncate this text node.
         const previousLabel = textState && `${textState.prefix}${textState.displayName}`;
         const retainedLabel = previousLabel && text.startsWith(previousLabel)
           && /^(?:\s|·|$)/.test(text.slice(previousLabel.length));
-        textState = retainedLabel
-          ? { ...textState, suffix: text.slice(previousLabel.length),
-            nativeText: `${textState.prefix}${textState.model}${text.slice(previousLabel.length)}` }
-          : pickerModelText(text);
+        const fallbackState = pickerFallbackText(element, text);
+        textState = fallbackState
+          ? { ...fallbackState, fallback: true }
+          : retainedLabel
+            ? { ...textState, suffix: text.slice(previousLabel.length),
+              nativeText: `${textState.prefix}${textState.nativeLabel || textState.model}${text.slice(previousLabel.length)}` }
+            : pickerModelText(text);
         if (!textState) {
           state.nodes.delete(node);
           continue;
@@ -1521,17 +1551,7 @@
     if (disposed || !element?.matches?.(modelPickerTriggerSelector)
       || element.closest?.("[data-turn-key]")) return;
     if (!modelPickerTriggers.has(element)) {
-      let fiber = reactFiberKeys(element).map((key) => element[key]).find(Boolean);
-      let isPicker = false;
-      for (let hops = 0; fiber && hops < 80; fiber = fiber.return, hops += 1) {
-        const props = fiber.memoizedProps;
-        if (typeof props?.model === "string" && Array.isArray(props.models)
-          && (Object.hasOwn(props, "onSelectModel") || Object.hasOwn(props, "onSelectServiceTier"))) {
-          isPicker = true;
-          break;
-        }
-        if (props && Object.hasOwn(props, "conversationId") && Object.hasOwn(props, "hideLabel")) break;
-      }
+      const isPicker = !!modelPickerProps(element);
       if (!isPicker && !pickerTextNodes(element).some((node) => pickerModelText(node.nodeValue || ""))) return;
       const MutationObserver = window.MutationObserver || globalThis.MutationObserver;
       const observer = typeof MutationObserver === "function"
