@@ -137,6 +137,7 @@ fn account_snapshot_exposes_models_unknown_to_the_fallback_list() {
     let home = tempfile::tempdir().unwrap();
     let snapshot = json!({
         "codey_account_snapshot": true,
+        "codey_runtime_source": catalog_source_for_app(""),
         "models": [
             {
                 "slug": "gpt-6-sol",
@@ -168,11 +169,170 @@ fn account_snapshot_exposes_models_unknown_to_the_fallback_list() {
 }
 
 #[test]
+fn mismatched_and_unmarked_codey_catalogs_never_supply_runtime_templates() {
+    let home = tempfile::tempdir().unwrap();
+    let first = home.path().join("first-cli");
+    let second = home.path().join("second-cli");
+    fs::write(&first, "first runtime").unwrap();
+    fs::write(&second, "second runtime").unwrap();
+    fs::create_dir_all(home.path().join("model-catalogs")).unwrap();
+    for marked in [true, false] {
+        let mut snapshot = official_cache();
+        snapshot["codey_account_snapshot"] = json!(true);
+        if marked {
+            snapshot["codey_runtime_source"] =
+                json!(catalog_source_for_app(first.to_str().unwrap()));
+        }
+        for relative in [DEBUG_CATALOG_RELATIVE_PATH, MODEL_CATALOG_RELATIVE_PATH] {
+            fs::write(
+                home.path().join(relative),
+                serde_json::to_vec(&snapshot).unwrap(),
+            )
+            .unwrap();
+        }
+        let before = fs::read(home.path().join(DEBUG_CATALOG_RELATIVE_PATH)).unwrap();
+        let entries = read_official_entries(home.path(), second.to_str().unwrap()).unwrap();
+        assert!(
+            entries
+                .iter()
+                .all(|model| model_instruction_source(model).is_none())
+        );
+        let error = refresh_for_provider_with_capabilities(
+            home.path(),
+            true,
+            None,
+            &[],
+            CapabilityLists::default(),
+            second.to_str().unwrap(),
+        )
+        .unwrap_err();
+        assert!(is_runtime_model_cache_unavailable(&error));
+        assert!(
+            !prepare_cached_catalog_for_current_capabilities(
+                home.path(),
+                &[],
+                &[],
+                &[],
+                second.to_str().unwrap(),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            before,
+            fs::read(home.path().join(DEBUG_CATALOG_RELATIVE_PATH)).unwrap()
+        );
+    }
+}
+
+#[test]
+fn matching_source_remains_usable_offline_and_cache_keys_include_runtime_source() {
+    let home = tempfile::tempdir().unwrap();
+    let first = home.path().join("first-cli");
+    let second = home.path().join("second-cli");
+    fs::write(&first, "runtime one").unwrap();
+    fs::write(&second, "runtime two").unwrap();
+    let mut snapshot = official_cache();
+    snapshot["codey_account_snapshot"] = json!(true);
+    snapshot["codey_runtime_source"] = json!(catalog_source_for_app(first.to_str().unwrap()));
+    fs::create_dir_all(home.path().join("model-catalogs")).unwrap();
+    fs::write(
+        home.path().join(DEBUG_CATALOG_RELATIVE_PATH),
+        serde_json::to_vec(&snapshot).unwrap(),
+    )
+    .unwrap();
+    let first_entries = read_official_entries(home.path(), first.to_str().unwrap()).unwrap();
+    assert!(
+        first_entries
+            .iter()
+            .any(|model| model_instruction_source(model).is_some())
+    );
+    let second_entries = read_official_entries(home.path(), second.to_str().unwrap()).unwrap();
+    assert!(
+        second_entries
+            .iter()
+            .all(|model| model_instruction_source(model).is_none())
+    );
+    refresh_for_provider_with_capabilities(
+        home.path(),
+        true,
+        None,
+        &[],
+        CapabilityLists::default(),
+        first.to_str().unwrap(),
+    )
+    .unwrap();
+    assert!(
+        prepare_cached_catalog_for_current_capabilities(
+            home.path(),
+            &[],
+            &[],
+            &[],
+            first.to_str().unwrap(),
+        )
+        .unwrap()
+    );
+    assert!(
+        !prepare_cached_catalog_for_current_capabilities(
+            home.path(),
+            &[],
+            &[],
+            &[],
+            second.to_str().unwrap(),
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn account_merge_excludes_old_runtime_templates_but_preserves_official_cache() {
+    let home = tempfile::tempdir().unwrap();
+    let first = home.path().join("first-cli");
+    let second = home.path().join("second-cli");
+    fs::write(&first, "runtime one").unwrap();
+    fs::write(&second, "runtime two").unwrap();
+    write_cache(home.path());
+    let cache_before = fs::read(home.path().join("models_cache.json")).unwrap();
+    let mut snapshot = official_cache();
+    for model in snapshot["models"].as_array_mut().unwrap() {
+        model["base_instructions"] = json!("old installation instructions");
+    }
+    snapshot["codey_runtime_source"] = json!(catalog_source_for_app(first.to_str().unwrap()));
+    fs::create_dir_all(home.path().join("model-catalogs")).unwrap();
+    fs::write(
+        home.path().join(DEBUG_CATALOG_RELATIVE_PATH),
+        serde_json::to_vec(&snapshot).unwrap(),
+    )
+    .unwrap();
+    merge_account_runtime_models(
+        home.path(),
+        &[json!({"slug": "gpt-6-sol", "visibility": "list"})],
+        second.to_str().unwrap(),
+    )
+    .unwrap();
+    let saved = read_catalog_value(&home.path().join(DEBUG_CATALOG_RELATIVE_PATH)).unwrap();
+    assert!(snapshot_matches_runtime_source(
+        &saved,
+        catalog_source_for_app(second.to_str().unwrap()).as_ref()
+    ));
+    assert_eq!(saved["models"].as_array().unwrap().len(), 1);
+    assert_ne!(
+        saved["models"][0]["base_instructions"],
+        "old installation instructions"
+    );
+    assert!(model_instruction_source(&saved["models"][0]).is_some());
+    assert_eq!(
+        cache_before,
+        fs::read(home.path().join("models_cache.json")).unwrap()
+    );
+}
+
+#[test]
 fn account_snapshot_ultrafast_follows_the_two_x_fast_family() {
     let home = tempfile::tempdir().unwrap();
     write_cache(home.path());
     let snapshot = json!({
         "codey_account_snapshot": true,
+        "codey_runtime_source": catalog_source_for_app(""),
         "models": [
             {
                 "slug": "gpt-6.1-sol",
@@ -328,6 +488,7 @@ fn account_snapshot_borrows_a_local_template_for_slugs_the_fallback_list_omits()
     write_cache(home.path());
     let snapshot = json!({
         "codey_account_snapshot": true,
+        "codey_runtime_source": catalog_source_for_app(""),
         "models": [
             {
                 "slug": "gpt-6-sol",
@@ -395,6 +556,7 @@ fn merging_account_models_preserves_runtime_templates_for_new_slugs() {
     fs::create_dir_all(home.path().join("model-catalogs")).unwrap();
     let snapshot = json!({
         "codey_account_snapshot": true,
+        "codey_runtime_source": catalog_source_for_app(""),
         "models": [
             {
                 "slug": "gpt-5.6-sol",
@@ -441,6 +603,7 @@ fn merging_account_models_preserves_runtime_templates_for_new_slugs() {
                 "visibility": "list"
             }),
         ],
+        "",
     )
     .unwrap();
 
@@ -1199,7 +1362,12 @@ fn instruction_bearing_snapshot_entry_repairs_an_incomplete_cache_entry() {
     fs::create_dir_all(home.path().join("model-catalogs")).unwrap();
     fs::write(
         home.path().join(DEBUG_CATALOG_RELATIVE_PATH),
-        serde_json::to_vec(&official_cache()).unwrap(),
+        serde_json::to_vec(&{
+            let mut cache = official_cache();
+            cache["codey_runtime_source"] = json!(catalog_source_for_app(""));
+            cache
+        })
+        .unwrap(),
     )
     .unwrap();
 
@@ -1681,7 +1849,7 @@ fn cached_catalog_migrates_the_legacy_1m_context_window() {
     fs::write(&path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
 
     assert!(
-        prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[], &[]).unwrap(),
+        prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[], &[], "").unwrap(),
         "the legacy window must be rewritten"
     );
     let catalog: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -1766,7 +1934,7 @@ fn remote_compaction_catalog_and_cached_refresh_keep_routes_independent() {
         HashSet::from([selected[0].clone()])
     );
     assert!(
-        prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[], &selected[1..],)
+        prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[], &selected[1..], "")
             .unwrap()
     );
     assert_eq!(
@@ -1804,7 +1972,9 @@ fn cached_catalog_fallback_removes_stale_image_detail_original_metadata() {
     let stale: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     assert_eq!(stale["models"][0]["supports_image_detail_original"], true);
 
-    assert!(prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[], &[]).unwrap());
+    assert!(
+        prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[], &[], "").unwrap()
+    );
     let sanitized: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     assert!(
         sanitized["models"][0]
@@ -2039,7 +2209,7 @@ fn cached_catalog_fallback_removes_stale_capability_metadata() {
     fs::write(&path, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
 
     assert!(
-        prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[], &[]).unwrap(),
+        prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[], &[], "").unwrap(),
         "a valid cached catalog should remain usable after stale capabilities are removed"
     );
     let sanitized: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -2051,7 +2221,9 @@ fn cached_catalog_fallback_removes_stale_capability_metadata() {
     );
     let sanitized_bytes = fs::read(&path).unwrap();
 
-    assert!(prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[], &[]).unwrap());
+    assert!(
+        prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[], &[], "").unwrap()
+    );
     assert_eq!(fs::read(&path).unwrap(), sanitized_bytes);
 }
 
@@ -2226,6 +2398,7 @@ fn luna_forwards_ultra_even_when_the_template_stops_at_max() {
         home.path().join(DEBUG_CATALOG_RELATIVE_PATH),
         serde_json::to_vec(&json!({
             "codey_account_snapshot": true,
+        "codey_runtime_source": catalog_source_for_app(""),
             "models": [luna.clone()]
         }))
         .unwrap(),
@@ -2445,6 +2618,7 @@ fn existing_catalog_without_description_is_not_reused_as_a_runtime_fallback() {
 fn cold_start_replaces_stale_codey_fast_metadata() {
     let home = tempfile::tempdir().unwrap();
     let mut stale_catalog = official_cache();
+    stale_catalog["codey_runtime_source"] = json!(catalog_source_for_app(""));
     for model in stale_catalog["models"].as_array_mut().unwrap() {
         add_fast_speed_controls(model);
     }
@@ -2520,6 +2694,7 @@ fn synced_third_party_provider_keeps_official_looking_ids_route_scoped() {
         &["third-model".into()],
         None,
         None,
+        "",
     )
     .unwrap();
 
@@ -3004,7 +3179,7 @@ fn codex_26_908_snapshot_alone_generates_the_catalog() {
         })
     })
     .collect::<Vec<_>>();
-    let snapshot = json!({ "models": models });
+    let snapshot = json!({ "models": models, "codey_runtime_source": catalog_source_for_app("") });
     fs::create_dir_all(home.path().join("model-catalogs")).unwrap();
     fs::write(
         home.path().join(DEBUG_CATALOG_RELATIVE_PATH),
@@ -3043,6 +3218,7 @@ fn newer_snapshot_supersedes_a_stale_cache_entry() {
     let home = tempfile::tempdir().unwrap();
     let source = |label: &str| {
         json!({
+            "codey_runtime_source": catalog_source_for_app(""),
             "models": OFFICIAL_MODELS
                 .iter()
                 .map(|(slug, _)| {
@@ -3073,7 +3249,7 @@ fn newer_snapshot_supersedes_a_stale_cache_entry() {
             .unwrap();
     }
 
-    let entries = read_official_entries(home.path()).unwrap();
+    let entries = read_official_entries(home.path(), "").unwrap();
     let sol = entries
         .iter()
         .find(|model| model["slug"] == "gpt-5.6-sol")
@@ -3091,7 +3267,7 @@ fn newer_snapshot_supersedes_a_stale_cache_entry() {
         .unwrap()
         .set_modified(newer + std::time::Duration::from_secs(100))
         .unwrap();
-    let entries = read_official_entries(home.path()).unwrap();
+    let entries = read_official_entries(home.path(), "").unwrap();
     let sol = entries
         .iter()
         .find(|model| model["slug"] == "gpt-5.6-sol")

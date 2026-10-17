@@ -1174,8 +1174,8 @@ fn model_changes_accept_only_the_known_builtin_catalog_fallback() {
         model_catalog::refresh_for_provider(home.path(), false, Some(&models), &models)
             .unwrap_err();
 
-    assert!(model_catalog_fallback(Err(missing_cache), home.path(), &[], &[], &[]).unwrap());
-    assert!(!model_catalog_fallback(Ok(()), home.path(), &[], &[], &[]).unwrap());
+    assert!(model_catalog_fallback(Err(missing_cache), home.path(), &[], &[], &[], "").unwrap());
+    assert!(!model_catalog_fallback(Ok(()), home.path(), &[], &[], &[], "").unwrap());
     assert_eq!(
         model_catalog_fallback(
             Err(anyhow::anyhow!("模型目录写入失败")),
@@ -1183,6 +1183,7 @@ fn model_changes_accept_only_the_known_builtin_catalog_fallback() {
             &[],
             &[],
             &[],
+            "",
         )
         .unwrap_err(),
         "模型目录写入失败"

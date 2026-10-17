@@ -1,19 +1,17 @@
 use super::*;
 
-/// Newest Codex CLI build whose catalog Codey already rendered in this process.
-/// The render takes seconds, so the same build is not consulted twice, while a
-/// Codex upgrade replaces the binary and its modification time and therefore
-/// lets a restart inside the same Codey process capture the new catalog.
+/// Application runtime whose catalog Codey already rendered in this process.
+/// A different path or binary must be captured even when it is an older build.
 #[cfg(not(test))]
-static RUNTIME_SNAPSHOT_SYNC_ATTEMPTED: std::sync::Mutex<Option<std::time::SystemTime>> =
+static RUNTIME_SNAPSHOT_SYNC_ATTEMPTED: std::sync::Mutex<Option<RuntimeCatalogSource>> =
     std::sync::Mutex::new(None);
 
 /// Claims the right to render the catalog for the current local Codex build.
 /// The claim is released again when the render fails so a later launch in the
 /// same process can retry.
-pub(super) fn claim_snapshot_sync_slot(
-    attempted: &std::sync::Mutex<Option<std::time::SystemTime>>,
-    stamp: Option<std::time::SystemTime>,
+pub(super) fn claim_snapshot_sync_slot<T: PartialEq>(
+    attempted: &std::sync::Mutex<Option<T>>,
+    stamp: Option<T>,
 ) -> bool {
     let Ok(mut attempted) = attempted.lock() else {
         return true;
@@ -25,9 +23,9 @@ pub(super) fn claim_snapshot_sync_slot(
     true
 }
 
-pub(super) fn release_snapshot_sync_slot(
-    attempted: &std::sync::Mutex<Option<std::time::SystemTime>>,
-    stamp: Option<std::time::SystemTime>,
+pub(super) fn release_snapshot_sync_slot<T: PartialEq>(
+    attempted: &std::sync::Mutex<Option<T>>,
+    stamp: Option<T>,
 ) {
     if stamp.is_none() {
         return;
@@ -46,19 +44,23 @@ pub(super) fn release_snapshot_sync_slot(
 #[cfg(not(test))]
 pub(super) fn sync_runtime_catalog_snapshot(home: &Path, codex_app_path: &str) -> Result<bool> {
     let candidates = codex_cli_candidates_for(codex_app_path);
-    let stamp = codex_cli_stamp_for(&candidates);
-    if !claim_snapshot_sync_slot(&RUNTIME_SNAPSHOT_SYNC_ATTEMPTED, stamp) {
+    let Some(source) = runtime_catalog_source(&candidates) else {
+        eprintln!("无法确认所选 Codex 的命令行来源，跳过模型清单探测");
+        return Ok(false);
+    };
+    if !claim_snapshot_sync_slot(&RUNTIME_SNAPSHOT_SYNC_ATTEMPTED, Some(source.clone())) {
         return Ok(false);
     }
     let Some(models) = debug_model_entries(home, &candidates) else {
         eprintln!("本机 Codex 命令行未产出可用的模型清单快照");
         // Nothing was captured, so a later launch in this process may retry.
-        release_snapshot_sync_slot(&RUNTIME_SNAPSHOT_SYNC_ATTEMPTED, stamp);
+        release_snapshot_sync_slot(&RUNTIME_SNAPSHOT_SYNC_ATTEMPTED, Some(source));
         return Ok(false);
     };
     let catalog = serde_json::to_vec_pretty(&json!({
         "models": models,
         "codey_account_snapshot": true,
+        "codey_runtime_source": source,
     }))
     .context("序列化 Codex 内置模型目录快照失败")?;
     atomic_write(&home.join(DEBUG_CATALOG_RELATIVE_PATH), &catalog)
@@ -85,11 +87,17 @@ pub(crate) fn refresh_account_runtime_snapshot(home: &Path, codex_app_path: &str
 /// The account response is the availability list. It usually has no Codex
 /// instruction template, so an existing runtime entry keeps those fields, and
 /// a slug the local catalog has never seen borrows the closest template.
-pub(crate) fn merge_account_runtime_models(home: &Path, models: &[Value]) -> Result<()> {
+pub(crate) fn merge_account_runtime_models(
+    home: &Path,
+    models: &[Value],
+    codex_app_path: &str,
+) -> Result<()> {
     let path = home.join(DEBUG_CATALOG_RELATIVE_PATH);
+    let source = catalog_source_for_app(codex_app_path);
     let mut catalog = fs::read(&path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .filter(|value| snapshot_matches_runtime_source(value, source.as_ref()))
         .unwrap_or_else(|| json!({"models": [], "codey_account_snapshot": true}));
     let entries = catalog
         .get_mut("models")
@@ -130,6 +138,9 @@ pub(crate) fn merge_account_runtime_models(home: &Path, models: &[Value]) -> Res
         }
     }
     catalog["codey_account_snapshot"] = Value::Bool(true);
+    if let Some(source) = source {
+        catalog["codey_runtime_source"] = serde_json::to_value(source)?;
+    }
     let bytes = serde_json::to_vec_pretty(&catalog).context("序列化官方模型目录快照失败")?;
     atomic_write(&path, &bytes).context("写入官方模型目录快照失败")
 }

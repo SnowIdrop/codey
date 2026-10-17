@@ -353,6 +353,7 @@ pub(crate) fn current_model_state_at(
             .unwrap_or_default(),
         Some(&reasoning_efforts),
         requested_default_model.as_deref(),
+        &config.codex_app_path,
     )
     .map_err(|error| error.to_string())
 }

@@ -25,7 +25,8 @@ mod wechat_claw;
 
 #[cfg(windows)]
 use codey_runtime_core::app_paths::{
-    build_codex_executable, normalize_codex_app_path, resolve_codex_app_dir_with_saved,
+    build_codex_executable, normalize_codex_app_path_checked,
+    resolve_codex_app_dir_with_saved_checked,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -1510,9 +1511,12 @@ fn validate_codex_app_path(path: &str) -> Result<PathBuf, String> {
         return Err("请先选择 Codex 桌面应用所在目录".to_string());
     }
 
-    let app_dir = normalize_codex_app_path(Path::new(selected)).ok_or_else(|| {
-        "所选目录不是可启动的 Codex 桌面应用。请选择包含 ChatGPT.exe 或 Codex.exe 的目录，不要选择 codex.exe 命令行程序或第三方 Codex 启动器".to_string()
-    })?;
+    let app_dir = normalize_codex_app_path_checked(Path::new(selected))
+        .and_then(|app_dir| {
+            codey_runtime_core::app_paths::validate_codex_app_dir(&app_dir)?;
+            Ok(app_dir)
+        })
+        .map_err(|error| format!("{error:#}"))?;
     let executable = build_codex_executable(&app_dir);
     if !executable.is_file() {
         return Err(format!(
@@ -1532,13 +1536,21 @@ async fn ensure_windows_codex_app_path(state: &Arc<AppState>) -> Result<(), Stri
         // The launcher needs a startable executable, not merely a normalizable
         // path: a stale or third-party directory must be reselected here instead
         // of surfacing later as a bare spawn failure.
-        resolve_codex_app_dir_with_saved(configured_path.as_deref(), None)
-            .filter(|app_dir| build_codex_executable(app_dir).is_file())
+        resolve_codex_app_dir_with_saved_checked(configured_path.as_deref(), None).and_then(|app| {
+            if let Some(path) = &app {
+                codey_runtime_core::app_paths::validate_codex_app_dir(path)?;
+            }
+            Ok(app)
+        })
     })
     .await
     .map_err(|error| format!("检测 Codex 桌面应用目录的任务异常退出：{error}"))?;
-    if resolved.is_some() {
+    if matches!(&resolved, Ok(Some(_))) {
         return Ok(());
+    }
+    let diagnostic = resolved.err().map(|error| format!("{error:#}"));
+    if let Some(error) = &diagnostic {
+        eprintln!("定位 Codex 桌面应用失败：{error}");
     }
 
     let Some(selected) = select_codex_app_directory().await? else {
@@ -1547,7 +1559,10 @@ async fn ensure_windows_codex_app_path(state: &Arc<AppState>) -> Result<(), Stri
         } else {
             CODEX_APP_PATH_INVALID_ERROR
         };
-        return Err(format!("{error}；已取消选择安装目录"));
+        return Err(format!(
+            "{}；已取消选择安装目录",
+            diagnostic.as_deref().unwrap_or(error)
+        ));
     };
     let app_dir = validate_codex_app_path(&selected.to_string_lossy())?;
     let _config_write_guard = state.config_write_lock.lock().await;

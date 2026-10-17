@@ -213,7 +213,7 @@ pub(crate) fn refresh_for_provider_with_capabilities(
         capabilities,
         codex_app_path,
     )?;
-    write_verified_catalog(home, &models)
+    write_verified_catalog_for_app(home, &models, codex_app_path)
 }
 
 pub(crate) fn refresh_for_provider_with_contexts(
@@ -234,7 +234,7 @@ pub(crate) fn refresh_for_provider_with_contexts(
         codex_app_path,
     )?;
     apply_overrides_to_models(&mut models, overrides)?;
-    write_verified_catalog(home, &models)
+    write_verified_catalog_for_app(home, &models, codex_app_path)
 }
 
 pub(crate) fn apply_catalog_overrides(home: &Path, overrides: CatalogOverrides<'_>) -> Result<()> {
@@ -536,7 +536,7 @@ fn render_catalog_for_provider(
     {
         return Ok(Vec::new());
     }
-    let mut official_models = read_official_entries(home)?;
+    let mut official_models = read_official_entries(home, codex_app_path)?;
     // Codex 26.908+ may never write `models_cache.json`; capture the CLI's own
     // catalog before declaring the runtime cache unusable. A snapshot older
     // than the local Codex binary is refreshed again so a
@@ -552,7 +552,7 @@ fn render_catalog_for_provider(
                 false
             });
         if snapshot_synced {
-            official_models = read_official_entries(home)?;
+            official_models = read_official_entries(home, codex_app_path)?;
         }
     }
     if official_models
@@ -726,6 +726,7 @@ pub fn selection_state(
         &[],
         None,
         requested_default_model,
+        "",
     )
 }
 
@@ -739,12 +740,13 @@ pub fn selection_state_with_manual_models(
         &std::collections::BTreeMap<String, Vec<crate::config::ModelReasoningEffort>>,
     >,
     requested_default_model: Option<&str>,
+    codex_app_path: &str,
 ) -> Result<ModelSelectionState> {
     // Model provenance comes from the route, not from a slug prefix. An API-key
     // provider may legitimately expose a model whose id also appears in the
     // official catalog; it must remain a route-scoped model and go through the
     // local router instead of acquiring official-account semantics.
-    let official_entries = match read_official_entries(home) {
+    let official_entries = match read_official_entries(home, codex_app_path) {
         Ok(entries) => entries,
         Err(error) if official_provider => return Err(error),
         Err(_) => Arc::new(Vec::new()),

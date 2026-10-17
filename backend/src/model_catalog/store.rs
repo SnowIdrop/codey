@@ -69,8 +69,13 @@ pub fn is_available(home: &Path) -> bool {
 /// launch and across repeated config-page lookups. The paths are part of the
 /// key so entries can never leak between Codex homes.
 type CatalogSignature = Vec<(PathBuf, u64, Option<std::time::SystemTime>)>;
-type OfficialEntriesCache =
-    std::sync::Mutex<Option<(CatalogSignature, std::sync::Arc<Vec<Value>>)>>;
+type OfficialEntriesCache = std::sync::Mutex<
+    Option<(
+        CatalogSignature,
+        Option<RuntimeCatalogSource>,
+        std::sync::Arc<Vec<Value>>,
+    )>,
+>;
 
 static OFFICIAL_ENTRIES_CACHE: std::sync::OnceLock<OfficialEntriesCache> =
     std::sync::OnceLock::new();
@@ -85,21 +90,26 @@ fn catalog_signature(paths: &[PathBuf]) -> CatalogSignature {
         .collect()
 }
 
-pub(super) fn read_official_entries(home: &Path) -> Result<std::sync::Arc<Vec<Value>>> {
+pub(super) fn read_official_entries(
+    home: &Path,
+    codex_app_path: &str,
+) -> Result<std::sync::Arc<Vec<Value>>> {
+    let source = catalog_source_for_app(codex_app_path);
     let paths = ordered_catalog_sources(home);
     let signature = catalog_signature(&paths);
     let cache = OFFICIAL_ENTRIES_CACHE.get_or_init(|| std::sync::Mutex::new(None));
     if let Ok(guard) = cache.lock()
-        && let Some((cached_signature, entries)) = guard.as_ref()
+        && let Some((cached_signature, cached_source, entries)) = guard.as_ref()
         && *cached_signature == signature
+        && *cached_source == source
     {
         // 缓存命中只递增引用计数；下游要么只读、要么本来就会拷贝出自己的
         // 工作副本，无需整目录深拷贝。
         return Ok(std::sync::Arc::clone(entries));
     }
-    let entries = std::sync::Arc::new(read_official_entries_uncached(&paths)?);
+    let entries = std::sync::Arc::new(read_official_entries_uncached(&paths, source.as_ref())?);
     if let Ok(mut guard) = cache.lock() {
-        *guard = Some((signature, std::sync::Arc::clone(&entries)));
+        *guard = Some((signature, source, std::sync::Arc::clone(&entries)));
     }
     Ok(entries)
 }
@@ -127,7 +137,10 @@ fn ordered_catalog_sources(home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
+fn read_official_entries_uncached(
+    paths: &[PathBuf],
+    source: Option<&RuntimeCatalogSource>,
+) -> Result<Vec<Value>> {
     let mut catalogs = Vec::new();
     let mut last_error = None;
     let mut account_snapshot_models = None;
@@ -147,6 +160,14 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
                 continue;
             }
         };
+        // Codey's raw and rendered catalogs can contain templates copied from
+        // another installation. Account-owned models_cache.json remains intact.
+        if (path.ends_with(DEBUG_CATALOG_RELATIVE_PATH)
+            || path.ends_with(MODEL_CATALOG_RELATIVE_PATH))
+            && !snapshot_matches_runtime_source(&value, source)
+        {
+            continue;
+        }
         let account_snapshot = path.ends_with(DEBUG_CATALOG_RELATIVE_PATH)
             && value
                 .get("codey_account_snapshot")
@@ -260,8 +281,21 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
 
 /// Writes the catalog and returns the exact bytes that now live on disk.
 pub(super) fn write_catalog(home: &Path, models: &[Value]) -> Result<Vec<u8>> {
-    let mut catalog = serde_json::to_vec_pretty(&json!({ "models": models }))
-        .context("序列化 Codey 模型目录失败")?;
+    let source = read_catalog_value(&home.join(relative_path()))
+        .and_then(|value| value.get("codey_runtime_source").cloned());
+    write_catalog_with_source(home, models, source)
+}
+
+fn write_catalog_with_source(
+    home: &Path,
+    models: &[Value],
+    source: Option<Value>,
+) -> Result<Vec<u8>> {
+    let mut value = json!({ "models": models });
+    if let Some(source) = source {
+        value["codey_runtime_source"] = source;
+    }
+    let mut catalog = serde_json::to_vec_pretty(&value).context("序列化 Codey 模型目录失败")?;
     catalog.push(b'\n');
     let path = home.join(relative_path());
     if fs::read(&path).is_ok_and(|current| current == catalog) {
@@ -274,6 +308,22 @@ pub(super) fn write_catalog(home: &Path, models: &[Value]) -> Result<Vec<u8>> {
 
 pub(super) fn write_verified_catalog(home: &Path, models: &[Value]) -> Result<usize> {
     let written = write_catalog(home, models)?;
+    verify_written_catalog(home, models, &written)
+}
+
+pub(super) fn write_verified_catalog_for_app(
+    home: &Path,
+    models: &[Value],
+    codex_app_path: &str,
+) -> Result<usize> {
+    let source = catalog_source_for_app(codex_app_path)
+        .map(serde_json::to_value)
+        .transpose()?;
+    let written = write_catalog_with_source(home, models, source)?;
+    verify_written_catalog(home, models, &written)
+}
+
+fn verify_written_catalog(home: &Path, models: &[Value], written: &[u8]) -> Result<usize> {
     // Verify the bytes on disk instead of re-parsing the whole catalog; the
     // serialized form already carries every slug in order.
     let path = home.join(relative_path());

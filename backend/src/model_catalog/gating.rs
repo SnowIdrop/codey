@@ -18,7 +18,13 @@ pub(crate) fn prepare_cached_catalog_for_current_capabilities(
     native_web_search_models: &[String],
     image_detail_original_models: &[String],
     remote_compaction_models: &[String],
+    codex_app_path: &str,
 ) -> Result<bool> {
+    if !read_catalog_value(&home.join(relative_path())).is_some_and(|value| {
+        snapshot_matches_runtime_source(&value, catalog_source_for_app(codex_app_path).as_ref())
+    }) {
+        return Ok(false);
+    }
     if !is_available(home) {
         return Ok(false);
     }

@@ -502,7 +502,7 @@ pub async fn fetch_route_models(
         None
     };
     if let Some(entries) = fetched_account_entries.as_deref() {
-        model_catalog::merge_account_runtime_models(codex_home(), entries)
+        model_catalog::merge_account_runtime_models(codex_home(), entries, &config.codex_app_path)
             .map_err(|error| format!("保存官方模型目录快照失败：{error:#}"))?;
     }
     let fetched_models = if let Some(entries) = fetched_account_entries.as_ref() {

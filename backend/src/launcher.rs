@@ -8,7 +8,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use codey_runtime_core::app_paths::resolve_codex_app_dir_with_saved;
+use codey_runtime_core::app_paths::resolve_codex_app_dir_with_saved_checked;
 use codey_runtime_core::config_manager::ConfigManager;
 use codey_runtime_core::launcher::build_codex_command;
 use serde::Serialize;
@@ -517,7 +517,8 @@ async fn resolve_configured_codex_app_dir(config: &CodeyConfig) -> Result<PathBu
         let configured_app_path = configured_app_path
             .map(|path| refresh_windows_packaged_app_dir(&path))
             .transpose()?;
-        let app_dir = resolve_codex_app_dir_with_saved(configured_app_path.as_deref(), None);
+        let app_dir =
+            resolve_codex_app_dir_with_saved_checked(configured_app_path.as_deref(), None)?;
         if let Some(app_dir) = app_dir.as_deref() {
             error_log::refresh_codex_app_version(Some(app_dir), None);
         }
@@ -702,6 +703,12 @@ async fn prepare_startup_model_catalog(
     let catalog_home = home.to_path_buf();
     // The snapshot has to come from the install this launch uses, so the
     // resolved app directory is forwarded instead of re-probing the default.
+    #[cfg(windows)]
+    let catalog_codex_app_path =
+        codey_runtime_core::app_paths::build_codex_executable(codex_app_dir)
+            .to_string_lossy()
+            .into_owned();
+    #[cfg(not(windows))]
     let catalog_codex_app_path = codex_app_dir.to_string_lossy().into_owned();
     let use_builtin_official_catalog =
         current_profile.enabled && config.uses_builtin_official_model_catalog();
@@ -785,6 +792,7 @@ async fn prepare_startup_model_catalog(
                     &runtime_native_web_search_models,
                     &runtime_image_detail_original_models,
                     &runtime_remote_compaction_models,
+                    &catalog_codex_app_path,
                 )
                 .and_then(|available| {
                     if available {
@@ -811,6 +819,7 @@ async fn prepare_startup_model_catalog(
                 &manual_models,
                 Some(&runtime_model_reasoning_efforts),
                 requested_default_model.as_deref(),
+                &catalog_codex_app_path,
             );
             (refresh, cached_catalog, selection)
         })
