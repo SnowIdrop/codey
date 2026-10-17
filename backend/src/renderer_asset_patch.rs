@@ -332,6 +332,15 @@ struct PatchSessionCounters {
     patched: AtomicU64,
     /// 候选资产被原样放行的次数：求值失败、补丁返回 null 或 fulfill 失败。
     skipped: AtomicU64,
+    /// Debugger.scriptParsed 观察到的候选脚本数：app:// 资产不过 Fetch，但
+    /// 每个模块求值前都会在 V8 层解析——这条通道不受自定义协议影响。
+    script_parsed: AtomicU64,
+    /// 经 setScriptSource 写回补丁源码的脚本数。
+    script_patched: AtomicU64,
+    /// scriptParsed 路径里读源/求值/写回任一环失败的次数。
+    script_patch_failed: AtomicU64,
+    /// 检测到 setScriptSource 被构建期禁用后置位：之后的新脚本直接跳过。
+    script_edit_disabled: AtomicU64,
 }
 
 /// 补丁会话的拦截统计快照。`entry_documents` 是会话建立后观察到的入口文档
@@ -344,6 +353,9 @@ pub(crate) struct PatchSessionStats {
     pub(crate) patched_assets: u64,
     pub(crate) skipped_assets: u64,
     pub(crate) entry_documents: u64,
+    pub(crate) script_parsed: u64,
+    pub(crate) script_patched: u64,
+    pub(crate) script_patch_failed: u64,
 }
 
 /// 注入侧持有的补丁会话句柄；泵退出后由下一次安装重建。
@@ -509,6 +521,9 @@ impl RendererAssetPatchSession {
             patched_assets: self.counters.patched.load(Ordering::Relaxed),
             skipped_assets: self.counters.skipped.load(Ordering::Relaxed),
             entry_documents: *self.bootstrap_epoch.borrow(),
+            script_parsed: self.counters.script_parsed.load(Ordering::Relaxed),
+            script_patched: self.counters.script_patched.load(Ordering::Relaxed),
+            script_patch_failed: self.counters.script_patch_failed.load(Ordering::Relaxed),
         }
     }
 }
@@ -527,6 +542,7 @@ pub(crate) fn session_stats(websocket_url: &str) -> Option<PatchSessionStats> {
 pub(crate) async fn install_renderer_asset_patch(
     websocket_url: &str,
     disable_pet: bool,
+    paused_start: bool,
 ) -> Result<Arc<RendererAssetPatchSession>> {
     let _install_guard = INSTALL_LOCK
         .get_or_init(|| tokio::sync::Mutex::new(()))
@@ -585,7 +601,10 @@ pub(crate) async fn install_renderer_asset_patch(
     // 同步握手失败时回收本轮已 spawn 的泵与 CDP 连接：否则会留下一条永不退出的
     // 常驻任务和一条已 enable 却无人应答的 Fetch 拦截器。被清掉的文档脚本注册
     // 由下一次安装重新登记，不回填。
-    if let Err(error) = session.bootstrap(disable_pet, &main_frame_id).await {
+    if let Err(error) = session
+        .bootstrap(disable_pet, &main_frame_id, paused_start)
+        .await
+    {
         if let Some(pump) = session
             .pump
             .lock()
@@ -609,6 +628,7 @@ impl RendererAssetPatchSession {
         &self,
         disable_pet: bool,
         main_frame_id: &Arc<Mutex<Option<String>>>,
+        paused_start: bool,
     ) -> Result<()> {
         self.send_command("Runtime.enable", json!({}))
             .await
@@ -680,15 +700,30 @@ impl RendererAssetPatchSession {
         )
         .await
         .context("启用渲染资产 Fetch 拦截失败")?;
+        // app:// 自定义协议的资产请求不过网络栈，Fetch 拦不到；但每个模块求值
+        // 前都会经过 V8 解析，Debugger.scriptParsed 事件不受协议影响。启用后
+        // 泵按 scriptParsed → getScriptSource → 补丁入口 → setScriptSource 的
+        // 顺序在求值前完成改写。失败不致命：文档脚本与 Fetch 会话照常工作。
+        if let Err(error) = self.send_command("Debugger.enable", json!({})).await {
+            let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+                "renderer_asset_patch.debugger_enable_failed",
+                json!({
+                    "message": format!("{error:#}"),
+                    "websocketUrl": self.websocket_url.as_ref(),
+                }),
+            );
+        }
         // 当前文档里立刻装一份补丁入口，覆盖「会话建好但 bridge 文档脚本尚未
         // 落地」这段窗口内到达的暂停请求。失败不致命：文档脚本会在下一次
-        // 导航时补装。
-        if let Err(error) = self
-            .send_command(
-                "Runtime.evaluate",
-                codey_runtime_core::bridge::runtime_evaluate_params(&script),
-            )
-            .await
+        // 导航时补装。页面被早期挂载暂停时还没有可求值上下文：求值只会排队到
+        // 放行或超时，直接跳过——首个文档将由刚注册的文档脚本覆盖。
+        if !paused_start
+            && let Err(error) = self
+                .send_command(
+                    "Runtime.evaluate",
+                    codey_runtime_core::bridge::runtime_evaluate_params(&script),
+                )
+                .await
         {
             let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
                 "renderer_asset_patch.evaluate_failed",
@@ -993,6 +1028,46 @@ fn handle_patch_event(value: &Value, state: &mut PatchEventState<'_>) {
         {
             record_patch_log(params.get("payload").and_then(Value::as_str));
         }
+        "Debugger.scriptParsed" => {
+            let url = params
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            // 只处理静态名单内的可补丁脚本：getScriptSource 会把整个模块正文
+            // （app-shared 约 8MB）经 CDP 拉回来，不过滤就是几百次无谓往返。
+            if !is_patch_candidate_url(url) || !is_patchable_named_asset(url) {
+                return;
+            }
+            // live-edit 被构建期禁用的 Electron 上 setScriptSource 恒失败；
+            // 熔断后不再为每个新脚本重复取源求值。
+            if counters.script_edit_disabled.load(Ordering::Relaxed) != 0 {
+                return;
+            }
+            let Some(script_id) = params
+                .get("scriptId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                return;
+            };
+            counters.script_parsed.fetch_add(1, Ordering::Relaxed);
+            if inflight.len() < MAX_CONCURRENT_PAUSES {
+                inflight.spawn(handle_parsed_script(
+                    command_tx.clone(),
+                    main_context_tx.subscribe(),
+                    install_script.clone(),
+                    evaluator.clone(),
+                    counters.clone(),
+                    script_id,
+                    url.to_string(),
+                ));
+            }
+        }
+        "Debugger.paused" => {
+            // 安全兜底：Debugger 域不设任何断点，但万一页面因其它原因暂停
+            // （debugger 语句、外部探针），立即放行，绝不让渲染进程卡死。
+            enqueue_debugger_resume(command_tx);
+        }
         _ => {}
     }
 }
@@ -1072,6 +1147,140 @@ fn enqueue_continue_request(command_tx: &mpsc::UnboundedSender<SessionCommand>, 
         method: "Fetch.continueRequest",
         params: json!({ "requestId": request_id }),
     });
+}
+
+fn enqueue_debugger_resume(command_tx: &mpsc::UnboundedSender<SessionCommand>) {
+    let _ = command_tx.send(SessionCommand::CdpFireAndForget {
+        method: "Debugger.resume",
+        params: json!({}),
+    });
+}
+
+/// 与页面侧 isCodexRendererAssetUrl 静态名单同口径的高层筛选：只用来给
+/// scriptParsed 通道的诊断节流，补丁适用性仍由页面入口全权决定。
+fn is_patchable_named_asset(url: &str) -> bool {
+    let base = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    [
+        "app-initial",
+        "app-shared",
+        "codex-composer-adapter",
+        "general-settings",
+        "model-list-filter",
+        "windows-model-controls",
+        "use-service-tier-settings",
+        "read-service-tier-for-request",
+        "subagent-activity-chip-group",
+        "appearance-settings",
+        "pet-settings",
+        "pets-settings",
+    ]
+    .iter()
+    .any(|prefix| base.starts_with(prefix))
+}
+
+fn log_script_patch_stage(url: &str, stage: &str, detail: &str) {
+    if !is_patchable_named_asset(url) {
+        return;
+    }
+    let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
+        "renderer_asset_patch.script_patch",
+        json!({ "url": url, "stage": stage, "detail": detail }),
+    );
+}
+
+/// scriptParsed → getScriptSource → 补丁入口 → setScriptSource：ES 模块图按
+/// 「整图解析→链接→求值」的顺序执行，解析事件到该脚本求值之间有天然窗口；
+/// 改写错过窗口也不致命——补丁幂等，运行时门禁仍是路由正确性的兜底。
+async fn handle_parsed_script(
+    command_tx: mpsc::UnboundedSender<SessionCommand>,
+    mut context_rx: watch::Receiver<Option<u64>>,
+    install_script: Arc<str>,
+    evaluator: Arc<PatchEvaluator>,
+    counters: Arc<PatchSessionCounters>,
+    script_id: String,
+    url: String,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let failed = || counters.script_patch_failed.fetch_add(1, Relaxed);
+    let source = match send_command_via(
+        &command_tx,
+        "Debugger.getScriptSource",
+        json!({ "scriptId": script_id }),
+    )
+    .await
+    {
+        Ok(value) => match value
+            .get("result")
+            .and_then(|result| result.get("scriptSource"))
+            .and_then(Value::as_str)
+        {
+            Some(source) => source.to_string(),
+            None => {
+                failed();
+                return;
+            }
+        },
+        Err(error) => {
+            log_script_patch_stage(&url, "getScriptSource", &format!("{error:#}"));
+            failed();
+            return;
+        }
+    };
+    // 与 Fetch 路径同一策略：优先辅助页（启动早期通常还不存在），失败退回
+    // 被拦页自己的上下文——主上下文在模块图求值前就已建好，窗口够用。
+    let patched = match evaluator.evaluate(&url, &source).await {
+        Ok(patched) => patched,
+        Err(evaluator_error) => match evaluate_in_page_context(
+            &command_tx,
+            &mut context_rx,
+            &install_script,
+            &url,
+            &source,
+        )
+        .await
+        {
+            Ok(patched) => patched,
+            Err(error) => {
+                log_script_patch_stage(
+                    &url,
+                    "evaluate",
+                    &format!("evaluator: {evaluator_error:#}; page: {error:#}"),
+                );
+                failed();
+                return;
+            }
+        },
+    };
+    let Some(patched) = patched.filter(|patched| *patched != source) else {
+        log_script_patch_stage(&url, "no_patch", "entry returned null/identical");
+        return;
+    };
+    match send_command_via(
+        &command_tx,
+        "Debugger.setScriptSource",
+        json!({ "scriptId": script_id, "scriptSource": patched }),
+    )
+    .await
+    {
+        Ok(_) => {
+            log_script_patch_stage(&url, "patched", "setScriptSource ok");
+            counters.script_patched.fetch_add(1, Relaxed);
+        }
+        Err(error) => {
+            log_script_patch_stage(&url, "setScriptSource", &format!("{error:#}"));
+            if format!("{error:#}").contains("no longer available") {
+                counters.script_edit_disabled.store(1, Relaxed);
+            }
+            failed();
+        }
+    }
 }
 
 async fn send_command_via(

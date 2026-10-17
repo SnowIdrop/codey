@@ -543,11 +543,26 @@ fn append_guarded_script(
     }
 }
 
+/// 预取（含浏览器端点早期挂载）的内部预算与注入总期限同级。
+pub const PREFETCH_BUDGET: Duration = CDP_INJECTION_TIMEOUT;
+
+/// 在 Codex 进程拉起与 CLI 包装器握手窗口内预取页面目标：调试端口在
+/// Chromium 主进程就绪后先于握手完成可用。除 /json 枚举外还会尝试浏览器
+/// 端点的自动挂载——窗口在首个导航前被暂停时，Fetch 拦截能赶在任何资产
+/// 请求之前落位（early_attach 模块负责）。找不到目标返回 None，注入主
+/// 流程照常走发现重试。
+pub fn spawn_injectable_target_prefetch(
+    debug_port: u16,
+) -> tokio::task::JoinHandle<Option<crate::early_attach::PrefetchedPage>> {
+    crate::early_attach::spawn_early_attach_prefetch(debug_port, PREFETCH_BUDGET)
+}
+
 pub async fn retry_inject_with_scripts(
     debug_port: u16,
     handler: BridgeHandler,
     scripts: &PreparedInjectionScripts,
     source: InjectionRetrySource,
+    prefetched_target: Option<tokio::task::JoinHandle<Option<crate::early_attach::PrefetchedPage>>>,
 ) -> std::result::Result<InjectedTarget, InjectionRetryFailure> {
     // Renderer asset preparation on newer Windows Codex builds can consume
     // more than ten seconds before the first injectable page appears. Keep
@@ -555,6 +570,15 @@ pub async fn retry_inject_with_scripts(
     // hard startup deadline.
     let started = tokio::time::Instant::now();
     let deadline = started + CDP_INJECTION_TIMEOUT;
+    // 预取任务本身就在做同样的只读枚举：等它出结果而不是并行跑第二份轮询。
+    // 它只在首轮建立注入时消费一次，后续重试照旧枚举（目标可能已换）。
+    let mut prefetched_target = match prefetched_target {
+        Some(handle) => match tokio::time::timeout_at(deadline, handle).await {
+            Ok(Ok(target)) => target,
+            _ => None,
+        },
+        None => None,
+    };
     let mut delay = INITIAL_RETRY_INTERVAL;
     let phase = Arc::new(AtomicU8::new(InjectionPhase::DiscoverTargets as u8));
     let mut previous_error = None;
@@ -578,6 +602,7 @@ pub async fn retry_inject_with_scripts(
             deadline,
             run_injection_attempt(
                 retained_bridge.take(),
+                prefetched_target.take(),
                 debug_port,
                 handler.clone(),
                 scripts,
@@ -975,6 +1000,7 @@ enum AttemptOutcome {
 
 async fn run_injection_attempt(
     retained: Option<EstablishedInjection>,
+    prefetched_page: Option<crate::early_attach::PrefetchedPage>,
     debug_port: u16,
     handler: BridgeHandler,
     scripts: &PreparedInjectionScripts,
@@ -985,16 +1011,18 @@ async fn run_injection_attempt(
         Some(bridge) => bridge,
         // 没有可复用的桥接（首轮，或上一轮留下的桥接泵已随页面导航/目标关闭
         // 而结束）时回到发现阶段整轮重建。
-        None => match establish_injection(debug_port, handler, scripts, phase).await {
-            Ok(bridge) => bridge,
-            Err(error) => {
-                return AttemptOutcome::Retry {
-                    error,
-                    retained: None,
-                    request_gate_unready: false,
-                };
+        None => {
+            match establish_injection(debug_port, prefetched_page, handler, scripts, phase).await {
+                Ok(bridge) => bridge,
+                Err(error) => {
+                    return AttemptOutcome::Retry {
+                        error,
+                        retained: None,
+                        request_gate_unready: false,
+                    };
+                }
             }
-        },
+        }
     };
     match verify_injection(&bridge, scripts, phase, degrade_request_gate).await {
         Ok(injection_statuses) => AttemptOutcome::Injected(InjectedTarget {
@@ -1022,21 +1050,38 @@ async fn run_injection_attempt(
 
 async fn establish_injection(
     debug_port: u16,
+    prefetched_page: Option<crate::early_attach::PrefetchedPage>,
     handler: BridgeHandler,
     scripts: &PreparedInjectionScripts,
     phase: &AtomicU8,
 ) -> Result<EstablishedInjection> {
     phase.store(InjectionPhase::DiscoverTargets as u8, Ordering::Release);
-    let targets = list_targets(debug_port)
-        .await
-        .context("枚举 Codex CDP 页面失败")?;
-    phase.store(InjectionPhase::SelectTarget as u8, Ordering::Release);
-    let target = pick_injectable_codex_page_target(&targets).with_context(|| {
-        format!(
-            "没有找到可注入的 Codex renderer；CDP targets={}",
-            summarize_cdp_targets(&targets)
-        )
-    })?;
+    // 握手窗口内已锁定目标（可能带暂停态）：两个发现阶段视作已过，直接建连。
+    let (target, mut hold) = match prefetched_page {
+        Some(crate::early_attach::PrefetchedPage::Paused { target, hold }) => {
+            phase.store(InjectionPhase::SelectTarget as u8, Ordering::Release);
+            (target, Some(hold))
+        }
+        Some(crate::early_attach::PrefetchedPage::Ready { target }) => {
+            phase.store(InjectionPhase::SelectTarget as u8, Ordering::Release);
+            (target, None)
+        }
+        None => {
+            let targets = list_targets(debug_port)
+                .await
+                .context("枚举 Codex CDP 页面失败")?;
+            phase.store(InjectionPhase::SelectTarget as u8, Ordering::Release);
+            (
+                pick_injectable_codex_page_target(&targets).with_context(|| {
+                    format!(
+                        "没有找到可注入的 Codex renderer；CDP targets={}",
+                        summarize_cdp_targets(&targets)
+                    )
+                })?,
+                None,
+            )
+        }
+    };
     let websocket_url: Arc<str> = Arc::from(
         target
             .web_socket_debugger_url
@@ -1048,12 +1093,20 @@ async fn establish_injection(
     // 渲染资产补丁先于 bridge：会话内部的覆盖 reload 会重建文档上下文，
     // 先让它完成，bridge 直接装在新文档上，校验拿到的就是补丁后的资产。
     // 补丁会话失败不阻断注入——请求入口校验会决定降级是否可接受。
-    match crate::renderer_asset_patch::install_renderer_asset_patch(
+    let paused_start = hold.is_some();
+    let patch_result = crate::renderer_asset_patch::install_renderer_asset_patch(
         &websocket_url,
         scripts.disable_pet,
+        paused_start,
     )
-    .await
-    {
+    .await;
+    // 暂停态页面的 Fetch 拦截已经就位：放行后首个导航（index.html 与资产）
+    // 全部经过 Fetch 通道，覆盖判定拿到 bootstrap 证据而不必补装 reload。
+    // 暂停会话失效时 resume 静默失败，后续路径照常走。
+    if let Some(hold) = hold.take() {
+        hold.resume().await;
+    }
+    match patch_result {
         Ok(patch_session) => {
             if let Err(error) = patch_session.ensure_document_coverage().await {
                 error_log::record_failure_async(
