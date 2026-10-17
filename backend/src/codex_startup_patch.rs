@@ -214,6 +214,21 @@ fn cli_wrapper_target(
 
 #[cfg(any(windows, target_os = "macos"))]
 pub fn run_cli_wrapper_if_requested() -> Result<bool> {
+    if std::env::args_os().nth(1).as_deref()
+        == Some(OsStr::new("--codey-observe-app-server-output"))
+    {
+        let result = observe_local_app_server_output(
+            std::io::stdin().lock(),
+            std::io::stdout().lock(),
+            crate::codex_config::codex_home(),
+        );
+        if let Err(error) = result
+            && error.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            return Err(error).context("转发 Codex 会话响应失败");
+        }
+        return Ok(true);
+    }
     if std::env::args_os().nth(1).as_deref() == Some(OsStr::new("--codey-route-app-server-input")) {
         let overrides =
             std::env::var(CLI_WRAPPER_OVERRIDES_ENV).context("Codex 请求转发缺少运行时配置")?;
@@ -223,6 +238,7 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
             std::io::stdin().lock(),
             std::io::stdout().lock(),
             &overrides,
+            Some(crate::codex_config::codex_home()),
         );
         if let Err(error) = result
             && error.kind() != std::io::ErrorKind::BrokenPipe
@@ -254,6 +270,7 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
     // 启动器只接收首次握手；之后 app-server 重启时仍必须能执行 CLI。
     let readiness = (app_server && managed_launch).then(CliWrapperReadiness::begin);
     let mut input_router: Option<std::process::Child> = None;
+    let mut output_observer: Option<std::process::Child> = None;
     let launch = (|| -> Result<std::process::Child> {
         anyhow::ensure!(
             target.is_absolute(),
@@ -341,6 +358,18 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
                     .context("Codex 本地路由请求管道不可用")?,
             );
             input_router = Some(relay);
+            let mut observer = std::process::Command::new(std::env::current_exe()?);
+            observer
+                .arg("--codey-observe-app-server-output")
+                .stdin(std::process::Stdio::piped());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                observer.creation_flags(codey_runtime_core::windows_create_no_window());
+            }
+            let mut observer = observer.spawn().context("启动 Codex 会话响应转发失败")?;
+            command.stdout(observer.stdin.take().context("Codex 会话响应管道不可用")?);
+            output_observer = Some(observer);
         }
         #[cfg(target_os = "macos")]
         {
@@ -365,6 +394,10 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
     let mut child = match launch {
         Ok(child) => child,
         Err(error) => {
+            if let Some(mut observer) = output_observer {
+                let _ = observer.kill();
+                let _ = observer.wait();
+            }
             if let Some(mut relay) = input_router {
                 let _ = relay.kill();
                 let _ = relay.wait();
@@ -386,6 +419,10 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
         readiness.executed();
     }
     let status = child.wait();
+    // 等待原生进程关闭 stdout 后读完最后一条通知，不能提前终止输出转发器。
+    if let Some(mut observer) = output_observer {
+        let _ = observer.wait();
+    }
     if let Some(mut relay) = input_router {
         let _ = relay.kill();
         let _ = relay.wait();
@@ -397,18 +434,130 @@ pub fn run_cli_wrapper_if_requested() -> Result<bool> {
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
+fn observe_local_app_server_output(
+    mut input: impl std::io::Read,
+    mut output: impl std::io::Write,
+    home: &std::path::Path,
+) -> std::io::Result<()> {
+    let mut buffer = [0; 8192];
+    let mut line = Vec::new();
+    let mut oversized = false;
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            if !oversized && !line.is_empty() {
+                remember_app_server_settings(&line, home);
+            }
+            return Ok(());
+        }
+        for &byte in &buffer[..count] {
+            if byte == b'\n' {
+                if !oversized {
+                    remember_app_server_settings(&line, home);
+                }
+                line.clear();
+                oversized = false;
+            } else if !oversized {
+                // 大型响应仍原样转发，但无需为观察小型设置通知保留完整副本。
+                if line.len() == 1024 * 1024 {
+                    line.clear();
+                    oversized = true;
+                } else {
+                    line.push(byte);
+                }
+            }
+        }
+        output.write_all(&buffer[..count])?;
+        output.flush()?;
+    }
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn remember_app_server_settings(line: &[u8], home: &std::path::Path) {
+    let Ok(message) = serde_json::from_slice::<serde_json::Value>(line) else {
+        return;
+    };
+    if message.get("method").and_then(serde_json::Value::as_str) != Some("thread/settings/updated")
+        || message.get("id").is_some()
+    {
+        return;
+    }
+    let Some(thread_id) = message
+        .pointer("/params/threadId")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return;
+    };
+    let Some(model) = message
+        .pointer("/params/threadSettings/model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    else {
+        return;
+    };
+    let provider = message
+        .pointer("/params/threadSettings/modelProvider")
+        .and_then(serde_json::Value::as_str);
+    let selected_at_ms = message
+        .get("emittedAtMs")
+        .and_then(serde_json::Value::as_i64);
+    let effort = message
+        .pointer("/params/threadSettings/effort")
+        .or_else(|| {
+            message.pointer("/params/threadSettings/collaborationMode/settings/reasoning_effort")
+        });
+    if let Err(error) = crate::session_model::remember_settings(
+        home,
+        thread_id,
+        model,
+        provider,
+        selected_at_ms,
+        effort,
+    ) {
+        eprintln!("Codey 保存会话模型失败：{error:#}");
+    }
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
 fn route_local_app_server_input(
     mut input: impl std::io::BufRead,
     mut output: impl std::io::Write,
     runtime_overrides: &[String],
+    codex_home: Option<&std::path::Path>,
 ) -> std::io::Result<()> {
     let mut line = Vec::new();
+    let mut live_threads = std::collections::HashSet::<String>::new();
     loop {
         line.clear();
         if input.read_until(b'\n', &mut line)? == 0 {
             return Ok(());
         }
-        if let Ok(mut message) = serde_json::from_slice::<serde_json::Value>(&line)
+        let mut parsed = serde_json::from_slice::<serde_json::Value>(&line).ok();
+        if let Some(message) = parsed.as_ref()
+            && matches!(
+                message.get("method").and_then(serde_json::Value::as_str),
+                Some("thread/unsubscribe" | "thread/archive")
+            )
+            && let Some(thread_id) = message
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str)
+        {
+            live_threads.remove(thread_id);
+        }
+        if let Some(message) = parsed.as_ref()
+            && matches!(
+                message.get("method").and_then(serde_json::Value::as_str),
+                Some("thread/settings/update" | "turn/start")
+            )
+            && let Some(thread_id) = message
+                .pointer("/params/threadId")
+                .and_then(serde_json::Value::as_str)
+        {
+            // 活跃会话的选择保留在原生进程内，磁盘上的最后一轮可能更旧。
+            live_threads.insert(thread_id.to_owned());
+        }
+        if let Some(message) = parsed.as_mut()
             && matches!(
                 message.get("method").and_then(serde_json::Value::as_str),
                 Some("thread/start" | "thread/resume" | "thread/fork")
@@ -422,6 +571,58 @@ fn route_local_app_server_input(
                 .get_mut("params")
                 .and_then(serde_json::Value::as_object_mut)
             {
+                if method == "thread/resume"
+                    && params
+                        .get("model")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|model| !model.trim().is_empty())
+                    && let Some(thread_id) =
+                        params.get("threadId").and_then(serde_json::Value::as_str)
+                {
+                    live_threads.insert(thread_id.to_owned());
+                }
+                if method == "thread/resume"
+                    && params.get("model").is_none_or(|model| {
+                        model.is_null()
+                            || model.as_str().is_some_and(|model| model.trim().is_empty())
+                    })
+                    && let Some(home) = codex_home
+                    && let Some(thread_id) =
+                        params.get("threadId").and_then(serde_json::Value::as_str)
+                    && !live_threads.contains(thread_id)
+                {
+                    match restored_resume_settings(home, thread_id, runtime_overrides) {
+                        Ok(Some((model, effort))) => {
+                            params.insert("model".into(), model.into());
+                            if let Some(effort) = effort {
+                                if effort.is_null() {
+                                    if let Some(config) = params
+                                        .get_mut("config")
+                                        .and_then(serde_json::Value::as_object_mut)
+                                    {
+                                        config.remove("model_reasoning_effort");
+                                    }
+                                } else if params
+                                    .get("config")
+                                    .is_none_or(serde_json::Value::is_null)
+                                {
+                                    params.insert(
+                                        "config".into(),
+                                        serde_json::json!({"model_reasoning_effort":effort}),
+                                    );
+                                } else if let Some(config) = params
+                                    .get_mut("config")
+                                    .and_then(serde_json::Value::as_object_mut)
+                                {
+                                    config.insert("model_reasoning_effort".into(), effort);
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        // 单向转发器无法发送 RPC 错误响应；保留请求和后续消息，错误仅写 stderr。
+                        Err(error) => eprintln!("Codey 恢复会话模型失败：{error:#}"),
+                    }
+                }
                 let provider = router_provider_for_params(&method, params, runtime_overrides);
                 params.insert("modelProvider".into(), provider.into());
                 params.remove("model_provider");
@@ -443,6 +644,76 @@ fn route_local_app_server_input(
         output.write_all(&line)?;
         output.flush()?;
     }
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn restored_resume_settings(
+    home: &std::path::Path,
+    thread_id: &str,
+    overrides: &[String],
+) -> Result<Option<(String, Option<serde_json::Value>)>> {
+    let saved = crate::session_model::read(home, thread_id)?;
+    let model = resolve_resume_model(&saved, overrides)?;
+    Ok(model.map(|model| (model, saved.get("reasoningEffort").cloned())))
+}
+
+#[cfg(test)]
+fn restored_resume_model(
+    home: &std::path::Path,
+    thread_id: &str,
+    overrides: &[String],
+) -> Result<Option<String>> {
+    Ok(restored_resume_settings(home, thread_id, overrides)?.map(|(model, _)| model))
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+fn resolve_resume_model(saved: &serde_json::Value, overrides: &[String]) -> Result<Option<String>> {
+    let Some(model) = saved.get("model").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(catalog_path) = runtime_override_string(overrides, "model_catalog_json") else {
+        return Ok(None);
+    };
+    let catalog: serde_json::Value = serde_json::from_slice(&std::fs::read(catalog_path)?)?;
+    let models = catalog
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .context("模型目录缺少 models")?;
+    let slugs = models
+        .iter()
+        .filter_map(|entry| entry.get("slug")?.as_str())
+        .collect::<Vec<_>>();
+    // 当前稳定 ID 优先，不把包含斜杠的上游型号误解为失效的线路 ID。
+    if let Some(slug) = slugs
+        .iter()
+        .find(|slug| crate::model_id::equal(slug, model))
+    {
+        return Ok(Some((*slug).to_owned()));
+    }
+    let provider = saved
+        .get("modelProvider")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty());
+    if let Some(provider) =
+        provider.filter(|provider| !crate::local_router::is_router_provider(provider))
+    {
+        let alias = crate::model_id::model_alias(provider, model);
+        return Ok(slugs
+            .iter()
+            .find(|slug| crate::model_id::equal(slug, &alias))
+            .map(|slug| (*slug).to_owned()));
+    }
+    let mut matches = slugs.iter().filter(|slug| {
+        crate::model_id::parse_alias(slug)
+            .is_some_and(|alias| crate::model_id::equal(alias.upstream_model, model))
+    });
+    let first = matches.next();
+    Ok(if matches.next().is_none() {
+        first.map(|slug| (*slug).to_owned())
+    } else {
+        None
+    })
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -901,6 +1172,260 @@ mod tests {
     use super::*;
 
     #[test]
+    fn output_observer_preserves_bytes_and_persists_only_confirmed_settings() {
+        struct SplitRead<'a>(&'a [u8]);
+        impl std::io::Read for SplitRead<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                std::io::Read::read(&mut self.0, &mut buffer[..1])
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let notification = |id: &str, model: &str| {
+            serde_json::json!({
+                "method":"thread/settings/updated", "emittedAtMs":chrono::Utc::now().timestamp_millis(),
+                "params":{"threadId":id,"threadSettings":{"model":model,"modelProvider":"codey_router"}}
+            })
+        };
+        let mut requested = notification("requested", "route/unconfirmed");
+        requested["method"] = "thread/settings/update".into();
+        requested["id"] = 9.into();
+        let mut invalid_request = notification("with-id", "route/unconfirmed");
+        invalid_request["id"] = 10.into();
+        let input = format!(
+            "invalid\r\n{{\"id\":9,\"error\":{{\"message\":\"failed\"}}}}\n{}\n{}\n{}\n{}\r\n{}",
+            requested,
+            invalid_request,
+            notification("blank", "  "),
+            notification("first", "route/first"),
+            notification("second", "route/second")
+        );
+        let mut output = Vec::new();
+        observe_local_app_server_output(SplitRead(input.as_bytes()), &mut output, home.path())
+            .unwrap();
+        assert_eq!(output, input.as_bytes());
+        for (id, model) in [("first", "route/first"), ("second", "route/second")] {
+            let saved = crate::session_model::read(home.path(), id).unwrap();
+            assert_eq!(saved["model"], model);
+            assert_eq!(saved["modelProvider"], "codey_router");
+        }
+        for id in ["requested", "with-id", "blank"] {
+            assert_eq!(
+                crate::session_model::read(home.path(), id).unwrap()["status"],
+                "missing"
+            );
+        }
+    }
+
+    #[test]
+    fn output_observer_keeps_forwarding_after_storage_failure_and_large_messages() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("codey-session-models"), b"blocked").unwrap();
+        let notification = serde_json::json!({"method":"thread/settings/updated",
+            "params":{"threadId":"first","threadSettings":{"model":"route/first"}}});
+        let input = format!(
+            "{}\n{}\n{{\"id\":1,\"result\":{{}}}}\n",
+            "x".repeat(1024 * 1024 + 1),
+            notification
+        );
+        let mut output = Vec::new();
+        observe_local_app_server_output(input.as_bytes(), &mut output, home.path()).unwrap();
+        assert_eq!(output, input.as_bytes());
+    }
+
+    #[test]
+    fn confirmed_effort_restores_with_model_and_preserves_other_config() {
+        let home = tempfile::tempdir().unwrap();
+        let catalog = home.path().join("catalog.json");
+        std::fs::write(&catalog, r#"{"models":[{"slug":"route/model"}]}"#).unwrap();
+        let overrides = vec![format!(
+            "model_catalog_json={}",
+            toml_edit::Value::from(catalog.to_str().unwrap())
+        )];
+        for (settings, expected) in [
+            (
+                serde_json::json!({"effort":"high"}),
+                Some(serde_json::json!("high")),
+            ),
+            (
+                serde_json::json!({"effort":null,"collaborationMode":{"settings":{"reasoning_effort":"low"}}}),
+                None,
+            ),
+            (
+                serde_json::json!({"collaborationMode":{"settings":{"reasoning_effort":"low"}}}),
+                Some(serde_json::json!("low")),
+            ),
+            (serde_json::json!({}), Some(serde_json::json!("medium"))),
+        ] {
+            let mut settings = settings;
+            settings["model"] = "route/model".into();
+            remember_app_server_settings(&serde_json::to_vec(&serde_json::json!({
+                "method":"thread/settings/updated", "params":{"threadId":"saved","threadSettings":settings}
+            })).unwrap(), home.path());
+            let input = b"{\"method\":\"thread/resume\",\"params\":{\"threadId\":\"saved\",\"model\":null,\"config\":{\"model_reasoning_effort\":\"medium\",\"other\":true}}}\n";
+            let mut output = Vec::new();
+            route_local_app_server_input(
+                input.as_slice(),
+                &mut output,
+                &overrides,
+                Some(home.path()),
+            )
+            .unwrap();
+            let result: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(result["params"]["model"], "route/model");
+            assert_eq!(result["params"]["config"]["other"], true);
+            assert_eq!(
+                result["params"]["config"]
+                    .get("model_reasoning_effort")
+                    .cloned(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn cli_resume_recovers_each_rollout_model_without_changing_explicit_or_new_models() {
+        let home = tempfile::tempdir().unwrap();
+        let db = rusqlite::Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT, model TEXT, model_provider TEXT, rollout_path TEXT);
+            INSERT INTO threads VALUES ('first', 'route/default', 'codey_router', 'first.jsonl');
+            INSERT INTO threads VALUES ('second', 'route/default', 'codey_router', 'second.jsonl');").unwrap();
+        for (id, model) in [("first", "route/first"), ("second", "route/second")] {
+            std::fs::write(home.path().join(format!("{id}.jsonl")), format!("{}\n{}\n",
+                serde_json::json!({"type":"session_meta","payload":{"id":id,"model_provider":"codey_router"}}),
+                serde_json::json!({"type":"turn_context","payload":{"model":model}}))).unwrap();
+        }
+        let catalog = home.path().join("catalog.json");
+        std::fs::write(&catalog, serde_json::json!({"models":[{"slug":"route/first"},{"slug":"route/second"},{"slug":"route/default"}]}).to_string()).unwrap();
+        let overrides = vec![format!(
+            "model_catalog_json={}",
+            toml_edit::Value::from(catalog.to_str().unwrap())
+        )];
+        for (method, thread, model, expected) in [
+            (
+                "thread/resume",
+                "first",
+                serde_json::Value::Null,
+                serde_json::json!("route/first"),
+            ),
+            (
+                "thread/resume",
+                "second",
+                serde_json::json!("  "),
+                serde_json::json!("route/second"),
+            ),
+            (
+                "thread/resume",
+                "first",
+                serde_json::json!("route/default"),
+                serde_json::json!("route/default"),
+            ),
+            (
+                "thread/resume",
+                "missing",
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            ),
+            (
+                "thread/start",
+                "first",
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            ),
+            (
+                "thread/fork",
+                "first",
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            ),
+        ] {
+            let input = format!(
+                "{}\n{{\"id\":2,\"result\":{{}}}}\r\ninvalid\n",
+                serde_json::json!({"id":1,"method":method,"params":{"threadId":thread,"model":model}})
+            );
+            let mut output = Vec::new();
+            route_local_app_server_input(
+                std::io::BufReader::with_capacity(1, input.as_bytes()),
+                &mut output,
+                &overrides,
+                Some(home.path()),
+            )
+            .unwrap();
+            let newline = output.iter().position(|byte| *byte == b'\n').unwrap();
+            let result: serde_json::Value = serde_json::from_slice(&output[..newline]).unwrap();
+            assert_eq!(result["params"]["model"], expected);
+            assert_eq!(
+                &output[newline + 1..],
+                b"{\"id\":2,\"result\":{}}\r\ninvalid\n"
+            );
+        }
+        // 活跃模型不被较旧的磁盘记录覆盖。
+        for method in ["thread/settings/update", "turn/start", "thread/resume"] {
+            let input = format!(
+                "{}\n{}\n",
+                serde_json::json!({"id":1,"method":method,"params":{"threadId":"first","model":"route/second"}}),
+                serde_json::json!({"id":2,"method":"thread/resume","params":{"threadId":"first"}})
+            );
+            let mut output = Vec::new();
+            route_local_app_server_input(
+                input.as_bytes(),
+                &mut output,
+                &overrides,
+                Some(home.path()),
+            )
+            .unwrap();
+            let lines = String::from_utf8(output).unwrap();
+            let result: serde_json::Value =
+                serde_json::from_str(lines.lines().nth(1).unwrap()).unwrap();
+            assert!(result["params"].get("model").is_none());
+        }
+        // 损坏的元数据不能中断共享协议流。
+        std::fs::write(home.path().join("first.jsonl"), "invalid").unwrap();
+        let mut output = Vec::new();
+        route_local_app_server_input(b"{\"method\":\"thread/resume\",\"params\":{\"threadId\":\"first\",\"model\":null}}\n{}\n".as_slice(), &mut output, &overrides, Some(home.path())).unwrap();
+        assert!(String::from_utf8(output).unwrap().ends_with("\n{}\n"));
+    }
+
+    #[test]
+    fn resume_model_alias_resolution_never_guesses_between_routes() {
+        let home = tempfile::tempdir().unwrap();
+        let db = rusqlite::Connection::open(home.path().join("state_5.sqlite")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE threads (id TEXT, model TEXT, model_provider TEXT);
+            INSERT INTO threads VALUES ('saved', 'shared', 'codey_router');",
+        )
+        .unwrap();
+        let catalog = home.path().join("catalog.json");
+        std::fs::write(&catalog, serde_json::json!({"models":[{"slug":"a/shared"},{"slug":"b/shared"},{"slug":"a/unique"}]}).to_string()).unwrap();
+        let overrides = vec![format!(
+            "model_catalog_json={}",
+            toml_edit::Value::from(catalog.to_str().unwrap())
+        )];
+        assert_eq!(
+            restored_resume_model(home.path(), "saved", &overrides).unwrap(),
+            None
+        );
+        for (model, provider, expected) in [
+            ("shared", "b", Some("b/shared")),
+            ("a/shared", "b", Some("a/shared")),
+            ("unique", "codey_router", Some("a/unique")),
+            ("unique", "b", None),
+            ("deleted/shared", "codey_router", None),
+        ] {
+            db.execute(
+                "UPDATE threads SET model=?1, model_provider=?2",
+                [model, provider],
+            )
+            .unwrap();
+            assert_eq!(
+                restored_resume_model(home.path(), "saved", &overrides)
+                    .unwrap()
+                    .as_deref(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn cli_wrapper_readiness_writes_marker_even_when_handshake_is_refused() {
         let temporary = tempfile::tempdir().unwrap();
         let marker_path = temporary.path().join("wrapper.json");
@@ -942,6 +1467,7 @@ mod tests {
                 std::io::BufReader::with_capacity(1, input.as_slice()),
                 &mut output,
                 &[],
+                None,
             )
             .unwrap();
             let first_line = output.iter().position(|byte| *byte == b'\n').unwrap();
@@ -987,7 +1513,8 @@ mod tests {
             ] {
                 let input = serde_json::json!({"method":method, "params":{"model":model,"modelProvider":"codey_router_remote"}}).to_string();
                 let mut output = Vec::new();
-                route_local_app_server_input(input.as_bytes(), &mut output, &overrides).unwrap();
+                route_local_app_server_input(input.as_bytes(), &mut output, &overrides, None)
+                    .unwrap();
                 let result: serde_json::Value = serde_json::from_slice(&output).unwrap();
                 assert_eq!(result["params"]["modelProvider"], provider);
             }
@@ -1049,8 +1576,13 @@ mod tests {
                         let input =
                             serde_json::json!({"method":method,"params":params}).to_string();
                         let mut output = Vec::new();
-                        route_local_app_server_input(input.as_bytes(), &mut output, &overrides)
-                            .unwrap();
+                        route_local_app_server_input(
+                            input.as_bytes(),
+                            &mut output,
+                            &overrides,
+                            None,
+                        )
+                        .unwrap();
                         let result: serde_json::Value = serde_json::from_slice(&output).unwrap();
                         params["modelProvider"] = "codey_router".into();
                         assert_eq!(result["params"], params);

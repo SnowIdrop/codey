@@ -46,6 +46,7 @@ mod renderer_asset_patch;
 mod route_request_log;
 mod session_index_cleanup;
 mod session_metadata;
+mod session_model;
 mod session_transfer;
 mod sqlite_util;
 mod startup_update;

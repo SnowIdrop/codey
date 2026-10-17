@@ -2070,6 +2070,10 @@ impl CodeyRuntime {
             .map(|local_router| local_router.update_config(config)))
     }
 
+    pub(crate) fn portable_compaction(&self, operation: &str, payload: &serde_json::Value) -> Result<serde_json::Value> {
+        self.local_router.as_ref().context("本地路由尚未启动")?.portable_compaction(operation, payload)
+    }
+
     pub(crate) fn revert_local_router_routes(&self, swap: local_router::RouterSnapshotSwap) {
         if let Some(local_router) = self.local_router.as_ref() {
             local_router.revert_config(swap);

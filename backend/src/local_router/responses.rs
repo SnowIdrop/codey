@@ -1623,6 +1623,10 @@ impl RouterServer {
             .unwrap_or_default()
             .trim()
             .to_string();
+        let mut portable_attempt = match PortableAttempt::acquire(self, &request, compacting, &snapshot) {
+            Ok(attempt) => attempt,
+            Err(error) => return downstream.write_error(409, "portable_compaction_unavailable", error.to_string(), None).await,
+        };
         let model_was_defaulted = requested_model.is_empty();
         let model = if model_was_defaulted {
             snapshot.default_model.trim().to_string()
@@ -1671,8 +1675,15 @@ impl RouterServer {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let bound_route = bindings.route_for_keys(&binding_keys);
-            let resolved =
-                snapshot.target_for_request(&model, route_hint.as_deref(), bound_route.as_deref());
+            let resolved = if let Some(attempt) = &portable_attempt {
+                Ok(RouteSelection {
+                    provider_id: attempt.source.provider_id.clone(), protocol: attempt.source.protocol,
+                    requested_model: model.clone(), route: Arc::clone(&attempt.source),
+                    upstream_model: attempt.model.clone(), fallback_reason: None,
+                })
+            } else {
+                snapshot.target_for_request(&model, route_hint.as_deref(), bound_route.as_deref())
+            };
             (resolved, bound_route)
         };
         let resolved = match resolved {
@@ -1686,7 +1697,14 @@ impl RouterServer {
         };
         let route_changed = previous_route
             .as_deref()
-            .is_some_and(|provider_id| provider_id != resolved.provider_id);
+            .is_some_and(|provider_id| provider_id != resolved.provider_id)
+            || self.bindings.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .routes.get(binding_keys.first().map(String::as_str).unwrap_or_default())
+                .is_some_and(|binding| {
+                    !binding.upstream_model.is_empty()
+                        && binding.context_config != Some(resolved.route.context_config)
+                });
         if model != resolved.upstream_model {
             body.as_object_mut()
                 .expect("validated Responses body must remain an object")
@@ -1758,6 +1776,7 @@ impl RouterServer {
             );
         }
         let native_compaction = compacting
+            && portable_attempt.is_none()
             && resolved.route.supports_remote_compaction
             && bridge == ProtocolBridge::NativeResponses;
         match restore_codey_compaction_summaries(&mut body) {
@@ -1778,7 +1797,15 @@ impl RouterServer {
             }
         }
         if compacting && !native_compaction {
-            if let Err(error) = prepare_gateway_compaction(&mut body) {
+            let metadata = crate::model_catalog::runtime_context_metadata(
+                &crate::codex_config::codex_home(),
+            );
+            let model_metadata = gateway_compaction_model_metadata(
+                &metadata, &resolved.provider_id, &resolved.upstream_model,
+            );
+            if let Err(error) = gateway_compaction_output_budget(&body, model_metadata)
+                .and_then(|budget| prepare_gateway_compaction(&mut body, budget))
+            {
                 return downstream
                     .write_error(
                         400,
@@ -1876,6 +1903,9 @@ impl RouterServer {
                 )
                 .await;
         }
+        // Only a full, restored request can establish portability. An unresolved
+        // previous_response_id carries history that is absent from this input.
+        let history_portable = portable_compaction::resolved_history_portability(&body);
         let discard_opaque_reasoning = route_changed || restoring_adapted_history;
         if bridge == ProtocolBridge::NativeResponses {
             if normalize_native_responses_context(&mut body, discard_opaque_reasoning) {
@@ -2084,15 +2114,19 @@ impl RouterServer {
         let auto_review_request =
             model_id::equal(&resolved.upstream_model, CODEX_AUTO_REVIEW_MODEL)
                 || resolved.fallback_reason.as_deref() == Some("auto_review_misc_model");
-        if !auto_review_request {
-            let refresh_session_binding = route_hint.is_some() && !subagent_request;
+        if !auto_review_request && portable_attempt.is_none() {
+            let refresh_session_binding = !subagent_request
+                && incoming_header(&request, "x-codex-parent-thread-id").is_none()
+                && (route_hint.is_some() || incoming_header(&request, "thread-id").is_none());
             self.bindings
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remember(
+                .remember_resolved(
                     &binding_keys,
-                    &resolved.provider_id,
+                    &resolved,
                     refresh_session_binding,
+                    native_compaction,
+                    history_portable,
                 );
         }
         let cache_key_deleted = resolved
@@ -2652,7 +2686,7 @@ impl RouterServer {
             _ if compacting => {
                 if !native_compaction {
                     write_gateway_compaction(downstream, response, bridge, &resolved.upstream_model,
-                        stream_requested, &resolved.route, &tool_bridge).await
+                        stream_requested, &resolved.route, &tool_bridge, portable_attempt.as_mut()).await
                 } else {
                 write_validated_compaction(
                     downstream,

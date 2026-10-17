@@ -411,6 +411,25 @@ pub(crate) fn apply_model_context(
     Ok(())
 }
 
+#[cfg(test)]
+#[test]
+fn compaction_threshold_uses_one_output_reserve_and_validates_boundaries() {
+    for (reserve, expected) in [(None, 90000), (Some(10000), 90000), (Some(25000), 75000)] {
+        let mut model = json!({});
+        let mut policy = crate::config::ModelContextConfig {
+            context_window_tokens: 100000,
+            reserve_output_tokens: reserve,
+            auto_compact_token_limit: None,
+        };
+        apply_model_context(&mut model, Some(&policy)).unwrap();
+        assert_eq!(model["auto_compact_token_limit"], expected);
+        policy.auto_compact_token_limit = Some(expected);
+        assert!(apply_model_context(&mut model, Some(&policy)).is_ok());
+        policy.auto_compact_token_limit = Some(expected + 1);
+        assert!(apply_model_context(&mut model, Some(&policy)).is_err());
+    }
+}
+
 /// Shadow copy of the declaration an override replaced, so dropping the
 /// override restores the template values instead of keeping stale ones.
 pub(super) const REASONING_BASE_FIELD: &str = "codey_reasoning_base";

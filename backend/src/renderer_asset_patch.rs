@@ -1156,8 +1156,8 @@ fn enqueue_debugger_resume(command_tx: &mpsc::UnboundedSender<SessionCommand>) {
     });
 }
 
-/// 与页面侧 isCodexRendererAssetUrl 静态名单同口径的高层筛选：只用来给
-/// scriptParsed 通道的诊断节流，补丁适用性仍由页面入口全权决定。
+/// 与页面侧 isCodexRendererAssetUrl 静态名单保持一致，限制 scriptParsed
+/// 通道的源码读取及诊断；具体补丁是否适用仍由页面入口决定。
 fn is_patchable_named_asset(url: &str) -> bool {
     let base = url
         .split(['?', '#'])
@@ -1169,6 +1169,7 @@ fn is_patchable_named_asset(url: &str) -> bool {
         .to_ascii_lowercase();
     [
         "app-initial",
+        "app-primary",
         "app-shared",
         "codex-composer-adapter",
         "general-settings",
@@ -1606,6 +1607,14 @@ mod tests {
         ] {
             assert!(!is_patch_candidate_url(rejected), "{rejected}");
         }
+    }
+
+    #[test]
+    fn primary_composer_asset_is_available_to_script_patching() {
+        let url = "app://-/assets/app-primary-b4ce9e46e8cf.js?build=desktop";
+        assert!(is_patch_candidate_url(url));
+        assert!(is_patchable_named_asset(url));
+        assert!(!is_patchable_named_asset("app://-/assets/chatgpt-composer.js"));
     }
 
     #[test]

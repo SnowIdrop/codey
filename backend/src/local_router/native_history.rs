@@ -1825,6 +1825,22 @@ mod tests {
     }
 
     #[test]
+    fn failed_compaction_keeps_the_last_successful_history() {
+        for status in ["failed", "incomplete"] {
+            let owner = [1; 32];
+            let mut history = NativeResponsesHistory::default();
+            history.prepare(owner, &mut json!({"input":"original task"}));
+            history.observe(&completed("resp-before", vec![]));
+            history.prepare(owner, &mut json!({"previous_response_id":"resp-before","input":[{"type":"compaction_trigger"}]}));
+            history.observe(&json!({"type":format!("response.{status}"),"response":{"id":"resp-failed","status":status,"output":[{"type":"compaction","encrypted_content":"partial"}]}}));
+            let mut next = json!({"previous_response_id":"resp-before","input":"continue"});
+            history.prepare(owner, &mut next);
+            assert!(history.restore_for_http(owner, &mut next, true).unwrap());
+            assert_eq!(next["input"], json!([{"role":"user","content":"original task"},{"role":"user","content":"continue"}]));
+        }
+    }
+
+    #[test]
     fn native_http_rejection_hint_survives_failure_normalization() {
         let mut history = NativeResponsesHistory::default();
         history.prepare([1; 32], &mut json!({"input":"task"}));

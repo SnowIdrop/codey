@@ -439,6 +439,19 @@ impl AppState {
                 self.session_scan_wake.notify_one();
                 json!({"status":"ok"})
             }
+            "/session/portable-compaction/prepare"
+            | "/session/portable-compaction/status"
+            | "/session/portable-compaction/cancel"
+            | "/session/portable-compaction/confirm" => {
+                let runtime = self.runtime.lock().await.clone();
+                let operation = path.rsplit('/').next().unwrap_or_default().to_owned();
+                blocking_value("准备会话摘要", move || {
+                    runtime
+                        .ok_or_else(|| anyhow::anyhow!("Codex 尚未启动"))
+                        .and_then(|runtime| runtime.portable_compaction(&operation, &payload))
+                })
+                .await
+            }
             "/session/stats" => {
                 let session_id = bridge_string(&payload, "sessionId");
                 if session_id.is_empty() {
@@ -448,6 +461,14 @@ impl AppState {
                 let stats =
                     runtime.and_then(|runtime| runtime.conversation_stats_snapshot(&session_id));
                 json!({"status":"ok", "stats": stats})
+            }
+            "/session/model" => {
+                let thread_id = bridge_string(&payload, "threadId");
+                let home = codex_home();
+                blocking_value("读取会话模型", move || {
+                    crate::session_model::read(&home, &thread_id)
+                })
+                .await
             }
             "/session/titles" => cache_session_titles(self, &payload).await,
             "/session/timestamps" => {

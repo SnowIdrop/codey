@@ -188,6 +188,7 @@ pub(super) fn load_or_create_router_token_at(path: &Path) -> String {
 
 pub(crate) struct LocalRouter {
     pub(crate) endpoint: RuntimeRouterEndpoint,
+    pub(crate) bindings: Arc<Mutex<RouteBindings>>,
     pub(crate) snapshot: Arc<RwLock<Arc<RouterSnapshot>>>,
     pub(crate) websocket_backoffs: Arc<Mutex<UpstreamWebSocketBackoffs>>,
     pub(crate) shutdown: Mutex<Option<oneshot::Sender<()>>>,
@@ -255,6 +256,7 @@ impl LocalRouter {
                 serde_json::json!({}),
             );
         }
+        let bindings = Arc::new(Mutex::new(RouteBindings::default()));
         let server = RouterServer {
             endpoint: endpoint.clone(),
             token: endpoint.token.clone(),
@@ -263,7 +265,7 @@ impl LocalRouter {
             connection_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
             rejection_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_REJECTIONS)),
             request_body_budget: Arc::new(Semaphore::new(REQUEST_BODY_BUDGET_PERMITS)),
-            bindings: Arc::new(Mutex::new(RouteBindings::default())),
+            bindings: Arc::clone(&bindings),
             websocket_backoffs: Arc::clone(&websocket_backoffs),
             native_history_cache: Arc::new(Mutex::new(NativeHistoryCache::default())),
             idle_downstreams: Arc::new(Mutex::new(IdleDownstreamRegistry::default())),
@@ -406,6 +408,7 @@ impl LocalRouter {
         });
         Ok(Self {
             endpoint,
+            bindings,
             snapshot,
             websocket_backoffs,
             shutdown: Mutex::new(Some(shutdown_tx)),
@@ -712,6 +715,7 @@ impl ResponsesRequestKind {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RouteBindings {
+    pub(crate) portable_tickets: HashMap<String, PortableTicket>,
     pub(crate) compacting: HashSet<String>,
     pub(crate) routes: HashMap<String, RouteBinding>,
     pub(crate) order: VecDeque<(String, u64)>,
@@ -722,6 +726,9 @@ pub(crate) struct RouteBindings {
 pub(crate) struct RouteBinding {
     pub(crate) provider_id: String,
     pub(crate) generation: u64,
+    pub(crate) upstream_model: String,
+    pub(crate) context_config: Option<[u8; 32]>,
+    pub(crate) portable: bool,
 }
 
 impl RouteBindings {
@@ -756,6 +763,9 @@ impl RouteBindings {
                 RouteBinding {
                     provider_id: provider_id.to_string(),
                     generation,
+                    upstream_model: String::new(),
+                    context_config: None,
+                    portable: false,
                 },
             );
             self.order.push_back((key.clone(), generation));

@@ -347,6 +347,14 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       blocked: true,
       routed: true,
     }]);
+    let releaseDirect;
+    routeGlobal.__codeyModelWhitelistPatch.guardDirectBridgeMessage = (_detail, send) => new Promise((resolve) => { releaseDirect = () => resolve(send()); });
+    routeTransport.postMessage({ type: "mcp-request", request: { id: "direct" } });
+    assert.equal(sentMessages.length, 1);
+    releaseDirect();
+    await new Promise(setImmediate);
+    assert.equal(sentMessages.length, 2);
+    assert.equal(sentMessages[1].request.id, "direct");
     assert.equal(
       patchErrors.length,
       2,
@@ -379,6 +387,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     const appServerGlobal = {
       __codeyModelWhitelistPatch: {
         rewriteOutgoingMessage(detail) {
+          if (detail.hostId !== "local") return detail;
           routedAppServerTypes.push(detail.type);
           if (detail.request.params.model === "blocked-route/model") {
             return { ...detail, blocked: true };
@@ -403,7 +412,8 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
         trackOutgoingMessage(detail) {
           trackedAppServerMessages.push(detail);
         },
-        rewriteIncomingResult(method, result) {
+        rewriteIncomingResult(method, result, hostId) {
+          if (hostId !== "local") return result;
           return method === "model/list"
             ? { ...result, data: [...result.data, { model: "route/model" }] }
             : result;
@@ -452,8 +462,23 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     assert.equal(trackedAppServerMessages.length, 2);
     assert.deepEqual(trackedAppServerMessages[0], {
       type: "mcp-request",
+      hostId: "local",
       request: requestClient.sent[0].payload.request,
     });
+    let releasePortable;
+    let reentering = false;
+    appServerGlobal.__codeyModelWhitelistPatch.guardOutgoingRequest = (_client, method, _params, proceed) => {
+      if (method !== "turn/start" || reentering) return null;
+      return new Promise((resolve) => { releasePortable = resolve; }).then(() => {
+        reentering = true;
+        try { return proceed(); } finally { reentering = false; }
+      });
+    };
+    const portableSend = requestClient.enqueueRequest("turn/start", { threadId: "portable", model: "route/model" }, {});
+    assert.equal(requestClient.sent.length, 2, "source gate waits before rewrite or transport");
+    releasePortable();
+    await portableSend;
+    assert.equal(requestClient.sent.length, 3, "source gate dispatches exactly once after preparation");
     const modelListResults = [];
     requestClient.requestPromises.set("model-list", {
       method: "model/list",
@@ -465,6 +490,15 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     assert.deepEqual(modelListResults, [{
       data: [{ model: "gpt-5.6-sol" }, { model: "route/model" }],
     }]);
+    const remoteClient = new AppServerRequestClient();
+    remoteClient.hostId = "remote-host";
+    await remoteClient.enqueueRequest("thread/start", { model: "remote-model" }, {});
+    assert.deepEqual(remoteClient.sent[0].payload.request.params, { model: "remote-model" });
+    assert.equal(trackedAppServerMessages.at(-1).hostId, "remote-host");
+    let remoteResult;
+    remoteClient.requestPromises.set("remote-list", { method: "model/list", resolve(value) { remoteResult = value; } });
+    remoteClient.onResult("remote-list", { data: [{ model: "remote-model" }] });
+    assert.deepEqual(remoteResult, { data: [{ model: "remote-model" }] });
     assert.equal(
       patchErrors.length,
       2,
@@ -487,9 +521,14 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       patchedSharedChunk,
       /__codeyAppServerRequestClients/,
     );
+    // Current Codex puts composer and request gates in app-primary too.
+    assert.equal(
+      patch("app://-/webview/assets/app-primary-6f60e9ac4103.js", appServerRequestSource),
+      patchedSharedChunk,
+    );
     // Assets outside the patch set must pass through untouched.
     const unrelatedChunk = patch(
-      "app://-/webview/assets/app-primary-6f60e9ac4103.js",
+      "app://-/webview/assets/unrelated-feature-6f60e9ac4103.js",
       appServerRequestSource,
     );
     assert.equal(unrelatedChunk, appServerRequestSource);
