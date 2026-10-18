@@ -2079,13 +2079,68 @@ enabled-reasoning-efforts = ["low", "medium", "high", "xhigh"]
 }
 
 #[test]
-fn router_patch_preserves_selected_service_tier() {
-    let result = patch_config("service_tier = \"priority\"\n", true).unwrap();
+fn isolated_runtime_sets_medium_and_normal_defaults_without_changing_user_config() {
+    let inherited_preferences = r#"model_reasoning_effort = "high"
+service_tier = "priority"
+profile = "work"
 
-    assert_eq!(
-        root_key_string(&result, "service_tier").as_deref(),
-        Some("priority")
-    );
+[profiles.work]
+model_reasoning_effort = "xhigh"
+service_tier = "flex"
+"#;
+    for original in ["", inherited_preferences] {
+        for local_router in [None, Some(test_runtime_router_endpoint())] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("codex-home");
+            let marker = temp.path().join("codey-state/codex-lease.json");
+            let backup_root = temp.path().join("codey-state/codex-backups");
+            fs::create_dir_all(&home).unwrap();
+            let config_path = home.join("config.toml");
+            fs::write(&config_path, original).unwrap();
+
+            let applied = apply_isolated_runtime_router_config(
+                &home,
+                RouterApplyOptions {
+                    remote_compaction_models: None,
+                    model_contexts: None,
+                    stream_max_retries: 5,
+                    local_router,
+                    use_official_catalog: false,
+                    default_model: None,
+                    fastctx_command: None,
+                    subagent_optimization: false,
+                    subagent_model: DEFAULT_SUBAGENT_MODEL,
+                    subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+                    subagent_roles: None,
+                    marker: &marker,
+                    backup_root: &backup_root,
+                },
+            )
+            .unwrap();
+
+            for (key, expected) in [
+                ("model_reasoning_effort", "medium"),
+                ("service_tier", "default"),
+            ] {
+                let values = applied
+                    .runtime_config_overrides
+                    .iter()
+                    .filter(|entry| runtime_override_key(entry) == key)
+                    .map(|entry| root_key_string(entry, key).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(values, [expected]);
+            }
+            assert!(
+                applied
+                    .runtime_config_overrides
+                    .iter()
+                    .all(|entry| !entry.starts_with("profiles."))
+            );
+            assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+            assert!(restore_runtime_config_at(&home, &marker, false).unwrap());
+            assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
+        }
+    }
 }
 
 #[test]
@@ -3810,6 +3865,7 @@ wire_api = "responses"
     for required_key in [
         "model_catalog_json",
         "desktop.enabled-reasoning-efforts",
+        "model_reasoning_effort",
         "service_tier",
         "developer_instructions",
         "mcp_servers.codey_fastctx.command",

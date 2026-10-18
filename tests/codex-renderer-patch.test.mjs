@@ -1,8 +1,189 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
 
 import { loadStartupPatchTemplate } from "./helpers/startup-patch.mjs";
+
+// Keep the native draft merge and persistence branches in the fixture. The
+// optional extracted production asset runs through the same behavior harness.
+const newDraftFixture = [
+  "let Hva=wo(U,e=>({isManuallyChanged:!1,modelSettings:null,serviceTier:null}));",
+  "function Jbo({userSavedModelString:e,userSavedReasoningEffort:t,listModelsData:n}){let r=n?.models.find(m=>m.model===e),i=r?.supportedReasoningEfforts?.map(e=>e.reasoningEffort),a=t!=null&&i!=null&&i.includes(t)?t:r?.defaultReasoningEffort;return{model:r?r.model:e,reasoningEffort:a??t??`medium`,profile:null,isLoading:!1}}",
+  "function nxo(e){let{managedNewThreadModelSettings:s,waitForModelList:c}=e;let{data:N,isLoading:P}=Za(M);let{data:R,isLoading:z}=wvo(L),B=Xbo(T?.settings,R),ne=Jbo({userSavedModelString:V,userSavedReasoningEffort:H,listModelsData:R});return ne}",
+  "function uxo(e,t){let n=(0,fxo.c)(29),r=e===void 0?null:e,d={enabled:r==null};let{draftSettings:f,isNewThreadDraft:p,updateDraftSettings:m}=Lva(d),h=sxo(r,p),{isLunaReserveActive:g}=h,_=r==null&&p,v=_&&h.hasManagedNewThreadSettings,y=_&&h.isUsingCopilotApi,b=_&&f.modelSettings!=null,x=h.modelSettings;if(b){x={...x,...f.modelSettings}}if(g)x={...x,model:YNt};let C=async(e,t,n)=>{let i=e,a=_&&n?.persistAsDefault===!1;if(a||v||y&&t===`ultra`?m(e=>({...e,isManuallyChanged:!0,modelSettings:{model:i,profile:h.modelSettings.profile,reasoningEffort:t},modelSettingsPersistAsDefault:!a,serviceTier:n?.serviceTier===void 0?e.serviceTier:{value:xir(n.serviceTier)}})):_&&f.modelSettings!=null&&m(dxo),a)return!0;return h.setModelAndReasoningEffort(i,t,n)};return{...h,modelSettings:x,setModelAndReasoningEffort:C}}function dxo(e){return{...e,modelSettings:null,modelSettingsPersistAsDefault:void 0}}",
+  "function vwo(e,t){let r=e===void 0?null:e,i=t===void 0?null:t,a=hi(U),{draftSettings:o,isNewThreadDraft:s,updateDraftSettings:c}=Lva(),l=_wo(r,uxo(r),o.serviceTier,s,i),{serviceTierAccess:d,...u}=l;return{...u,setServiceTier:async(e,t)=>{if(!We(e,d))return!1;let n=r==null&&s&&(u.hasManagedNewThreadSettings||i!=null||o.serviceTier!=null);n&&c(t=>({...t,isManuallyChanged:!0,serviceTier:{value:xir(e)}}));let[l]=await Promise.all([u.setServiceTier(e,t),n?Vh(a,u.hostId).clearPrewarmedThreads():void 0]);return l}}}function afterSpeed(){}",
+].join("");
+
+function exerciseDraftHooks(source) {
+  const takeFunction = (name) => {
+    const start = source.indexOf(`function ${name}(`);
+    assert.ok(start >= 0, `${name} exists`);
+    const end = Math.min(...[source.indexOf("}function ", start), source.indexOf("}var ", start)].filter((index) => index >= 0));
+    assert.ok(end > start, `${name} has a bounded next declaration`);
+    return source.slice(start, end + 1);
+  };
+  const factory = source.match(/=>\(\{isManuallyChanged:!1,modelSettings:null,serviceTier:\{value:`default`\}\}\)/)?.[0];
+  assert.ok(factory, "each draft has its own ordinary-speed initializer");
+  const makeDraft = Function(`return e${factory}`)();
+  const state = {
+    draft: makeDraft(),
+    isDraft: true,
+    cache: [],
+    speedCache: [],
+    savedSpeed: "fast",
+    existingSpeed: "fast",
+    catalog: {
+      models: [
+        { model: "chosen-model", defaultReasoningEffort: "high", supportedReasoningEfforts: [{ reasoningEffort: "medium" }, { reasoningEffort: "high" }] },
+        { model: "high-only", defaultReasoningEffort: "high", supportedReasoningEfforts: [{ reasoningEffort: "high" }] },
+      ],
+    },
+    settings: { model: "chosen-model", reasoningEffort: "high", profile: "saved-profile", isLoading: false },
+    writes: [],
+    hooks: 0,
+  };
+  const scope = { set() {}, get() {} };
+  const base = {
+    hostId: "local",
+    hasManagedNewThreadSettings: false,
+    isUsingCopilotApi: false,
+    isLunaReserveActive: false,
+    setModelAndReasoningEffort: async (...args) => { state.writes.push(args); return true; },
+    setModelAndReasoningEffortForNextTurn: async () => true,
+  };
+  const bindings = {
+    fxo: { c: (size) => {
+      if (state.cache.length === 0) state.cache = Array(size).fill(Symbol.for("react.memo_cache_sentinel"));
+      return state.cache;
+    } },
+    ywo: { c: (size) => {
+      if (state.speedCache.length === 0) state.speedCache = Array(size).fill(Symbol.for("react.memo_cache_sentinel"));
+      return state.speedCache;
+    } },
+    Lva: () => ({ draftSettings: state.draft, isNewThreadDraft: state.isDraft, updateDraftSettings: (update) => { state.draft = update(state.draft); } }),
+    sxo: () => ({ ...base, modelSettings: state.settings }),
+    wvo: () => { state.hooks += 1; return { data: state.catalog }; },
+    hi: () => scope,
+    U: {},
+    J_o() {},
+    IJ: {},
+    Vh: () => ({ clearPrewarmedThreads: async () => {} }),
+    xir: (tier) => tier ?? "default",
+    qbo: (models, model) => models?.find((entry) => entry.model === model),
+    YNt: "gpt-reserve",
+    We: () => true,
+    _wo: (threadId, _model, draftTier) => ({
+      hostId: "local",
+      hasManagedNewThreadSettings: false,
+      serviceTierAccess: {},
+      // Native speed resolver gives existing-thread settings precedence, then
+      // the draft value, then saved global preferences.
+      serviceTierSettings: { selectedServiceTier: threadId != null ? state.existingSpeed : draftTier?.value ?? state.savedSpeed },
+      setServiceTier: async (tier) => { state.savedSpeed = tier; return true; },
+    }),
+  };
+  const { useModel, useSpeed } = Function(...Object.keys(bindings), `${takeFunction("Jbo")}${takeFunction("uxo")}${takeFunction("vwo")}function dxo(e){return{...e,modelSettings:null,modelSettingsPersistAsDefault:void 0}}return{useModel:uxo,useSpeed:vwo}`)(...Object.values(bindings));
+  return { state, makeDraft, useModel, useSpeed };
+}
+
+test("new drafts initialize ordinary speed and supported medium reasoning without replacing manual choices", async (t) => {
+  (0, eval)(await loadStartupPatchTemplate());
+  const sources = [["fixture", newDraftFixture]];
+  if (process.env.CODEY_NEW_CHAT_RENDERER_ASSET) {
+    sources.push(["installed renderer", await readFile(process.env.CODEY_NEW_CHAT_RENDERER_ASSET, "utf8")]);
+  }
+  for (const [label, source] of sources) {
+    await t.test(label, async (t) => {
+      const errors = [];
+      const savedLog = globalThis.__codeyPatchLog;
+      const savedError = console.error;
+      let patched;
+      globalThis.__codeyPatchLog = (record) => errors.push(JSON.parse(record));
+      console.error = () => {};
+      try {
+        patched = globalThis.__codeyRendererPatchEntry("app://-/assets/app-initial-new-drafts.js", source) ?? source;
+      } finally {
+        globalThis.__codeyPatchLog = savedLog;
+        console.error = savedError;
+      }
+      assert.ok(patched.includes("/*codey-new-thread-draft-defaults*/"));
+      assert.deepEqual(errors.filter(({ operation }) => operation === "renderer_patch:new thread draft defaults"), []);
+      const syntax = spawnSync(process.execPath, ["--check", "--input-type=module"], { input: patched, encoding: "utf8" });
+      assert.equal(syntax.status, 0, syntax.stderr);
+      const { state, makeDraft, useModel, useSpeed } = exerciseDraftHooks(patched);
+      await t.test("two new drafts reset independently and keep the chosen default model", async () => {
+        const first = useModel();
+        assert.equal(first.modelSettings.reasoningEffort, "medium");
+        assert.equal(first.modelSettings.model, "chosen-model");
+        assert.equal(first.modelSettings.profile, "saved-profile");
+        assert.equal(state.draft.serviceTier.value, "default");
+        assert.equal(useModel().modelSettings, first.modelSettings, "default object stays memoized");
+        await first.setModelAndReasoningEffort("chosen-model", "high", { serviceTier: "fast" });
+        assert.equal(useModel().modelSettings.reasoningEffort, "high");
+        assert.equal(state.draft.serviceTier.value, "fast");
+        assert.equal(state.writes.length, 1, "native default-model persistence is preserved");
+        const previousDraft = state.draft;
+        state.draft = makeDraft();
+        state.cache = [];
+        assert.equal(useModel().modelSettings.reasoningEffort, "medium");
+        assert.equal(state.draft.serviceTier.value, "default");
+        assert.equal(previousDraft.serviceTier.value, "fast");
+      });
+      await t.test("independent speed choices remain local to the current draft", async () => {
+        assert.equal(useSpeed().serviceTierSettings.selectedServiceTier, "default");
+        await useSpeed().setServiceTier("fast", "picker");
+        assert.equal(useSpeed().serviceTierSettings.selectedServiceTier, "fast");
+        assert.equal(useModel().modelSettings.reasoningEffort, "medium", "a speed change does not restore old reasoning");
+        state.draft = makeDraft();
+        assert.equal(useSpeed().serviceTierSettings.selectedServiceTier, "default");
+        assert.equal(useSpeed("existing-thread").serviceTierSettings.selectedServiceTier, "fast");
+      });
+      await t.test("unsupported medium uses the native model fallback", () => {
+        state.settings = { ...state.settings, model: "high-only" };
+        assert.equal(useModel().modelSettings.reasoningEffort, "high");
+      });
+      await t.test("missing or loading catalogs retain valid settings and keep hook order", () => {
+        state.settings = { ...state.settings, model: "not-in-catalog", reasoningEffort: "low" };
+        assert.equal(useModel().modelSettings, state.settings);
+        state.catalog = undefined;
+        const before = state.hooks;
+        assert.equal(useModel().modelSettings, state.settings);
+        assert.equal(state.hooks, before + 1);
+      });
+      await t.test("existing and restoring threads retain reasoning and ignore draft speed", async () => {
+        state.isDraft = false;
+        state.settings = { ...state.settings, reasoningEffort: "high", isLoading: true };
+        assert.equal(useModel("existing-thread").modelSettings, state.settings);
+        const previous = state.draft;
+        await useModel("existing-thread").setModelAndReasoningEffort("high-only", "high");
+        assert.equal(state.draft, previous);
+      });
+    });
+  }
+});
+
+test("draft default patch is atomic when anchors drift and idempotent when reapplied", async () => {
+  (0, eval)(await loadStartupPatchTemplate());
+  const patch = (source) => globalThis.__codeyRendererPatchEntry("app://-/assets/app-initial-new-drafts.js", source) ?? source;
+  const patched = patch(newDraftFixture);
+  assert.equal(patch(patched), patched);
+  const savedLog = globalThis.__codeyPatchLog;
+  const savedError = console.error;
+  globalThis.__codeyPatchLog = () => {};
+  console.error = () => {};
+  try {
+    for (const source of [
+      newDraftFixture.replace("serviceTier:null", "serviceTier:void 0"),
+      newDraftFixture.replace("waitForModelList:c", "fetchModels:c"),
+      newDraftFixture.replace("a||v||y&&t===`ultra`?", "a||v?"),
+      `${newDraftFixture}let duplicate=wo(U,e=>({isManuallyChanged:!1,modelSettings:null,serviceTier:null}));`,
+    ]) assert.equal(patch(source), source);
+  } finally {
+    globalThis.__codeyPatchLog = savedLog;
+    console.error = savedError;
+  }
+});
 
 test("an incompatible optional renderer patch never blocks the Codex module response", async () => {
   const patchRecords = [];

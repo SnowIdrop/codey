@@ -2225,7 +2225,7 @@ fn patch_config_with_fastctx_mode(
         set_model_selection(&mut doc, default_model);
     }
     enable_desktop_reasoning_efforts(&mut doc)?;
-    ensure_default_service_tier(&mut doc);
+    set_runtime_model_defaults(&mut doc);
     let fastctx_namespace = if let Some(command) = fastctx_command {
         enable_fast_context_tools(&mut doc, command)?
     } else {
@@ -2554,6 +2554,12 @@ fn build_isolated_runtime_overrides(
         effective,
         &["desktop", "enabled-reasoning-efforts"],
         "desktop.enabled-reasoning-efforts",
+    )?;
+    push_required_document_override(
+        &mut overrides,
+        effective,
+        &["model_reasoning_effort"],
+        "model_reasoning_effort",
     )?;
     push_required_document_override(&mut overrides, effective, &["service_tier"], "service_tier")?;
 
@@ -3318,10 +3324,10 @@ fn enable_desktop_reasoning_efforts(doc: &mut DocumentMut) -> Result<()> {
     Ok(())
 }
 
-fn ensure_default_service_tier(doc: &mut DocumentMut) {
-    if doc.get("service_tier").is_none() {
-        doc["service_tier"] = value("default");
-    }
+fn set_runtime_model_defaults(doc: &mut DocumentMut) {
+    // 运行参数为新会话提供默认值，不写回用户配置。
+    doc["model_reasoning_effort"] = value("medium");
+    doc["service_tier"] = value("default");
 }
 
 fn remove_model_selection(doc: &mut DocumentMut) {

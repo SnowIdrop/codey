@@ -306,9 +306,56 @@
       "})()).find(",
       `${coordinationName}.clientCoordination,${hostIdName},${conversationIdName})`,
     ].join("");
+  const patchNewThreadDraftDefaults = (source) => {
+    const name = "new thread draft defaults";
+    if (source.includes("/*codey-new-thread-draft-defaults*/")
+      || activeRendererPatchFailures?.has(name)) return source;
+    // 三处必须同时识别：草稿速度初值、模型目录校验、手动草稿选择。
+    // 缓存中的默认模型继续有效；旧推理强度不再成为下一个草稿的初值。
+    const patterns = {
+      factory: /\b[$A-Z_a-z][$\w]*=[$A-Z_a-z][$\w]*\([$A-Z_a-z][$\w]*,[$A-Z_a-z][$\w]*=>\(\{isManuallyChanged:!1,modelSettings:null,serviceTier:null\}\)\)/g,
+      resolver: /function ([$A-Z_a-z][$\w]*)\(\{userSavedModelString:[$A-Z_a-z][$\w]*,userSavedReasoningEffort:[$A-Z_a-z][$\w]*,listModelsData:[$A-Z_a-z][$\w]*\}\)/g,
+      catalog: /managedNewThreadModelSettings:[$A-Z_a-z][$\w]*,waitForModelList:[\s\S]{0,4000}?let\{data:([$A-Z_a-z][$\w]*),isLoading:[$A-Z_a-z][$\w]*\}=([$A-Z_a-z][$\w]*)\([$A-Z_a-z][$\w]*\),[$A-Z_a-z][$\w]*=[$A-Z_a-z][$\w]*\([$A-Z_a-z][$\w]*\?\.settings,\1\),[\s\S]{0,1500}?userSavedModelString:/g,
+      model: /function [$A-Z_a-z][$\w]*\([$A-Z_a-z][$\w]*,[$A-Z_a-z][$\w]*\)\{let ([$A-Z_a-z][$\w]*)=\(0,([$A-Z_a-z][$\w]*)\.c\)\((\d+)\)[\s\S]{0,700}?let\{draftSettings:([$A-Z_a-z][$\w]*),isNewThreadDraft:[$A-Z_a-z][$\w]*,updateDraftSettings:([$A-Z_a-z][$\w]*)\}=[$A-Z_a-z][$\w]*\([$A-Z_a-z][$\w]*\),([$A-Z_a-z][$\w]*)=[$A-Z_a-z][$\w]*\([^)]*\),\{isLunaReserveActive:[$A-Z_a-z][$\w]*\}=\6,([$A-Z_a-z][$\w]*)=[$A-Z_a-z][$\w]*==null&&[$A-Z_a-z][$\w]*,[^;]{0,300}?,([$A-Z_a-z][$\w]*)=\7&&\4\.modelSettings!=null,([$A-Z_a-z][$\w]*)=\6\.modelSettings;(?=if\(\8\))/g,
+    };
+    const matches = {};
+    for (const [key, pattern] of Object.entries(patterns)) {
+      const found = [...source.matchAll(pattern)];
+      if (found.length !== 1) return recordIncompatibleRendererGate(source, name, found.length);
+      matches[key] = found[0];
+    }
+    const [, cache, , cacheSize, , update, settings, isDraft, hasOverride, model] = matches.model;
+    const escapedUpdate = update.replace(/\$/g, "\\$");
+    const manualPattern = new RegExp(
+      `([$_A-Za-z][$\\w]*\\|\\|[$_A-Za-z][$\\w]*\\|\\|[$_A-Za-z][$\\w]*&&[$_A-Za-z][$\\w]*===\x60ultra\x60\\?)${escapedUpdate}\\([$A-Z_a-z][$\\w]*=>\\(\\{\\.\\.\\.[$A-Z_a-z][$\\w]*,isManuallyChanged:!0,modelSettings:`,
+      "g",
+    );
+    // 只在已识别的草稿 hook 内查找回调，不能误改另一个模型选择器。
+    const modelEnd = source.indexOf("}function ", matches.model.index + matches.model[0].length);
+    if (modelEnd < 0) return recordIncompatibleRendererGate(source, name, 0);
+    const modelScope = source.slice(matches.model.index, modelEnd + 1);
+    const manualMatches = [...modelScope.matchAll(manualPattern)];
+    if (manualMatches.length !== 1) return recordIncompatibleRendererGate(source, name, manualMatches.length);
+    const slots = Number(cacheSize);
+    const catalogHook = matches.catalog[2];
+    const resolver = matches.resolver[1];
+    // 新增目录 hook 始终调用，保留 React hook 顺序。未加载或模型不在目录中
+    // 时保留现有设置；目录就绪后由原生解析器选择 medium 或模型支持的回退。
+    const defaults = `/*codey-new-thread-draft-defaults*/let __codeyDraftCatalog=${catalogHook}({hostId:${settings}.hostId,enabled:${isDraft}}).data;if(${isDraft}&&!${hasOverride}&&__codeyDraftCatalog?.models?.some(e=>e.model===${model}.model)){let __codeyDraftEffort=${resolver}({userSavedModelString:${model}.model,userSavedReasoningEffort:\`medium\`,listModelsData:__codeyDraftCatalog}).reasoningEffort;if(${model}.reasoningEffort!==__codeyDraftEffort){let __codeyDraftSettings;${cache}[${slots}]!==${model}||${cache}[${slots + 1}]!==__codeyDraftEffort?(__codeyDraftSettings={...${model},reasoningEffort:__codeyDraftEffort},${cache}[${slots}]=${model},${cache}[${slots + 1}]=__codeyDraftEffort,${cache}[${slots + 2}]=__codeyDraftSettings):__codeyDraftSettings=${cache}[${slots + 2}],${model}=__codeyDraftSettings}}`;
+    let patchedScope = modelScope.replace(matches.model[0],
+      matches.model[0].replace(`.c)(${cacheSize})`, `.c)(${slots + 3})`) + defaults);
+    patchedScope = patchedScope.replace(manualPattern, (match) => `${isDraft}||${match}`);
+    return (source.slice(0, matches.model.index) + patchedScope + source.slice(modelEnd + 1))
+      .replace(matches.factory[0], matches.factory[0].replace("serviceTier:null", "serviceTier:{value:`default`}"));
+  };
   const patchCodexRendererAsset = (source) => {
     let patched = source;
     let nativeCustomProviderModelAccess = false;
+    if (source.includes("isNewThreadDraft:")
+      && source.includes("modelSettingsPersistAsDefault:")
+      && source.includes("userSavedReasoningEffort:")) {
+      patched = patchNewThreadDraftDefaults(patched);
+    }
     if (!source.includes("/*codey-app-server-manager-registry*/")
       && source.includes("inactiveThreadUnsubscriber.clearConversationStreamOwnership")
       && source.includes("getStreamRole(")
