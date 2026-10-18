@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const panel = await readFile(new URL("../src/OfficialAccountsPanel.tsx", import.meta.url), "utf8");
+const accountState = await readFile(new URL("../src/useOfficialAccounts.ts", import.meta.url), "utf8");
 const styles = await readFile(new URL("../src/styles.models.css", import.meta.url), "utf8");
 const types = await readFile(new URL("../src/App.types.ts", import.meta.url), "utf8");
 const mockApi = await readFile(new URL("../src/dev/mockApi.ts", import.meta.url), "utf8");
@@ -88,7 +89,7 @@ test("失效账号的线路随失效标记一起移除", () => {
   assert.match(refreshRoutes, /"config": redacted_config\(&config\)/);
   assert.match(refreshRoutes, /"modelState": model_state/);
   assert.match(
-    panel,
+    accountState,
     /invoke<OfficialAccountsResult>\("refresh_official_account_routes"\)/,
   );
   // 预览派生同样跳过失效账号，界面检查时线路列表与后端一致。
