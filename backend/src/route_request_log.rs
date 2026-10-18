@@ -25,10 +25,11 @@ pub(crate) use collector::{
     upstream_response_model,
 };
 pub(crate) use query::{
-    clear_route_request_log_files, latest_session_recorded_speed, query_route_request_log_models,
-    query_route_request_log_stats, query_route_request_logs, session_recorded_average,
-    session_recorded_timing,
+    clear_route_request_log_files, last_turn_recorded_stats, query_route_request_log_models,
+    query_route_request_log_stats, query_route_request_logs,
 };
+#[cfg(test)]
+pub(crate) use query::{session_recorded_average, session_recorded_timing};
 
 const SCHEMA_VERSION: u8 = 13;
 const MAX_LOG_STRING_BYTES: usize = 512;
@@ -643,6 +644,7 @@ struct QueuedEntry {
     enqueued_at: Instant,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SessionRecordedTiming {
     pub requests: u64,

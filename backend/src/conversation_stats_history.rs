@@ -1,12 +1,16 @@
 //! 从当前 Codex 数据目录读取原生累计快照，不累加每轮或运行期统计。
 use super::{
-    ConversationStatsSnapshot, RuntimeHistoryBoundary, lock_unpoisoned, normalize_session_id,
+    ConversationStatsRegistry, ConversationStatsSnapshot, RuntimeHistoryBoundary,
+    TurnRequestTotals, TurnWindow, lock_unpoisoned, normalize_session_id,
 };
-use crate::route_request_log::SessionGenerationTotals;
+#[cfg(test)]
+use crate::route_request_log::{SessionGenerationTotals, SessionRecordedTiming};
 use codey_runtime_core::codex_sqlite::codex_session_db_paths_from_home;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -23,8 +27,45 @@ struct CachedHistory {
     lookup_at: Option<Instant>,
     path: Option<PathBuf>,
     version: Option<FileVersion>,
+    append_checkpoint: Option<AppendCheckpoint>,
     snapshot: Option<ConversationStatsSnapshot>,
     activity: super::activity::Activity,
+}
+
+// 仅文件版本变化时读取首尾固定窗口；缓存只保存摘要，不保存会话正文。
+const APPEND_SAMPLE_BYTES: usize = 4096;
+
+#[derive(PartialEq, Eq)]
+struct AppendCheckpoint {
+    len: u64,
+    digest: [u8; 32],
+}
+
+impl AppendCheckpoint {
+    fn read(path: &Path, len: u64) -> std::io::Result<Self> {
+        let mut file = std::fs::File::open(path)?;
+        let mut hash = Sha256::new();
+        let mut buffer = [0; APPEND_SAMPLE_BYTES];
+        let head_len = len.min(APPEND_SAMPLE_BYTES as u64);
+        let tail_start = head_len.max(len.saturating_sub(APPEND_SAMPLE_BYTES as u64));
+        for (start, size) in [(0, head_len), (tail_start, len - tail_start)] {
+            if size == 0 {
+                continue;
+            }
+            file.seek(SeekFrom::Start(start))?;
+            file.read_exact(&mut buffer[..size as usize])?;
+            hash.update(start.to_le_bytes());
+            hash.update(&buffer[..size as usize]);
+        }
+        Ok(Self {
+            len,
+            digest: hash.finalize().into(),
+        })
+    }
+
+    fn still_matches(&self, path: &Path) -> bool {
+        Self::read(path, self.len).is_ok_and(|current| current == *self)
+    }
 }
 
 #[derive(PartialEq, Eq)]
@@ -86,74 +127,69 @@ impl FileVersion {
 pub(crate) async fn snapshot_with_history(
     home: PathBuf,
     session_id: String,
-    runtime: Option<ConversationStatsSnapshot>,
+    registry: Option<Arc<ConversationStatsRegistry>>,
 ) -> Option<ConversationStatsSnapshot> {
-    let suppress_history_speed = runtime
-        .as_ref()
-        .is_some_and(|s| s.in_flight.unwrap_or(0) > 0 || s.output_tokens_per_second.is_some());
-    let average_boundary = runtime
-        .as_ref()
-        .and_then(|s| s.average_history_boundary.clone());
-    let (history, speed, timing, average) = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let history = cached_history(&home, &session_id);
-        let speed = if suppress_history_speed {
-            None
-        } else {
-            cached_speed(&home, &session_id)
-        };
-        let timing = cached_timing(&home, &session_id);
-        let average = cached_average(&home, &session_id, average_boundary.as_ref());
-        (history, speed, timing, average)
+        let last_turn = history
+            .as_ref()
+            .and_then(|snapshot| snapshot.last_turn.clone());
+        let runtime =
+            registry.and_then(|registry| registry.snapshot_with_turn(&session_id, last_turn));
+        let mut snapshot = merge(history, runtime)?;
+        if let Some(turn) = &snapshot.last_turn
+            && let Some(window) = TurnWindow::from_snapshot(turn)
+        {
+            let recorded = cached_turn(&home, &session_id, &window, turn.runtime_boundary.as_ref());
+            apply_recorded_turn(&mut snapshot, recorded);
+        }
+        Some(snapshot)
     })
     .await
     .ok()
-    .unwrap_or_default();
-    apply_recorded_average(
-        apply_recorded_speed(
-            apply_recorded_timing(merge(history, runtime), timing),
-            speed,
-        ),
-        average,
-    )
+    .flatten()
 }
-
-type AverageCache = HashMap<(PathBuf, PathBuf, String), Arc<Mutex<CachedAverage>>>;
-static AVERAGE_CACHE: OnceLock<Mutex<AverageCache>> = OnceLock::new();
-const LOG_LOOKUP_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
-struct CachedAverage {
+struct CachedTurn {
+    key: Option<(TurnWindow, Option<RuntimeHistoryBoundary>)>,
     at: Option<Instant>,
-    boundary: Option<RuntimeHistoryBoundary>,
-    totals: Option<SessionGenerationTotals>,
+    value: Option<TurnRequestTotals>,
 }
 
-impl CachedAverage {
+impl CachedTurn {
     fn get_or_query(
         &mut self,
+        window: &TurnWindow,
         boundary: Option<&RuntimeHistoryBoundary>,
         now: Instant,
-        query: impl FnOnce() -> Option<SessionGenerationTotals>,
-    ) -> Option<SessionGenerationTotals> {
+        query: impl FnOnce() -> Option<TurnRequestTotals>,
+    ) -> Option<TurnRequestTotals> {
         if self
             .at
             .is_some_and(|at| now.saturating_duration_since(at) < LOG_LOOKUP_TTL)
-            && self.boundary.as_ref() == boundary
+            && self.key.as_ref().is_some_and(|(old_window, old_boundary)| {
+                old_window == window && old_boundary.as_ref() == boundary
+            })
         {
-            return self.totals;
+            return self.value;
         }
-        self.totals = query();
-        self.boundary = boundary.cloned();
+        self.value = query();
         self.at = Some(now);
-        self.totals
+        self.key = Some((window.clone(), boundary.cloned()));
+        self.value
     }
 }
 
-fn cached_average(
+type TurnCache = HashMap<(PathBuf, PathBuf, String), Arc<Mutex<CachedTurn>>>;
+static TURN_CACHE: OnceLock<Mutex<TurnCache>> = OnceLock::new();
+
+fn cached_turn(
     home: &Path,
     session_id: &str,
+    window: &TurnWindow,
     boundary: Option<&RuntimeHistoryBoundary>,
-) -> Option<SessionGenerationTotals> {
+) -> Option<TurnRequestTotals> {
     let session_id = normalize_session_id(session_id);
     uuid::Uuid::parse_str(session_id).ok()?;
     let root = codey_runtime_core::paths::default_app_state_dir();
@@ -163,7 +199,7 @@ fn cached_average(
         session_id.to_owned(),
     );
     let entry = {
-        let mut cache = lock_unpoisoned(AVERAGE_CACHE.get_or_init(Default::default));
+        let mut cache = lock_unpoisoned(TURN_CACHE.get_or_init(Default::default));
         if cache.len() >= 128
             && !cache.contains_key(&key)
             && let Some(old) = cache.keys().next().cloned()
@@ -172,12 +208,76 @@ fn cached_average(
         }
         Arc::clone(cache.entry(key).or_default())
     };
-    // 磁盘查询只锁当前会话，不能让慢库阻塞其他会话的缓存命中。
-    lock_unpoisoned(&entry).get_or_query(boundary, Instant::now(), || {
-        crate::route_request_log::session_recorded_average(&root, session_id, boundary)
+    lock_unpoisoned(&entry).get_or_query(window, boundary, Instant::now(), || {
+        crate::route_request_log::last_turn_recorded_stats(&root, session_id, window, boundary)
     })
 }
 
+fn apply_recorded_turn(
+    snapshot: &mut ConversationStatsSnapshot,
+    recorded: Option<TurnRequestTotals>,
+) {
+    let Some(turn) = &mut snapshot.last_turn else {
+        return;
+    };
+    let mut totals = turn.runtime_totals;
+    let has_runtime = totals.requests > 0 || turn.in_flight.unwrap_or(0) > 0;
+    if let Some(recorded) = recorded {
+        totals.add(recorded);
+    }
+    totals.apply(turn);
+    let incomplete = turn.runtime_partial
+        || turn.activity_partial
+        || recorded.is_some_and(TurnRequestTotals::incomplete)
+        || totals.incomplete()
+        || turn.step_count.is_some_and(|steps| steps > totals.requests);
+    turn.coverage = if incomplete {
+        "partial"
+    } else {
+        match (has_runtime, recorded.is_some()) {
+            (true, true) => "recorded_and_runtime",
+            (true, false) => "runtime",
+            (false, true) => "recorded",
+            (false, false) => "unknown",
+        }
+    };
+}
+
+#[cfg(test)]
+type CachedAverage = CachedLog<SessionGenerationTotals>;
+const LOG_LOOKUP_TTL: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+#[derive(Default)]
+struct CachedLog<T> {
+    at: Option<Instant>,
+    boundary: Option<RuntimeHistoryBoundary>,
+    value: Option<T>,
+}
+
+#[cfg(test)]
+impl<T: Copy> CachedLog<T> {
+    fn get_or_query(
+        &mut self,
+        boundary: Option<&RuntimeHistoryBoundary>,
+        now: Instant,
+        query: impl FnOnce() -> Option<T>,
+    ) -> Option<T> {
+        if self
+            .at
+            .is_some_and(|at| now.saturating_duration_since(at) < LOG_LOOKUP_TTL)
+            && self.boundary.as_ref() == boundary
+        {
+            return self.value;
+        }
+        self.value = query();
+        self.boundary = boundary.cloned();
+        self.at = Some(now);
+        self.value
+    }
+}
+
+#[cfg(test)]
 fn apply_recorded_average(
     snapshot: Option<ConversationStatsSnapshot>,
     recorded: Option<SessionGenerationTotals>,
@@ -208,48 +308,10 @@ fn apply_recorded_average(
     Some(snapshot)
 }
 
-type TimingCache = HashMap<
-    (PathBuf, PathBuf, String),
-    (
-        Instant,
-        Option<crate::route_request_log::SessionRecordedTiming>,
-    ),
->;
-static TIMING_CACHE: OnceLock<Mutex<TimingCache>> = OnceLock::new();
-fn cached_timing(
-    home: &Path,
-    session_id: &str,
-) -> Option<crate::route_request_log::SessionRecordedTiming> {
-    let session_id = normalize_session_id(session_id);
-    uuid::Uuid::parse_str(session_id).ok()?;
-    let root = codey_runtime_core::paths::default_app_state_dir();
-    let key = (
-        home.canonicalize().ok()?,
-        root.clone(),
-        session_id.to_owned(),
-    );
-    let cache = lock_unpoisoned(TIMING_CACHE.get_or_init(Default::default));
-    if let Some((at, timing)) = cache.get(&key)
-        && at.elapsed() < Duration::from_secs(30)
-    {
-        return *timing;
-    }
-    drop(cache);
-    let timing = crate::route_request_log::session_recorded_timing(&root, session_id);
-    let mut cache = lock_unpoisoned(TIMING_CACHE.get_or_init(Default::default));
-    if cache.len() >= 128
-        && !cache.contains_key(&key)
-        && let Some(old) = cache.keys().next().cloned()
-    {
-        cache.remove(&old);
-    }
-    cache.insert(key, (Instant::now(), timing));
-    timing
-}
-
+#[cfg(test)]
 fn apply_recorded_timing(
     snapshot: Option<ConversationStatsSnapshot>,
-    timing: Option<crate::route_request_log::SessionRecordedTiming>,
+    timing: Option<SessionRecordedTiming>,
 ) -> Option<ConversationStatsSnapshot> {
     let Some(timing) = timing else {
         return snapshot;
@@ -264,49 +326,53 @@ fn apply_recorded_timing(
         snapshot.step_source = Some("request_log");
         snapshot.step_scope = Some("recorded_requests");
     }
-    // 两者覆盖的时间范围不同，不能比较样本数量来判断新旧，也不能相加。
-    if snapshot.model_duration_ms.is_none() && snapshot.average_ttft_ms.is_none() {
-        snapshot.model_duration_ms = timing.model_duration_ms;
-        snapshot.average_ttft_ms = timing.average_ttft_ms;
-        snapshot.timing_request_count = Some(timing.timing_request_count);
-        snapshot.ttft_sample_count = Some(timing.ttft_sample_count);
-        snapshot.timing_source = Some("request_log");
-        snapshot.timing_scope = Some("recorded_requests");
+    // 历史查询已排除运行期跟踪的请求，两段计时可以相加；每个字段单独保留未知值。
+    let has_runtime = snapshot.model_duration_ms.is_some() || snapshot.average_ttft_ms.is_some();
+    let has_recorded = timing.model_duration_ms.is_some() || timing.average_ttft_ms.is_some();
+    if let Some(duration) = timing.model_duration_ms {
+        snapshot.model_duration_ms = Some(
+            snapshot
+                .model_duration_ms
+                .unwrap_or(0)
+                .saturating_add(duration),
+        );
+        snapshot.timing_request_count = Some(
+            snapshot
+                .timing_request_count
+                .unwrap_or(0)
+                .saturating_add(timing.timing_request_count),
+        );
+    }
+    if let Some(average) = timing.average_ttft_ms
+        && timing.ttft_sample_count > 0
+    {
+        let runtime_samples = snapshot
+            .average_ttft_ms
+            .map_or(0, |_| snapshot.ttft_sample_count.unwrap_or(0));
+        let samples = runtime_samples.saturating_add(timing.ttft_sample_count);
+        snapshot.average_ttft_ms = Some(
+            (snapshot.average_ttft_ms.unwrap_or(0.0) * runtime_samples as f64
+                + average * timing.ttft_sample_count as f64)
+                / samples as f64,
+        );
+        snapshot.ttft_sample_count = Some(samples);
+    }
+    if has_recorded {
+        snapshot.timing_source = Some(if has_runtime {
+            "runtime_and_request_log"
+        } else {
+            "request_log"
+        });
+        snapshot.timing_scope = Some(if has_runtime {
+            "recorded_and_runtime"
+        } else {
+            "recorded_requests"
+        });
     }
     Some(snapshot)
 }
 
-// 缓存键包含当前 home 与实际应用数据目录，30 秒后包括缺失记录也重新查询。
-type SpeedCache = HashMap<(PathBuf, PathBuf, String), (Instant, Option<(f64, u64)>)>;
-static SPEED_CACHE: OnceLock<Mutex<SpeedCache>> = OnceLock::new();
-fn cached_speed(home: &Path, session_id: &str) -> Option<(f64, u64)> {
-    let session_id = normalize_session_id(session_id);
-    uuid::Uuid::parse_str(session_id).ok()?;
-    let root = codey_runtime_core::paths::default_app_state_dir();
-    let key = (
-        home.canonicalize().ok()?,
-        root.clone(),
-        session_id.to_owned(),
-    );
-    let cache = lock_unpoisoned(SPEED_CACHE.get_or_init(Default::default));
-    if let Some((at, speed)) = cache.get(&key)
-        && at.elapsed() < Duration::from_secs(30)
-    {
-        return *speed;
-    }
-    drop(cache);
-    let speed = crate::route_request_log::latest_session_recorded_speed(&root, session_id);
-    let mut cache = lock_unpoisoned(SPEED_CACHE.get_or_init(Default::default));
-    if cache.len() >= 128
-        && !cache.contains_key(&key)
-        && let Some(old) = cache.keys().next().cloned()
-    {
-        cache.remove(&old);
-    }
-    cache.insert(key, (Instant::now(), speed));
-    speed
-}
-
+#[cfg(test)]
 fn apply_recorded_speed(
     snapshot: Option<ConversationStatsSnapshot>,
     speed: Option<(f64, u64)>,
@@ -336,6 +402,9 @@ fn merge(
         return runtime;
     };
     if let Some(runtime) = runtime {
+        if runtime.last_turn.is_some() {
+            history.last_turn = runtime.last_turn;
+        }
         // 原生文件可能只有活动事件，尚无 Token 累计；此时保留运行期用量。
         if history.usage_source == "unknown" {
             history.input_tokens = runtime.input_tokens;
@@ -403,6 +472,7 @@ fn cached_history(home: &Path, session_id: &str) -> Option<ConversationStatsSnap
         let path = locate_rollout(&home, session_id);
         if cached.path != path {
             cached.version = None;
+            cached.append_checkpoint = None;
             cached.snapshot = None;
             cached.activity = Default::default();
         }
@@ -422,6 +492,7 @@ fn cached_history(home: &Path, session_id: &str) -> Option<ConversationStatsSnap
             cached.path = locate_rollout(&home, session_id);
             cached.lookup_at = Some(Instant::now());
             cached.version = None;
+            cached.append_checkpoint = None;
             cached.snapshot = None;
             cached.activity = Default::default();
             canonical_rollout(&home, cached.path.as_ref()?)?
@@ -435,11 +506,17 @@ fn cached_history(home: &Path, session_id: &str) -> Option<ConversationStatsSnap
                 old.identity.0 == version.identity.0 && old.identity.1 == version.identity.1;
             #[cfg(not(any(unix, windows)))]
             let same_file = old.created == version.created;
-            same_file && version.len > old.len
+            same_file
+                && version.len > old.len
+                && cached
+                    .append_checkpoint
+                    .as_ref()
+                    .is_some_and(|checkpoint| checkpoint.still_matches(&path))
         });
         if !appended {
             cached.activity = Default::default();
         }
+        let append_checkpoint = AppendCheckpoint::read(&path, version.len).ok();
         let activity_ok = cached.activity.read_append(&path, session_id).is_ok();
         let mut snapshot = activity_ok
             .then(|| cached.activity.usage_snapshot.clone())
@@ -457,9 +534,12 @@ fn cached_history(home: &Path, session_id: &str) -> Option<ConversationStatsSnap
             || snapshot.output_tokens.is_some()
             || snapshot.turn_count.is_some()
             || snapshot.step_count.is_some()
-            || snapshot.tool_duration_ms.is_some())
+            || snapshot.tool_duration_ms.is_some()
+            || snapshot.last_turn.is_some())
         .then_some(snapshot);
-        cached.version = Some(version);
+        // 读取中失败不能固化偏移和版本，下次轮询重新读取。
+        cached.version = activity_ok.then_some(version);
+        cached.append_checkpoint = activity_ok.then_some(append_checkpoint).flatten();
     }
     cached.snapshot.clone()
 }
@@ -569,6 +649,146 @@ mod tests {
     use super::*;
     use serde_json::json;
     const ID: &str = "01a1471c-962b-7d00-a9c4-0658dd26dd46";
+
+    #[test]
+    fn last_turn_history_restores_window_and_merges_runtime_once() {
+        use crate::conversation_stats::ConversationStatsRegistry;
+        let home = tempfile::tempdir().unwrap();
+        let log_root = tempfile::tempdir().unwrap();
+        let dir = home.path().join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-test-{ID}.jsonl"));
+        let record = |second: u32, payload: Value| json!({"type":"event_msg", "timestamp":format!("2026-10-18T00:00:{second:02}Z"), "payload":payload});
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                record(0, json!({"type":"task_started","turn_id":"old"})),
+                record(5, json!({"type":"task_complete","turn_id":"old"})),
+                record(10, json!({"type":"task_started","turn_id":"last"})),
+                record(
+                    20,
+                    json!({"type":"task_complete","turn_id":"last","duration_ms":10000})
+                )
+            ),
+        )
+        .unwrap();
+        let history = cached_history(home.path(), ID).unwrap();
+        assert_eq!(history.turn_count, Some(2));
+        let last = history.last_turn.as_ref().unwrap();
+        let start = last.started_at_unix_ms.unwrap();
+        let connection = Connection::open(log_root.path().join("route-requests.sqlite3")).unwrap();
+        connection.execute_batch("CREATE TABLE route_request_logs (
+            request_id TEXT PRIMARY KEY, codex_session_id TEXT, timestamp_unix_ms INTEGER,
+            request_kind TEXT, codex_session_is_parent INTEGER, total_duration_ms INTEGER,
+            router_pre_upstream_ms INTEGER, downstream_first_content_ms INTEGER,
+            upstream_first_byte_ms INTEGER, output_tokens INTEGER);
+            CREATE INDEX idx_route_request_logs_session_time ON route_request_logs(codex_session_id, timestamp_unix_ms);").unwrap();
+        let insert = |id: &str, timestamp: u64, output: u64, duration: u64, ttft: u64| {
+            connection.execute("INSERT INTO route_request_logs VALUES (?1,?2,?3,'responses',0,?4,100,?5,200,?6)",
+                rusqlite::params![id, ID, timestamp, duration+300, ttft, output]).unwrap();
+        };
+        insert("old", start - 5000, 99999, 99999, 999);
+        insert("historical-step", start + 1000, 100, 1000, 100);
+        let registry = ConversationStatsRegistry::default();
+        let mut entry = super::super::tests::sample_entry(Some(ID), "responses");
+        entry.request_id = "runtime-step".into();
+        entry.timestamp_unix_ms = start + 5000;
+        entry.router_pre_upstream_ms = Some(100);
+        entry.upstream_first_byte_ms = Some(200);
+        entry.total_duration_ms = 3300;
+        entry.downstream_first_content_ms = Some(300);
+        entry.token_usage.output_tokens = Some(600);
+        registry.finish_request(&entry);
+        let runtime = registry.snapshot_with_turn(ID, history.last_turn.clone());
+        let mut merged = merge(Some(history.clone()), runtime).unwrap();
+        assert_eq!(merged.turn_count, Some(2));
+        assert_eq!(merged.activity_scope, Some("session"));
+        let last = merged.last_turn.as_ref().unwrap();
+        let window = TurnWindow::from_snapshot(last).unwrap();
+        let boundary = last.runtime_boundary.clone();
+        let historical = crate::route_request_log::last_turn_recorded_stats(
+            log_root.path(),
+            ID,
+            &window,
+            boundary.as_ref(),
+        );
+        apply_recorded_turn(&mut merged, historical);
+        let result = merged.last_turn.as_ref().unwrap();
+        assert_eq!(result.average_output_tokens_per_second, Some(175.0));
+        assert_eq!(result.model_duration_ms, Some(4400));
+        assert_eq!(result.average_ttft_ms, Some(200.0));
+        assert_eq!(result.step_count, Some(2));
+        assert_eq!(result.coverage, "recorded_and_runtime");
+        insert("runtime-step", start + 5000, 600, 3000, 300);
+        let after_flush = crate::route_request_log::last_turn_recorded_stats(
+            log_root.path(),
+            ID,
+            &window,
+            boundary.as_ref(),
+        );
+        assert_eq!(historical, after_flush);
+        let mut restored = history;
+        apply_recorded_turn(
+            &mut restored,
+            crate::route_request_log::last_turn_recorded_stats(log_root.path(), ID, &window, None),
+        );
+        let restored = restored.last_turn.unwrap();
+        assert_eq!(restored.average_output_tokens_per_second, Some(175.0));
+        assert_eq!(restored.model_duration_ms, Some(4400));
+        assert_eq!(restored.coverage, "recorded");
+    }
+
+    #[test]
+    fn last_turn_cache_hits_avoid_queries_and_invalidate_window_or_runtime_boundary() {
+        let mut cache = CachedTurn::default();
+        let now = Instant::now();
+        let mut window = TurnWindow {
+            id: "last".into(),
+            started_at_unix_ms: 100,
+            completed_at_unix_ms: None,
+        };
+        let mut queries = 0;
+        for _ in 0..10_000 {
+            cache.get_or_query(&window, None, now, || {
+                queries += 1;
+                None
+            });
+        }
+        assert_eq!(queries, 1);
+        window.completed_at_unix_ms = Some(500);
+        cache.get_or_query(&window, None, now, || {
+            queries += 1;
+            None
+        });
+        window.id = "next".into();
+        window.started_at_unix_ms = 600;
+        window.completed_at_unix_ms = None;
+        cache.get_or_query(&window, None, now, || {
+            queries += 1;
+            None
+        });
+        let boundary = RuntimeHistoryBoundary {
+            timestamp_unix_ms: 650,
+            request_ids: std::collections::HashSet::from(["request".into()]),
+            exclude_entire_millisecond: false,
+        };
+        cache.get_or_query(&window, Some(&boundary), now, || {
+            queries += 1;
+            None
+        });
+        assert_eq!(queries, 4);
+        cache.get_or_query(
+            &window,
+            Some(&boundary),
+            now + Duration::from_secs(30),
+            || {
+                queries += 1;
+                None
+            },
+        );
+        assert_eq!(queries, 5);
+    }
 
     fn event(total: u64) -> String {
         json!({"type":"event_msg","timestamp":"2026-10-17T00:00:00Z","payload":{
@@ -740,7 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn activity_only_history_keeps_runtime_usage_and_logs_do_not_double_count_timing() {
+    fn activity_only_history_keeps_runtime_usage_and_combines_disjoint_timing() {
         let history = ConversationStatsSnapshot {
             turn_count: Some(2),
             step_count: Some(3),
@@ -773,19 +993,21 @@ mod tests {
         assert_eq!(snapshot.total_tokens, Some(10));
         assert_eq!(snapshot.turn_count, Some(2));
         assert_eq!(snapshot.step_count, Some(3));
-        assert_eq!(snapshot.model_duration_ms, Some(1000));
-        assert_eq!(snapshot.average_ttft_ms, Some(200.0));
-        assert_eq!(snapshot.timing_scope, Some("runtime"));
+        assert_eq!(snapshot.model_duration_ms, Some(6000));
+        assert_eq!(snapshot.average_ttft_ms, Some(280.0));
+        assert_eq!(snapshot.timing_request_count, Some(5));
+        assert_eq!(snapshot.ttft_sample_count, Some(5));
+        assert_eq!(snapshot.timing_scope, Some("recorded_and_runtime"));
     }
 
     #[test]
-    fn recorded_timing_fills_missing_data_without_overwriting_current_runtime_samples() {
+    fn recorded_timing_preserves_zero_duration_and_weights_valid_ttft_samples() {
         let timing = crate::route_request_log::SessionRecordedTiming {
             requests: 100,
             model_duration_ms: Some(500_000),
             average_ttft_ms: Some(3000.0),
             timing_request_count: 100,
-            ttft_sample_count: 100,
+            ttft_sample_count: 2,
         };
         let recovered = apply_recorded_timing(None, Some(timing)).unwrap();
         assert_eq!(recovered.step_count, Some(100));
@@ -808,10 +1030,183 @@ mod tests {
         let current = apply_recorded_timing(Some(runtime), Some(timing)).unwrap();
         assert_eq!(current.step_count, Some(1));
         assert_eq!(current.step_scope, Some("runtime"));
-        assert_eq!(current.model_duration_ms, Some(0));
-        assert_eq!(current.average_ttft_ms, Some(0.0));
-        assert_eq!(current.timing_scope, Some("runtime"));
-        assert_eq!(current.timing_request_count, Some(1));
+        assert_eq!(current.model_duration_ms, Some(500_000));
+        assert_eq!(current.average_ttft_ms, Some(2000.0));
+        assert_eq!(current.timing_scope, Some("recorded_and_runtime"));
+        assert_eq!(current.timing_request_count, Some(101));
+        assert_eq!(current.ttft_sample_count, Some(3));
+    }
+
+    #[test]
+    fn recorded_timing_merges_each_available_field_without_filling_unknowns_with_zero() {
+        let runtime_model = ConversationStatsSnapshot {
+            model_duration_ms: Some(500),
+            timing_request_count: Some(1),
+            ..Default::default()
+        };
+        let recorded_ttft = SessionRecordedTiming {
+            requests: 3,
+            average_ttft_ms: Some(200.0),
+            ttft_sample_count: 2,
+            ..Default::default()
+        };
+        let merged = apply_recorded_timing(Some(runtime_model), Some(recorded_ttft)).unwrap();
+        assert_eq!(merged.model_duration_ms, Some(500));
+        assert_eq!(merged.timing_request_count, Some(1));
+        assert_eq!(merged.average_ttft_ms, Some(200.0));
+        assert_eq!(merged.ttft_sample_count, Some(2));
+        assert_eq!(merged.timing_source, Some("runtime_and_request_log"));
+
+        let runtime_ttft = ConversationStatsSnapshot {
+            average_ttft_ms: Some(800.0),
+            ttft_sample_count: Some(1),
+            ..Default::default()
+        };
+        let recorded_model = SessionRecordedTiming {
+            requests: 3,
+            model_duration_ms: Some(1000),
+            timing_request_count: 2,
+            ..Default::default()
+        };
+        let merged = apply_recorded_timing(Some(runtime_ttft), Some(recorded_model)).unwrap();
+        assert_eq!(merged.model_duration_ms, Some(1000));
+        assert_eq!(merged.timing_request_count, Some(2));
+        assert_eq!(merged.average_ttft_ms, Some(800.0));
+        assert_eq!(merged.ttft_sample_count, Some(1));
+
+        let unknown = apply_recorded_timing(
+            None,
+            Some(SessionRecordedTiming {
+                requests: 1,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        assert_eq!(unknown.model_duration_ms, None);
+        assert_eq!(unknown.average_ttft_ms, None);
+        assert_eq!(unknown.timing_request_count, None);
+        assert_eq!(unknown.ttft_sample_count, None);
+        let only_model = apply_recorded_timing(None, Some(recorded_model)).unwrap();
+        assert_eq!(only_model.average_ttft_ms, None);
+        assert_eq!(only_model.ttft_sample_count, None);
+        let only_ttft = apply_recorded_timing(None, Some(recorded_ttft)).unwrap();
+        assert_eq!(only_ttft.model_duration_ms, None);
+        assert_eq!(only_ttft.timing_request_count, None);
+    }
+
+    #[test]
+    fn historical_timing_survives_short_runtime_request_log_flush_and_next_step() {
+        use crate::conversation_stats::ConversationStatsRegistry;
+        use crate::route_request_log::session_recorded_timing;
+        let root = tempfile::tempdir().unwrap();
+        let connection = Connection::open(root.path().join("route-requests.sqlite3")).unwrap();
+        connection.execute_batch("CREATE TABLE route_request_logs (
+            request_id TEXT PRIMARY KEY, codex_session_id TEXT, timestamp_unix_ms INTEGER,
+            request_kind TEXT, codex_session_is_parent INTEGER, total_duration_ms INTEGER,
+            router_pre_upstream_ms INTEGER, downstream_first_content_ms INTEGER);
+            CREATE INDEX idx_route_request_logs_session_time ON route_request_logs(codex_session_id, timestamp_unix_ms);").unwrap();
+        let insert = |id: &str, timestamp: u64, duration: u64, ttft: u64| {
+            connection
+                .execute(
+                    "INSERT INTO route_request_logs VALUES (?1,?2,?3,'responses',0,?4,100,?5)",
+                    rusqlite::params![id, ID, timestamp, duration + 100, ttft],
+                )
+                .unwrap();
+        };
+        insert("historical-1", 100, 10_000, 100);
+        insert("historical-2", 150, 20_000, 300);
+        let registry = ConversationStatsRegistry::default();
+        registry.begin_request(ID, "runtime", 200);
+        let waiting = registry.snapshot(ID).unwrap();
+        let boundary = waiting.average_history_boundary.clone().unwrap();
+        let recorded = session_recorded_timing(root.path(), ID, Some(&boundary));
+        let waiting = apply_recorded_timing(Some(waiting), recorded).unwrap();
+        assert_eq!(waiting.model_duration_ms, Some(30_000));
+        assert_eq!(waiting.average_ttft_ms, Some(200.0));
+        assert_eq!(waiting.timing_scope, Some("recorded_requests"));
+        assert_eq!(waiting.speed_state, Some("waiting"));
+
+        let mut entry = super::super::tests::sample_entry(Some(ID), "responses");
+        entry.request_id = "runtime".into();
+        entry.timestamp_unix_ms = 200;
+        entry.router_pre_upstream_ms = Some(100);
+        entry.total_duration_ms = 600;
+        entry.downstream_first_content_ms = Some(500);
+        registry.finish_request(&entry);
+        let finished = apply_recorded_timing(registry.snapshot(ID), recorded).unwrap();
+        assert_eq!(finished.model_duration_ms, Some(30_500));
+        assert_eq!(finished.average_ttft_ms, Some(300.0));
+        assert_eq!(finished.timing_request_count, Some(3));
+        assert_eq!(finished.ttft_sample_count, Some(3));
+        assert_eq!(finished.timing_scope, Some("recorded_and_runtime"));
+        insert("runtime", 200, 500, 500);
+        let flushed = session_recorded_timing(root.path(), ID, Some(&boundary));
+        let after_flush = apply_recorded_timing(registry.snapshot(ID), flushed).unwrap();
+        assert_eq!(after_flush.model_duration_ms, finished.model_duration_ms);
+        assert_eq!(after_flush.average_ttft_ms, finished.average_ttft_ms);
+        assert_eq!(after_flush.ttft_sample_count, finished.ttft_sample_count);
+        registry.begin_request(ID, "next", 300);
+        let next = apply_recorded_timing(registry.snapshot(ID), flushed).unwrap();
+        assert_eq!(next.model_duration_ms, Some(30_500));
+        assert_eq!(next.average_ttft_ms, Some(300.0));
+        assert_eq!(next.speed_state, Some("waiting"));
+        let runtime_only = apply_recorded_timing(registry.snapshot(ID), None).unwrap();
+        assert_eq!(runtime_only.model_duration_ms, Some(500));
+        assert_eq!(runtime_only.average_ttft_ms, Some(500.0));
+        assert_eq!(runtime_only.timing_scope, Some("runtime"));
+        assert_eq!(runtime_only.timing_source, Some("runtime"));
+    }
+
+    #[test]
+    fn timing_cache_reuses_results_and_invalidates_every_boundary_change() {
+        let mut cache = CachedLog::<SessionRecordedTiming>::default();
+        let now = Instant::now();
+        let mut queries = 0;
+        let mut query = || {
+            queries += 1;
+            Some(SessionRecordedTiming {
+                model_duration_ms: Some(500),
+                ..Default::default()
+            })
+        };
+        let mut boundary = RuntimeHistoryBoundary {
+            timestamp_unix_ms: 200,
+            request_ids: std::collections::HashSet::from(["a".into()]),
+            exclude_entire_millisecond: false,
+        };
+        for second in 0..30 {
+            let timing = cache
+                .get_or_query(
+                    Some(&boundary),
+                    now + Duration::from_secs(second),
+                    &mut query,
+                )
+                .unwrap();
+            assert_eq!(timing.model_duration_ms, Some(500));
+        }
+        assert_eq!(queries, 1);
+        for change in 0..3 {
+            match change {
+                0 => {
+                    boundary.request_ids.insert("b".into());
+                }
+                1 => boundary.exclude_entire_millisecond = true,
+                _ => boundary.timestamp_unix_ms = 199,
+            }
+            cache.get_or_query(Some(&boundary), now + Duration::from_secs(29), || {
+                queries += 1;
+                None
+            });
+        }
+        assert_eq!(queries, 4);
+        cache.get_or_query(Some(&boundary), now + Duration::from_secs(58), || {
+            panic!("missing result should be cached")
+        });
+        cache.get_or_query(Some(&boundary), now + Duration::from_secs(59), || {
+            queries += 1;
+            None
+        });
+        assert_eq!(queries, 5);
     }
 
     #[test]
@@ -974,6 +1369,166 @@ mod tests {
         let snapshot = cached_history(home.path(), ID).unwrap();
         assert_eq!(merge(Some(snapshot), None).unwrap().total_tokens, Some(200));
         assert!(cached_history(home.path(), "../secrets").is_none());
+    }
+
+    fn cached_read_metrics(home: &Path) -> (u64, u64, u64) {
+        let key = (home.canonicalize().unwrap(), ID.to_owned());
+        let entry = {
+            let cache = lock_unpoisoned(CACHE.get().unwrap());
+            Arc::clone(cache.get(&key).unwrap())
+        };
+        let cached = lock_unpoisoned(&entry);
+        (
+            cached.activity.last_read_start,
+            cached.activity.last_read_bytes,
+            cached.activity.offset,
+        )
+    }
+
+    #[test]
+    fn total_turn_count_reads_appends_once_and_rebuilds_after_truncation() {
+        use std::io::Write;
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-turn-count-{ID}.jsonl"));
+        let start = |id: &str, second: u32| json!({"type":"event_msg","timestamp":format!("2026-10-18T00:00:{second:02}Z"),"payload":{"type":"task_started","turn_id":id}});
+        let initial = format!("{}\n{}\n", start("first", 0), start("second", 1));
+        std::fs::write(&path, &initial).unwrap();
+        assert_eq!(cached_history(home.path(), ID).unwrap().turn_count, Some(2));
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let appended = start("third", 2).to_string();
+        file.write_all(appended.as_bytes()).unwrap();
+        assert_eq!(cached_history(home.path(), ID).unwrap().turn_count, Some(3));
+        assert_eq!(
+            cached_read_metrics(home.path()),
+            (initial.len() as u64, appended.len() as u64, initial.len() as u64)
+        );
+        file.write_all(b"\n").unwrap();
+        assert_eq!(cached_history(home.path(), ID).unwrap().turn_count, Some(3));
+        let metrics = cached_read_metrics(home.path());
+        for _ in 0..10 {
+            assert_eq!(cached_history(home.path(), ID).unwrap().turn_count, Some(3));
+            assert_eq!(cached_read_metrics(home.path()), metrics);
+        }
+        drop(file);
+        let truncated = format!("{}\n", start("only", 3));
+        std::fs::write(&path, &truncated).unwrap();
+        assert_eq!(cached_history(home.path(), ID).unwrap().turn_count, Some(1));
+        assert_eq!(
+            cached_read_metrics(home.path()),
+            (0, truncated.len() as u64, truncated.len() as u64)
+        );
+    }
+
+    #[test]
+    fn history_cache_restarts_after_same_inode_longer_rewrite() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-rewrite-{ID}.jsonl"));
+        // 首部保持相同，要求文件尾部样本也能发现原地截断重写。
+        let prefix = format!("{}\n", json!({"type":"padding","payload":"x".repeat(9000)}));
+        let start = |id: &str| json!({"type":"event_msg","timestamp":"2026-10-18T00:00:00Z","payload":{"type":"task_started","turn_id":id}});
+        let tool = |id: &str, seconds: u64| json!({"type":"event_msg","payload":{"type":"item_completed","turn_id":id,"item":{"type":"McpToolCall","id":"tool","duration":{"secs":seconds,"nanos":0}}}});
+        for suffix in ["\n".to_owned(), String::new(), "\n{\"type\":".to_owned()] {
+            let old = format!("{prefix}{}\n{}{suffix}", start("old"), tool("old", 1));
+            std::fs::write(&path, old).unwrap();
+            let first = cached_history(home.path(), ID).unwrap();
+            assert_eq!(first.turn_count, Some(1));
+            let first = first.last_turn.unwrap();
+            assert_eq!(first.id, "old");
+            assert_eq!(first.tool_duration_ms, Some(1000));
+            let before = FileVersion::from_path(&path).unwrap();
+
+            let rewritten = format!("{prefix}{}\n{}\n{prefix}", start("new"), tool("new", 2));
+            std::fs::write(&path, rewritten).unwrap();
+            let after = FileVersion::from_path(&path).unwrap();
+            assert!(after.len > before.len);
+            #[cfg(any(unix, windows))]
+            assert_eq!(
+                (before.identity.0, before.identity.1),
+                (after.identity.0, after.identity.1)
+            );
+            let current = cached_history(home.path(), ID).unwrap();
+            assert_eq!(current.turn_count, Some(1));
+            let current = current.last_turn.unwrap();
+            assert_eq!(current.id, "new");
+            assert_eq!(current.tool_duration_ms, Some(2000));
+            assert_eq!(cached_read_metrics(home.path()), (0, after.len, after.len));
+        }
+    }
+
+    #[test]
+    fn history_cache_parses_only_appended_bytes_and_retries_unfinished_tail() {
+        use std::io::Write;
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-append-{ID}.jsonl"));
+        let prefix = format!(
+            "{}\n{}\n",
+            json!({"type":"padding","payload":"x".repeat(9000)}),
+            json!({"type":"event_msg","timestamp":"2026-10-18T00:00:00Z","payload":{"type":"task_started","turn_id":"current"}})
+        );
+        let partial = "{\"type\":\"event_msg\",\"payload\":";
+        std::fs::write(&path, format!("{prefix}{partial}")).unwrap();
+        let first = cached_history(home.path(), ID).unwrap().last_turn.unwrap();
+        assert_eq!(first.tool_duration_ms, None);
+        let prefix_len = prefix.len() as u64;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let suffix = format!(
+            "{}}}",
+            json!({"type":"item_completed","turn_id":"current","item":{"type":"McpToolCall","id":"first","duration":{"secs":1,"nanos":0}}})
+        );
+        file.write_all(suffix.as_bytes()).unwrap();
+        let current = cached_history(home.path(), ID).unwrap().last_turn.unwrap();
+        assert_eq!(current.tool_duration_ms, Some(1000));
+        let tail_len = (partial.len() + suffix.len()) as u64;
+        assert_eq!(
+            cached_read_metrics(home.path()),
+            (prefix_len, tail_len, prefix_len)
+        );
+
+        file.write_all(b"\n").unwrap();
+        let current = cached_history(home.path(), ID).unwrap().last_turn.unwrap();
+        assert_eq!(current.tool_duration_ms, Some(1000));
+        let completed_len = prefix_len + tail_len + 1;
+        assert_eq!(
+            cached_read_metrics(home.path()),
+            (prefix_len, tail_len + 1, completed_len)
+        );
+
+        let appended = format!(
+            "{}\n",
+            json!({"type":"event_msg","payload":{"type":"item_completed","turn_id":"current","item":{"type":"McpToolCall","id":"second","duration":{"secs":2,"nanos":0}}}})
+        );
+        file.write_all(appended.as_bytes()).unwrap();
+        let current = cached_history(home.path(), ID).unwrap().last_turn.unwrap();
+        assert_eq!(current.tool_duration_ms, Some(3000));
+        let expected = (
+            completed_len,
+            appended.len() as u64,
+            completed_len + appended.len() as u64,
+        );
+        assert_eq!(cached_read_metrics(home.path()), expected);
+        for _ in 0..10 {
+            assert_eq!(
+                cached_history(home.path(), ID)
+                    .unwrap()
+                    .last_turn
+                    .unwrap()
+                    .tool_duration_ms,
+                Some(3000)
+            );
+            assert_eq!(cached_read_metrics(home.path()), expected);
+        }
     }
 
     #[test]

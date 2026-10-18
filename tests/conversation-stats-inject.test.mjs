@@ -184,7 +184,15 @@ const createEnvironment = (options = {}) => {
   };
 };
 
+const LAST_TURN = {
+  id: "turn-1", status: "completed", stepCount: 2,
+  modelDurationMs: 10000, toolDurationMs: 3000, averageTtftMs: 500,
+  averageOutputTokensPerSecond: 187.52, speedIsEstimate: false,
+  inFlight: 0, speedState: null, coverage: "runtime",
+};
 const STATS = {
+  lastTurn: LAST_TURN,
+  turnCount: 4,
   usageSource: "runtime",
   usageScope: "runtime",
   requestsScope: "runtime",
@@ -246,7 +254,7 @@ test("refreshes with one composer scan per async phase and only writes changed t
     await flushTimers(30);
     assert.deepEqual(counts, { composerScans: 2, textWrites: 0 });
     assert.equal(env.calls.length, initialCalls + 1);
-    env.setStats("conversation-1", { ...STATS, totalTokens: 500, averageOutputTokensPerSecond: 50 });
+    env.setStats("conversation-1", { ...STATS, totalTokens: 500, lastTurn: { ...LAST_TURN, averageOutputTokensPerSecond: 50 } });
     env.refresh();
     await flushTimers(30);
     assert.deepEqual(counts, { composerScans: 4, textWrites: 4 });
@@ -326,6 +334,8 @@ test("mounts the stats bar under the composer and renders speed/cache/total", as
   assert.equal(bar.parentElement, env.scope);
   assert.equal(bar.hidden, false);
   assert.equal(metric(bar, "speed"), "188 tok/s");
+  assert.equal(metric(bar, "activity"), "4 轮 · 2 步");
+  assert.match(bar.__codeyCs.activity.title, /轮数为会话总轮数，步骤和速度为最近一轮/);
   assert.equal(metric(bar, "cache-rate"), "93%");
   assert.equal(metric(bar, "total"), "132k tok");
   assert.equal(field(bar, "outputTokens"), "3,100 tok");
@@ -335,7 +345,8 @@ test("mounts the stats bar under the composer and renders speed/cache/total", as
   }
   assert.equal(field(bar, "totalTokens"), "131,500 tok");
   assert.equal(field(bar, "cachedInputTokens"), "120,000 tok");
-  assert.match(summary(env).getAttribute("aria-label"), /会话统计/);
+  assert.match(summary(env).getAttribute("aria-label"), /最近一轮统计/);
+  assert.match(summary(env).getAttribute("aria-label"), /会话总轮数 4 轮，最近一轮统计 2 步/);
   assert.match(summary(env).getAttribute("aria-label"), /查看统计详情/);
   assert.equal(
     env.calls.filter((call) => call.path === "/session/stats").at(-1).payload.sessionId,
@@ -356,7 +367,7 @@ test("shows unknown values when upstream omits speed and cache", async () => {
     statsBySession: {
       "conversation-1": {
         ...STATS,
-        averageOutputTokensPerSecond: null,
+        lastTurn: { ...LAST_TURN, averageOutputTokensPerSecond: null },
         cachedInputTokens: null,
         inputTokens: null,
       },
@@ -402,8 +413,9 @@ test("clears stale numbers immediately on a session switch before refetch", asyn
   const bar = env.bar();
   assert.equal(bar.hidden, false);
   assert.equal(metric(bar, "total"), "—", "previous session totals must be cleared");
+  assert.equal(metric(bar, "activity"), "— 轮 · — 步");
   assert.equal(metric(bar, "status"), "暂无统计");
-  assert.match(summary(env).getAttribute("aria-label"), /会话统计/);
+  assert.match(summary(env).getAttribute("aria-label"), /最近一轮统计/);
   assert.doesNotMatch(summary(env).getAttribute("aria-label"), /132k/);
 });
 
@@ -425,7 +437,7 @@ test("remounts the bar after Codex rebuilds the composer DOM", async () => {
 
 test("marks in-flight requests as running", async () => {
   const env = createEnvironment({
-    statsBySession: { "conversation-1": { ...STATS, inFlight: 1 } },
+    statsBySession: { "conversation-1": { ...STATS, lastTurn: { ...LAST_TURN, status: "running", inFlight: 1 } } },
   });
   await flushTimers(30);
   const bar = env.bar();
@@ -447,23 +459,19 @@ test("does not fetch in a hidden page and refreshes when visibility returns", as
   assert.equal(env.calls.length, calls + 1);
 });
 
-test("shows unsuccessful request states and prioritizes active requests", async () => {
+test("shows the turn state independently of old request state", async () => {
   const env = createEnvironment();
-  for (const [lastStatus, label, detail] of [
-    ["failed", "最近请求失败", "失败"],
-    ["incomplete", "最近请求未完成", "未完成"],
-    ["cancelled", "最近请求已取消", "已取消"],
+  for (const [status, label] of [
+    ["aborted", "本轮已中止"],
+    ["running", "本轮进行中"],
+    ["completed", "运行期统计"],
   ]) {
-    env.setStats("conversation-1", { ...STATS, lastStatus });
+    env.setStats("conversation-1", { ...STATS, lastStatus: "failed", lastTurn: { ...LAST_TURN, status } });
     env.refresh();
     await flushTimers(30);
     assert.equal(metric(env.bar(), "status"), label);
     assert.ok(summary(env).getAttribute("aria-label").includes(label));
   }
-  env.setStats("conversation-1", { ...STATS, lastStatus: "failed", inFlight: 1 });
-  env.refresh();
-  await flushTimers(30);
-  assert.equal(metric(env.bar(), "status"), "1 个进行中");
 });
 
 test("ignores hidden composer anchors and stays empty without a session", async () => {
@@ -731,190 +739,170 @@ test("historical tokens and current runtime request details keep separate scopes
   await flushTimers(30);
   assert.equal(field(env.bar(), "totalTokens"), "131,500 tok");
   assert.equal(metric(env.bar(), "speed"), "188 tok/s");
-  env.setStats("conversation-1", { ...STATS, usageSource: "rollout", usageScope: "session", averageOutputTokensPerSecond: null });
+  env.setStats("conversation-1", { ...STATS, usageSource: "rollout", usageScope: "session", lastTurn: { ...LAST_TURN, averageOutputTokensPerSecond: null } });
   env.refresh();
   await flushTimers(30);
   assert.equal(metric(env.bar(), "speed"), "—");
 });
 
-test("shows recorded historical average independently of runtime request fields", async () => {
-  const history = {
-    usageSource: "rollout", usageScope: "session", requestsScope: null,
-    totalTokens: 131500, requests: null, model: null, lastStatus: null,
-    averageOutputTokensPerSecond: 62.35, averageSpeedSource: "request_log",
-    averageSpeedScope: "recorded_requests", averageSpeedRequestCount: 20,
-  };
-  const env = createEnvironment({ statsBySession: { "conversation-1": history } });
-  await flushTimers(30);
-  assert.equal(metric(env.bar(), "speed"), "62.4 tok/s");
-  assert.match(summary(env).getAttribute("aria-label"), /仅覆盖有记录且有有效计时的请求/);
-  env.setStats("conversation-1", { ...history, totalTokens: null, usageSource: "unknown", usageScope: "unknown" });
-  env.refresh();
-  await flushTimers(30);
-  assert.equal(metric(env.bar(), "speed"), "62.4 tok/s");
-  assert.equal(env.bar().dataset.state, "ok");
-  assert.match(env.bar().querySelector(".codey-cs-tokens-summary").getAttribute("aria-label"), /统计范围未知/);
-  assert.equal(metric(env.bar(), "status"), "历史速度记录");
-});
-
-test("preserves the recorded average while the next step waits for output", async () => {
-  const data = { ...STATS, averageSpeedSource: "request_log", averageSpeedScope: "recorded_requests" };
-  const env = createEnvironment({ statsBySession: { "conversation-1": data } });
-  await flushTimers(30);
-  assert.equal(metric(env.bar(), "speed"), "188 tok/s");
-  for (const changes of [{ inFlight: 1, speedState: "waiting" }, { averageOutputTokensPerSecond: null }, { averageSpeedScope: null }]) {
-    env.setStats("conversation-1", { ...data, ...changes });
-    env.refresh();
-    await flushTimers(30);
-    assert.equal(metric(env.bar(), "speed"), changes.inFlight ? "188 tok/s" : "—");
-  }
-  env.setStats("conversation-1", { ...STATS, speedSource: "runtime", speedScope: "latest_request" });
-  env.refresh();
-  await flushTimers(30);
-  assert.equal(metric(env.bar(), "speed"), "188 tok/s");
-});
-
-test("legacy backend is runtime only and cannot present a single-request speed as an average", async () => {
-  const legacy = { ...STATS };
-  delete legacy.usageSource;
-  delete legacy.usageScope;
-  delete legacy.requestsScope;
-  delete legacy.averageOutputTokensPerSecond;
-  delete legacy.averageSpeedSource;
-  delete legacy.averageSpeedScope;
-  const env = createEnvironment({ statsBySession: { "conversation-1": legacy } });
-  await flushTimers(30);
-  assert.match(env.bar().querySelector(".codey-cs-tokens-summary").getAttribute("aria-label"), /本次运行/);
-  assert.doesNotMatch(summary(env).getAttribute("aria-label"), /会话累计/);
-  assert.equal(metric(env.bar(), "speed"), "—");
-});
-
-test("shows exact and estimated session averages during generation", async () => {
-  const env = createEnvironment();
-  for (const [averageSpeedIsEstimate, expected] of [[false, "62.4 tok/s"], [true, "≈62.4 tok/s"]]) {
-    env.setStats("conversation-1", { ...STATS, inFlight: 1, averageOutputTokensPerSecond: 62.35,
-      averageSpeedIsEstimate });
-    env.refresh();
-    await flushTimers(30);
-    assert.equal(metric(env.bar(), "speed"), expected);
-    assert.equal(field(env.bar(), "speed"), expected);
-    assert.equal(env.bar().dataset.running, "true");
-    assert.match(summary(env).getAttribute("aria-label"), /会话平均速度/);
-    assert.match(env.bar().__codeyCs.notes.activity.textContent, /累计输出 Token ÷ 累计生成耗时，工具间隔不计/);
-    assert.equal(env.bar().__codeyCs.notes.activity.textContent.includes("含生成中的 Token 估算"), averageSpeedIsEstimate);
-  }
-});
-
-test("uses the backend weighted average instead of total tokens or the last step speed", async () => {
-  // 两步各输出 100 token，用时 1 秒和 9 秒；累计平均为 20，不能取两步速度的算术平均。
+test("session totals own the turn count while the last turn owns speed, steps and timing", async () => {
   const env = createEnvironment({ statsBySession: { "conversation-1": {
-    ...STATS, outputTokens: 10000, outputTokensPerSecond: 100 / 9,
-    averageOutputTokensPerSecond: 200 / 10, modelDurationMs: 30000,
+    ...STATS, turnCount: 99, stepCount: 500, modelDurationMs: 900000,
+    toolDurationMs: 800000, averageTtftMs: 9999, averageOutputTokensPerSecond: 999,
+    outputTokensPerSecond: 777,
+    lastTurn: { ...LAST_TURN, stepCount: 3, averageOutputTokensPerSecond: 20 },
   } } });
   await flushTimers(30);
+  assert.equal(metric(env.bar(), "activity"), "99 轮 · 3 步");
+  assert.equal(field(env.bar(), "modelDurationMs"), "10秒");
+  assert.equal(field(env.bar(), "toolDurationMs"), "3秒");
+  assert.equal(field(env.bar(), "averageTtftMs"), "0.5秒");
   assert.equal(metric(env.bar(), "speed"), "20.0 tok/s");
-  assert.equal(field(env.bar(), "speed"), "20.0 tok/s");
+  assert.equal(metric(env.bar(), "total"), "132k tok");
+  assert.equal(field(env.bar(), "outputTokens"), "3,100 tok");
   assert.equal(panel(env).querySelectorAll("dt").at(-1).textContent, "平均速度（TPS）");
+  assert.match(env.bar().__codeyCs.notes.activity.textContent, /本轮总输出 Token ÷ 本轮生成耗时，工具间隔不计/);
 });
 
-test("keeps the accumulated runtime average and open panel across step boundaries", async () => {
+test("uses only the reported session turn count and preserves zero independently of last turn availability", async () => {
+  const env = createEnvironment();
+  try {
+    for (const turnCount of [undefined, null, NaN, Infinity, -1, 1.5, "4", 0, 4]) {
+      env.setStats("conversation-1", { ...STATS, turnCount, requests: 900,
+        lastTurn: { ...LAST_TURN, id: "turn-50" } });
+      env.refresh();
+      await flushTimers(30);
+      const expected = turnCount === 0 || turnCount === 4 ? String(turnCount) : "—";
+      assert.equal(metric(env.bar(), "activity"), `${expected} 轮 · 2 步`);
+      assert.equal(metric(env.bar(), "speed"), "188 tok/s");
+    }
+    env.setStats("conversation-1", { turnCount: 0 });
+    env.refresh();
+    await flushTimers(30);
+    assert.equal(metric(env.bar(), "activity"), "0 轮 · — 步");
+    assert.equal(metric(env.bar(), "speed"), "—");
+    assert.notEqual(env.bar().dataset.state, "empty");
+  } finally {
+    env.dispose();
+  }
+});
+
+test("does not reuse session or request statistics without an identified turn", async () => {
+  const env = createEnvironment();
+  for (const lastTurn of [undefined, null, {}, { ...LAST_TURN, id: "" }, { ...LAST_TURN, id: " " }]) {
+    env.setStats("conversation-1", { ...STATS, lastTurn, modelDurationMs: 500, toolDurationMs: 10, stepCount: 9 });
+    env.refresh();
+    await flushTimers(30);
+    assert.equal(metric(env.bar(), "activity"), "4 轮 · — 步");
+    for (const name of ["modelDurationMs", "toolDurationMs", "averageTtftMs", "speed"]) assert.equal(field(env.bar(), name), "—");
+    assert.match(env.bar().__codeyCs.notes.activity.textContent, /暂无可识别的最近一轮/);
+  }
+});
+
+test("keeps the same turn average through multiple steps and tool intervals without recreating panels", async () => {
   const env = createEnvironment({ statsBySession: { "conversation-1": STATS } });
   await flushTimers(30);
   click(summary(env));
   const originalPanel = panel(env);
-  env.setStats("conversation-1", { ...STATS, requests: 3, inFlight: 1,
-    speedState: "waiting", outputTokensPerSecond: null });
+  for (const inFlight of [1, 0, 1]) {
+    env.setStats("conversation-1", { ...STATS, outputTokensPerSecond: null,
+      lastTurn: { ...LAST_TURN, status: "running", stepCount: 3, inFlight, speedState: "waiting" } });
+    env.refresh();
+    await flushTimers(30);
+    assert.equal(metric(env.bar(), "speed"), "188 tok/s");
+    assert.equal(field(env.bar(), "speed"), "188 tok/s");
+    assert.equal(env.bar().dataset.running, "true");
+    assert.equal(panel(env), originalPanel);
+    assertExpanded(env, true);
+  }
+});
+
+test("a new user turn clears all prior turn values without clearing session tokens", async () => {
+  const env = createEnvironment({ statsBySession: { "conversation-1": STATS } });
+  await flushTimers(30);
+  click(summary(env));
+  env.setStats("conversation-1", { ...STATS, turnCount: 5, lastTurn: { id: "turn-2", status: "running", stepCount: 0,
+    averageOutputTokensPerSecond: null, speedState: "waiting", coverage: "runtime" } });
   env.refresh();
   await flushTimers(30);
-  assert.equal(metric(env.bar(), "speed"), "188 tok/s");
-  assert.equal(field(env.bar(), "speed"), "188 tok/s");
-  assert.equal(panel(env), originalPanel);
+  assert.equal(metric(env.bar(), "speed"), "等待输出");
+  assert.equal(metric(env.bar(), "activity"), "5 轮 · 0 步");
+  for (const name of ["modelDurationMs", "toolDurationMs", "averageTtftMs"]) assert.equal(field(env.bar(), name), "—");
+  assert.equal(metric(env.bar(), "total"), "132k tok");
   assertExpanded(env, true);
 });
 
-test("shows combined historical and live averages with an explicit coverage limit", async () => {
-  const env = createEnvironment({ statsBySession: { "conversation-1": {
-    ...STATS, usageSource: "rollout", usageScope: "session", inFlight: 1,
-    averageOutputTokensPerSecond: 42, averageSpeedIsEstimate: true,
-    averageSpeedSource: "runtime_and_request_log", averageSpeedScope: "recorded_and_runtime",
-  } } });
-  await flushTimers(30);
-  assert.equal(metric(env.bar(), "speed"), "≈42.0 tok/s");
-  assert.match(env.bar().__codeyCs.notes.activity.textContent, /覆盖有记录的历史请求与本次运行，未记录的历史请求不计入/);
-});
-
-test("rejects invalid averages and mismatched or missing average attribution", async () => {
+test("distinguishes waiting, streaming, estimated average and completed average for one turn", async () => {
   const env = createEnvironment();
-  for (const changes of [
-    { averageOutputTokensPerSecond: NaN }, { averageOutputTokensPerSecond: Infinity },
-    { averageOutputTokensPerSecond: -5 },
-    { averageSpeedSource: undefined }, { averageSpeedSource: "request_log" },
-    { averageSpeedScope: "latest_request" },
+  for (const [changes, expected] of [
+    [{ status: "running", speedState: "waiting", averageOutputTokensPerSecond: null }, "等待输出"],
+    [{ status: "running", speedState: "streaming", averageOutputTokensPerSecond: null }, "生成中"],
+    [{ status: "running", speedIsEstimate: true, averageOutputTokensPerSecond: 62.35 }, "≈62.4 tok/s"],
+    [{ status: "running", speedIsEstimate: false, averageOutputTokensPerSecond: 65 }, "65.0 tok/s"],
+    [{ status: "completed", averageOutputTokensPerSecond: 71.2 }, "71.2 tok/s"],
+    [{ status: "completed", averageOutputTokensPerSecond: null }, "—"],
   ]) {
-    env.setStats("conversation-1", { ...STATS, ...changes });
-    env.refresh();
-    await flushTimers(30);
-    assert.equal(metric(env.bar(), "speed"), "—");
-  }
-});
-
-test("preserves a reported zero session average", async () => {
-  const env = createEnvironment({ statsBySession: { "conversation-1": {
-    ...STATS, averageOutputTokensPerSecond: 0,
-  } } });
-  await flushTimers(30);
-  assert.equal(metric(env.bar(), "speed"), "0.0 tok/s");
-  assert.equal(field(env.bar(), "speed"), "0.0 tok/s");
-});
-
-test("waits for current output instead of showing a previous request speed", async () => {
-  const env = createEnvironment();
-  for (const speedScope of [undefined, "latest_request", "latest_recorded_request", "current_request"]) {
-    env.setStats("conversation-1", { ...STATS, inFlight: 1, averageOutputTokensPerSecond: null,
-      speedSource: speedScope === "latest_recorded_request" ? "request_log" : "runtime",
-      speedScope, speedState: "waiting", outputTokensPerSecond: speedScope === "current_request" ? null : 188 });
-    env.refresh();
-    await flushTimers(30);
-    assert.equal(metric(env.bar(), "speed"), "等待输出");
-    assert.equal(field(env.bar(), "speed"), "等待输出");
-  }
-});
-
-test("distinguishes initial waiting from output arriving without a speed sample", async () => {
-  const env = createEnvironment();
-  for (const [speedState, expected] of [["waiting", "等待输出"], ["streaming", "生成中"], [undefined, "生成中"]]) {
-    env.setStats("conversation-1", { ...STATS, inFlight: 1, speedSource: "runtime",
-      speedScope: "current_request", averageOutputTokensPerSecond: null, speedState });
+    env.setStats("conversation-1", { ...STATS, lastTurn: { ...LAST_TURN, ...changes } });
     env.refresh();
     await flushTimers(30);
     assert.equal(metric(env.bar(), "speed"), expected);
     assert.equal(field(env.bar(), "speed"), expected);
+    assert.match(summary(env).getAttribute("aria-label"), /本轮平均速度/);
+    assert.equal(env.bar().__codeyCs.notes.activity.textContent.includes("含生成中的 Token 估算"), changes.speedIsEstimate === true);
   }
 });
 
-test("transitions the live average to a completed average without using the final single-step speed", async () => {
-  const live = { ...STATS, inFlight: 1, averageOutputTokensPerSecond: 62.35,
-    averageSpeedIsEstimate: true, outputTokensPerSecond: 900 };
-  const env = createEnvironment({ statsBySession: { "conversation-1": live } });
-  await flushTimers(30);
-  assert.equal(metric(env.bar(), "speed"), "≈62.4 tok/s");
-  env.setStats("conversation-1", { ...live, inFlight: 0, averageOutputTokensPerSecond: null });
-  env.refresh();
-  await flushTimers(30);
-  assert.equal(metric(env.bar(), "speed"), "—", "a single-step measurement cannot substitute a missing session average");
-  env.setStats("conversation-1", { ...live, inFlight: 0, averageOutputTokensPerSecond: 71.2,
-    averageSpeedIsEstimate: false });
-  env.refresh();
-  await flushTimers(30);
-  assert.equal(metric(env.bar(), "speed"), "71.2 tok/s");
-  assert.match(summary(env).getAttribute("aria-label"), /会话平均速度/);
+test("uses the backend weighted turn average and preserves valid zero values", async () => {
+  // 两步各输出 100 token，用时 1 秒和 9 秒，轮平均为 20。
+  const env = createEnvironment();
+  for (const averageOutputTokensPerSecond of [200 / 10, 0]) {
+    env.setStats("conversation-1", { ...STATS, lastTurn: { ...LAST_TURN,
+      averageOutputTokensPerSecond, stepCount: 0, modelDurationMs: 0, toolDurationMs: 0, averageTtftMs: 0 } });
+    env.refresh();
+    await flushTimers(30);
+    assert.equal(metric(env.bar(), "speed"), `${averageOutputTokensPerSecond.toFixed(1)} tok/s`);
+    assert.equal(metric(env.bar(), "activity"), "4 轮 · 0 步");
+    for (const name of ["modelDurationMs", "toolDurationMs", "averageTtftMs"]) assert.equal(field(env.bar(), name), "0秒");
+  }
 });
 
-test("hides a frozen live speed after refresh failure and resumes on recovery", async () => {
-  const live = { ...STATS, inFlight: 1, averageSpeedIsEstimate: true };
+test("rejects invalid last turn values and keeps absent values unknown", async () => {
+  const env = createEnvironment();
+  for (const value of [undefined, null, NaN, Infinity, -5]) {
+    env.setStats("conversation-1", { ...STATS, lastTurn: { ...LAST_TURN,
+      averageOutputTokensPerSecond: value, stepCount: value, modelDurationMs: value, toolDurationMs: value, averageTtftMs: value } });
+    env.refresh();
+    await flushTimers(30);
+    assert.equal(metric(env.bar(), "activity"), "4 轮 · — 步");
+    for (const name of ["speed", "modelDurationMs", "toolDurationMs", "averageTtftMs"]) assert.equal(field(env.bar(), name), "—");
+  }
+});
+
+test("explains limited coverage of historical and partial turn records", async () => {
+  const env = createEnvironment();
+  for (const [coverage, note] of [
+    ["recorded", "仅覆盖本轮可恢复且有有效计时的记录"],
+    ["recorded_and_runtime", "合并本轮可恢复记录与本次运行统计，缺失记录不计入"],
+    ["partial", "本轮记录不完整，仅统计可恢复的部分"],
+    ["runtime", "仅覆盖本轮在本次运行中可统计的步骤"],
+    ["unknown", "本轮统计范围未知"],
+  ]) {
+    env.setStats("conversation-1", { ...STATS, requestsScope: null, requests: null,
+      lastTurn: { ...LAST_TURN, coverage } });
+    env.refresh();
+    await flushTimers(30);
+    assert.equal(metric(env.bar(), "speed"), "188 tok/s");
+    assert.ok(env.bar().__codeyCs.notes.activity.textContent.includes(note));
+  }
+});
+
+test("hides a frozen live turn speed after failure and resumes without changing its panel", async () => {
+  const live = { ...STATS, lastTurn: { ...LAST_TURN, status: "running", speedIsEstimate: true } };
   let response = { status: "ok", stats: live };
   const env = createEnvironment({ request: () => response });
   await flushTimers(30);
+  click(summary(env));
+  const originalPanel = panel(env);
   assert.equal(metric(env.bar(), "speed"), "≈188 tok/s");
   response = { status: "failed" };
   env.refresh();
@@ -922,15 +910,17 @@ test("hides a frozen live speed after refresh failure and resumes on recovery", 
   assert.equal(metric(env.bar(), "speed"), "更新暂停");
   assert.equal(field(env.bar(), "speed"), "更新暂停");
   assert.equal(metric(env.bar(), "total"), "132k tok");
-  response = { status: "ok", stats: { ...live, averageOutputTokensPerSecond: 54 } };
+  response = { status: "ok", stats: { ...live, lastTurn: { ...live.lastTurn, averageOutputTokensPerSecond: 54 } } };
   env.refresh();
   await flushTimers(30);
   assert.equal(metric(env.bar(), "speed"), "≈54.0 tok/s");
+  assert.equal(panel(env), originalPanel);
+  assertExpanded(env, true);
 });
 
-test("clears live speed and waiting state on conversation changes", async () => {
+test("clears live turn speed and waiting state on conversation changes", async () => {
   const env = createEnvironment({ statsBySession: { "conversation-1": {
-    ...STATS, inFlight: 1, averageSpeedIsEstimate: true,
+    ...STATS, lastTurn: { ...LAST_TURN, status: "running", speedIsEstimate: true },
   } } });
   await flushTimers(30);
   assert.equal(metric(env.bar(), "speed"), "≈188 tok/s");
@@ -979,16 +969,72 @@ test("preserves the same session values while refreshing and marks failed values
 
 test("shows reference activity rows and computes uncached input without double counting", async () => {
   const env = createEnvironment({ statsBySession: { "conversation-1": { ...STATS,
-    turnCount: 4, stepCount: 209, modelDurationMs: 1286000, toolDurationMs: 573000,
-    averageTtftMs: 2800, activityScope: "recorded_session", timingScope: "recorded_requests",
+    lastTurn: { ...LAST_TURN, stepCount: 209, modelDurationMs: 1286000, toolDurationMs: 573000,
+      averageTtftMs: 2800, coverage: "recorded" },
   } } });
   await flushTimers(30);
-  assert.equal(metric(env.bar(), "activity"), "4 轮 209 步");
+  assert.equal(metric(env.bar(), "activity"), "4 轮 · 209 步");
   assert.equal(field(env.bar(), "modelDurationMs"), "21分 26秒");
   assert.equal(field(env.bar(), "toolDurationMs"), "9分 33秒");
   assert.equal(field(env.bar(), "averageTtftMs"), "2.8秒");
   assert.equal(field(env.bar(), "uncachedInputTokens"), "8,400 tok");
   assert.equal(env.bar().querySelectorAll(".codey-cs-summary").length, 2);
+});
+
+test("renders merged timing of one turn without accumulating again or restoring another session response", async () => {
+  // 后端已合并本轮历史与运行期计时，UI 只负责展示。
+  const merged = { ...STATS, usageSource: "rollout", usageScope: "session",
+    lastTurn: { ...LAST_TURN, modelDurationMs: 120500, averageTtftMs: 750,
+      averageOutputTokensPerSecond: 42, coverage: "recorded_and_runtime" },
+  };
+  const runtime = { ...STATS, lastTurn: { ...LAST_TURN, id: "another-turn", modelDurationMs: 500, averageTtftMs: 200,
+    coverage: "runtime" } };
+  let pendingRefresh;
+  let deferNext = false;
+  const env = createEnvironment({ request: sessionId => {
+    if (deferNext) {
+      deferNext = false;
+      return new Promise(resolve => { pendingRefresh = resolve; });
+    }
+    return { status: "ok", stats: sessionId === "conversation-1" ? merged : runtime };
+  } });
+  const assertMerged = () => {
+    assert.equal(field(env.bar(), "modelDurationMs"), "2分 0秒");
+    assert.equal(field(env.bar(), "averageTtftMs"), "0.8秒");
+    assert.equal(field(env.bar(), "speed"), "42.0 tok/s");
+    assert.equal(metric(env.bar(), "speed"), "42.0 tok/s");
+    assert.match(env.bar().__codeyCs.notes.activity.textContent, /合并本轮可恢复记录与本次运行统计/);
+    assert.doesNotMatch(env.bar().__codeyCs.notes.activity.textContent, /仅覆盖本轮在本次运行中/);
+  };
+  try {
+    await flushTimers(30);
+    click(summary(env));
+    assertMerged();
+    env.refresh();
+    await flushTimers(30);
+    assertMerged();
+    assertExpanded(env, true);
+
+    env.setConversation("conversation-2");
+    env.emitAnchorMutation();
+    await flushTimers(160);
+    assert.equal(field(env.bar(), "modelDurationMs"), "0.5秒");
+    assert.match(env.bar().__codeyCs.notes.activity.textContent, /仅覆盖本轮在本次运行中/);
+
+    deferNext = true;
+    env.refresh();
+    await flushTimers(30);
+    env.setConversation("conversation-1");
+    env.emitAnchorMutation();
+    await flushTimers(160);
+    assert.equal(field(env.bar(), "modelDurationMs"), "—");
+    pendingRefresh({ status: "ok", stats: runtime });
+    await flushTimers(30);
+    assertMerged();
+    assert.equal(env.calls.at(-1).payload.sessionId, "conversation-1");
+  } finally {
+    env.dispose();
+  }
 });
 
 test("preview remains open during pointer travel and click pins it", async () => {
@@ -1012,23 +1058,22 @@ test("preview remains open during pointer travel and click pins it", async () =>
 
 test("does not fabricate missing activity or subtract inconsistent cache", async () => {
   const env = createEnvironment({ statsBySession: { "conversation-1": { ...STATS,
-    turnCount: 0, stepCount: null, toolDurationMs: 0, modelDurationMs: -1,
-    averageTtftMs: null, cachedInputTokens: 999999,
+    lastTurn: { ...LAST_TURN, stepCount: null, toolDurationMs: 0, modelDurationMs: -1,
+      averageTtftMs: null }, cachedInputTokens: 999999,
   } } });
   await flushTimers(30);
-  assert.equal(metric(env.bar(), "activity"), "0 轮 — 步");
+  assert.equal(metric(env.bar(), "activity"), "4 轮 · — 步");
   assert.equal(field(env.bar(), "toolDurationMs"), "0秒");
   for (const key of ["modelDurationMs", "averageTtftMs", "uncachedInputTokens", "cacheRate"]) assert.equal(field(env.bar(), key), "—");
 });
 
-test("explains independently sourced steps and accumulated tool timing", async () => {
+test("explains turn boundaries and accumulated tool timing", async () => {
   const env = createEnvironment({ statsBySession: { "conversation-1": { ...STATS,
-    turnCount: 4, stepCount: 2, activityScope: "recorded_session", stepScope: "runtime",
-    timingScope: "recorded_requests", toolTimingScope: "recorded_tools",
+    lastTurn: { ...LAST_TURN, coverage: "recorded" },
   } } });
   await flushTimers(30);
   const note = env.bar().__codeyCs.notes.activity.textContent;
-  assert.match(note, /步数仅覆盖本次运行/);
-  assert.match(note, /有有效计时的请求/);
-  assert.match(note, /工具用时为累计值，并行调用可能重叠/);
+  assert.match(note, /一次提问为一轮，步数为该轮模型生成次数/);
+  assert.match(note, /有有效计时的记录/);
+  assert.match(note, /工具用时为本轮累计值，并行调用可能重叠/);
 });
