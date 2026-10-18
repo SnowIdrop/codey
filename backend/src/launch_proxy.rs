@@ -81,11 +81,6 @@ impl CodexLaunchProxy {
             url.scheme()
         };
         let host = url.host_str().expect("启动代理地址已通过校验");
-        let host = if host.parse::<std::net::Ipv6Addr>().is_ok() {
-            format!("[{host}]")
-        } else {
-            host.to_string()
-        };
         let port = url
             .port_or_known_default()
             .expect("启动代理协议具有默认端口");

@@ -7,9 +7,9 @@
 //! socks5 上游走 RFC 1929 用户名密码握手（socks5h 仍由上游解析目标域名）。
 
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv4Addr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -18,12 +18,10 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{OnceCell, Semaphore};
 
-/// 解析出的上游代理，凭据可为空：直连地址与带凭据的中继上游共用同一
-/// 解析与探活逻辑。`raw` 是用户填写的原始地址：共享 app-server 先于
-/// Codex 启动、中继尚未运行时，把它放进环境变量，reqwest 能理解其中的
-/// Basic 凭据。
+/// 直连与认证中继共用上游解析和探活；原始地址仅用作中继复用键，
+/// 凭据由中继发给上游，不写入 Codex 或共享 app-server 的环境变量。
 #[derive(Clone)]
 pub(crate) struct UpstreamProxy {
     raw: String,
@@ -37,7 +35,7 @@ pub(crate) struct UpstreamProxy {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum UpstreamScheme {
     Http,
-    /// https 指用 TLS 连接代理本身，不是“代理 https 流量”。
+    /// https 指用 TLS 连接代理本身。
     Https,
     Socks5,
     /// 目标域名交给上游解析。
@@ -58,7 +56,7 @@ impl UpstreamProxy {
         Some(Self {
             raw: raw.to_string(),
             scheme,
-            host: url.host_str()?.to_string(),
+            host: unbracketed_host(url.host_str()?).to_string(),
             port: url.port_or_known_default()?,
             username: percent_decode(url.username()),
             password: percent_decode(url.password().unwrap_or_default()),
@@ -79,7 +77,7 @@ impl UpstreamProxy {
     }
 
     fn basic_auth_header(&self) -> Option<String> {
-        if self.username.is_empty() && self.password.is_empty() {
+        if !self.has_credentials() {
             return None;
         }
         let mut credentials = self.username.clone();
@@ -93,6 +91,13 @@ fn percent_decode(value: &str) -> Vec<u8> {
     percent_encoding::percent_decode_str(value).collect()
 }
 
+/// URL 中的 IPv6 主机带方括号；网络连接与 SOCKS 地址编码使用裸 IP。
+fn unbracketed_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
 /// RFC 1929 的 ULEN/PLEN 只有一个字节。
 pub(crate) fn socks_credentials_too_long(username: &[u8], password: &[u8]) -> bool {
     username.len() > u8::MAX as usize || password.len() > u8::MAX as usize
@@ -103,46 +108,104 @@ const HEAD_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 const MAX_CONNECTIONS: usize = 128;
 
-/// 同一上游地址复用同一个监听端口；配置变化本来就要求重启，旧中继不主动
+/// 同一上游复用仍在运行的监听任务；配置变化本来就要求重启，旧中继不主动
 /// 关闭，避免正在运行的 Codex 断网。
-static RELAYS: Mutex<BTreeMap<String, u16>> = Mutex::const_new(BTreeMap::new());
+static RELAYS: Mutex<BTreeMap<String, Arc<OnceCell<RunningRelay>>>> = Mutex::new(BTreeMap::new());
+
+struct RunningRelay {
+    port: u16,
+    task: tokio::task::JoinHandle<()>,
+}
+
+struct RelayRegistration<'a> {
+    key: &'a str,
+    relay: Option<Arc<OnceCell<RunningRelay>>>,
+}
+
+impl Drop for RelayRegistration<'_> {
+    fn drop(&mut self) {
+        let Some(relay) = self.relay.take() else {
+            return;
+        };
+        if relay.get().is_some() {
+            return;
+        }
+        let mut relays = RELAYS.lock().unwrap_or_else(|error| error.into_inner());
+        // 同一把锁保护查找与移除，保证其他调用拿到的初始化状态仍在注册表中。
+        if relay.get().is_none()
+            && Arc::strong_count(&relay) == 2
+            && relays
+                .get(self.key)
+                .is_some_and(|registered| Arc::ptr_eq(registered, &relay))
+        {
+            relays.remove(self.key);
+        }
+        // 在锁内释放本次引用，让最后一个同时退出的调用能清理空条目。
+        drop(relay);
+    }
+}
 
 /// 确保上游的回环认证中继在运行，返回其监听端口。
 pub(crate) async fn ensure_running(upstream: &UpstreamProxy) -> anyhow::Result<u16> {
-    let mut relays = RELAYS.lock().await;
-    if let Some(port) = relays.get(&upstream.raw) {
-        return Ok(*port);
-    }
-    preflight(upstream).await?;
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .context("启动 Codex 代理认证中继失败")?;
-    let port = spawn_relay(listener, Arc::new(upstream.clone()));
-    relays.insert(upstream.raw.clone(), port);
-    Ok(port)
+    let relay = RelayRegistration {
+        key: &upstream.raw,
+        relay: Some({
+            let mut relays = RELAYS.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(relay) = relays.get(&upstream.raw).filter(|relay| {
+                !relay
+                    .get()
+                    .is_some_and(|running| running.task.is_finished())
+            }) {
+                Arc::clone(relay)
+            } else {
+                let relay = Arc::new(OnceCell::new());
+                relays.insert(upstream.raw.clone(), Arc::clone(&relay));
+                relay
+            }
+        }),
+    };
+    // 仅同一上游等待初始化；探活失败或调用被取消后，后续调用可重试。
+    let running = relay
+        .relay
+        .as_ref()
+        .expect("中继注册引用仅在退出时释放")
+        .get_or_try_init(|| async {
+            preflight(upstream).await?;
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .context("启动 Codex 代理认证中继失败")?;
+            spawn_relay(listener, Arc::new(upstream.clone()))
+        })
+        .await?;
+    Ok(running.port)
 }
 
-fn spawn_relay(listener: TcpListener, upstream: Arc<UpstreamProxy>) -> u16 {
-    let port = listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
-    tokio::spawn(async move { accept_loop(listener, upstream).await });
-    port
+fn spawn_relay(
+    listener: TcpListener,
+    upstream: Arc<UpstreamProxy>,
+) -> anyhow::Result<RunningRelay> {
+    let port = listener.local_addr()?.port();
+    let task = tokio::spawn(async move { accept_loop(listener, upstream).await });
+    Ok(RunningRelay { port, task })
 }
 
 /// 启动前先探活上游：代理连不通时立刻报错，而不是让 Codex 带着死代理
 /// 静默挂起。https 顺带完成 TLS 握手，SOCKS 上游顺带完成认证协商，凭据
 /// 错误在此暴露。
 pub(crate) async fn preflight(upstream: &UpstreamProxy) -> anyhow::Result<()> {
-    let result = match upstream.scheme {
-        UpstreamScheme::Http => open_upstream_tcp(upstream).await.map(|_| ()),
-        UpstreamScheme::Https => open_upstream_stream(upstream).await.map(|_| ()),
-        UpstreamScheme::Socks5 | UpstreamScheme::Socks5h => {
-            async {
+    let result = tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, async {
+        match upstream.scheme {
+            UpstreamScheme::Http => open_upstream_tcp(upstream).await.map(|_| ()),
+            UpstreamScheme::Https => open_upstream_stream(upstream).await.map(|_| ()),
+            UpstreamScheme::Socks5 | UpstreamScheme::Socks5h => {
                 let mut stream = open_upstream_tcp(upstream).await?;
                 socks5_negotiate(&mut stream, upstream).await
             }
-            .await
         }
-    };
+    })
+    .await
+    .context("上游代理探活超时")
+    .and_then(std::convert::identity);
     result.with_context(|| format!("Codex 启动代理上游 {} 不可用", upstream.display_addr()))
 }
 
@@ -267,14 +330,15 @@ async fn read_head(stream: &mut (impl AsyncRead + Unpin)) -> std::io::Result<(Ve
     let deadline = tokio::time::Instant::now() + HEAD_READ_TIMEOUT;
     let mut buffer = Vec::with_capacity(2048);
     loop {
-        if let Some(end) = memchr::memmem::find(&buffer, b"\r\n\r\n").map(|index| index + 4) {
-            return Ok((buffer, end));
-        }
-        if buffer.len() > MAX_HEAD_BYTES {
+        let head_end = memchr::memmem::find(&buffer, b"\r\n\r\n").map(|index| index + 4);
+        if head_end.unwrap_or(buffer.len()) > MAX_HEAD_BYTES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "代理请求头过长",
             ));
+        }
+        if let Some(end) = head_end {
+            return Ok((buffer, end));
         }
         let mut chunk = [0u8; 8192];
         let read = tokio::time::timeout_at(deadline, stream.read(&mut chunk))
@@ -318,12 +382,10 @@ async fn serve(mut client: TcpStream, upstream: Arc<UpstreamProxy>) -> anyhow::R
     let Some((method, target)) = parse_request_line(&buffer[..head_end]) else {
         return respond_status(&mut client, 400, "Bad Request").await;
     };
-    let method = method.to_string();
-    let target = target.to_string();
     if method.eq_ignore_ascii_case("CONNECT") {
-        serve_connect(client, upstream, &target, buffer[head_end..].to_vec()).await
+        serve_connect(client, upstream, target, &buffer[head_end..]).await
     } else {
-        serve_forward(client, upstream, &target, buffer, head_end).await
+        serve_forward(client, upstream, target, &buffer, head_end).await
     }
 }
 
@@ -333,7 +395,7 @@ async fn serve_connect(
     mut client: TcpStream,
     upstream: Arc<UpstreamProxy>,
     authority: &str,
-    buffered: Vec<u8>,
+    buffered: &[u8],
 ) -> anyhow::Result<()> {
     let Some((host, port)) = split_authority(authority) else {
         return respond_status(&mut client, 400, "Bad Request").await;
@@ -370,7 +432,7 @@ async fn serve_connect(
                 client.write_all(&response[response_end..]).await?;
             }
             if !buffered.is_empty() {
-                stream.write_all(&buffered).await?;
+                stream.write_all(buffered).await?;
             }
             tokio::io::copy_bidirectional(&mut client, &mut stream).await?;
             return Ok(());
@@ -392,7 +454,7 @@ async fn serve_connect(
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
     if !buffered.is_empty() {
-        stream.write_all(&buffered).await?;
+        stream.write_all(buffered).await?;
     }
     tokio::io::copy_bidirectional(&mut client, &mut stream).await?;
     Ok(())
@@ -404,7 +466,7 @@ async fn serve_forward(
     mut client: TcpStream,
     upstream: Arc<UpstreamProxy>,
     target: &str,
-    buffer: Vec<u8>,
+    buffer: &[u8],
     head_end: usize,
 ) -> anyhow::Result<()> {
     let Some(origin) = reqwest::Url::parse(target)
@@ -434,31 +496,22 @@ async fn serve_forward(
             Ok(())
         }
         UpstreamScheme::Socks5 | UpstreamScheme::Socks5h => {
-            let host = origin.host_str().unwrap_or_default().to_string();
+            let authority = origin.host_str().unwrap_or_default();
+            let host = unbracketed_host(authority);
             let port = origin.port_or_known_default().unwrap_or(80);
             let mut stream = match open_upstream_tcp(&upstream).await {
                 Ok(stream) => stream,
                 Err(_) => return respond_status(&mut client, 502, "Bad Gateway").await,
             };
-            if socks5_connect(&mut stream, &upstream, &host, port)
+            if socks5_connect(&mut stream, &upstream, host, port)
                 .await
                 .is_err()
             {
                 return respond_status(&mut client, 502, "Bad Gateway").await;
             }
-            let authority = origin
-                .host_str()
-                .map(|host| {
-                    if host.parse::<Ipv6Addr>().is_ok() {
-                        format!("[{host}]")
-                    } else {
-                        host.to_string()
-                    }
-                })
-                .unwrap_or_default();
             let authority = match origin.port() {
                 Some(port) => format!("{authority}:{port}"),
-                None => authority,
+                None => authority.to_string(),
             };
             let mut path = origin.path().to_string();
             if path.is_empty() {
@@ -531,11 +584,13 @@ fn rewrite_forward_head(
             .position(|byte| *byte == b':')
             .map(|colon| &line[..colon])
             .unwrap_or(line);
-        match name.to_ascii_lowercase().as_slice() {
-            b"connection" | b"proxy-connection" | b"proxy-authorization" => continue,
-            b"host" => saw_host = true,
-            _ => {}
+        if name.eq_ignore_ascii_case(b"connection")
+            || name.eq_ignore_ascii_case(b"proxy-connection")
+            || name.eq_ignore_ascii_case(b"proxy-authorization")
+        {
+            continue;
         }
+        saw_host |= name.eq_ignore_ascii_case(b"host");
         output.extend_from_slice(line);
         output.extend_from_slice(b"\r\n");
     }
@@ -587,20 +642,23 @@ fn split_authority(authority: &str) -> Option<(String, u16)> {
 }
 
 /// socks5 方法协商与 RFC 1929 认证；preflight 只跑到这一步，不请求目标。
-async fn socks5_negotiate(stream: &mut TcpStream, upstream: &UpstreamProxy) -> anyhow::Result<()> {
-    let mut methods = vec![0x00u8];
-    if upstream.basic_auth_header().is_some() {
-        methods.push(0x02);
-    }
-    let mut greeting = vec![0x05, methods.len() as u8];
-    greeting.extend_from_slice(&methods);
-    stream.write_all(&greeting).await?;
+async fn socks5_negotiate(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    upstream: &UpstreamProxy,
+) -> anyhow::Result<()> {
+    let greeting: &[u8] = if upstream.has_credentials() {
+        &[0x05, 0x02, 0x00, 0x02]
+    } else {
+        &[0x05, 0x01, 0x00]
+    };
+    stream.write_all(greeting).await?;
     let mut selection = [0u8; 2];
     stream.read_exact(&mut selection).await?;
     anyhow::ensure!(selection[0] == 0x05, "上游不是 socks5 代理");
     match selection[1] {
         0x00 => Ok(()),
         0x02 => {
+            anyhow::ensure!(upstream.has_credentials(), "上游代理选择了未提供的认证方式");
             anyhow::ensure!(
                 !socks_credentials_too_long(&upstream.username, &upstream.password),
                 "SOCKS 用户名或密码过长"
@@ -612,6 +670,7 @@ async fn socks5_negotiate(stream: &mut TcpStream, upstream: &UpstreamProxy) -> a
             stream.write_all(&auth).await?;
             let mut reply = [0u8; 2];
             stream.read_exact(&mut reply).await?;
+            anyhow::ensure!(reply[0] == 0x01, "上游代理返回了无效的认证版本");
             anyhow::ensure!(reply[1] == 0x00, "上游代理认证失败");
             Ok(())
         }
@@ -623,7 +682,21 @@ async fn socks5_negotiate(stream: &mut TcpStream, upstream: &UpstreamProxy) -> a
 /// socks5 CONNECT。socks5h 的目标域名交给上游解析；socks5 本地先解析，
 /// 与 curl 等客户端对两个 scheme 的约定一致。
 async fn socks5_connect(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    upstream: &UpstreamProxy,
+    host: &str,
+    port: u16,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(
+        UPSTREAM_CONNECT_TIMEOUT,
+        socks5_connect_inner(stream, upstream, host, port),
+    )
+    .await
+    .context("SOCKS 连接协商超时")?
+}
+
+async fn socks5_connect_inner(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     upstream: &UpstreamProxy,
     host: &str,
     port: u16,
@@ -660,6 +733,7 @@ async fn socks5_connect(
     let mut head = [0u8; 4];
     stream.read_exact(&mut head).await?;
     anyhow::ensure!(head[0] == 0x05, "上游不是 socks5 代理");
+    anyhow::ensure!(head[2] == 0x00, "上游返回了无效的 SOCKS 保留字段");
     let bound = match head[3] {
         0x01 => 4,
         0x03 => {
@@ -686,6 +760,8 @@ async fn socks5_connect(
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv6Addr;
+
     use super::*;
 
     fn upstream(raw: &str) -> UpstreamProxy {
@@ -708,7 +784,326 @@ mod tests {
 
     async fn start_test_relay(upstream: UpstreamProxy) -> u16 {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        spawn_relay(listener, Arc::new(upstream))
+        spawn_relay(listener, Arc::new(upstream)).unwrap().port
+    }
+
+    async fn test_deadline<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(2), future)
+            .await
+            .expect("本机代理测试应及时完成")
+    }
+
+    #[tokio::test]
+    async fn ipv6_upstream_preflight_uses_unbracketed_address() {
+        let listener = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = upstream(&format!("http://user:pass@{address}"));
+        assert_eq!(upstream.host, "::1");
+        assert_eq!(upstream.display_addr(), address.to_string());
+        test_deadline(preflight(&upstream)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks_forward_encodes_ipv6_target_and_keeps_bracketed_host_header() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.read_exact(&mut [0; 4]).await.unwrap();
+            stream.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut target = [0; 22];
+            stream.read_exact(&mut target).await.unwrap();
+            assert_eq!(&target[..4], &[0x05, 0x01, 0x00, 0x04]);
+            assert_eq!(&target[4..20], &Ipv6Addr::LOCALHOST.octets());
+            assert_eq!(&target[20..], &8080u16.to_be_bytes());
+            stream
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            let request = read_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            request
+        });
+        let port = start_test_relay(upstream(&format!("socks5h://user:pass@{address}"))).await;
+        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        client
+            .write_all(b"GET http://[::1]:8080/x?y=1 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        test_deadline(client.read_to_end(&mut response))
+            .await
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        let request = server.await.unwrap();
+        assert!(request.starts_with("GET /x?y=1 HTTP/1.1\r\n"), "{request}");
+        assert!(request.contains("Host: [::1]:8080\r\n"), "{request}");
+    }
+
+    #[tokio::test]
+    async fn unrelated_upstreams_initialize_while_socks_preflight_waits() {
+        let slow_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let slow = upstream(&format!(
+            "socks5://user:pass@{}",
+            slow_listener.local_addr().unwrap()
+        ));
+        let pending = tokio::spawn({
+            let slow = slow.clone();
+            async move { ensure_running(&slow).await }
+        });
+        let (mut connection, _) = test_deadline(slow_listener.accept()).await.unwrap();
+        test_deadline(connection.read_exact(&mut [0; 4]))
+            .await
+            .unwrap();
+
+        let fast_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let fast = upstream(&format!(
+            "http://user:pass@{}",
+            fast_listener.local_addr().unwrap()
+        ));
+        let port = test_deadline(ensure_running(&fast)).await.unwrap();
+        assert!(port > 0);
+        assert!(!pending.is_finished());
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        let mut relays = RELAYS.lock().unwrap();
+        assert!(!relays.contains_key(&slow.raw));
+        relays.remove(&fast.raw);
+    }
+
+    #[tokio::test]
+    async fn same_upstream_concurrent_initialization_reuses_one_listener() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let upstream = upstream(&format!(
+            "socks5://user:pass@{}",
+            listener.local_addr().unwrap()
+        ));
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.read_exact(&mut [0; 4]).await.unwrap();
+            stream.write_all(&[0x05, 0x00]).await.unwrap();
+            // 只处理一次探活；重复初始化将无法成功。
+        });
+        let (first, second) = test_deadline(async {
+            tokio::join!(ensure_running(&upstream), ensure_running(&upstream))
+        })
+        .await;
+        assert_eq!(first.unwrap(), second.unwrap());
+        server.await.unwrap();
+        RELAYS.lock().unwrap().remove(&upstream.raw);
+    }
+
+    #[tokio::test]
+    async fn failed_preflight_is_removed_and_can_retry() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let upstream = upstream(&format!(
+            "socks5://user:pass@{}",
+            listener.local_addr().unwrap()
+        ));
+        let server = tokio::spawn(async move {
+            for method in [0xff, 0x00] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream.read_exact(&mut [0; 4]).await.unwrap();
+                stream.write_all(&[0x05, method]).await.unwrap();
+            }
+        });
+        assert!(test_deadline(ensure_running(&upstream)).await.is_err());
+        assert!(!RELAYS.lock().unwrap().contains_key(&upstream.raw));
+        let port = test_deadline(ensure_running(&upstream)).await.unwrap();
+        test_deadline(TcpStream::connect((Ipv4Addr::LOCALHOST, port)))
+            .await
+            .unwrap();
+        server.await.unwrap();
+        RELAYS.lock().unwrap().remove(&upstream.raw);
+    }
+
+    #[tokio::test]
+    async fn waiting_initializer_retries_after_first_caller_is_cancelled() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let upstream = upstream(&format!(
+            "socks5://user:pass@{}",
+            listener.local_addr().unwrap()
+        ));
+        let first = tokio::spawn({
+            let upstream = upstream.clone();
+            async move { ensure_running(&upstream).await }
+        });
+        let (mut first_stream, _) = test_deadline(listener.accept()).await.unwrap();
+        test_deadline(first_stream.read_exact(&mut [0; 4]))
+            .await
+            .unwrap();
+        let second = tokio::spawn({
+            let upstream = upstream.clone();
+            async move { ensure_running(&upstream).await }
+        });
+        test_deadline(async {
+            loop {
+                if Arc::strong_count(RELAYS.lock().unwrap().get(&upstream.raw).unwrap()) == 3 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert!(RELAYS.lock().unwrap().contains_key(&upstream.raw));
+        let (mut second_stream, _) = test_deadline(listener.accept()).await.unwrap();
+        test_deadline(second_stream.read_exact(&mut [0; 4]))
+            .await
+            .unwrap();
+        second_stream.write_all(&[0x05, 0x00]).await.unwrap();
+        assert!(test_deadline(second).await.unwrap().unwrap() > 0);
+        RELAYS.lock().unwrap().remove(&upstream.raw);
+    }
+
+    #[tokio::test]
+    async fn stopped_listener_is_recreated_before_returning_cached_port() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let upstream = upstream(&format!(
+            "http://user:pass@{}",
+            listener.local_addr().unwrap()
+        ));
+        let old_port = test_deadline(ensure_running(&upstream)).await.unwrap();
+        let task = RELAYS.lock().unwrap()[&upstream.raw]
+            .get()
+            .unwrap()
+            .task
+            .abort_handle();
+        task.abort();
+        test_deadline(async {
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        // 占用旧端口，确保重建不会恰好获得相同端口，掩盖失效缓存。
+        let _old_port_guard = TcpListener::bind((Ipv4Addr::LOCALHOST, old_port))
+            .await
+            .unwrap();
+        let new_port = test_deadline(ensure_running(&upstream)).await.unwrap();
+        assert_ne!(old_port, new_port);
+        test_deadline(TcpStream::connect((Ipv4Addr::LOCALHOST, new_port)))
+            .await
+            .unwrap();
+        RELAYS.lock().unwrap().remove(&upstream.raw);
+    }
+
+    #[tokio::test]
+    async fn socks_preflight_times_out_without_leaking_credentials_or_registration() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let upstream = upstream(&format!(
+            "socks5://user:secret@{}",
+            listener.local_addr().unwrap()
+        ));
+        let pending = tokio::spawn({
+            let upstream = upstream.clone();
+            async move { ensure_running(&upstream).await }
+        });
+        let (mut connection, _) = test_deadline(listener.accept()).await.unwrap();
+        test_deadline(connection.read_exact(&mut [0; 4]))
+            .await
+            .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(UPSTREAM_CONNECT_TIMEOUT).await;
+        let error = pending.await.unwrap().unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("探活超时"), "{error}");
+        assert!(error.contains(&upstream.display_addr()), "{error}");
+        assert!(!error.contains("secret"), "{error}");
+        assert!(!RELAYS.lock().unwrap().contains_key(&upstream.raw));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn socks_handshake_times_out_at_each_incomplete_response_stage() {
+        let upstream = upstream("socks5h://user:pass@127.0.0.1:1080");
+        for response in [
+            &[][..],
+            &[0x05, 0x02][..],
+            &[0x05, 0x02, 0x01, 0x00][..],
+            &[0x05, 0x02, 0x01, 0x00, 0x05, 0x00, 0x00, 0x03][..],
+            &[0x05, 0x02, 0x01, 0x00, 0x05, 0x00, 0x00, 0x03, 0xff][..],
+        ] {
+            let (mut stream, mut peer) = tokio::io::duplex(1024);
+            peer.write_all(response).await.unwrap();
+            let start = tokio::time::Instant::now();
+            let error = socks5_connect(&mut stream, &upstream, "example.com", 443)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("协商超时"), "{error:#}");
+            assert_eq!(start.elapsed(), UPSTREAM_CONNECT_TIMEOUT);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn socks_handshake_uses_one_deadline_across_authentication_stages() {
+        let upstream = upstream("socks5h://user:pass@127.0.0.1:1080");
+        let (mut stream, mut peer) = tokio::io::duplex(1024);
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            peer.write_all(&[0x05, 0x02]).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            peer.write_all(&[0x01, 0x00]).await.unwrap();
+        });
+        let start = tokio::time::Instant::now();
+        let error = socks5_connect(&mut stream, &upstream, "example.com", 443)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("协商超时"), "{error:#}");
+        assert_eq!(start.elapsed(), UPSTREAM_CONNECT_TIMEOUT);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn socks_rejects_unoffered_auth_and_malformed_responses() {
+        for (raw, response, expected) in [
+            (
+                "socks5h://127.0.0.1:1080",
+                &[0x05, 0x02][..],
+                "未提供的认证方式",
+            ),
+            (
+                "socks5h://user:pass@127.0.0.1:1080",
+                &[0x05, 0x02, 0x05, 0x00][..],
+                "认证版本",
+            ),
+            (
+                "socks5h://127.0.0.1:1080",
+                &[0x05, 0x00, 0x05, 0x00, 0x01, 0x01][..],
+                "保留字段",
+            ),
+        ] {
+            let (mut stream, mut peer) = tokio::io::duplex(1024);
+            peer.write_all(response).await.unwrap();
+            let error = test_deadline(socks5_connect(
+                &mut stream,
+                &upstream(raw),
+                "example.com",
+                443,
+            ))
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_head_enforces_limit_even_when_terminator_arrives_in_same_chunk() {
+        let mut oversized = vec![b'x'; MAX_HEAD_BYTES];
+        oversized.extend_from_slice(b"\r\n\r\n");
+        let error = read_head(&mut oversized.as_slice()).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+        let mut valid = vec![b'x'; MAX_HEAD_BYTES - 4];
+        valid.extend_from_slice(b"\r\n\r\npayload");
+        let (read, end) = read_head(&mut valid.as_slice()).await.unwrap();
+        assert_eq!(end, MAX_HEAD_BYTES);
+        assert_eq!(read, valid[..read.len()]);
     }
 
     #[tokio::test]
