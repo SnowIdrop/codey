@@ -36,6 +36,8 @@ pub(crate) struct WebSocketIngress {
     permit: Option<OwnedSemaphorePermit>,
     read_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     reading: bool,
+    #[cfg(test)]
+    write_blocked: bool,
 }
 
 impl WebSocketIngress {
@@ -72,6 +74,8 @@ impl WebSocketIngress {
             permit: None,
             read_deadline: None,
             reading: false,
+            #[cfg(test)]
+            write_blocked: false,
         }
     }
 
@@ -338,6 +342,11 @@ impl AsyncWrite for WebSocketIngress {
         cx: &mut TaskContext<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
+        // 测试直接阻塞写入，避免依赖操作系统的套接字缓冲区大小。
+        #[cfg(test)]
+        if self.write_blocked {
+            return Poll::Pending;
+        }
         Pin::new(
             self.get_mut()
                 .stream
@@ -651,39 +660,42 @@ mod tests {
         assert_eq!(budget.available_permits(), 4);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancelled_decoder_flush_keeps_message_and_permit_until_fixed_deadline() {
         let budget = Arc::new(Semaphore::new(4));
-        let (mut socket, mut sender) = raw_pair_with_config(
-            Arc::clone(&budget),
-            downstream_websocket_config().write_buffer_size(32 * 1024 * 1024),
+        let mut ingress = WebSocketIngress::empty(None, Arc::clone(&budget), false);
+        // 预填完整入站帧，使轮询只等待被阻塞的写入。
+        let mut prefetched = header(1, true, 16 * 1024);
+        prefetched.resize(prefetched.len() + 16 * 1024, b'x');
+        ingress.prefetched_end = prefetched.len();
+        ingress.prefetched = prefetched.into_boxed_slice();
+        ingress.write_blocked = true;
+        let stream = WebSocketStream::from_raw_socket(
+            ingress,
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            Some(downstream_websocket_config().write_buffer_size(1024)),
         )
         .await;
-        // Leave enough buffered output to make flush wait for this unread peer.
+        let mut socket = BudgetedWebSocket::new(stream);
         socket
             .socket
             .as_mut()
             .unwrap()
-            .feed(WebSocketMessage::Binary(vec![0; 16 * 1024 * 1024].into()))
+            .feed(WebSocketMessage::Binary(vec![0].into()))
             .await
             .unwrap();
-        frame(&mut sender, 1, true, &vec![b'x'; 16 * 1024]).await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), socket.next())
-                .await
-                .is_err()
-        );
-        assert!(socket.pending.is_some());
+        // 每次轮询后丢弃尚未完成的 next()，无需等待实际时间即可模拟取消。
+        assert!(futures_util::poll!(std::pin::pin!(socket.next())).is_pending());
+        assert_eq!(socket.pending.as_ref().unwrap().len(), 16 * 1024);
         assert!(socket.socket.is_some());
         assert_eq!(budget.available_permits(), 3);
         let original_deadline = socket.flush_deadline.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), socket.next())
-                .await
-                .is_err()
-        );
+        tokio::time::advance(DOWNSTREAM_WRITE_TIMEOUT / 2).await;
+        assert!(futures_util::poll!(std::pin::pin!(socket.next())).is_pending());
+        assert_eq!(socket.pending.as_ref().unwrap().len(), 16 * 1024);
+        assert_eq!(budget.available_permits(), 3);
         assert_eq!(socket.flush_deadline, Some(original_deadline));
-        socket.flush_deadline = Some(tokio::time::Instant::now() - Duration::from_millis(1));
+        tokio::time::advance(original_deadline - tokio::time::Instant::now()).await;
         let error = socket.next().await.unwrap().unwrap_err();
         assert!(
             matches!(error, WebSocketError::Io(ref error) if error.kind() == io::ErrorKind::TimedOut)

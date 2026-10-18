@@ -34,12 +34,20 @@ struct FileVersion {
     created: Option<SystemTime>,
     #[cfg(unix)]
     identity: (u64, u64, i64, i64),
+    #[cfg(windows)]
+    identity: (u32, u64),
 }
 
 impl FileVersion {
-    fn from_metadata(metadata: &std::fs::Metadata) -> Option<Self> {
+    fn from_path(path: &Path) -> Option<Self> {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
+        #[cfg(windows)]
+        let file = std::fs::File::open(path).ok()?;
+        #[cfg(windows)]
+        let metadata = file.metadata().ok()?;
+        #[cfg(not(windows))]
+        let metadata = path.metadata().ok()?;
         Some(Self {
             len: metadata.len(),
             modified: metadata.modified().ok()?,
@@ -51,6 +59,26 @@ impl FileVersion {
                 metadata.ctime(),
                 metadata.ctime_nsec(),
             ),
+            #[cfg(windows)]
+            identity: {
+                use std::os::windows::io::AsRawHandle;
+                use windows::Win32::Foundation::HANDLE;
+                use windows::Win32::Storage::FileSystem::{
+                    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+                };
+                let mut information = BY_HANDLE_FILE_INFORMATION::default();
+                // 创建时间可能相同或被保留，卷号和文件索引才能识别同路径替换。
+                // file 在调用期间持有有效句柄，information 提供完整的可写输出空间。
+                unsafe {
+                    GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut information)
+                }
+                .ok()?;
+                (
+                    information.dwVolumeSerialNumber,
+                    (u64::from(information.nFileIndexHigh) << 32)
+                        | u64::from(information.nFileIndexLow),
+                )
+            },
         })
     }
 }
@@ -399,14 +427,13 @@ fn cached_history(home: &Path, session_id: &str) -> Option<ConversationStatsSnap
             canonical_rollout(&home, cached.path.as_ref()?)?
         }
     };
-    let metadata = path.metadata().ok()?;
-    let version = FileVersion::from_metadata(&metadata)?;
+    let version = FileVersion::from_path(&path)?;
     if cached.version.as_ref() != Some(&version) {
         let appended = cached.version.as_ref().is_some_and(|old| {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             let same_file =
                 old.identity.0 == version.identity.0 && old.identity.1 == version.identity.1;
-            #[cfg(not(unix))]
+            #[cfg(not(any(unix, windows)))]
             let same_file = old.created == version.created;
             same_file && version.len > old.len
         });
@@ -1014,17 +1041,46 @@ mod tests {
             cached_history(home.path(), ID).unwrap().total_tokens,
             Some(200)
         );
+        let initial_version = FileVersion::from_path(&current).unwrap();
         let replacement = dir.join("replacement.jsonl");
         std::fs::write(&replacement, event(300)).unwrap();
-        OpenOptions::new()
-            .write(true)
-            .open(&replacement)
-            .unwrap()
+        let replacement_file = OpenOptions::new().write(true).open(&replacement).unwrap();
+        replacement_file
             .set_times(FileTimes::new().set_modified(current_time))
             .unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::{fs::MetadataExt, io::AsRawHandle};
+            use windows::Win32::Foundation::{FILETIME, HANDLE};
+            use windows::Win32::Storage::FileSystem::SetFileTime;
+            let created = current.metadata().unwrap().creation_time();
+            let created = FILETIME {
+                dwLowDateTime: created as u32,
+                dwHighDateTime: (created >> 32) as u32,
+            };
+            // 显式保留创建时间，避免测试结果依赖 Windows 的时间戳精度。
+            // replacement_file 和 created 在调用期间保持有效。
+            unsafe {
+                SetFileTime(
+                    HANDLE(replacement_file.as_raw_handle()),
+                    Some(&created),
+                    None,
+                    None,
+                )
+            }
+            .unwrap();
+        }
+        drop(replacement_file);
         // Windows rename 不覆盖目标；先移走旧文件，同路径替换仍保留相同大小和 mtime。
         std::fs::rename(&current, dir.join("previous.jsonl")).unwrap();
         std::fs::rename(&replacement, &current).unwrap();
+        let replaced_version = FileVersion::from_path(&current).unwrap();
+        assert_eq!(initial_version.len, replaced_version.len);
+        assert_eq!(initial_version.modified, replaced_version.modified);
+        #[cfg(windows)]
+        assert_eq!(initial_version.created, replaced_version.created);
+        #[cfg(any(unix, windows))]
+        assert_ne!(initial_version.identity, replaced_version.identity);
         assert_eq!(
             cached_history(home.path(), ID).unwrap().total_tokens,
             Some(300)
