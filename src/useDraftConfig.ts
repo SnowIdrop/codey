@@ -62,13 +62,14 @@ export function useDraftConfig() {
   }
 
   function adoptSavedConfig(incoming: Config, submittedDraft: Config | null) {
-    if (persistedConfigRef.current && incoming.settingsRevision < persistedConfigRef.current.settingsRevision) return;
+    if (persistedConfigRef.current && incoming.settingsRevision < persistedConfigRef.current.settingsRevision) return null;
     const merged = reconcileConfigDraft(submittedDraft, draftConfigRef.current, incoming);
-    if (!merged) return;
+    if (!merged) return null;
     persistedConfigRef.current = incoming;
     draftConfigRef.current = merged.config;
     setConfig(merged.config);
     setDirty(merged.dirty);
+    return merged;
   }
 
   function discardDraft() {

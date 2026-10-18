@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   IconCheck as Check,
   IconAdjustmentsHorizontal,
@@ -283,14 +283,18 @@ function ModelSectionComponent({
   const [routeImportText, setRouteImportText] = useState("");
   const [routeImportError, setRouteImportError] = useState("");
   const [routeImportApplied, setRouteImportApplied] = useState(false);
+  const routeImportGeneration = useRef(0);
   const routeConfigReadOnly = !config.localRouterEnabled;
 
   const resetRouteImport = useCallback(() => {
+    routeImportGeneration.current += 1;
     setRouteImportOpen(false);
     setRouteImportText("");
     setRouteImportError("");
     setRouteImportApplied(false);
   }, []);
+
+  useEffect(() => () => { routeImportGeneration.current += 1; }, []);
 
   useEffect(() => {
     if (!routeConfigReadOnly) return;
@@ -594,6 +598,7 @@ function ModelSectionComponent({
   };
   // 优先读剪贴板，命中连接信息直接填入；读不到或不匹配时展开手动粘贴面板。
   const handleRouteQuickImport = async () => {
+    const generation = ++routeImportGeneration.current;
     if (routeImportOpen) {
       setRouteImportOpen(false);
       return;
@@ -605,6 +610,7 @@ function ModelSectionComponent({
     } catch {
       clipboardText = null;
     }
+    if (generation !== routeImportGeneration.current) return;
     const info = parseNewApiConnectionInfo(clipboardText);
     if (info) {
       applyRouteConnectionInfo(info);
@@ -618,6 +624,7 @@ function ModelSectionComponent({
     setRouteImportOpen(true);
   };
   const handleRouteImportTextChange = (value: string) => {
+    routeImportGeneration.current += 1;
     setRouteImportText(value);
     const info = parseNewApiConnectionInfo(value);
     if (info) {
@@ -714,6 +721,7 @@ function ModelSectionComponent({
       : await onSaveRoute({ ...routeDraft, modelRequestHeaders });
     if (saved) {
       if (routeDraft.authMode === "officialAccount") void refreshOfficialAccounts();
+      resetRouteImport();
       setRouteDialogOpen(false);
       setRouteDraft(null);
       setOfficialRouteDraft(null);

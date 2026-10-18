@@ -42,6 +42,7 @@ import { SettingsLayout } from "./SettingsLayout";
 import { useModelSelection } from "./useModelSelection";
 import { useRuntimeStatus } from "./useRuntimeStatus";
 import { configApplyNotice } from "./configApply";
+import { applyConfigCommandResult, type ConfigCommandResult } from "./configCommandResult";
 import { useAppUpdates } from "./useAppUpdates";
 import {
   NoticeLoadingText,
@@ -274,12 +275,7 @@ export function App({
     currentProvider: provider ?? null,
     officialAccountAvailable: status.officialAccountAvailable === true,
     runOperation,
-    setPersistedConfig: (incoming) => {
-      const merged = adoptRouteConfig(incoming);
-      if (merged) setDirty(merged.dirty);
-    },
-    setStatus,
-    acceptConfigApply,
+    applyConfigResult: (result) => applyCommandResult(result, adoptRouteConfig),
     setNotice,
   });
   const {
@@ -322,7 +318,10 @@ export function App({
         if (result.providerStatus) setProviderStatus(result.providerStatus);
         if (result.modelState) setModelState(result.modelState);
       })
-      .catch(() => undefined);
+      .catch((error) => setNotice({
+        tone: "error",
+        text: `未能刷新插件线路：${errorText(error)}。请重新加载设置页面；已完成的插件操作无需重复。`,
+      }));
   };
   useEffect(() => {
     const refresh = () => refreshPluginRoutesRef.current();
@@ -456,8 +455,7 @@ export function App({
       subagentConfigHotReloadError?: string;
       fastContextToolsStatus?: FastContextToolsStatus;
     }>("save_codey_config", { config: next });
-    adoptSavedConfig(result.config, submittedDraft);
-    result.configApply = acceptConfigApply(result.configApply);
+    if (!applyCommandResult(result, (incoming) => adoptSavedConfig(incoming, submittedDraft))) return result;
     setFastContextToolsStatus(
       result.fastContextToolsStatus ?? UNKNOWN_FAST_CONTEXT_TOOLS_STATUS,
     );
@@ -466,14 +464,6 @@ export function App({
         detail: { config: result.config },
       }),
     );
-    if (result.providerStatus) setProviderStatus(result.providerStatus);
-    if (result.modelState) setModelState(result.modelState);
-    if (!result.configApply && typeof result.restartRequired === "boolean") {
-      setStatus((current) => ({
-        ...current,
-        restartRequired: result.restartRequired,
-      }));
-    }
     // 保存结果已包含配置、模型和重启状态；其余运行状态在后台补充。
     void refreshStatus().catch(() => undefined);
     return result;
@@ -600,30 +590,23 @@ export function App({
     });
   }
 
-  function applyRouteResult(result: {
-    configApply?: import("./App.types").ConfigApplyStatus | null;
-    config: Config;
-    providerStatus?: ProviderStatus;
-    modelState?: ModelState;
-    restartRequired?: boolean;
-  }) {
-    result.configApply = acceptConfigApply(result.configApply);
-    const merged = adoptRouteConfig(result.config);
-    if (!merged) return;
-    if (result.providerStatus) setProviderStatus(result.providerStatus);
-    if (result.modelState) setModelState(result.modelState);
-    if (!result.configApply && typeof result.restartRequired === "boolean") {
-      setStatus((current) => ({
-        ...current,
-        restartRequired: result.restartRequired,
-      }));
-    }
-    setDirty(merged.dirty);
+  function applyCommandResult(
+    result: ConfigCommandResult,
+    adoptConfig: (incoming: Config) => { dirty: boolean } | null,
+  ) {
+    return applyConfigCommandResult(result, {
+      adoptConfig, acceptConfigApply, setDirty, setProviderStatus, setModelState, setStatus,
+    });
+  }
+
+  function applyRouteResult(result: ConfigCommandResult) {
+    if (!applyCommandResult(result, adoptRouteConfig)) return false;
     window.dispatchEvent(
       new CustomEvent("codey:config-changed", {
         detail: { config: result.config },
       }),
     );
+    return true;
   }
 
   async function saveRoute(route: Profile) {
