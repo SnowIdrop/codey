@@ -1,5 +1,8 @@
 //! 从当前 Codex 数据目录读取原生累计快照，不累加每轮或运行期统计。
-use super::{ConversationStatsSnapshot, lock_unpoisoned, normalize_session_id};
+use super::{
+    ConversationStatsSnapshot, RuntimeHistoryBoundary, lock_unpoisoned, normalize_session_id,
+};
+use crate::route_request_log::SessionGenerationTotals;
 use codey_runtime_core::codex_sqlite::codex_session_db_paths_from_home;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
@@ -60,7 +63,10 @@ pub(crate) async fn snapshot_with_history(
     let suppress_history_speed = runtime
         .as_ref()
         .is_some_and(|s| s.in_flight.unwrap_or(0) > 0 || s.output_tokens_per_second.is_some());
-    let (history, speed, timing) = tokio::task::spawn_blocking(move || {
+    let average_boundary = runtime
+        .as_ref()
+        .and_then(|s| s.average_history_boundary.clone());
+    let (history, speed, timing, average) = tokio::task::spawn_blocking(move || {
         let history = cached_history(&home, &session_id);
         let speed = if suppress_history_speed {
             None
@@ -68,15 +74,110 @@ pub(crate) async fn snapshot_with_history(
             cached_speed(&home, &session_id)
         };
         let timing = cached_timing(&home, &session_id);
-        (history, speed, timing)
+        let average = cached_average(&home, &session_id, average_boundary.as_ref());
+        (history, speed, timing, average)
     })
     .await
     .ok()
     .unwrap_or_default();
-    apply_recorded_speed(
-        apply_recorded_timing(merge(history, runtime), timing),
-        speed,
+    apply_recorded_average(
+        apply_recorded_speed(
+            apply_recorded_timing(merge(history, runtime), timing),
+            speed,
+        ),
+        average,
     )
+}
+
+type AverageCache = HashMap<(PathBuf, PathBuf, String), Arc<Mutex<CachedAverage>>>;
+static AVERAGE_CACHE: OnceLock<Mutex<AverageCache>> = OnceLock::new();
+const LOG_LOOKUP_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct CachedAverage {
+    at: Option<Instant>,
+    boundary: Option<RuntimeHistoryBoundary>,
+    totals: Option<SessionGenerationTotals>,
+}
+
+impl CachedAverage {
+    fn get_or_query(
+        &mut self,
+        boundary: Option<&RuntimeHistoryBoundary>,
+        now: Instant,
+        query: impl FnOnce() -> Option<SessionGenerationTotals>,
+    ) -> Option<SessionGenerationTotals> {
+        if self
+            .at
+            .is_some_and(|at| now.saturating_duration_since(at) < LOG_LOOKUP_TTL)
+            && self.boundary.as_ref() == boundary
+        {
+            return self.totals;
+        }
+        self.totals = query();
+        self.boundary = boundary.cloned();
+        self.at = Some(now);
+        self.totals
+    }
+}
+
+fn cached_average(
+    home: &Path,
+    session_id: &str,
+    boundary: Option<&RuntimeHistoryBoundary>,
+) -> Option<SessionGenerationTotals> {
+    let session_id = normalize_session_id(session_id);
+    uuid::Uuid::parse_str(session_id).ok()?;
+    let root = codey_runtime_core::paths::default_app_state_dir();
+    let key = (
+        home.canonicalize().ok()?,
+        root.clone(),
+        session_id.to_owned(),
+    );
+    let entry = {
+        let mut cache = lock_unpoisoned(AVERAGE_CACHE.get_or_init(Default::default));
+        if cache.len() >= 128
+            && !cache.contains_key(&key)
+            && let Some(old) = cache.keys().next().cloned()
+        {
+            cache.remove(&old);
+        }
+        Arc::clone(cache.entry(key).or_default())
+    };
+    // 磁盘查询只锁当前会话，不能让慢库阻塞其他会话的缓存命中。
+    lock_unpoisoned(&entry).get_or_query(boundary, Instant::now(), || {
+        crate::route_request_log::session_recorded_average(&root, session_id, boundary)
+    })
+}
+
+fn apply_recorded_average(
+    snapshot: Option<ConversationStatsSnapshot>,
+    recorded: Option<SessionGenerationTotals>,
+) -> Option<ConversationStatsSnapshot> {
+    let Some(recorded) = recorded else {
+        return snapshot;
+    };
+    let mut snapshot = snapshot.unwrap_or_else(|| ConversationStatsSnapshot {
+        usage_source: "unknown",
+        usage_scope: "unknown",
+        ..Default::default()
+    });
+    let mut totals = snapshot.average_runtime_totals;
+    let has_runtime = totals.requests > 0;
+    totals.add(recorded);
+    snapshot.average_output_tokens_per_second = totals.speed();
+    snapshot.average_speed_request_count = Some(totals.requests);
+    snapshot.average_speed_source = Some(if has_runtime {
+        "runtime_and_request_log"
+    } else {
+        "request_log"
+    });
+    snapshot.average_speed_scope = Some(if has_runtime {
+        "recorded_and_runtime"
+    } else {
+        "recorded_requests"
+    });
+    Some(snapshot)
 }
 
 type TimingCache = HashMap<
@@ -99,13 +200,15 @@ fn cached_timing(
         root.clone(),
         session_id.to_owned(),
     );
-    let mut cache = lock_unpoisoned(TIMING_CACHE.get_or_init(Default::default));
+    let cache = lock_unpoisoned(TIMING_CACHE.get_or_init(Default::default));
     if let Some((at, timing)) = cache.get(&key) {
         if at.elapsed() < Duration::from_secs(30) {
             return *timing;
         }
     }
+    drop(cache);
     let timing = crate::route_request_log::session_recorded_timing(&root, session_id);
+    let mut cache = lock_unpoisoned(TIMING_CACHE.get_or_init(Default::default));
     if cache.len() >= 128 && !cache.contains_key(&key) {
         if let Some(old) = cache.keys().next().cloned() {
             cache.remove(&old);
@@ -156,13 +259,15 @@ fn cached_speed(home: &Path, session_id: &str) -> Option<(f64, u64)> {
         root.clone(),
         session_id.to_owned(),
     );
-    let mut cache = lock_unpoisoned(SPEED_CACHE.get_or_init(Default::default));
+    let cache = lock_unpoisoned(SPEED_CACHE.get_or_init(Default::default));
     if let Some((at, speed)) = cache.get(&key) {
         if at.elapsed() < Duration::from_secs(30) {
             return *speed;
         }
     }
+    drop(cache);
     let speed = crate::route_request_log::latest_session_recorded_speed(&root, session_id);
+    let mut cache = lock_unpoisoned(SPEED_CACHE.get_or_init(Default::default));
     if cache.len() >= 128 && !cache.contains_key(&key) {
         if let Some(old) = cache.keys().next().cloned() {
             cache.remove(&old);
@@ -222,6 +327,15 @@ fn merge(
         history.speed_source = runtime.speed_source;
         history.speed_scope = runtime.speed_scope;
         history.speed_recorded_at_unix_ms = runtime.speed_recorded_at_unix_ms;
+        history.speed_is_estimate = runtime.speed_is_estimate;
+        history.speed_state = runtime.speed_state;
+        history.average_output_tokens_per_second = runtime.average_output_tokens_per_second;
+        history.average_speed_is_estimate = runtime.average_speed_is_estimate;
+        history.average_speed_source = runtime.average_speed_source;
+        history.average_speed_scope = runtime.average_speed_scope;
+        history.average_speed_request_count = runtime.average_speed_request_count;
+        history.average_runtime_totals = runtime.average_runtime_totals;
+        history.average_history_boundary = runtime.average_history_boundary;
         history.updated_at_unix_ms = runtime.updated_at_unix_ms;
         history.model_duration_ms = runtime.model_duration_ms;
         history.average_ttft_ms = runtime.average_ttft_ms;
@@ -434,6 +548,165 @@ mod tests {
             "cached_input_tokens":10
         }}}})
         .to_string()
+    }
+
+    #[test]
+    fn average_cache_reuses_history_until_ttl_or_boundary_changes() {
+        let mut cache = CachedAverage::default();
+        let now = Instant::now();
+        let mut queries = 0;
+        let totals = SessionGenerationTotals {
+            output_tokens: 10.0,
+            generation_ms: 1000.0,
+            requests: 1,
+        };
+        let mut query = || {
+            queries += 1;
+            Some(totals)
+        };
+        let mut boundary = RuntimeHistoryBoundary {
+            timestamp_unix_ms: 1000,
+            request_ids: std::collections::HashSet::from(["a".to_owned()]),
+            exclude_entire_millisecond: false,
+        };
+        for second in 0..30 {
+            assert_eq!(
+                cache.get_or_query(
+                    Some(&boundary),
+                    now + Duration::from_secs(second),
+                    &mut query
+                ),
+                Some(totals)
+            );
+        }
+        drop(query);
+        assert_eq!(queries, 1);
+        let hit_started = Instant::now();
+        for _ in 0..10_000 {
+            cache.get_or_query(Some(&boundary), now + Duration::from_secs(29), || {
+                queries += 1;
+                Some(totals)
+            });
+        }
+        eprintln!(
+            "session average: 10000 in-memory cache hits: {:?}; query calls including first lookup: {queries}",
+            hit_started.elapsed()
+        );
+        assert_eq!(queries, 1);
+        // 同毫秒新增运行期请求必须立刻更新排除条件，不能等待 TTL。
+        boundary.request_ids.insert("b".into());
+        cache.get_or_query(Some(&boundary), now + Duration::from_secs(29), || {
+            queries += 1;
+            Some(totals)
+        });
+        assert_eq!(queries, 2);
+        cache.get_or_query(Some(&boundary), now + Duration::from_secs(59), || {
+            queries += 1;
+            None
+        });
+        cache.get_or_query(Some(&boundary), now + Duration::from_secs(60), || {
+            queries += 1;
+            Some(totals)
+        });
+        assert_eq!(queries, 3, "missing logs are also cached");
+        boundary.timestamp_unix_ms = 999;
+        cache.get_or_query(Some(&boundary), now + Duration::from_secs(60), || {
+            queries += 1;
+            Some(totals)
+        });
+        assert_eq!(queries, 4);
+    }
+
+    #[test]
+    fn average_history_and_runtime_merge_without_recounting_delayed_logs() {
+        use crate::conversation_stats::{ConversationStatsRegistry, LiveSpeedSample};
+        use crate::route_request_log::session_recorded_average;
+        let root = tempfile::tempdir().unwrap();
+        let connection = Connection::open(root.path().join("route-requests.sqlite3")).unwrap();
+        connection.execute_batch("CREATE TABLE route_request_logs (
+            request_id TEXT PRIMARY KEY, codex_session_id TEXT, timestamp_unix_ms INTEGER,
+            request_kind TEXT, codex_session_is_parent INTEGER, output_tokens INTEGER,
+            total_duration_ms INTEGER, router_pre_upstream_ms INTEGER, upstream_first_byte_ms INTEGER);
+            CREATE INDEX idx_route_request_logs_session_time ON route_request_logs(codex_session_id, timestamp_unix_ms);").unwrap();
+        let insert = |id: &str, session: &str, timestamp: u64, output: u64, duration: u64| {
+            connection
+                .execute(
+                    "INSERT INTO route_request_logs VALUES (?1,?2,?3,'responses',0,?4,?5,100,200)",
+                    rusqlite::params![id, session, timestamp, output, duration + 300],
+                )
+                .unwrap();
+        };
+        insert("historical", ID, 100, 100, 1000);
+        insert("foreign", "foreign", 100, 9999, 1);
+        let historical = session_recorded_average(root.path(), ID, None);
+        assert_eq!(
+            apply_recorded_average(None, historical)
+                .unwrap()
+                .average_output_tokens_per_second,
+            Some(100.0)
+        );
+        let registry = ConversationStatsRegistry::default();
+        registry.begin_request(ID, "new", 200);
+        let waiting = registry.snapshot(ID).unwrap();
+        let boundary = waiting.average_history_boundary.clone().unwrap();
+        let mut cache = CachedAverage::default();
+        let now = Instant::now();
+        let recorded = cache.get_or_query(Some(&boundary), now, || {
+            session_recorded_average(root.path(), ID, Some(&boundary))
+        });
+        let waiting = apply_recorded_average(Some(waiting), recorded).unwrap();
+        assert_eq!(waiting.average_output_tokens_per_second, Some(100.0));
+        assert_eq!(waiting.average_speed_scope, Some("recorded_requests"));
+        registry.update_request_speed(
+            ID,
+            "new",
+            LiveSpeedSample {
+                output_tokens: 300.0,
+                generation_started_at: now - Duration::from_secs(1),
+                is_estimate: true,
+            },
+            201,
+        );
+        let running = registry.snapshot_at(ID, now).unwrap();
+        let running = apply_recorded_average(
+            merge(parse_tail(event(1_000_000).as_bytes(), ID), Some(running)),
+            recorded,
+        )
+        .unwrap();
+        assert_eq!(running.average_output_tokens_per_second, Some(200.0));
+        assert_eq!(running.average_speed_scope, Some("recorded_and_runtime"));
+        assert!(running.average_speed_is_estimate);
+        assert_eq!(running.total_tokens, Some(1_000_000));
+        let mut entry = super::super::tests::sample_entry(Some(ID), "responses");
+        entry.request_id = "new".into();
+        entry.timestamp_unix_ms = 200;
+        entry.token_usage.output_tokens = Some(600);
+        entry.router_pre_upstream_ms = Some(100);
+        entry.upstream_first_byte_ms = Some(200);
+        entry.total_duration_ms = 3300;
+        registry.finish_request(&entry);
+        // 完成后日志尚未落盘，运行期已能立即给出整个会话的加权值。
+        let completed = apply_recorded_average(registry.snapshot(ID), recorded).unwrap();
+        assert_eq!(completed.average_output_tokens_per_second, Some(175.0));
+        assert!(!completed.average_speed_is_estimate);
+        insert("new", ID, 200, 600, 3000);
+        // 同毫秒的历史请求仍保留，只排除跟踪到的那个请求 ID。
+        insert("same-ms-historical", ID, 200, 0, 1000);
+        let refreshed = cache.get_or_query(Some(&boundary), now + Duration::from_secs(30), || {
+            session_recorded_average(root.path(), ID, Some(&boundary))
+        });
+        let done = apply_recorded_average(registry.snapshot(ID), refreshed).unwrap();
+        assert_eq!(done.average_output_tokens_per_second, Some(140.0));
+        assert_eq!(done.average_speed_request_count, Some(3));
+        assert_eq!(done.average_speed_source, Some("runtime_and_request_log"));
+        registry.begin_request(ID, "next", 300);
+        let next = apply_recorded_average(registry.snapshot(ID), refreshed).unwrap();
+        assert_eq!(next.average_output_tokens_per_second, Some(140.0));
+        assert_eq!(next.speed_state, Some("waiting"));
+        // 丢失或关闭日志时保留真实运行期累计，范围明确为 runtime。
+        let runtime_only = apply_recorded_average(registry.snapshot(ID), None).unwrap();
+        assert_eq!(runtime_only.average_output_tokens_per_second, Some(200.0));
+        assert_eq!(runtime_only.average_speed_scope, Some("runtime"));
     }
 
     #[test]
@@ -671,6 +944,28 @@ mod tests {
         let snapshot = cached_history(home.path(), ID).unwrap();
         assert_eq!(merge(Some(snapshot), None).unwrap().total_tokens, Some(200));
         assert!(cached_history(home.path(), "../secrets").is_none());
+    }
+
+    #[test]
+    fn history_merge_preserves_current_request_speed_metadata() {
+        let history = parse_tail(event(100).as_bytes(), ID).unwrap();
+        let runtime = ConversationStatsSnapshot {
+            in_flight: Some(1),
+            requests_scope: Some("runtime"),
+            output_tokens_per_second: Some(42.0),
+            speed_source: Some("runtime"),
+            speed_scope: Some("current_request"),
+            speed_state: Some("streaming"),
+            speed_is_estimate: true,
+            ..Default::default()
+        };
+        let merged =
+            apply_recorded_speed(merge(Some(history), Some(runtime)), Some((99.0, 1000))).unwrap();
+        assert_eq!(merged.total_tokens, Some(100));
+        assert_eq!(merged.output_tokens_per_second, Some(42.0));
+        assert_eq!(merged.speed_scope, Some("current_request"));
+        assert_eq!(merged.speed_state, Some("streaming"));
+        assert!(merged.speed_is_estimate);
     }
 
     #[test]

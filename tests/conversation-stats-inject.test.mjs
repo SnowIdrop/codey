@@ -18,6 +18,10 @@ class FakeElement extends FakeElementCore {
   }
 
   matches(selector) {
+    if (selector === ":popover-open") {
+      if (typeof this.showPopover !== "function") throw new SyntaxError("Unsupported popover selector");
+      return this.popoverOpen === true;
+    }
     const match = selector.match(/^(\w+)?\.([\w-]+)$/);
     if (match) return (!match[1] || this.tagName === match[1].toUpperCase())
       && String(this.className || "").split(/\s+/).includes(match[2]);
@@ -89,12 +93,16 @@ const createEnvironment = (options = {}) => {
     documentElement,
     visibilityState: "visible",
     activeElement: body,
-    createElement: (tagName) => Object.assign(new FakeElement(tagName), { ownerDocument: document }),
+    createElement: (tagName) => Object.assign(new FakeElement(tagName), { ownerDocument: document }, options.popover ? {
+      showPopover() { this.popoverOpen = true; },
+      hidePopover() { this.popoverOpen = false; },
+    } : {}),
     getElementById: (id) => findById(documentElement, id),
     querySelector: (selector) => documentElement.querySelector(selector),
     querySelectorAll: (selector) => documentElement.querySelectorAll(selector),
     listeners: new Map(),
     addEventListener: FakeElementCore.prototype.addEventListener,
+    removeEventListener: FakeElementCore.prototype.removeEventListener,
     dispatchEvent: FakeElementCore.prototype.dispatchEvent,
   };
   for (const element of [documentElement, body, scope, anchor, textarea]) element.ownerDocument = document;
@@ -123,7 +131,9 @@ const createEnvironment = (options = {}) => {
     innerHeight: 800,
     innerWidth: 1000,
     location,
-    addEventListener: () => {},
+    listeners: new Map(),
+    addEventListener: FakeElementCore.prototype.addEventListener,
+    removeEventListener: FakeElementCore.prototype.removeEventListener,
   };
 
   const testSetTimeout = (callback, delay, ...args) => {
@@ -168,6 +178,9 @@ const createEnvironment = (options = {}) => {
       ]);
     },
     rerun: () => vm.runInContext(source, context),
+    dispose: () => context.window.__codeyConversationStats.dispose(),
+    markPreviousVersion: () => { context.window.__codeyConversationStats.version = 3; },
+    window,
   };
 };
 
@@ -179,7 +192,12 @@ const STATS = {
   requests: 2,
   inFlight: 0,
   lastStatus: "succeeded",
-  outputTokensPerSecond: 187.52,
+  outputTokensPerSecond: 999,
+  averageOutputTokensPerSecond: 187.52,
+  averageSpeedIsEstimate: false,
+  averageSpeedSource: "runtime",
+  averageSpeedScope: "runtime",
+  averageSpeedRequestCount: 2,
   inputTokens: 128_400,
   outputTokens: 3_100,
   cachedInputTokens: 120_000,
@@ -189,7 +207,7 @@ const STATS = {
 };
 
 const metric = (bar, name) => name === "status" ? bar.dataset.status : bar.querySelector(`.codey-cs-${name}`).textContent;
-const field = (bar, name) => bar.querySelector(`[data-field="${name}"]`).textContent;
+const field = (bar, name) => bar.__codeyCs.fields[name].textContent;
 const summary = (env) => env.bar().querySelector("button.codey-cs-summary");
 const panel = (env) => env.document.getElementById("codey-conversation-stats-activity");
 const click = (element) => element.dispatchEvent({ type: "click" });
@@ -197,6 +215,107 @@ const assertExpanded = (env, expanded) => {
   assert.equal(summary(env).getAttribute("aria-expanded"), String(expanded));
   assert.equal(panel(env).hidden, !expanded);
 };
+
+const observeRenderWork = (env) => {
+  const counts = { composerScans: 0, textWrites: 0 };
+  const querySelectorAll = env.document.querySelectorAll;
+  env.document.querySelectorAll = (selector) => {
+    if (selector === "[data-above-composer-conversation-id]") counts.composerScans += 1;
+    return querySelectorAll(selector);
+  };
+  const refs = env.bar().__codeyCs;
+  for (const element of [refs.speed, refs["cache-rate"], refs.total, refs.activity,
+    ...Object.values(refs.fields), ...Object.values(refs.notes)]) {
+    let value = element.textContent;
+    Object.defineProperty(element, "textContent", {
+      configurable: true,
+      get: () => value,
+      set: (next) => { counts.textWrites += 1; value = next; },
+    });
+  }
+  return counts;
+};
+
+test("refreshes with one composer scan per async phase and only writes changed text", async () => {
+  const env = createEnvironment({ statsBySession: { "conversation-1": STATS } });
+  try {
+    await flushTimers(30);
+    const counts = observeRenderWork(env);
+    const initialCalls = env.calls.length;
+    env.refresh();
+    await flushTimers(30);
+    assert.deepEqual(counts, { composerScans: 2, textWrites: 0 });
+    assert.equal(env.calls.length, initialCalls + 1);
+    env.setStats("conversation-1", { ...STATS, totalTokens: 500, averageOutputTokensPerSecond: 50 });
+    env.refresh();
+    await flushTimers(30);
+    assert.deepEqual(counts, { composerScans: 4, textWrites: 4 });
+    assert.equal(metric(env.bar(), "total"), "500 tok");
+    assert.equal(field(env.bar(), "totalTokens"), "500 tok");
+    assert.equal(metric(env.bar(), "speed"), "50.0 tok/s");
+    assert.equal(field(env.bar(), "speed"), "50.0 tok/s");
+  } finally {
+    env.dispose();
+  }
+});
+
+test("remounts into a replacement composer after an in-flight stats response", async () => {
+  let resolve;
+  const env = createEnvironment({ request: () => new Promise(done => { resolve = done; }) });
+  try {
+    await flushTimers(30);
+    const originalBar = env.bar();
+    env.scope.remove();
+    const replacement = env.document.createElement("div");
+    const anchor = env.document.createElement("div");
+    anchor.setAttribute("data-above-composer-conversation-id", "conversation-1");
+    replacement.append(anchor, env.document.createElement("textarea"));
+    env.document.body.appendChild(replacement);
+    // 不发 MutationObserver 通知，确保完成异步读取时主动重新定位。
+    resolve({ status: "ok", stats: STATS });
+    await flushTimers(30);
+    assert.equal(env.bar(), originalBar);
+    assert.equal(env.bar().parentElement, replacement);
+    assert.equal(metric(env.bar(), "total"), "132k tok");
+  } finally {
+    env.dispose();
+  }
+});
+
+test("discards a response after navigation without a mutation notification", async () => {
+  const pending = [];
+  const env = createEnvironment({ request: sessionId => new Promise(resolve => pending.push({ sessionId, resolve })) });
+  try {
+    await flushTimers(30);
+    env.setConversation("conversation-2");
+    pending[0].resolve({ status: "ok", stats: STATS });
+    await flushTimers(30);
+    assert.equal(metric(env.bar(), "total"), "—");
+    assert.equal(pending[1].sessionId, "conversation-2");
+    pending[1].resolve({ status: "ok", stats: { ...STATS, totalTokens: 700 } });
+    await flushTimers(30);
+    assert.equal(metric(env.bar(), "total"), "700 tok");
+  } finally {
+    env.dispose();
+  }
+});
+
+test("mounts cached stats when the composer appears after the initial response", async () => {
+  const env = createEnvironment({ anchor: false, pathname: "/c/conversation-1", statsBySession: { "conversation-1": STATS } });
+  try {
+    await flushTimers(30);
+    assert.equal(env.bar(), null);
+    assert.equal(env.calls.length, 1);
+    env.scope.append(env.anchor, env.textarea);
+    env.emitAnchorMutation();
+    await flushTimers(160);
+    assert.equal(env.bar().parentElement, env.scope);
+    assert.equal(metric(env.bar(), "total"), "132k tok");
+    assert.equal(env.calls.length, 1, "mounting must not refetch the same session");
+  } finally {
+    env.dispose();
+  }
+});
 
 test("mounts the stats bar under the composer and renders speed/cache/total", async () => {
   const env = createEnvironment({ statsBySession: { "conversation-1": STATS } });
@@ -237,7 +356,7 @@ test("shows unknown values when upstream omits speed and cache", async () => {
     statsBySession: {
       "conversation-1": {
         ...STATS,
-        outputTokensPerSecond: null,
+        averageOutputTokensPerSecond: null,
         cachedInputTokens: null,
         inputTokens: null,
       },
@@ -312,6 +431,20 @@ test("marks in-flight requests as running", async () => {
   const bar = env.bar();
   assert.equal(bar.hidden, false);
   assert.equal(bar.dataset.running, "true");
+});
+
+test("does not fetch in a hidden page and refreshes when visibility returns", async () => {
+  const env = createEnvironment({ statsBySession: { "conversation-1": { ...STATS, inFlight: 1 } } });
+  await flushTimers(30);
+  const calls = env.calls.length;
+  env.document.visibilityState = "hidden";
+  env.refresh();
+  await flushTimers(30);
+  assert.equal(env.calls.length, calls);
+  env.document.visibilityState = "visible";
+  env.document.dispatchEvent({ type: "visibilitychange" });
+  await flushTimers(30);
+  assert.equal(env.calls.length, calls + 1);
 });
 
 test("shows unsuccessful request states and prioritizes active requests", async () => {
@@ -442,12 +575,86 @@ test("pointerdown inside details keeps them open, outside closes them", async ()
   const env = createEnvironment();
   await flushTimers(30);
   click(summary(env));
+  assert.equal(panel(env).parentElement.parentElement, env.document.body);
+  assert.equal(env.bar().contains(panel(env)), false, "details must escape the clipping composer");
   env.document.dispatchEvent({ type: "pointerdown", target: panel(env).querySelector("dd") });
   assertExpanded(env, true);
   env.textarea.focus();
   env.document.dispatchEvent({ type: "pointerdown", target: env.textarea });
   assertExpanded(env, false);
   assert.equal(env.document.activeElement, env.textarea);
+});
+
+test("Escape from the independent panel restores its trigger focus", async () => {
+  const env = createEnvironment();
+  await flushTimers(30);
+  click(summary(env));
+  panel(env).focus();
+  env.document.dispatchEvent({ type: "keydown", key: "Escape", preventDefault() {}, stopPropagation() {} });
+  assertExpanded(env, false);
+  assert.equal(env.document.activeElement, summary(env));
+});
+
+test("native popovers switch and close together with their triggers", async () => {
+  const env = createEnvironment({ popover: true });
+  await flushTimers(30);
+  click(summary(env));
+  assert.equal(panel(env).popoverOpen, true);
+  const tokens = env.bar().__codeyCs.panels.tokens;
+  click(env.bar().__codeyCs.buttons.tokens);
+  assert.equal(panel(env).popoverOpen, false);
+  assert.equal(tokens.popoverOpen, true);
+  env.document.dispatchEvent({ type: "pointerdown", target: env.textarea });
+  assert.equal(tokens.popoverOpen, false);
+});
+
+test("reuses one detached bar and overlay and closes panels on remount", async () => {
+  const env = createEnvironment({ statsBySession: { "conversation-1": STATS } });
+  await flushTimers(30);
+  const originalBar = env.bar();
+  const overlay = panel(env).parentElement;
+  click(summary(env));
+  originalBar.remove();
+  env.emitMutation([{ type: "childList", target: env.scope, removedNodes: [originalBar] }]);
+  await flushTimers(160);
+  assert.equal(env.bar(), originalBar);
+  assert.equal(panel(env).parentElement, overlay);
+  assert.equal(env.document.querySelectorAll("#codey-conversation-stats-overlay").length, 1);
+  assertExpanded(env, false);
+  overlay.remove();
+  env.emitMutation([{ type: "childList", target: env.document.body, removedNodes: [overlay] }]);
+  await flushTimers(160);
+  assert.equal(overlay.parentElement, env.document.body);
+  assert.equal(metric(env.bar(), "total"), "132k tok");
+});
+
+test("dispose removes portal, listeners and pending response without resurrecting UI", async () => {
+  let resolve;
+  const env = createEnvironment({ request: () => new Promise(done => { resolve = done; }) });
+  await flushTimers(30);
+  env.dispose();
+  assert.equal(env.bar(), null);
+  assert.equal(env.document.getElementById("codey-conversation-stats-overlay"), null);
+  assert.equal(env.document.getElementById("codey-conversation-stats-styles"), null);
+  assert.ok([...env.document.listeners.values(), ...env.window.listeners.values()].every(list => list.length === 0));
+  resolve({ status: "ok", stats: STATS });
+  await flushTimers(30);
+  assert.equal(env.bar(), null);
+  assert.equal(env.calls.length, 1);
+});
+
+test("version replacement disposes previous ownership before installing one new portal", async () => {
+  const env = createEnvironment();
+  await flushTimers(30);
+  const originalBar = env.bar();
+  env.markPreviousVersion();
+  env.rerun();
+  await flushTimers(30);
+  assert.notEqual(env.bar(), originalBar);
+  assert.equal(env.document.querySelectorAll("#codey-conversation-stats-overlay").length, 1);
+  assert.equal(env.document.listeners.get("pointerdown").length, 1);
+  click(summary(env));
+  assertExpanded(env, true);
 });
 
 test("hiding the composer closes its open details", async () => {
@@ -524,23 +731,23 @@ test("historical tokens and current runtime request details keep separate scopes
   await flushTimers(30);
   assert.equal(field(env.bar(), "totalTokens"), "131,500 tok");
   assert.equal(metric(env.bar(), "speed"), "188 tok/s");
-  env.setStats("conversation-1", { ...STATS, usageSource: "rollout", usageScope: "session", outputTokensPerSecond: null });
+  env.setStats("conversation-1", { ...STATS, usageSource: "rollout", usageScope: "session", averageOutputTokensPerSecond: null });
   env.refresh();
   await flushTimers(30);
   assert.equal(metric(env.bar(), "speed"), "—");
 });
 
-test("shows recorded historical speed independently of runtime request fields", async () => {
+test("shows recorded historical average independently of runtime request fields", async () => {
   const history = {
     usageSource: "rollout", usageScope: "session", requestsScope: null,
     totalTokens: 131500, requests: null, model: null, lastStatus: null,
-    outputTokensPerSecond: 62.35, speedSource: "request_log",
-    speedScope: "latest_recorded_request", speedRecordedAtUnixMs: 1_760_000_000_000,
+    averageOutputTokensPerSecond: 62.35, averageSpeedSource: "request_log",
+    averageSpeedScope: "recorded_requests", averageSpeedRequestCount: 20,
   };
   const env = createEnvironment({ statsBySession: { "conversation-1": history } });
   await flushTimers(30);
   assert.equal(metric(env.bar(), "speed"), "62.4 tok/s");
-  assert.match(summary(env).getAttribute("aria-label"), /可能早于最近请求/);
+  assert.match(summary(env).getAttribute("aria-label"), /仅覆盖有记录且有有效计时的请求/);
   env.setStats("conversation-1", { ...history, totalTokens: null, usageSource: "unknown", usageScope: "unknown" });
   env.refresh();
   await flushTimers(30);
@@ -550,16 +757,16 @@ test("shows recorded historical speed independently of runtime request fields", 
   assert.equal(metric(env.bar(), "status"), "历史速度记录");
 });
 
-test("recorded speed has its own scope and is hidden while a new request runs", async () => {
-  const data = { ...STATS, speedSource: "request_log", speedScope: "latest_recorded_request" };
+test("preserves the recorded average while the next step waits for output", async () => {
+  const data = { ...STATS, averageSpeedSource: "request_log", averageSpeedScope: "recorded_requests" };
   const env = createEnvironment({ statsBySession: { "conversation-1": data } });
   await flushTimers(30);
   assert.equal(metric(env.bar(), "speed"), "188 tok/s");
-  for (const changes of [{ inFlight: 1 }, { outputTokensPerSecond: null }, { speedScope: null }]) {
+  for (const changes of [{ inFlight: 1, speedState: "waiting" }, { averageOutputTokensPerSecond: null }, { averageSpeedScope: null }]) {
     env.setStats("conversation-1", { ...data, ...changes });
     env.refresh();
     await flushTimers(30);
-    assert.equal(metric(env.bar(), "speed"), "—");
+    assert.equal(metric(env.bar(), "speed"), changes.inFlight ? "188 tok/s" : "—");
   }
   env.setStats("conversation-1", { ...STATS, speedSource: "runtime", speedScope: "latest_request" });
   env.refresh();
@@ -567,16 +774,171 @@ test("recorded speed has its own scope and is hidden while a new request runs", 
   assert.equal(metric(env.bar(), "speed"), "188 tok/s");
 });
 
-test("legacy backend is explicitly runtime only and cannot claim a latest speed", async () => {
+test("legacy backend is runtime only and cannot present a single-request speed as an average", async () => {
   const legacy = { ...STATS };
   delete legacy.usageSource;
   delete legacy.usageScope;
   delete legacy.requestsScope;
+  delete legacy.averageOutputTokensPerSecond;
+  delete legacy.averageSpeedSource;
+  delete legacy.averageSpeedScope;
   const env = createEnvironment({ statsBySession: { "conversation-1": legacy } });
   await flushTimers(30);
   assert.match(env.bar().querySelector(".codey-cs-tokens-summary").getAttribute("aria-label"), /本次运行/);
   assert.doesNotMatch(summary(env).getAttribute("aria-label"), /会话累计/);
   assert.equal(metric(env.bar(), "speed"), "—");
+});
+
+test("shows exact and estimated session averages during generation", async () => {
+  const env = createEnvironment();
+  for (const [averageSpeedIsEstimate, expected] of [[false, "62.4 tok/s"], [true, "≈62.4 tok/s"]]) {
+    env.setStats("conversation-1", { ...STATS, inFlight: 1, averageOutputTokensPerSecond: 62.35,
+      averageSpeedIsEstimate });
+    env.refresh();
+    await flushTimers(30);
+    assert.equal(metric(env.bar(), "speed"), expected);
+    assert.equal(field(env.bar(), "speed"), expected);
+    assert.equal(env.bar().dataset.running, "true");
+    assert.match(summary(env).getAttribute("aria-label"), /会话平均速度/);
+    assert.match(env.bar().__codeyCs.notes.activity.textContent, /累计输出 Token ÷ 累计生成耗时，工具间隔不计/);
+    assert.equal(env.bar().__codeyCs.notes.activity.textContent.includes("含生成中的 Token 估算"), averageSpeedIsEstimate);
+  }
+});
+
+test("uses the backend weighted average instead of total tokens or the last step speed", async () => {
+  // 两步各输出 100 token，用时 1 秒和 9 秒；累计平均为 20，不能取两步速度的算术平均。
+  const env = createEnvironment({ statsBySession: { "conversation-1": {
+    ...STATS, outputTokens: 10000, outputTokensPerSecond: 100 / 9,
+    averageOutputTokensPerSecond: 200 / 10, modelDurationMs: 30000,
+  } } });
+  await flushTimers(30);
+  assert.equal(metric(env.bar(), "speed"), "20.0 tok/s");
+  assert.equal(field(env.bar(), "speed"), "20.0 tok/s");
+  assert.equal(panel(env).querySelectorAll("dt").at(-1).textContent, "平均速度（TPS）");
+});
+
+test("keeps the accumulated runtime average and open panel across step boundaries", async () => {
+  const env = createEnvironment({ statsBySession: { "conversation-1": STATS } });
+  await flushTimers(30);
+  click(summary(env));
+  const originalPanel = panel(env);
+  env.setStats("conversation-1", { ...STATS, requests: 3, inFlight: 1,
+    speedState: "waiting", outputTokensPerSecond: null });
+  env.refresh();
+  await flushTimers(30);
+  assert.equal(metric(env.bar(), "speed"), "188 tok/s");
+  assert.equal(field(env.bar(), "speed"), "188 tok/s");
+  assert.equal(panel(env), originalPanel);
+  assertExpanded(env, true);
+});
+
+test("shows combined historical and live averages with an explicit coverage limit", async () => {
+  const env = createEnvironment({ statsBySession: { "conversation-1": {
+    ...STATS, usageSource: "rollout", usageScope: "session", inFlight: 1,
+    averageOutputTokensPerSecond: 42, averageSpeedIsEstimate: true,
+    averageSpeedSource: "runtime_and_request_log", averageSpeedScope: "recorded_and_runtime",
+  } } });
+  await flushTimers(30);
+  assert.equal(metric(env.bar(), "speed"), "≈42.0 tok/s");
+  assert.match(env.bar().__codeyCs.notes.activity.textContent, /覆盖有记录的历史请求与本次运行，未记录的历史请求不计入/);
+});
+
+test("rejects invalid averages and mismatched or missing average attribution", async () => {
+  const env = createEnvironment();
+  for (const changes of [
+    { averageOutputTokensPerSecond: NaN }, { averageOutputTokensPerSecond: Infinity },
+    { averageOutputTokensPerSecond: -5 },
+    { averageSpeedSource: undefined }, { averageSpeedSource: "request_log" },
+    { averageSpeedScope: "latest_request" },
+  ]) {
+    env.setStats("conversation-1", { ...STATS, ...changes });
+    env.refresh();
+    await flushTimers(30);
+    assert.equal(metric(env.bar(), "speed"), "—");
+  }
+});
+
+test("preserves a reported zero session average", async () => {
+  const env = createEnvironment({ statsBySession: { "conversation-1": {
+    ...STATS, averageOutputTokensPerSecond: 0,
+  } } });
+  await flushTimers(30);
+  assert.equal(metric(env.bar(), "speed"), "0.0 tok/s");
+  assert.equal(field(env.bar(), "speed"), "0.0 tok/s");
+});
+
+test("waits for current output instead of showing a previous request speed", async () => {
+  const env = createEnvironment();
+  for (const speedScope of [undefined, "latest_request", "latest_recorded_request", "current_request"]) {
+    env.setStats("conversation-1", { ...STATS, inFlight: 1, averageOutputTokensPerSecond: null,
+      speedSource: speedScope === "latest_recorded_request" ? "request_log" : "runtime",
+      speedScope, speedState: "waiting", outputTokensPerSecond: speedScope === "current_request" ? null : 188 });
+    env.refresh();
+    await flushTimers(30);
+    assert.equal(metric(env.bar(), "speed"), "等待输出");
+    assert.equal(field(env.bar(), "speed"), "等待输出");
+  }
+});
+
+test("distinguishes initial waiting from output arriving without a speed sample", async () => {
+  const env = createEnvironment();
+  for (const [speedState, expected] of [["waiting", "等待输出"], ["streaming", "生成中"], [undefined, "生成中"]]) {
+    env.setStats("conversation-1", { ...STATS, inFlight: 1, speedSource: "runtime",
+      speedScope: "current_request", averageOutputTokensPerSecond: null, speedState });
+    env.refresh();
+    await flushTimers(30);
+    assert.equal(metric(env.bar(), "speed"), expected);
+    assert.equal(field(env.bar(), "speed"), expected);
+  }
+});
+
+test("transitions the live average to a completed average without using the final single-step speed", async () => {
+  const live = { ...STATS, inFlight: 1, averageOutputTokensPerSecond: 62.35,
+    averageSpeedIsEstimate: true, outputTokensPerSecond: 900 };
+  const env = createEnvironment({ statsBySession: { "conversation-1": live } });
+  await flushTimers(30);
+  assert.equal(metric(env.bar(), "speed"), "≈62.4 tok/s");
+  env.setStats("conversation-1", { ...live, inFlight: 0, averageOutputTokensPerSecond: null });
+  env.refresh();
+  await flushTimers(30);
+  assert.equal(metric(env.bar(), "speed"), "—", "a single-step measurement cannot substitute a missing session average");
+  env.setStats("conversation-1", { ...live, inFlight: 0, averageOutputTokensPerSecond: 71.2,
+    averageSpeedIsEstimate: false });
+  env.refresh();
+  await flushTimers(30);
+  assert.equal(metric(env.bar(), "speed"), "71.2 tok/s");
+  assert.match(summary(env).getAttribute("aria-label"), /会话平均速度/);
+});
+
+test("hides a frozen live speed after refresh failure and resumes on recovery", async () => {
+  const live = { ...STATS, inFlight: 1, averageSpeedIsEstimate: true };
+  let response = { status: "ok", stats: live };
+  const env = createEnvironment({ request: () => response });
+  await flushTimers(30);
+  assert.equal(metric(env.bar(), "speed"), "≈188 tok/s");
+  response = { status: "failed" };
+  env.refresh();
+  await flushTimers(30);
+  assert.equal(metric(env.bar(), "speed"), "更新暂停");
+  assert.equal(field(env.bar(), "speed"), "更新暂停");
+  assert.equal(metric(env.bar(), "total"), "132k tok");
+  response = { status: "ok", stats: { ...live, averageOutputTokensPerSecond: 54 } };
+  env.refresh();
+  await flushTimers(30);
+  assert.equal(metric(env.bar(), "speed"), "≈54.0 tok/s");
+});
+
+test("clears live speed and waiting state on conversation changes", async () => {
+  const env = createEnvironment({ statsBySession: { "conversation-1": {
+    ...STATS, inFlight: 1, averageSpeedIsEstimate: true,
+  } } });
+  await flushTimers(30);
+  assert.equal(metric(env.bar(), "speed"), "≈188 tok/s");
+  env.setConversation("conversation-2");
+  env.emitAnchorMutation();
+  await flushTimers(160);
+  assert.equal(metric(env.bar(), "speed"), "—");
+  assert.equal(env.bar().dataset.running, "false");
 });
 
 test("partial historical usage keeps absent values unknown and preserves explicit zero", async () => {
@@ -612,7 +974,7 @@ test("preserves the same session values while refreshing and marks failed values
   resolveRefresh({ status: "failed" });
   await flushTimers(30);
   assert.equal(metric(env.bar(), "total"), "132k tok");
-  assert.match(env.bar().querySelector(".codey-cs-note").textContent, /可能已过期/);
+  assert.match(env.bar().__codeyCs.notes.activity.textContent, /可能已过期/);
 });
 
 test("shows reference activity rows and computes uncached input without double counting", async () => {
@@ -665,7 +1027,7 @@ test("explains independently sourced steps and accumulated tool timing", async (
     timingScope: "recorded_requests", toolTimingScope: "recorded_tools",
   } } });
   await flushTimers(30);
-  const note = env.bar().querySelector(".codey-cs-activity-note").textContent;
+  const note = env.bar().__codeyCs.notes.activity.textContent;
   assert.match(note, /步数仅覆盖本次运行/);
   assert.match(note, /有有效计时的请求/);
   assert.match(note, /工具用时为累计值，并行调用可能重叠/);

@@ -2,10 +2,15 @@
 // /session/stats 返回统计范围；会话 id 取自可见 composer，隐藏会话不参与。
 (() => {
   const PROBE_KEY = "__codeyConversationStats";
-  if (window[PROBE_KEY]?.installed) return;
+  const VERSION = 5;
+  const previous = window[PROBE_KEY];
+  if (previous?.installed && (previous.version === VERSION || !previous.dispose)) return;
+  previous?.dispose?.();
 
   const barId = "codey-conversation-stats";
   const styleId = "codey-conversation-stats-styles";
+  const overlayId = `${barId}-overlay`;
+  const styleScope = `:is(#${barId}, #${overlayId})`;
   const conversationAttribute = "data-above-composer-conversation-id";
   // 与 codey-inject.js 的会话识别保持同一优先级：先看可见 composer，再看
   // 会话元素属性、活动侧边栏项，最后退回 URL。
@@ -35,6 +40,12 @@
   let lastResult = null;
   let sessionGeneration = 0;
   let fetchAttempted = false;
+  let disposed = false;
+  const listeners = [];
+  const listen = (target, type, handler, options) => {
+    target.addEventListener?.(type, handler, options);
+    listeners.push(() => target.removeEventListener?.(type, handler, options));
+  };
 
   const isRendered = (element) => (
     element instanceof HTMLElement
@@ -89,8 +100,7 @@
     String(value || "").trim().replace(/^local:/, "").trim()
   );
 
-  const resolveSessionId = () => {
-    const anchor = findVisibleComposerAnchor();
+  const resolveSessionId = (anchor = findVisibleComposerAnchor()) => {
     // 可见输入框的空标识表示会话尚未建立，不从旧 URL 或侧边栏取回旧会话。
     if (anchor) return normalizeSessionId(anchor.getAttribute(conversationAttribute));
     for (const attribute of sessionIdAttributes.slice(1)) {
@@ -107,42 +117,47 @@
     return normalizeSessionId(params.get("conversation_id") || params.get("session_id"));
   };
 
+  // 只在同一同步阶段复用查询结果；跨过桥接请求后重新确认当前 composer。
+  const resolveSessionContext = () => {
+    const anchor = findVisibleComposerAnchor();
+    return { anchor, sessionId: resolveSessionId(anchor) };
+  };
+
   const ensureStyle = () => {
     if (document.getElementById(styleId)) return;
     const style = document.createElement("style");
     style.id = styleId;
     style.textContent = `
-      #${barId} { --cs-text: var(--text-primary, CanvasText); --cs-muted: color-mix(in srgb, var(--cs-text) 60%, transparent); --cs-line: color-mix(in srgb, var(--cs-text) 11%, transparent); --cs-surface: color-mix(in srgb, var(--bg-primary, Canvas) 97%, var(--cs-text)); -webkit-app-region: no-drag !important; pointer-events: auto !important; position: relative; box-sizing: border-box; width: 100%; min-width: 0; padding: 5px 4px 0; color: var(--cs-text); font: 12px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif; font-variant-numeric: tabular-nums; }
-      #${barId} *, #${barId} *::before { box-sizing: border-box; }
-      #${barId}[hidden], #${barId} [hidden] { display: none !important; }
-      #${barId} .codey-cs-groups { display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 2px 10px; }
-      #${barId} button { font: inherit; color: inherit; cursor: pointer; }
-      #${barId} .codey-cs-summary { display: inline-flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 6px; min-width: 0; max-width: 100%; padding: 4px 9px; border: 0; border-radius: 999px; background: transparent; color: var(--cs-muted); text-align: center; }
-      #${barId} .codey-cs-summary:hover, #${barId} .codey-cs-summary[aria-expanded="true"] { background: color-mix(in srgb, var(--cs-text) 5%, transparent); color: color-mix(in srgb, var(--cs-text) 72%, transparent); }
-      #${barId} button:focus-visible { outline: 2px solid var(--cs-text); outline-offset: 2px; }
-      #${barId} .codey-cs-icon { display: inline-block; width: 15px; height: 15px; flex: 0 0 15px; background: currentColor; mask: var(--cs-icon) center / contain no-repeat; }
-      #${barId} .codey-cs-metric { white-space: nowrap; }
-      #${barId} .codey-cs-details { position: fixed; z-index: 1000; width: min(360px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); overflow: auto; padding: 17px 18px 15px; background: var(--cs-surface); border: 1px solid var(--cs-line); border-radius: 15px; box-shadow: 0 5px 20px #0000000d; user-select: text; }
-      #${barId} .codey-cs-heading { display: flex; align-items: center; gap: 8px; padding-bottom: 11px; margin-bottom: 10px; border-bottom: 1px solid var(--cs-line); }
-      #${barId} .codey-cs-heading strong { font-size: 13px; font-weight: 550; white-space: nowrap; }
-      #${barId} .codey-cs-heading-total { margin-left: auto; font-size: 13px; text-align: right; }
-      #${barId} dl { margin: 0; }
-      #${barId} .codey-cs-detail-row { display: flex; justify-content: space-between; gap: 14px; padding: 4px 0; }
-      #${barId} dt { color: var(--cs-muted); }
-      #${barId} dd { margin: 0; text-align: right; color: color-mix(in srgb, var(--cs-text) 72%, transparent); overflow-wrap: anywhere; }
-      #${barId} .codey-cs-note { margin: 10px 0 0; color: var(--cs-muted); font-size: 10px; line-height: 1.6; }
-      @media (max-width: 480px) { #${barId} .codey-cs-groups { gap: 2px; } #${barId} .codey-cs-summary { padding-inline: 6px; font-size: 11px; } #${barId} .codey-cs-details { padding: 14px; } }
+      ${styleScope} { --cs-text: var(--text-primary, CanvasText); --cs-muted: color-mix(in srgb, var(--cs-text) 60%, transparent); --cs-line: color-mix(in srgb, var(--cs-text) 11%, transparent); --cs-surface: color-mix(in srgb, var(--bg-primary, Canvas) 97%, var(--cs-text)); -webkit-app-region: no-drag !important; pointer-events: auto !important; position: relative; box-sizing: border-box; width: 100%; min-width: 0; padding: 5px 4px 0; color: var(--cs-text); font: 12px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif; font-variant-numeric: tabular-nums; }
+      ${styleScope} *, ${styleScope} *::before { box-sizing: border-box; }
+      ${styleScope}[hidden], ${styleScope} [hidden] { display: none !important; }
+      ${styleScope} .codey-cs-groups { display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: 2px 10px; }
+      ${styleScope} button { font: inherit; color: inherit; cursor: pointer; }
+      ${styleScope} .codey-cs-summary { display: inline-flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 6px; min-width: 0; max-width: 100%; padding: 4px 9px; border: 0; border-radius: 999px; background: transparent; color: var(--cs-muted); text-align: center; }
+      ${styleScope} .codey-cs-summary:hover, ${styleScope} .codey-cs-summary[aria-expanded="true"] { background: color-mix(in srgb, var(--cs-text) 5%, transparent); color: color-mix(in srgb, var(--cs-text) 72%, transparent); }
+      ${styleScope} button:focus-visible { outline: 2px solid var(--cs-text); outline-offset: 2px; }
+      ${styleScope} .codey-cs-icon { display: inline-block; width: 15px; height: 15px; flex: 0 0 15px; background: currentColor; mask: var(--cs-icon) center / contain no-repeat; }
+      ${styleScope} .codey-cs-metric { white-space: nowrap; }
+      ${styleScope} .codey-cs-details { -webkit-app-region: no-drag !important; pointer-events: auto !important; position: fixed; inset: auto; margin: 0; z-index: 1000; width: min(360px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); overflow: auto; padding: 17px 18px 15px; color: var(--cs-text); background: var(--cs-surface); border: 1px solid var(--cs-line); border-radius: 15px; box-shadow: 0 5px 20px #0000000d; user-select: text; }
+      ${styleScope} .codey-cs-heading { display: flex; align-items: center; gap: 8px; padding-bottom: 11px; margin-bottom: 10px; border-bottom: 1px solid var(--cs-line); }
+      ${styleScope} .codey-cs-heading strong { font-size: 13px; font-weight: 550; white-space: nowrap; }
+      ${styleScope} .codey-cs-heading-total { margin-left: auto; font-size: 13px; text-align: right; }
+      ${styleScope} dl { margin: 0; }
+      ${styleScope} .codey-cs-detail-row { display: flex; justify-content: space-between; gap: 14px; padding: 4px 0; }
+      ${styleScope} dt { color: var(--cs-muted); }
+      ${styleScope} dd { margin: 0; text-align: right; color: color-mix(in srgb, var(--cs-text) 72%, transparent); overflow-wrap: anywhere; }
+      ${styleScope} .codey-cs-note { margin: 10px 0 0; color: var(--cs-muted); font-size: 10px; line-height: 1.6; }
+      @media (max-width: 480px) { ${styleScope} .codey-cs-groups { gap: 2px; } ${styleScope} .codey-cs-summary { padding-inline: 6px; font-size: 11px; } ${styleScope} .codey-cs-details { padding: 14px; } }
     `;
     document.documentElement.appendChild(style);
   };
 
   // 状态条挂在 composer 标记所在的同一列容器末尾，即输入卡片下方；
   // composer 容器会随会话切换重建，所以每次都要重新核对挂载父节点。
-  const ensureBar = () => {
-    const anchor = findVisibleComposerAnchor();
+  const ensureBar = (anchor = findVisibleComposerAnchor()) => {
     const host = anchor?.parentElement;
     if (!host) return null;
-    let bar = document.getElementById(barId);
+    let bar = document.getElementById(barId) || statsElement;
     if (!bar?.__codeyCs) {
       bar = document.createElement("div");
       bar.id = barId;
@@ -155,7 +170,11 @@
         return element;
       };
       const groups = make("div", "codey-cs-groups", "", bar);
-      const refs = { buttons: {}, panels: {}, fields: {}, notes: {}, active: null, pinned: false, closeTimer: 0 };
+      // 浮层独立于 composer，避免 transform 改变 fixed 坐标系或 overflow 裁切。
+      const overlay = make("div", "", "", document.body || document.documentElement);
+      overlay.id = overlayId;
+      overlay.style.display = "contents";
+      const refs = { overlay, buttons: {}, panels: {}, fields: {}, notes: {}, active: null, pinned: false, closeTimer: 0 };
       // Tabler Icons v3.45.0 (MIT), matching the existing application icon family.
       const paths = {
         activity: ["M3 12a9 9 0 1 0 18 0a9 9 0 1 0 -18 0", "M11 12a1 1 0 1 0 2 0a1 1 0 1 0 -2 0", "M13.41 10.59l2.59 -2.59", "M7 12a5 5 0 0 1 5 -5"],
@@ -168,7 +187,7 @@
         element.style.setProperty?.("--cs-icon", `url("data:image/svg+xml,${encodeURIComponent(svg)}")`);
       };
       for (const [kind, title, fields] of [
-        ["activity", "会话统计", [["modelDurationMs", "模型用时"], ["toolDurationMs", "工具调用用时"], ["averageTtftMs", "首 token 平均（TTFT）"], ["speed", "输出速度（TPS）"]]],
+        ["activity", "会话统计", [["modelDurationMs", "模型用时"], ["toolDurationMs", "工具调用用时"], ["averageTtftMs", "首 token 平均（TTFT）"], ["speed", "平均速度（TPS）"]]],
         ["tokens", "Token 用量", [["cacheRate", "缓存命中"], ["uncachedInputTokens", "未缓存输入"], ["cachedInputTokens", "缓存读取"], ["outputTokens", "输出"]]],
       ]) {
         const button = make("button", `codey-cs-summary codey-cs-${kind}-summary`, "", groups);
@@ -186,9 +205,10 @@
           const cache = make("span", "codey-cs-metric", "缓存命中 ", button);
           refs["cache-rate"] = make("span", "codey-cs-cache-rate", "—", cache);
         }
-        const panel = make("section", "codey-cs-details", "", bar);
+        const panel = make("section", "codey-cs-details", "", overlay);
         panel.id = `${barId}-${kind}`;
         panel.hidden = true;
+        if (typeof panel.showPopover === "function") panel.setAttribute("popover", "manual");
         panel.setAttribute("aria-label", title);
         const heading = make("div", "codey-cs-heading", "", panel);
         icon(kind, heading);
@@ -223,9 +243,33 @@
       }
       bar.__codeyCs = refs;
     }
-    if (bar.parentElement !== host) host.appendChild(bar);
+    if (bar.parentElement !== host) {
+      if (statsElement) setExpanded(false);
+      host.appendChild(bar);
+    }
+    const overlay = bar.__codeyCs.overlay;
+    if (!overlay.isConnected) {
+      setExpanded(false);
+      (document.body || document.documentElement).appendChild(overlay);
+    }
     statsElement = bar;
     return bar;
+  };
+
+  const containsStats = (target) => Boolean(target && (
+    statsElement?.contains(target) || statsElement?.__codeyCs?.overlay.contains(target)
+  ));
+
+  const syncPanelTheme = () => {
+    const overlay = statsElement?.__codeyCs?.overlay;
+    const computed = statsElement && window.getComputedStyle?.(statsElement);
+    if (!overlay || !computed) return;
+    for (const name of ["--text-primary", "--bg-primary", "--cs-text", "--cs-muted", "--cs-line", "--cs-surface"]) {
+      const value = computed.getPropertyValue(name).trim();
+      if (value) overlay.style.setProperty(name, value);
+      else overlay.style.removeProperty(name);
+    }
+    overlay.style.colorScheme = computed.colorScheme;
   };
 
   const formatTokenCount = (value) => {
@@ -238,6 +282,8 @@
   const positionPanel = () => {
     const refs = statsElement?.__codeyCs;
     if (!refs?.active) return;
+    if (!statsElement.isConnected || !findVisibleComposerAnchor()) { setExpanded(false); return; }
+    syncPanelTheme();
     const panel = refs.panels[refs.active];
     const rect = refs.buttons[refs.active].getBoundingClientRect();
     const panelRect = panel.getBoundingClientRect();
@@ -258,8 +304,14 @@
     refs.active = expanded ? active : null;
     if (!expanded) refs.pinned = false;
     for (const key of Object.keys(refs.panels)) {
-      refs.panels[key].hidden = !expanded || key !== active;
-      refs.buttons[key].setAttribute("aria-expanded", String(expanded && key === active));
+      const panel = refs.panels[key];
+      const visible = expanded && key === active;
+      if (!visible && panel.hasAttribute("popover") && panel.matches(":popover-open")) panel.hidePopover();
+      panel.hidden = !visible;
+      if (visible && panel.hasAttribute("popover") && !panel.matches(":popover-open")) {
+        try { panel.showPopover(); } catch { panel.removeAttribute("popover"); }
+      }
+      refs.buttons[key].setAttribute("aria-expanded", String(visible));
     }
     if (expanded) positionPanel();
     else if (restoreFocus) {
@@ -280,7 +332,7 @@
   };
 
   const formatSpeed = (value) => (
-    value == null || !Number.isFinite(value) || value <= 0
+    value == null || !Number.isFinite(value) || value < 0
       ? null
       : `${value >= 100 ? Math.round(value) : value.toFixed(1)} tok/s`
   );
@@ -292,12 +344,18 @@
     return `${Math.round((cached / input) * 100)}%`;
   };
 
-  const render = () => {
-    const bar = ensureBar();
+  const setText = (element, value) => {
+    // 相同 textContent 仍会替换文本节点，触发其他页面观察器。
+    if (element.textContent !== value) element.textContent = value;
+  };
+
+  const render = (anchor) => {
+    if (disposed) return;
+    const bar = ensureBar(anchor);
     if (!bar) {
       // 输入框不可见（例如离开会话页）时，若旧宿主仍在隐藏会话里，显式
       // 隐藏状态条，避免恢复可见时短暂展示过期数据。
-      if (statsElement?.isConnected) { statsElement.hidden = true; setExpanded(false); }
+      if (statsElement) { statsElement.hidden = true; setExpanded(false); }
       return;
     }
     bar.hidden = false;
@@ -306,28 +364,37 @@
     const runtimeRequests = data.requestsScope === "runtime"
       || (data.usageSource == null && data.usageScope == null);
     const hasRuntimeRequest = runtimeRequests && (data.requests > 0 || data.inFlight > 0);
-    const recordedSpeed = data.speedSource === "request_log"
-      && data.speedScope === "latest_recorded_request" && !(data.inFlight > 0);
-    const runtimeSpeed = hasRuntimeRequest && data.requestsScope === "runtime"
-      && (data.speedSource == null || data.speedSource === "runtime")
-      && (data.speedScope == null || data.speedScope === "latest_request");
+    const running = hasRuntimeRequest && data.inFlight > 0;
+    const stale = fetchAttempted && !lastFetchOk;
+    const recordedSpeed = data.averageSpeedSource === "request_log"
+      && data.averageSpeedScope === "recorded_requests";
+    const runtimeSpeed = data.averageSpeedSource === "runtime"
+      && data.averageSpeedScope === "runtime";
+    const combinedSpeed = data.averageSpeedSource === "runtime_and_request_log"
+      && data.averageSpeedScope === "recorded_and_runtime";
     if (!hasRuntimeRequest) {
       for (const key of ["requests", "inFlight", "model", "lastStatus", "updatedAtUnixMs"]) data[key] = null;
     }
-    // 历史速度独立于运行期请求信息；缺少明确归属时保留未知。
-    if (!recordedSpeed && !runtimeSpeed) data.outputTokensPerSecond = null;
+    // 只展示后端按累计输出与生成耗时计算的平均值，不回退到旧的单次请求速度。
+    if ((!recordedSpeed && !runtimeSpeed && !combinedSpeed) || (running && stale)) data.averageOutputTokensPerSecond = null;
     for (const key of ["totalTokens", "inputTokens", "outputTokens", "cachedInputTokens", "cacheWriteInputTokens", "requests", "inFlight"]) {
       if (!Number.isFinite(data[key]) || data[key] < 0) data[key] = null;
     }
-    const speedText = formatSpeed(data.outputTokensPerSecond) || "—";
-    const speedKnown = speedText !== "—";
-    const speedNote = speedKnown && recordedSpeed ? "最近有记录请求的输出速度，可能早于最近请求" : "本次运行最近请求的输出速度；未记录时显示未知";
+    const formattedSpeed = formatSpeed(data.averageOutputTokensPerSecond);
+    const speedKnown = formattedSpeed != null;
+    const estimatedSpeed = data.averageSpeedIsEstimate === true;
+    const speedText = speedKnown ? `${estimatedSpeed ? "≈" : ""}${formattedSpeed}` : running ? stale ? "更新暂停" : data.speedState === "waiting" ? "等待输出" : "生成中" : "—";
+    const averageScopeNote = combinedSpeed ? "覆盖有记录的历史请求与本次运行，未记录的历史请求不计入"
+      : recordedSpeed ? "仅覆盖有记录且有有效计时的请求"
+        : runtimeSpeed ? "仅覆盖本次运行中有有效计时的请求" : "缺少有效计时时显示 —";
+    const speedNote = running && stale ? "实时统计更新失败，恢复后继续显示会话平均速度"
+      : `累计输出 Token ÷ 累计生成耗时，工具间隔不计；${averageScopeNote}${estimatedSpeed && speedKnown ? "；含生成中的 Token 估算" : ""}`;
     const rate = cacheRatePercent(data.inputTokens, data.cachedInputTokens) || "—";
     const refs = bar.__codeyCs;
-    refs.speed.textContent = speedText;
+    setText(refs.speed, speedText);
     refs.speed.title = speedNote;
-    refs["cache-rate"].textContent = rate;
-    refs.total.textContent = data.totalTokens == null ? "—" : `${formatTokenCount(data.totalTokens)} tok`;
+    setText(refs["cache-rate"], rate);
+    setText(refs.total, data.totalTokens == null ? "—" : `${formatTokenCount(data.totalTokens)} tok`);
     const finite = value => Number.isFinite(value) && value >= 0;
     const count = value => finite(value) ? value.toLocaleString("zh-CN") : "—";
     const duration = (value, average = false) => {
@@ -336,8 +403,7 @@
       if (average || seconds < 60) return `${Number(seconds.toFixed(1))}秒`;
       return `${Math.floor(seconds / 60)}分 ${Math.floor(seconds % 60)}秒`;
     };
-    refs.activity.textContent = `${count(data.turnCount)} 轮 ${count(data.stepCount)} 步`;
-    const stale = fetchAttempted && !lastFetchOk;
+    setText(refs.activity, `${count(data.turnCount)} 轮 ${count(data.stepCount)} 步`);
     const hasData = stats && (hasRuntimeRequest || speedKnown || [data.totalTokens, data.inputTokens, data.outputTokens, data.turnCount, data.stepCount, data.modelDurationMs, data.toolDurationMs, data.averageTtftMs].some(finite));
     const unknownUsage = data.usageSource === "unknown" || data.usageScope === "unknown";
     const scopeLabel = !stats || unknownUsage ? "统计范围未知" : sessionUsage ? "会话累计" : "本次运行";
@@ -350,17 +416,16 @@
     const tokenValue = value => finite(value) ? `${count(value)} tok` : "—";
     data.uncachedInputTokens = finite(data.inputTokens) && finite(data.cachedInputTokens) && data.cachedInputTokens <= data.inputTokens ? data.inputTokens - data.cachedInputTokens : null;
     for (const [key, element] of Object.entries(refs.fields)) {
-      element.textContent = key === "cacheRate" ? rate : key === "speed" ? speedText : key.endsWith("Ms") ? duration(data[key], key === "averageTtftMs") : tokenValue(data[key]);
+      setText(element, key === "cacheRate" ? rate : key === "speed" ? speedText : key.endsWith("Ms") ? duration(data[key], key === "averageTtftMs") : tokenValue(data[key]));
     }
     const pendingNote = stale ? (stats ? "更新失败，当前数据可能已过期。" : "暂时无法读取统计，将自动重试。") : !currentSessionId ? "建立会话后显示统计。" : !stats ? "缺失数据以 — 显示。" : "";
     const sourceNote = unknownUsage ? "Token 统计范围未知。" : sessionUsage ? "会话累计用量，缓存已包含在输入中。" : "仅统计本次运行的用量。";
     const timingNote = data.timingScope === "runtime" ? "模型计时仅覆盖本次运行。" : data.timingScope ? "模型计时仅覆盖有有效计时的请求。" : "缺少有效计时时显示 —。";
     const activityNote = data.stepScope === "runtime" ? "步数仅覆盖本次运行。" : data.stepScope === "recorded_requests" ? "步数仅覆盖有记录的生成请求。" : data.stepScope === "recorded_session" ? "步数为会话内模型生成次数。" : "缺失的轮数和步数显示 —。";
     const toolNote = data.toolTimingScope ? "工具用时为累计值，并行调用可能重叠。" : "";
-    const speedDate = speedKnown && recordedSpeed && finite(data.speedRecordedAtUnixMs) ? `（${new Date(data.speedRecordedAtUnixMs).toLocaleString("zh-CN", { hour12: false })}）` : "";
-    refs.notes.activity.textContent = `${pendingNote}${activityNote}${timingNote}${toolNote}${speedKnown ? `${speedNote}${speedDate}。` : ""}`;
-    refs.notes.tokens.textContent = `${pendingNote}${sourceNote}`;
-    refs.buttons.activity.setAttribute("aria-label", `会话统计，${refs.activity.textContent}，最近速度 ${speedText}，${status}。${speedNote}。查看统计详情`);
+    setText(refs.notes.activity, `${pendingNote}${activityNote}${timingNote}${toolNote}${speedNote}。`);
+    setText(refs.notes.tokens, `${pendingNote}${sourceNote}`);
+    refs.buttons.activity.setAttribute("aria-label", `会话统计，${refs.activity.textContent}，会话平均速度 ${speedText}，${status}。${speedNote}。查看统计详情`);
     refs.buttons.tokens.setAttribute("aria-label", `Token 用量，${scopeLabel} ${refs.total.textContent}，缓存命中 ${rate}，${status}。查看统计详情`);
     bar.dataset.running = data.inFlight > 0 ? "true" : "false";
     bar.dataset.state = state;
@@ -368,19 +433,21 @@
   };
 
   const schedulePoll = (delay) => {
+    if (disposed) return;
     clearTimeout(pollTimer);
     pollTimer = setTimeout(poll, delay);
   };
 
   const poll = async () => {
+    if (disposed) return;
     if (document.visibilityState === "hidden") {
       schedulePoll(POLL_IDLE_MS);
       return;
     }
-    const sessionId = resolveSessionId();
+    const { anchor, sessionId } = resolveSessionContext();
     if (sessionId !== currentSessionId) {
       resetSession(sessionId);
-      render();
+      render(anchor);
     }
     if (!currentSessionId) {
       schedulePoll(POLL_IDLE_MS);
@@ -388,47 +455,52 @@
     }
     if (!fetchInFlight) {
       fetchInFlight = true;
-      render();
+      render(anchor);
       const requestSessionId = currentSessionId;
       const requestGeneration = sessionGeneration;
+      let completedContext = null;
       try {
         const result = await callBridge("/session/stats", { sessionId: requestSessionId });
-        if (requestGeneration !== sessionGeneration || resolveSessionId() !== requestSessionId) return;
+        if (disposed) return;
+        completedContext = resolveSessionContext();
+        if (requestGeneration !== sessionGeneration || completedContext.sessionId !== requestSessionId) return;
         fetchAttempted = true;
         lastResult = result ?? null;
         if (result?.status === "ok") {
           lastFetchOk = true;
-          // 轮询途中会话又切换时丢弃过期响应。
-          if (resolveSessionId() === currentSessionId) {
-            stats = result.stats ?? null;
-          }
+          stats = result.stats ?? null;
         } else {
           lastFetchOk = false;
         }
       } catch {
-        if (requestGeneration === sessionGeneration && resolveSessionId() === requestSessionId) {
+        if (!disposed) completedContext = resolveSessionContext();
+        if (!disposed && requestGeneration === sessionGeneration && completedContext.sessionId === requestSessionId) {
           fetchAttempted = true;
           lastFetchOk = false;
         }
       } finally {
         fetchInFlight = false;
-        schedulePoll(requestGeneration !== sessionGeneration || resolveSessionId() !== requestSessionId ? 0 : stats?.inFlight > 0 ? POLL_ACTIVE_MS : POLL_IDLE_MS);
+        if (!disposed) {
+          completedContext ||= resolveSessionContext();
+          schedulePoll(requestGeneration !== sessionGeneration || completedContext.sessionId !== requestSessionId ? 0 : stats?.inFlight > 0 ? POLL_ACTIVE_MS : POLL_IDLE_MS);
+        }
       }
-      render();
+      render(completedContext?.anchor);
+      return;
     }
     schedulePoll(stats?.inFlight > 0 ? POLL_ACTIVE_MS : POLL_IDLE_MS);
   };
 
   const scheduleRescan = () => {
-    if (rescanTimer) return;
+    if (disposed || rescanTimer) return;
     rescanTimer = setTimeout(() => {
       rescanTimer = 0;
-      const sessionId = resolveSessionId();
+      const { anchor, sessionId } = resolveSessionContext();
       const changed = sessionId !== currentSessionId;
       if (changed) {
         resetSession(sessionId);
       }
-      render();
+      render(anchor);
       // 会话切换立即拉取，不等下一轮轮询。
       if (changed && currentSessionId) schedulePoll(0);
     }, RESCAN_DEBOUNCE_MS);
@@ -439,7 +511,7 @@
       if (mutation.type === "attributes") {
         const target = mutation.target;
         if (!(target instanceof HTMLElement)) continue;
-        if (target.id === barId || target.closest?.(`#${barId}`)) continue;
+        if (containsStats(target)) continue;
         if (
           target.hasAttribute?.(conversationAttribute)
           || target.hasAttribute?.("hidden")
@@ -453,6 +525,8 @@
       const nodes = [...(mutation.addedNodes || []), ...(mutation.removedNodes || [])];
       for (const node of nodes) {
         if (!(node instanceof HTMLElement)) continue;
+        if (node.id === overlayId) { scheduleRescan(); continue; }
+        if (node.closest?.(`#${overlayId}`)) continue;
         if (node.id === barId || node.closest?.(`#${barId}`) || node.querySelector?.(`#${barId}`)) {
           // 状态条自身被移除时也要尽快重挂。
           if (node.id === barId || node.querySelector?.(`#${barId}`)) scheduleRescan();
@@ -503,25 +577,26 @@
       observer.observe(document.documentElement, options);
       window.__codeyConversationStatsObserver = observer;
     }
-    document.addEventListener?.("visibilitychange", () => {
+    listen(document, "visibilitychange", () => {
       if (document.visibilityState !== "hidden") schedulePoll(0);
     });
-    window.addEventListener?.("focus", () => schedulePoll(0));
-    window.addEventListener?.("pageshow", () => schedulePoll(0));
-    window.addEventListener?.("resize", positionPanel);
-    document.addEventListener?.("scroll", positionPanel, true);
-    document.addEventListener?.("pointerdown", (event) => {
-      if (statsElement && !statsElement.contains(event.target)) setExpanded(false);
+    listen(window, "focus", () => schedulePoll(0));
+    listen(window, "pageshow", () => schedulePoll(0));
+    listen(window, "resize", positionPanel);
+    listen(document, "scroll", positionPanel, true);
+    listen(document, "pointerdown", (event) => {
+      if (statsElement && !containsStats(event.target)) setExpanded(false);
     });
-    document.addEventListener?.("keydown", (event) => {
+    listen(document, "keydown", (event) => {
       if (event.key !== "Escape" || !statsElement?.__codeyCs?.active) return;
-      const focusedInside = statsElement.contains(document.activeElement);
+      const focusedInside = containsStats(document.activeElement);
       setExpanded(false, focusedInside);
       if (focusedInside) { event.preventDefault(); event.stopPropagation(); }
     });
     schedulePoll(0);
     window[PROBE_KEY] = {
       installed: true,
+      version: VERSION,
       snapshot: () => ({
         sessionId: currentSessionId,
         anchorFound: Boolean(findVisibleComposerAnchor()),
@@ -532,6 +607,21 @@
         lastResult,
       }),
       refresh: () => schedulePoll(0),
+      dispose: () => {
+        if (disposed) return;
+        disposed = true;
+        sessionGeneration += 1;
+        clearTimeout(pollTimer);
+        clearTimeout(rescanTimer);
+        setExpanded(false);
+        window.__codeyConversationStatsObserver?.disconnect?.();
+        delete window.__codeyConversationStatsObserver;
+        listeners.splice(0).forEach(remove => remove());
+        statsElement?.__codeyCs?.overlay.remove();
+        statsElement?.remove();
+        document.getElementById(styleId)?.remove();
+        window[PROBE_KEY].installed = false;
+      },
     };
   };
 
