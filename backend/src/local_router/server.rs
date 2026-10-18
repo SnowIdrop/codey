@@ -604,6 +604,7 @@ pub(crate) struct RouterSnapshotSwap {
     installed: Arc<RouterSnapshot>,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) enum ConnectionPermitError {
     Busy,
@@ -612,6 +613,7 @@ pub(crate) enum ConnectionPermitError {
 
 /// HTTP 连接在名额用尽时立刻返回 503。已建立的 WebSocket 再等一小段时间，
 /// 仍然没有名额就同样返回 503，而不是一直占着这条连接。
+#[cfg(test)]
 pub(crate) async fn acquire_connection_permit_within(
     limit: &Arc<Semaphore>,
     wait: Duration,

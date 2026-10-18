@@ -4127,7 +4127,10 @@ mod tests {
             )
             .unwrap();
         let reloaded = OfficialAccountStore::new(dir.path().join("accounts"));
-        assert_eq!(reloaded.get(&record.id).unwrap().unwrap().max_concurrency, 3);
+        assert_eq!(
+            reloaded.get(&record.id).unwrap().unwrap().max_concurrency,
+            3
+        );
         let summary = serde_json::to_value(reloaded.summaries().unwrap()).unwrap();
         assert_eq!(summary[0]["maxConcurrency"], json!(3));
 
@@ -4184,7 +4187,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(saved.max_concurrency, 7);
-        assert_eq!(saved.auth["tokens"]["access_token"], json!("refreshed-token"));
+        assert_eq!(
+            saved.auth["tokens"]["access_token"],
+            json!("refreshed-token")
+        );
 
         // 重新导入或重新登录得到的记录默认是 0，不能覆盖账号已有设置。
         store.upsert(&record).unwrap();

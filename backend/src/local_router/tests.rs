@@ -541,9 +541,12 @@ pub(super) async fn local_websocket_pair() -> (
             Arc::new(Semaphore::new(REQUEST_BODY_BUDGET_PERMITS)),
         );
         BudgetedWebSocket::new(
-            tokio_tungstenite::accept_async_with_config(stream, Some(downstream_websocket_config()))
-                .await
-                .unwrap(),
+            tokio_tungstenite::accept_async_with_config(
+                stream,
+                Some(downstream_websocket_config()),
+            )
+            .await
+            .unwrap(),
         )
     };
     let client = async {

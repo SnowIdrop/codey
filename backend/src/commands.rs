@@ -472,7 +472,7 @@ impl AppState {
                 let thread_id = bridge_string(&payload, "threadId");
                 let home = codex_home();
                 blocking_value("读取会话模型", move || {
-                    crate::session_model::read(&home, &thread_id)
+                    crate::session_model::read(home, &thread_id)
                 })
                 .await
             }

@@ -1233,7 +1233,9 @@ async fn official_launch_commit_rebuilds_routes_after_a_newer_account_refresh() 
     existing.upstream_proxy = Some("http://127.0.0.1:8080".into());
     existing.base_url = Some("https://old.example/v1".into());
     store.upsert(&existing).unwrap();
-    store.upsert(&stored_official_account("removed", 2)).unwrap();
+    store
+        .upsert(&stored_official_account("removed", 2))
+        .unwrap();
     store.set_default_account_id(Some("existing")).unwrap();
     let stale_probe = crate::codex_provider::OfficialAccountLaunch::resolve(&home, &store).unwrap();
     assert!(matches!(
@@ -1242,7 +1244,9 @@ async fn official_launch_commit_rebuilds_routes_after_a_newer_account_refresh() 
     ));
 
     // 旧探测结束后新增默认账号、删除账号，同时修改原账号的全部线路设置。
-    store.upsert(&stored_official_account("imported", 3)).unwrap();
+    store
+        .upsert(&stored_official_account("imported", 3))
+        .unwrap();
     store.set_default_account_id(Some("imported")).unwrap();
     store.remove_with_codex_login("removed", &home).unwrap();
     store
@@ -1341,7 +1345,9 @@ async fn official_launch_commit_includes_import_during_config_lock_without_chang
     });
     tokio::task::yield_now().await;
     // 导入不持有配置锁。读取当前账号必须在等待配置锁之后发生。
-    store.upsert(&stored_official_account("imported", 1)).unwrap();
+    store
+        .upsert(&stored_official_account("imported", 1))
+        .unwrap();
     store.set_default_account_id(Some("imported")).unwrap();
     drop(commit_guard);
     tokio::time::timeout(Duration::from_secs(5), commit)

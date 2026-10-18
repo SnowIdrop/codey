@@ -251,7 +251,7 @@ impl AsyncRead for WebSocketIngress {
         }
         if this.handshake {
             if this.prefetched_start == this.prefetched_end {
-                let mut buffer = ReadBuf::new(&mut *this.prefetched);
+                let mut buffer = ReadBuf::new(&mut this.prefetched);
                 let stream = this.stream.as_mut().ok_or(io::ErrorKind::NotConnected)?;
                 std::task::ready!(Pin::new(stream).poll_read(cx, &mut buffer))?;
                 this.prefetched_start = 0;
@@ -420,14 +420,13 @@ impl BudgetedWebSocket {
             let deadline = *self
                 .flush_deadline
                 .get_or_insert_with(|| tokio::time::Instant::now() + DOWNSTREAM_WRITE_TIMEOUT);
-            let flushed = tokio::time::timeout_at(deadline, socket.flush())
-                .await
-                .unwrap_or_else(|_| {
-                    Err(WebSocketError::Io(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "WebSocket 控制帧写入超时",
-                    )))
-                });
+            let flushed = match tokio::time::timeout_at(deadline, socket.flush()).await {
+                Ok(result) => result,
+                Err(_) => Err(WebSocketError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "WebSocket 控制帧写入超时",
+                ))),
+            };
             if let Err(error) = flushed {
                 self.pending.take();
                 self.socket.take();

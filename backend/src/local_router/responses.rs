@@ -1773,7 +1773,7 @@ impl RouterServer {
         }
         if compacting && !native_compaction {
             let metadata =
-                crate::model_catalog::runtime_context_metadata(&crate::codex_config::codex_home());
+                crate::model_catalog::runtime_context_metadata(crate::codex_config::codex_home());
             let model_metadata = gateway_compaction_model_metadata(
                 &metadata,
                 &resolved.provider_id,

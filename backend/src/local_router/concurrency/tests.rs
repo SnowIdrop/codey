@@ -173,7 +173,8 @@ async fn http_reset_cancels_queued_request_without_upstream_work() {
     )
     .await
     .unwrap()
-    .err().unwrap();
+    .err()
+    .unwrap();
     assert!(error.is::<DownstreamClosed>());
     assert_eq!(counts(&registry), (1, 0));
     drop(first);
@@ -422,13 +423,20 @@ async fn websocket_cancel_and_interrupt_remove_waiter_even_with_no_body_budget()
             tokio::spawn(async move { tokio_tungstenite::connect_async(url).await.unwrap().0 });
         let (server, _) = listener.accept().await.unwrap();
         let server = tokio_tungstenite::accept_async_with_config(
-            WebSocketIngress::new(server, Arc::new(Semaphore::new(REQUEST_BODY_BUDGET_PERMITS))),
+            WebSocketIngress::new(
+                server,
+                Arc::new(Semaphore::new(REQUEST_BODY_BUDGET_PERMITS)),
+            ),
             Some(downstream_websocket_config()),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let mut client = connect.await.unwrap();
         let mut downstream = WebSocketResponsesDownstream::new(BudgetedWebSocket::new(server));
         downstream.request_body_budget = Arc::new(Semaphore::new(0));
-        downstream.socket.set_budget(Arc::clone(&downstream.request_body_budget));
+        downstream
+            .socket
+            .set_budget(Arc::clone(&downstream.request_body_budget));
         let registry = registry(1);
         let first = ready(&registry);
         let waiter = queued(&registry);

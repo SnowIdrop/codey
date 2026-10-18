@@ -118,13 +118,12 @@ pub(crate) async fn hot_reload_runtime_models_locked(
     } else {
         None
     };
-    if skip_unchanged {
-        if let Ok(previous_catalog) = current_renderer_model_catalog_async(previous.clone()).await {
-            if previous_catalog == expected_catalog {
-                runtime.mark_model_config_applied(&delivered).await;
-                return ModelHotReloadOutcome::default();
-            }
-        }
+    if skip_unchanged
+        && let Ok(previous_catalog) = current_renderer_model_catalog_async(previous.clone()).await
+        && previous_catalog == expected_catalog
+    {
+        runtime.mark_model_config_applied(&delivered).await;
+        return ModelHotReloadOutcome::default();
     }
     match refresh_current_renderer(&runtime, &expected_catalog).await {
         Ok(refresh) => {

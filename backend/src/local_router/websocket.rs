@@ -1896,7 +1896,9 @@ mod admission_tests {
         let (socket, mut peer) = local_websocket_pair().await;
         let mut downstream = WebSocketResponsesDownstream::new(socket);
         downstream.request_body_budget = Arc::new(Semaphore::new(0));
-        downstream.socket.set_budget(Arc::clone(&downstream.request_body_budget));
+        downstream
+            .socket
+            .set_budget(Arc::clone(&downstream.request_body_budget));
         let (release, released) = oneshot::channel::<()>();
         let waiting = tokio::spawn(async move {
             downstream
@@ -2067,7 +2069,9 @@ mod admission_tests {
         let (socket, mut peer) = local_websocket_pair().await;
         let mut downstream = WebSocketResponsesDownstream::new(socket);
         downstream.request_body_budget = Arc::new(Semaphore::new(0));
-        downstream.socket.set_budget(Arc::clone(&downstream.request_body_budget));
+        downstream
+            .socket
+            .set_budget(Arc::clone(&downstream.request_body_budget));
         downstream.interrupt_forwarding = true;
         peer.send(WebSocketMessage::Text(
             json!({"type":"response.interrupt","padding":"x".repeat(MAX_EMERGENCY_INTERRUPT_BYTES)})

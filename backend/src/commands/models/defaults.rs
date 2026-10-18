@@ -299,12 +299,7 @@ async fn persist_official_account_runtime_settings(
 ) -> Result<(), String> {
     let store = state.official_accounts();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        store.update_route_runtime_settings(
-            &account_id,
-            upstream_proxy,
-            base_url,
-            max_concurrency,
-        )
+        store.update_route_runtime_settings(&account_id, upstream_proxy, base_url, max_concurrency)
     })
     .await
     .map_err(|error| format!("保存官方账号线路运行设置任务异常退出：{error}"))?

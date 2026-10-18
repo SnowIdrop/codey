@@ -31,10 +31,8 @@ impl Activity {
                 let buf = reader.fill_buf()?;
                 if buf.is_empty() {
                     // 完整 JSON 可以暂时没有换行；不推进偏移，追加后仍重新校验。
-                    if !oversized {
-                        if let Ok(record) = serde_json::from_slice::<Value>(&line) {
-                            self.record(&record, session_id);
-                        }
+                    if !oversized && let Ok(record) = serde_json::from_slice::<Value>(&line) {
+                        self.record(&record, session_id);
                     }
                     return Ok(());
                 }
@@ -53,10 +51,8 @@ impl Activity {
                 }
             }
             self.offset = start + consumed;
-            if !oversized {
-                if let Ok(record) = serde_json::from_slice::<Value>(&line) {
-                    self.record(&record, session_id);
-                }
+            if !oversized && let Ok(record) = serde_json::from_slice::<Value>(&line) {
+                self.record(&record, session_id);
             }
         }
     }
@@ -95,10 +91,9 @@ impl Activity {
                 if payload["session_id"]
                     .as_str()
                     .is_some_and(|id| normalize_session_id(id).eq_ignore_ascii_case(session_id))
+                    && let Some(id) = payload["response_id"].as_str().filter(|id| !id.is_empty())
                 {
-                    if let Some(id) = payload["response_id"].as_str().filter(|id| !id.is_empty()) {
-                        self.responses.insert(id.to_owned());
-                    }
+                    self.responses.insert(id.to_owned());
                 }
             }
             (Some("event_msg"), Some("item_completed")) => {
@@ -129,10 +124,10 @@ impl Activity {
                             .as_u64()?
                             .checked_sub(payload["started_at_ms"].as_u64()?)
                     });
-                if let (Some(id), Some(duration)) = (item["id"].as_str(), duration) {
-                    if self.tools.insert(id.to_owned()) {
-                        self.tool_ms = self.tool_ms.saturating_add(duration);
-                    }
+                if let (Some(id), Some(duration)) = (item["id"].as_str(), duration)
+                    && self.tools.insert(id.to_owned())
+                {
+                    self.tool_ms = self.tool_ms.saturating_add(duration);
                 }
             }
             _ => {}

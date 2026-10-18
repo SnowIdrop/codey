@@ -201,18 +201,19 @@ fn cached_timing(
         session_id.to_owned(),
     );
     let cache = lock_unpoisoned(TIMING_CACHE.get_or_init(Default::default));
-    if let Some((at, timing)) = cache.get(&key) {
-        if at.elapsed() < Duration::from_secs(30) {
-            return *timing;
-        }
+    if let Some((at, timing)) = cache.get(&key)
+        && at.elapsed() < Duration::from_secs(30)
+    {
+        return *timing;
     }
     drop(cache);
     let timing = crate::route_request_log::session_recorded_timing(&root, session_id);
     let mut cache = lock_unpoisoned(TIMING_CACHE.get_or_init(Default::default));
-    if cache.len() >= 128 && !cache.contains_key(&key) {
-        if let Some(old) = cache.keys().next().cloned() {
-            cache.remove(&old);
-        }
+    if cache.len() >= 128
+        && !cache.contains_key(&key)
+        && let Some(old) = cache.keys().next().cloned()
+    {
+        cache.remove(&old);
     }
     cache.insert(key, (Instant::now(), timing));
     timing
@@ -260,18 +261,19 @@ fn cached_speed(home: &Path, session_id: &str) -> Option<(f64, u64)> {
         session_id.to_owned(),
     );
     let cache = lock_unpoisoned(SPEED_CACHE.get_or_init(Default::default));
-    if let Some((at, speed)) = cache.get(&key) {
-        if at.elapsed() < Duration::from_secs(30) {
-            return *speed;
-        }
+    if let Some((at, speed)) = cache.get(&key)
+        && at.elapsed() < Duration::from_secs(30)
+    {
+        return *speed;
     }
     drop(cache);
     let speed = crate::route_request_log::latest_session_recorded_speed(&root, session_id);
     let mut cache = lock_unpoisoned(SPEED_CACHE.get_or_init(Default::default));
-    if cache.len() >= 128 && !cache.contains_key(&key) {
-        if let Some(old) = cache.keys().next().cloned() {
-            cache.remove(&old);
-        }
+    if cache.len() >= 128
+        && !cache.contains_key(&key)
+        && let Some(old) = cache.keys().next().cloned()
+    {
+        cache.remove(&old);
     }
     cache.insert(key, (Instant::now(), speed));
     speed
@@ -560,26 +562,27 @@ mod tests {
             generation_ms: 1000.0,
             requests: 1,
         };
-        let mut query = || {
-            queries += 1;
-            Some(totals)
-        };
         let mut boundary = RuntimeHistoryBoundary {
             timestamp_unix_ms: 1000,
             request_ids: std::collections::HashSet::from(["a".to_owned()]),
             exclude_entire_millisecond: false,
         };
-        for second in 0..30 {
-            assert_eq!(
-                cache.get_or_query(
-                    Some(&boundary),
-                    now + Duration::from_secs(second),
-                    &mut query
-                ),
+        {
+            let mut query = || {
+                queries += 1;
                 Some(totals)
-            );
+            };
+            for second in 0..30 {
+                assert_eq!(
+                    cache.get_or_query(
+                        Some(&boundary),
+                        now + Duration::from_secs(second),
+                        &mut query
+                    ),
+                    Some(totals)
+                );
+            }
         }
-        drop(query);
         assert_eq!(queries, 1);
         let hit_started = Instant::now();
         for _ in 0..10_000 {

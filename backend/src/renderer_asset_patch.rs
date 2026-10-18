@@ -1614,7 +1614,9 @@ mod tests {
         let url = "app://-/assets/app-primary-b4ce9e46e8cf.js?build=desktop";
         assert!(is_patch_candidate_url(url));
         assert!(is_patchable_named_asset(url));
-        assert!(!is_patchable_named_asset("app://-/assets/chatgpt-composer.js"));
+        assert!(!is_patchable_named_asset(
+            "app://-/assets/chatgpt-composer.js"
+        ));
     }
 
     #[test]

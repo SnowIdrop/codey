@@ -1836,7 +1836,10 @@ mod tests {
             let mut next = json!({"previous_response_id":"resp-before","input":"continue"});
             history.prepare(owner, &mut next);
             assert!(history.restore_for_http(owner, &mut next, true).unwrap());
-            assert_eq!(next["input"], json!([{"role":"user","content":"original task"},{"role":"user","content":"continue"}]));
+            assert_eq!(
+                next["input"],
+                json!([{"role":"user","content":"original task"},{"role":"user","content":"continue"}])
+            );
         }
     }
 

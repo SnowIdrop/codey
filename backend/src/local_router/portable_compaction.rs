@@ -43,18 +43,30 @@ impl LocalRouter {
         self.portable_compaction_from_home(operation, payload, crate::codex_config::codex_home())
     }
 
-    fn portable_compaction_from_home(&self, operation: &str, payload: &Value, home: &std::path::Path) -> Result<Value> {
+    fn portable_compaction_from_home(
+        &self,
+        operation: &str,
+        payload: &Value,
+        home: &std::path::Path,
+    ) -> Result<Value> {
         let thread = payload
             .get("threadId")
             .and_then(Value::as_str)
             .and_then(valid_codex_session_id)
             .context("缺少有效的 threadId")?;
         let key = format!("thread-id:{thread}");
-        let restore_source = if operation == "prepare" && !self.bindings.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner).routes.contains_key(&key)
+        let restore_source = if operation == "prepare"
+            && !self
+                .bindings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .routes
+                .contains_key(&key)
         {
             crate::session_model::native_compaction_source(home, thread)?
-        } else { None };
+        } else {
+            None
+        };
         let snapshot = self
             .snapshot
             .read()
@@ -97,19 +109,35 @@ impl LocalRouter {
             if !bindings.routes.contains_key(&key)
                 && let Some(source) = restore_source.as_deref()
             {
-                anyhow::ensure!(snapshot.aliases.contains_key(&model_id::key(source)),
-                    "压缩历史的源线路或模型已不可用，请恢复原线路后重试");
+                anyhow::ensure!(
+                    snapshot.aliases.contains_key(&model_id::key(source)),
+                    "压缩历史的源线路或模型已不可用，请恢复原线路后重试"
+                );
                 let resolved = snapshot.target_for_request(source, None, None)?;
-                anyhow::ensure!(resolved.fallback_reason.is_none(), "压缩历史的源线路已不可用");
-                anyhow::ensure!(ProtocolBridge::from_upstream_protocol(resolved.protocol) == ProtocolBridge::NativeResponses,
-                    "压缩历史的源线路协议已变化");
-                bindings.remember_resolved(&[key.clone()], &resolved, false, true, Some(false));
+                anyhow::ensure!(
+                    resolved.fallback_reason.is_none(),
+                    "压缩历史的源线路已不可用"
+                );
+                anyhow::ensure!(
+                    ProtocolBridge::from_upstream_protocol(resolved.protocol)
+                        == ProtocolBridge::NativeResponses,
+                    "压缩历史的源线路协议已变化"
+                );
+                bindings.remember_resolved(
+                    std::slice::from_ref(&key),
+                    &resolved,
+                    false,
+                    true,
+                    Some(false),
+                );
             }
             let Some(binding) = bindings.routes.get(&key).cloned() else {
                 return Ok(json!({"status":"ok","required":false}));
             };
-            if binding.portable || (binding.provider_id == target
-                && binding.context_config == Some(target_route.route.context_config)) {
+            if binding.portable
+                || (binding.provider_id == target
+                    && binding.context_config == Some(target_route.route.context_config))
+            {
                 return Ok(json!({"status":"ok","required":false}));
             }
             let source = snapshot
@@ -327,9 +355,9 @@ impl RouteBindings {
             {
                 binding.upstream_model = resolved.upstream_model.clone();
                 binding.context_config = Some(resolved.route.context_config);
-                binding.portable =
-                    !native_compaction
-                        && history_portable.unwrap_or_else(|| portable.get(key).copied().unwrap_or(false));
+                binding.portable = !native_compaction
+                    && history_portable
+                        .unwrap_or_else(|| portable.get(key).copied().unwrap_or(false));
             }
         }
     }
@@ -349,10 +377,23 @@ mod tests {
             }}),
             json!({"type":"turn_context","payload":{"model":target}}),
         ];
-        std::fs::write(home.path().join("session.jsonl"), records.iter().map(Value::to_string).collect::<Vec<_>>().join("\n")).unwrap();
+        std::fs::write(
+            home.path().join("session.jsonl"),
+            records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
         let db = rusqlite::Connection::open(home.path().join("state_5.sqlite")).unwrap();
-        db.execute_batch("CREATE TABLE threads (id TEXT, rollout_path TEXT, model TEXT);").unwrap();
-        db.execute("INSERT INTO threads VALUES ('parent','session.jsonl',?1)", [target]).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT, rollout_path TEXT, model TEXT);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES ('parent','session.jsonl',?1)",
+            [target],
+        )
+        .unwrap();
         home
     }
 
@@ -363,8 +404,11 @@ mod tests {
         let target_alias = model_alias(&target, "target-model");
         let home = cold_native_history(&source_alias, &target_alias);
         let before = std::fs::read(home.path().join("session.jsonl")).unwrap();
-        let payload = json!({"threadId":"parent","targetProviderId":target,"targetModel":"target-model"});
-        let prepared = router.portable_compaction_from_home("prepare", &payload, home.path()).unwrap();
+        let payload =
+            json!({"threadId":"parent","targetProviderId":target,"targetModel":"target-model"});
+        let prepared = router
+            .portable_compaction_from_home("prepare", &payload, home.path())
+            .unwrap();
         assert_eq!(prepared["required"], true);
         assert_eq!(prepared["sourceProviderId"], source);
         assert_eq!(prepared["sourceModel"], model);
@@ -391,26 +435,75 @@ mod tests {
             .send().await.unwrap();
         assert_eq!(response.status().as_u16(), 200);
         let result: Value = response.json().await.unwrap();
-        router.portable_compaction("confirm", &json!({"threadId":"parent","token":prepared["token"]})).unwrap();
-        assert_eq!(post(&client, &router, "parent", &target_alias, result["output"].clone()).send().await.unwrap().status().as_u16(), 200);
+        router
+            .portable_compaction(
+                "confirm",
+                &json!({"threadId":"parent","token":prepared["token"]}),
+            )
+            .unwrap();
+        assert_eq!(
+            post(
+                &client,
+                &router,
+                "parent",
+                &target_alias,
+                result["output"].clone()
+            )
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+            200
+        );
         upstream_task.await.unwrap();
-        assert_eq!(std::fs::read(home.path().join("session.jsonl")).unwrap(), before);
+        assert_eq!(
+            std::fs::read(home.path().join("session.jsonl")).unwrap(),
+            before
+        );
         router.stop().await.unwrap();
     }
 
     #[tokio::test]
     async fn portable_compaction_cold_source_never_falls_back_or_overwrites_active_binding() {
         let (router, _upstream, source, target, model) = fixture().await;
-        let payload = json!({"threadId":"parent","targetProviderId":target,"targetModel":"target-model"});
-        for invalid_source in ["missing/provider-model".to_string(), model_alias(&source, "disabled-model"), model.clone()] {
+        let payload =
+            json!({"threadId":"parent","targetProviderId":target,"targetModel":"target-model"});
+        for invalid_source in [
+            "missing/provider-model".to_string(),
+            model_alias(&source, "disabled-model"),
+            model.clone(),
+        ] {
             let home = cold_native_history(&invalid_source, &model_alias(&target, "target-model"));
-            assert!(router.portable_compaction_from_home("prepare", &payload, home.path()).is_err());
-            assert!(!router.bindings.lock().unwrap().routes.contains_key("thread-id:parent"));
+            assert!(
+                router
+                    .portable_compaction_from_home("prepare", &payload, home.path())
+                    .is_err()
+            );
+            assert!(
+                !router
+                    .bindings
+                    .lock()
+                    .unwrap()
+                    .routes
+                    .contains_key("thread-id:parent")
+            );
         }
-        let home = cold_native_history(&model_alias(&source, &model), &model_alias(&target, "target-model"));
+        let home = cold_native_history(
+            &model_alias(&source, &model),
+            &model_alias(&target, "target-model"),
+        );
         bind_source(&router, &target, "target-model");
-        assert_eq!(router.portable_compaction_from_home("prepare", &payload, home.path()).unwrap()["required"], false);
-        assert_eq!(router.bindings.lock().unwrap().routes["thread-id:parent"].provider_id, target);
+        assert_eq!(
+            router
+                .portable_compaction_from_home("prepare", &payload, home.path())
+                .unwrap()["required"],
+            false
+        );
+        assert_eq!(
+            router.bindings.lock().unwrap().routes["thread-id:parent"].provider_id,
+            target
+        );
         router.stop().await.unwrap();
     }
 
@@ -432,10 +525,28 @@ mod tests {
 
     #[test]
     fn portable_compaction_unrestored_delta_cannot_establish_portability() {
-        assert_eq!(resolved_history_portability(&json!({"input":"next","previous_response_id":"resp-old"})), None);
-        assert_eq!(resolved_history_portability(&json!({"input":[{"type":"compaction","encrypted_content":"opaque"}],"previous_response_id":"resp-old"})), Some(false));
-        assert_eq!(resolved_history_portability(&json!({"input":[{"type":"item_reference","id":"item-old"}]})), Some(false));
-        assert_eq!(resolved_history_portability(&json!({"input":"full history"})), Some(true));
+        assert_eq!(
+            resolved_history_portability(
+                &json!({"input":"next","previous_response_id":"resp-old"})
+            ),
+            None
+        );
+        assert_eq!(
+            resolved_history_portability(
+                &json!({"input":[{"type":"compaction","encrypted_content":"opaque"}],"previous_response_id":"resp-old"})
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            resolved_history_portability(
+                &json!({"input":[{"type":"item_reference","id":"item-old"}]})
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            resolved_history_portability(&json!({"input":"full history"})),
+            Some(true)
+        );
     }
 
     #[tokio::test]
@@ -450,11 +561,25 @@ mod tests {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             assert_eq!(body["input"], expected);
             assert_eq!(body["model"], "target-model");
-            write_json_response(&mut socket, 200, &json!({"id":"native","status":"completed",
-                "output":[{"type":"compaction","encrypted_content":"target-ciphertext"}]})).await.unwrap();
+            write_json_response(
+                &mut socket,
+                200,
+                &json!({"id":"native","status":"completed",
+                "output":[{"type":"compaction","encrypted_content":"target-ciphertext"}]}),
+            )
+            .await
+            .unwrap();
         });
-        let response = post(&client(), &router, "parent", &model_alias(&target, "target-model"), history)
-            .send().await.unwrap();
+        let response = post(
+            &client(),
+            &router,
+            "parent",
+            &model_alias(&target, "target-model"),
+            history,
+        )
+        .send()
+        .await
+        .unwrap();
         assert_eq!(response.status().as_u16(), 200);
         upstream_task.await.unwrap();
         router.stop().await.unwrap();
@@ -476,16 +601,48 @@ mod tests {
                 let request = read_http_request(&mut socket).await.unwrap();
                 let body: Value = serde_json::from_slice(&request.body).unwrap();
                 assert_eq!(body["input"], expected);
-                write_json_response(&mut socket, 200, &json!({"id":"reply","output":[]})).await.unwrap();
+                write_json_response(&mut socket, 200, &json!({"id":"reply","output":[]}))
+                    .await
+                    .unwrap();
             }
         });
         let client = client();
-        assert_eq!(post(&client, &router, "parent", &model_alias(&source, &model), history.clone())
-            .send().await.unwrap().status().as_u16(), 200);
-        let payload = json!({"threadId":"parent","targetProviderId":target,"targetModel":"target-model"});
-        assert_eq!(router.portable_compaction("prepare", &payload).unwrap()["required"], false);
-        assert_eq!(post(&client, &router, "parent", &model_alias(&target, "target-model"), history)
-            .send().await.unwrap().status().as_u16(), 200);
+        assert_eq!(
+            post(
+                &client,
+                &router,
+                "parent",
+                &model_alias(&source, &model),
+                history.clone()
+            )
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+            200
+        );
+        let payload =
+            json!({"threadId":"parent","targetProviderId":target,"targetModel":"target-model"});
+        assert_eq!(
+            router.portable_compaction("prepare", &payload).unwrap()["required"],
+            false
+        );
+        assert_eq!(
+            post(
+                &client,
+                &router,
+                "parent",
+                &model_alias(&target, "target-model"),
+                history
+            )
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+            200
+        );
         upstream_task.await.unwrap();
         router.stop().await.unwrap();
     }
@@ -493,10 +650,15 @@ mod tests {
     #[tokio::test]
     async fn portable_compaction_incremental_history_preserves_opaque_state_and_identity() {
         let (router, _upstream, source, target, model) = fixture().await;
-        let mut resolved = router.snapshot.read().unwrap()
-            .target_for_request(&model, Some(&source), None).unwrap();
+        let mut resolved = router
+            .snapshot
+            .read()
+            .unwrap()
+            .target_for_request(&model, Some(&source), None)
+            .unwrap();
         let keys = ["thread-id:parent".into()];
-        let payload = json!({"threadId":"parent","targetProviderId":target,"targetModel":"target-model"});
+        let payload =
+            json!({"threadId":"parent","targetProviderId":target,"targetModel":"target-model"});
         for (native, history, expected) in [
             (false, None, false),
             (false, Some(true), true),
@@ -506,19 +668,62 @@ mod tests {
             (false, Some(false), false),
             (false, Some(true), true),
         ] {
-            router.bindings.lock().unwrap().remember_resolved(&keys, &resolved, false, native, history);
-            assert_eq!(router.bindings.lock().unwrap().routes[&keys[0]].portable, expected);
+            router
+                .bindings
+                .lock()
+                .unwrap()
+                .remember_resolved(&keys, &resolved, false, native, history);
+            assert_eq!(
+                router.bindings.lock().unwrap().routes[&keys[0]].portable,
+                expected
+            );
         }
         resolved.upstream_model = "changed-model".into();
-        router.bindings.lock().unwrap().remember_resolved(&keys, &resolved, false, false, None);
+        router
+            .bindings
+            .lock()
+            .unwrap()
+            .remember_resolved(&keys, &resolved, false, false, None);
         assert!(!router.bindings.lock().unwrap().routes[&keys[0]].portable);
-        assert_eq!(router.portable_compaction("prepare", &payload).unwrap()["required"], true);
-        let token = router.bindings.lock().unwrap().portable_tickets[&keys[0]].token.clone();
-        router.portable_compaction("cancel", &json!({"threadId":"parent","token":token})).unwrap();
-        assert_eq!(router.portable_compaction("prepare", &json!({"threadId":"parent","targetProviderId":source,"targetModel":model})).unwrap()["required"], false);
-        router.bindings.lock().unwrap().remember_resolved(&keys, &resolved, false, false, Some(true));
-        router.bindings.lock().unwrap().routes.get_mut(&keys[0]).unwrap().context_config = Some([1; 32]);
-        router.bindings.lock().unwrap().remember_resolved(&keys, &resolved, false, false, None);
+        assert_eq!(
+            router.portable_compaction("prepare", &payload).unwrap()["required"],
+            true
+        );
+        let token = router.bindings.lock().unwrap().portable_tickets[&keys[0]]
+            .token
+            .clone();
+        router
+            .portable_compaction("cancel", &json!({"threadId":"parent","token":token}))
+            .unwrap();
+        assert_eq!(
+            router
+                .portable_compaction(
+                    "prepare",
+                    &json!({"threadId":"parent","targetProviderId":source,"targetModel":model})
+                )
+                .unwrap()["required"],
+            false
+        );
+        router.bindings.lock().unwrap().remember_resolved(
+            &keys,
+            &resolved,
+            false,
+            false,
+            Some(true),
+        );
+        router
+            .bindings
+            .lock()
+            .unwrap()
+            .routes
+            .get_mut(&keys[0])
+            .unwrap()
+            .context_config = Some([1; 32]);
+        router
+            .bindings
+            .lock()
+            .unwrap()
+            .remember_resolved(&keys, &resolved, false, false, None);
         assert!(!router.bindings.lock().unwrap().routes[&keys[0]].portable);
         router.stop().await.unwrap();
     }
@@ -526,12 +731,20 @@ mod tests {
     #[test]
     fn portable_compaction_binding_keys_isolate_session_only_children() {
         let mut request = HttpRequest {
-            method: "POST".into(), path: "/responses".into(),
+            method: "POST".into(),
+            path: "/responses".into(),
             headers: vec![("session-id".into(), "parent".into())],
-            body: vec![], _body_budget_permit: None,
+            body: vec![],
+            _body_budget_permit: None,
         };
-        assert_eq!(request_binding_keys(&request), ["thread-id:parent", "session-id:parent"]);
-        assert_eq!(portable_request_key(&request).as_deref(), Some("thread-id:parent"));
+        assert_eq!(
+            request_binding_keys(&request),
+            ["thread-id:parent", "session-id:parent"]
+        );
+        assert_eq!(
+            portable_request_key(&request).as_deref(),
+            Some("thread-id:parent")
+        );
         for header in ["x-openai-subagent", "x-codex-parent-thread-id"] {
             request.headers.push((header.into(), "parent".into()));
             assert_eq!(request_binding_keys(&request), ["session-id:parent"]);
@@ -539,26 +752,48 @@ mod tests {
             request.headers.pop();
         }
         request.headers.push(("thread-id".into(), "child".into()));
-        assert_eq!(request_binding_keys(&request), ["thread-id:child", "session-id:parent"]);
-        assert_eq!(portable_request_key(&request).as_deref(), Some("thread-id:child"));
+        assert_eq!(
+            request_binding_keys(&request),
+            ["thread-id:child", "session-id:parent"]
+        );
+        assert_eq!(
+            portable_request_key(&request).as_deref(),
+            Some("thread-id:child")
+        );
     }
 
     #[tokio::test]
     async fn portable_compaction_session_only_round_trip_refreshes_source_binding() {
         let (router, upstream, source, target, model) = fixture().await;
         // Seed a stale shared fallback as an earlier request would have done.
-        let mut resolved = router.snapshot.read().unwrap()
-            .target_for_request(&model, Some(&source), None).unwrap();
+        let mut resolved = router
+            .snapshot
+            .read()
+            .unwrap()
+            .target_for_request(&model, Some(&source), None)
+            .unwrap();
         resolved.upstream_model = "old-model".into();
         router.bindings.lock().unwrap().remember_resolved(
-            &["session-id:parent".into()], &resolved, false, false, None);
+            &["session-id:parent".into()],
+            &resolved,
+            false,
+            false,
+            None,
+        );
         let old_generation = router.bindings.lock().unwrap().routes["session-id:parent"].generation;
         let upstream_task = tokio::spawn(async move {
             for stage in 0..3 {
                 let (mut socket, _) = upstream.accept().await.unwrap();
                 let request = read_http_request(&mut socket).await.unwrap();
                 let body: Value = serde_json::from_slice(&request.body).unwrap();
-                assert_eq!(body["model"], if stage == 2 { "target-model" } else { "provider-model" });
+                assert_eq!(
+                    body["model"],
+                    if stage == 2 {
+                        "target-model"
+                    } else {
+                        "provider-model"
+                    }
+                );
                 if stage == 1 {
                     assert_eq!(body["input"][0]["encrypted_content"], "opaque");
                 } else if stage == 2 {
@@ -569,36 +804,77 @@ mod tests {
             }
         });
         let client = client();
-        let send = |model: String, input: Value| client
-            .post(format!("{}/responses", router.endpoint.base_url))
-            .bearer_auth(&router.endpoint.token).header("session-id", "parent")
-            .json(&json!({"model":model,"input":input,"stream":false}));
+        let send = |model: String, input: Value| {
+            client
+                .post(format!("{}/responses", router.endpoint.base_url))
+                .bearer_auth(&router.endpoint.token)
+                .header("session-id", "parent")
+                .json(&json!({"model":model,"input":input,"stream":false}))
+        };
         // No route metadata: this must still refresh the session model/generation.
-        assert_eq!(send(model.clone(), json!([{"type":"compaction","encrypted_content":"opaque"}])).send().await.unwrap().status().as_u16(), 200);
+        assert_eq!(
+            send(
+                model.clone(),
+                json!([{"type":"compaction","encrypted_content":"opaque"}])
+            )
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+            200
+        );
         {
             let bindings = router.bindings.lock().unwrap();
             assert_eq!(bindings.routes["session-id:parent"].upstream_model, model);
-            assert_ne!(bindings.routes["session-id:parent"].generation, old_generation);
+            assert_ne!(
+                bindings.routes["session-id:parent"].generation,
+                old_generation
+            );
             assert_eq!(bindings.routes["thread-id:parent"].upstream_model, model);
         }
-        let payload = json!({"threadId":"parent","targetProviderId":target,"targetModel":"target-model"});
+        let payload =
+            json!({"threadId":"parent","targetProviderId":target,"targetModel":"target-model"});
         let prepared = router.portable_compaction("prepare", &payload).unwrap();
         assert_eq!(prepared["required"], true);
         assert_eq!(prepared["sourceModel"], model);
         let handle = json!({"threadId":"parent","token":prepared["token"]});
         let compact = json!([{"type":"compaction","encrypted_content":"opaque"},{"type":"compaction_trigger"}]);
-        assert_eq!(send(model.clone(), json!("blocked")).send().await.unwrap().status().as_u16(), 409);
+        assert_eq!(
+            send(model.clone(), json!("blocked"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            409
+        );
         for header in ["x-openai-subagent", "x-codex-parent-thread-id"] {
             let response = send(model_alias(&target, "target-model"), compact.clone())
-                .header(header, "parent").send().await.unwrap();
+                .header(header, "parent")
+                .send()
+                .await
+                .unwrap();
             assert_ne!(response.status().as_u16(), 200);
-            assert_eq!(router.portable_compaction("status", &handle).unwrap()["state"], "prepared");
+            assert_eq!(
+                router.portable_compaction("status", &handle).unwrap()["state"],
+                "prepared"
+            );
         }
-        let response = send(model_alias(&target, "target-model"), compact).send().await.unwrap();
+        let response = send(model_alias(&target, "target-model"), compact)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status().as_u16(), 200);
         let result: Value = response.json().await.unwrap();
         router.portable_compaction("confirm", &handle).unwrap();
-        let response = send(model_alias(&target, "target-model"), result["output"].clone()).send().await.unwrap();
+        let response = send(
+            model_alias(&target, "target-model"),
+            result["output"].clone(),
+        )
+        .send()
+        .await
+        .unwrap();
         assert_eq!(response.status().as_u16(), 200);
         // A subsequent normal turn advances the exact binding, invalidating old confirmation.
         assert!(router.portable_compaction("confirm", &handle).is_err());
@@ -611,29 +887,72 @@ mod tests {
         for state in ["failed", "expired"] {
             let (router, upstream, source, target, model) = fixture().await;
             bind_source(&router, &source, &model);
-            let prepared = router.portable_compaction("prepare", &json!({
-                "threadId":"parent","targetProviderId":target,"targetModel":"target-model"
-            })).unwrap();
+            let prepared = router
+                .portable_compaction(
+                    "prepare",
+                    &json!({
+                        "threadId":"parent","targetProviderId":target,"targetModel":"target-model"
+                    }),
+                )
+                .unwrap();
             let handle = json!({"threadId":"parent","token":prepared["token"]});
-            router.bindings.lock().unwrap().portable_tickets.get_mut("thread-id:parent").unwrap().state = state;
+            router
+                .bindings
+                .lock()
+                .unwrap()
+                .portable_tickets
+                .get_mut("thread-id:parent")
+                .unwrap()
+                .state = state;
             let compact = json!([{"type":"compaction_trigger"}]);
-            let response = post(&client(), &router, "parent", &model_alias(&source, &model), compact.clone())
-                .send().await.unwrap();
+            let response = post(
+                &client(),
+                &router,
+                "parent",
+                &model_alias(&source, &model),
+                compact.clone(),
+            )
+            .send()
+            .await
+            .unwrap();
             assert_eq!(response.status().as_u16(), 409);
-            assert_eq!(router.portable_compaction("status", &handle).unwrap()["state"], state);
+            assert_eq!(
+                router.portable_compaction("status", &handle).unwrap()["state"],
+                state
+            );
             router.portable_compaction("cancel", &handle).unwrap();
             assert!(router.portable_compaction("status", &handle).is_err());
             let upstream_task = tokio::spawn(async move {
                 let (mut socket, _) = upstream.accept().await.unwrap();
                 let request = read_http_request(&mut socket).await.unwrap();
-                assert_eq!(incoming_header(&request, "authorization"), Some("Bearer sk-upstream"));
-                write_json_response(&mut socket, 200, &json!({"id":"native","status":"completed",
-                    "output":[{"type":"compaction","encrypted_content":"native-ciphertext"}]})).await.unwrap();
+                assert_eq!(
+                    incoming_header(&request, "authorization"),
+                    Some("Bearer sk-upstream")
+                );
+                write_json_response(
+                    &mut socket,
+                    200,
+                    &json!({"id":"native","status":"completed",
+                    "output":[{"type":"compaction","encrypted_content":"native-ciphertext"}]}),
+                )
+                .await
+                .unwrap();
             });
-            let response = post(&client(), &router, "parent", &model_alias(&source, &model), compact)
-                .send().await.unwrap();
+            let response = post(
+                &client(),
+                &router,
+                "parent",
+                &model_alias(&source, &model),
+                compact,
+            )
+            .send()
+            .await
+            .unwrap();
             assert_eq!(response.status().as_u16(), 200);
-            assert_eq!(response.json::<Value>().await.unwrap()["output"][0]["encrypted_content"], "native-ciphertext");
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["output"][0]["encrypted_content"],
+                "native-ciphertext"
+            );
             upstream_task.await.unwrap();
             router.stop().await.unwrap();
         }

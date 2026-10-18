@@ -87,7 +87,8 @@ pub(crate) fn gateway_compaction_model_metadata<'a>(
 ) -> Option<&'a serde_json::Map<String, Value>> {
     // 以实际解析出的线路为准，避免原始模型名命中同名官方模型的预算。
     let canonical = crate::model_id::model_alias(provider, upstream);
-    metadata.iter()
+    metadata
+        .iter()
         .find(|(slug, _)| crate::model_id::equal(slug, &canonical))
         .map(|(_, value)| value)
 }
@@ -100,14 +101,23 @@ pub(crate) fn gateway_compaction_output_budget(
 ) -> Result<u64> {
     let mut budget = 16_384;
     if let Some(metadata) = metadata {
-        if let Some(window) = metadata.get("context_window")
-            .and_then(Value::as_u64).filter(|n| *n > 0) {
-            let percent = metadata.get("effective_context_window_percent")
-                .and_then(Value::as_u64).unwrap_or(100).min(100);
+        if let Some(window) = metadata
+            .get("context_window")
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+        {
+            let percent = metadata
+                .get("effective_context_window_percent")
+                .and_then(Value::as_u64)
+                .unwrap_or(100)
+                .min(100);
             budget = budget.min(window.saturating_mul(percent) / 100 / 8);
         }
-        if let Some(limit) = metadata.get("auto_compact_token_limit")
-            .and_then(Value::as_u64).filter(|n| *n > 0) {
+        if let Some(limit) = metadata
+            .get("auto_compact_token_limit")
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+        {
             budget = budget.min(limit / 4);
         }
     }
@@ -116,7 +126,9 @@ pub(crate) fn gateway_compaction_output_budget(
             if value.is_null() {
                 continue;
             }
-            let limit = value.as_u64().filter(|n| *n > 0)
+            let limit = value
+                .as_u64()
+                .filter(|n| *n > 0)
                 .with_context(|| format!("{field} 必须为正整数"))?;
             budget = budget.min(limit);
         }
@@ -247,7 +259,8 @@ fn validate_portable_context_items(items: &[Value], allow_trigger: bool) -> Resu
     };
     for (index, item) in items.iter().enumerate() {
         // 末尾的无参数触发项是当前压缩操作，不携带旧线路的加密历史。
-        if allow_trigger && index + 1 == items.len()
+        if allow_trigger
+            && index + 1 == items.len()
             && item["type"] == "compaction_trigger"
             && item.as_object().is_some_and(|object| object.len() == 1)
         {
@@ -1923,6 +1936,7 @@ impl SseFrameAccumulator for CompactionAccumulator {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_gateway_compaction<D: ResponsesDownstream + ?Sized>(
     downstream: &mut D,
     response: reqwest::Response,
@@ -1967,9 +1981,14 @@ pub(crate) async fn write_gateway_compaction<D: ResponsesDownstream + ?Sized>(
     }).await?;
     match result {
         Ok(value) => {
-            if stream { write_responses_response_as_events(downstream, &value).await?; }
-            else { downstream.write_json(200, &value).await?; }
-            if let Some(attempt) = portable_attempt { attempt.complete(); }
+            if stream {
+                write_responses_response_as_events(downstream, &value).await?;
+            } else {
+                downstream.write_json(200, &value).await?;
+            }
+            if let Some(attempt) = portable_attempt {
+                attempt.complete();
+            }
             Ok(())
         }
         Err(error) => {
