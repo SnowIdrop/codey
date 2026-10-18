@@ -37,6 +37,8 @@ export type Profile = {
   clearApiKey?: boolean;
   modelRequestHeaders?: Record<string, string>;
   upstreamProxy?: string;
+  /** 官方账号线路的最高并发数；0 或缺省表示不限制。 */
+  maxConcurrency?: number;
   sourceProviderId?: string;
   pluginOwnerId?: string;
   /** 宿主已返回的插件声明；这里只使用独立于用户设置的模型能力。 */
@@ -203,6 +205,7 @@ export type OfficialAccount = {
   lastRefresh?: string;
   routeName?: string;
   routeShortName?: string;
+  maxConcurrency?: number;
   upstreamProxy?: string;
   /** 自定义 OpenAI 网关。留空时使用官方默认地址。 */
   baseUrl?: string;

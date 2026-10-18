@@ -175,6 +175,7 @@ fn apply_account_route_overrides(
     profile.short_name = trimmed(record.route_short_name.as_deref())
         .map(ToString::to_string)
         .unwrap_or_default();
+    profile.max_concurrency = record.max_concurrency;
     if let Some(proxy) = trimmed(record.upstream_proxy.as_deref()) {
         profile.upstream_proxy = proxy.to_string();
     }
@@ -396,6 +397,7 @@ fn profile_from_provider(
         plugin_owner_id: None,
         plugin_route_spec: None,
         official_account: provider.official,
+        max_concurrency: 0,
         official_account_id: None,
         official_siwc: false,
         supports_remote_compaction: provider.supports_remote_compaction,
@@ -920,6 +922,7 @@ experimental_bearer_token = "sk-relay"
             added_at,
             route_name: None,
             route_short_name: None,
+            max_concurrency: 0,
             upstream_proxy: None,
             base_url: None,
             invalid_reason: None,

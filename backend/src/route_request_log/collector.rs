@@ -131,6 +131,7 @@ impl RouteRequestLogProducer {
                 upstream_started_at: OnceLock::new(),
                 first_byte_micros: AtomicU64::new(0),
                 router_pre_upstream_micros: AtomicU64::new(0),
+                concurrency_wait_micros: AtomicU64::new(0),
                 downstream_first_content_micros: AtomicU64::new(0),
                 upstream_header_micros: AtomicU64::new(0),
                 finished: AtomicBool::new(false),
@@ -215,6 +216,7 @@ struct ProbeShared {
     upstream_started_at: OnceLock<Instant>,
     first_byte_micros: AtomicU64,
     router_pre_upstream_micros: AtomicU64,
+    concurrency_wait_micros: AtomicU64,
     downstream_first_content_micros: AtomicU64,
     upstream_header_micros: AtomicU64,
     finished: AtomicBool,
@@ -503,6 +505,11 @@ impl RouteRequestLogProbe {
             != 0
     }
 
+    #[cfg(test)]
+    pub(crate) fn concurrency_wait_for_test(&self) -> Option<u64> {
+        load_duration_ms(&self.shared.concurrency_wait_micros)
+    }
+
     fn shield(&self, operation: impl FnOnce()) {
         let _ = self.shared.producer.catch_observer_panic(operation);
     }
@@ -572,6 +579,13 @@ impl RouteRequestLogProbe {
             let _ = self.shared.upstream_started_at.set(Instant::now());
             lock_unpoisoned(&self.shared.entry).upstream_transport = Some(transport);
         });
+    }
+
+    pub(crate) fn record_concurrency_wait(&self, elapsed: Duration) {
+        self.shared.concurrency_wait_micros.store(
+            (elapsed.as_micros().min(u64::MAX as u128) as u64).max(1),
+            Ordering::Relaxed,
+        );
     }
 
     pub(crate) fn mark_upstream_headers(
@@ -930,6 +944,7 @@ impl RouteRequestLogProbe {
             upstream_header_ms: load_duration_ms(&self.shared.upstream_header_micros),
             total_duration_ms,
             queue_delay_ms: 0,
+            concurrency_wait_ms: load_duration_ms(&self.shared.concurrency_wait_micros),
             output_tokens_per_second,
             usage_reported,
             usage_unavailable_reason,

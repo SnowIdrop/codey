@@ -62,6 +62,9 @@ pub struct ProviderProfile {
     pub plugin_route_spec: Option<crate::codey_plugins::PluginRouteSpec>,
     #[serde(default)]
     pub official_account: bool,
+    /// 官方账号线路的最高并发数；0 表示不限制。
+    #[serde(default)]
+    pub max_concurrency: u32,
     /// Codey account id when this route is derived from one stored official
     /// account. Every stored account owns exactly one derived official route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -160,6 +163,7 @@ impl ProviderProfile {
             plugin_owner_id: None,
             plugin_route_spec: None,
             official_account: false,
+            max_concurrency: 0,
             official_account_id: None,
             official_siwc: false,
             supports_remote_compaction: false,

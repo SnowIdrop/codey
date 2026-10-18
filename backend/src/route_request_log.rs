@@ -30,7 +30,7 @@ pub(crate) use query::{
     session_recorded_timing,
 };
 
-const SCHEMA_VERSION: u8 = 12;
+const SCHEMA_VERSION: u8 = 13;
 const MAX_LOG_STRING_BYTES: usize = 512;
 const MAX_LOG_HEADERS_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_LOG_ERROR_BYTES: usize = 64 * 1024;
@@ -252,6 +252,9 @@ pub(crate) struct RouteRequestLogEntry {
     pub upstream_header_ms: Option<u64>,
     pub total_duration_ms: u64,
     pub queue_delay_ms: u64,
+    /// 官方账号执行额度的等待时间，与日志写入队列延迟独立。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency_wait_ms: Option<u64>,
     /// 输出速度（上游响应阶段每秒输出 Token 数），无法计算时不记录。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens_per_second: Option<f64>,
@@ -468,6 +471,7 @@ pub(crate) struct RouteRequestLogQueryItem {
     pub upstream_header_ms: Option<u64>,
     pub total_duration_ms: u64,
     pub queue_delay_ms: u64,
+    pub concurrency_wait_ms: Option<u64>,
     /// 输出速度（上游响应阶段每秒输出 Token 数），无法计算时为 None。
     pub output_tokens_per_second: Option<f64>,
     pub input_tokens: Option<u64>,

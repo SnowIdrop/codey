@@ -155,6 +155,9 @@ pub struct OfficialAccountRecord {
     pub route_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_short_name: Option<String>,
+    /// 官方账号线路的最高并发数；旧记录默认不限制。
+    #[serde(default)]
+    pub max_concurrency: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_proxy: Option<String>,
     /// Custom OpenAI gateway for this account. `None` keeps the official
@@ -194,6 +197,7 @@ pub struct OfficialAccountSummary {
     pub route_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub route_short_name: Option<String>,
+    pub max_concurrency: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_proxy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -274,6 +278,7 @@ impl OfficialAccountRecord {
             // `OfficialAccountStore::upsert` keeps the saved route settings.
             route_name: None,
             route_short_name: None,
+            max_concurrency: 0,
             upstream_proxy: None,
             base_url: None,
             invalid_reason: None,
@@ -317,6 +322,7 @@ impl OfficialAccountRecord {
             last_refresh: self.last_refresh(),
             route_name: self.route_name.clone(),
             route_short_name: self.route_short_name.clone(),
+            max_concurrency: self.max_concurrency,
             upstream_proxy: self.upstream_proxy.clone(),
             base_url: self.base_url.clone(),
             invalid: self.invalid(),
@@ -925,6 +931,7 @@ impl OfficialAccountStore {
         if let Some(saved) = self.get(&record.id)? {
             record.route_name = saved.route_name;
             record.route_short_name = saved.route_short_name;
+            record.max_concurrency = saved.max_concurrency;
             record.upstream_proxy = saved.upstream_proxy;
             record.base_url = saved.base_url;
             // 重新登录只替换 Codex 凭据，SIWC 槽位按账号保留。
@@ -978,6 +985,7 @@ impl OfficialAccountStore {
 
     /// Replaces the route overrides of one account; `None` restores the value
     /// derived from the Codex configuration.
+    #[cfg(test)]
     pub fn update_route_settings(
         &self,
         id: &str,
@@ -985,6 +993,26 @@ impl OfficialAccountStore {
         route_short_name: Option<String>,
         upstream_proxy: Option<String>,
         base_url: Option<String>,
+    ) -> Result<()> {
+        self.update_route_settings_with_concurrency(
+            id,
+            route_name,
+            route_short_name,
+            upstream_proxy,
+            base_url,
+            None,
+        )
+    }
+
+    /// 未提供并发值时保留当前设置，显式传入 0 才解除限制。
+    pub fn update_route_settings_with_concurrency(
+        &self,
+        id: &str,
+        route_name: Option<String>,
+        route_short_name: Option<String>,
+        upstream_proxy: Option<String>,
+        base_url: Option<String>,
+        max_concurrency: Option<u32>,
     ) -> Result<()> {
         let _guard = self.lock_writes()?;
         let mut record = self
@@ -994,6 +1022,33 @@ impl OfficialAccountStore {
         record.route_short_name = route_setting(route_short_name);
         record.upstream_proxy = route_setting(upstream_proxy);
         record.base_url = route_setting(base_url);
+        if let Some(max_concurrency) = max_concurrency {
+            record.max_concurrency = max_concurrency;
+        }
+        self.write(&record)
+    }
+
+    /// 模型同步只改明确提供的运行设置，避免覆盖同时更新的账号元数据。
+    pub fn update_route_runtime_settings(
+        &self,
+        id: &str,
+        upstream_proxy: Option<String>,
+        base_url: Option<Option<String>>,
+        max_concurrency: Option<u32>,
+    ) -> Result<()> {
+        let _guard = self.lock_writes()?;
+        let mut record = self
+            .get(id)?
+            .ok_or_else(|| anyhow!("找不到官方账号：{id}"))?;
+        if let Some(upstream_proxy) = upstream_proxy {
+            record.upstream_proxy = route_setting(Some(upstream_proxy));
+        }
+        if let Some(base_url) = base_url {
+            record.base_url = route_setting(base_url);
+        }
+        if let Some(max_concurrency) = max_concurrency {
+            record.max_concurrency = max_concurrency;
+        }
         self.write(&record)
     }
 
@@ -4038,6 +4093,117 @@ mod tests {
             .update_route_settings("acct_missing", None, None, None, None)
             .unwrap_err();
         assert!(error.to_string().contains("acct_missing"));
+    }
+
+    #[test]
+    fn official_concurrency_defaults_persists_and_preserves_omitted_updates() {
+        let dir = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(dir.path().join("accounts"));
+        let record = OfficialAccountRecord::from_auth(
+            chatgpt_auth("acct-limit", "limit@example.com", "2026-01-01T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        legacy.as_object_mut().unwrap().remove("maxConcurrency");
+        let legacy: OfficialAccountRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.max_concurrency, 0);
+        store.upsert(&legacy).unwrap();
+
+        store
+            .update_route_settings_with_concurrency(
+                &record.id,
+                Some("主账号".into()),
+                Some("主".into()),
+                None,
+                None,
+                Some(3),
+            )
+            .unwrap();
+        let reloaded = OfficialAccountStore::new(dir.path().join("accounts"));
+        assert_eq!(reloaded.get(&record.id).unwrap().unwrap().max_concurrency, 3);
+        let summary = serde_json::to_value(reloaded.summaries().unwrap()).unwrap();
+        assert_eq!(summary[0]["maxConcurrency"], json!(3));
+
+        // 只同步模型或代理时不清除并发配置和其他账号元数据。
+        store
+            .update_route_runtime_settings(
+                &record.id,
+                Some("http://localhost:8080".into()),
+                None,
+                None,
+            )
+            .unwrap();
+        store.ensure_generated_route_settings().unwrap();
+        store.update_route_short_name(&record.id, "新").unwrap();
+        store.update_plan_type(&record.id, Some("pro")).unwrap();
+        let saved = store.get(&record.id).unwrap().unwrap();
+        assert_eq!(saved.max_concurrency, 3);
+        assert_eq!(saved.route_name.as_deref(), Some("主账号"));
+        assert_eq!(saved.route_short_name.as_deref(), Some("新"));
+
+        store
+            .update_route_runtime_settings(&record.id, None, None, Some(0))
+            .unwrap();
+        assert_eq!(store.get(&record.id).unwrap().unwrap().max_concurrency, 0);
+        store
+            .update_route_runtime_settings(&record.id, None, None, Some(u32::MAX))
+            .unwrap();
+        assert_eq!(
+            store.get(&record.id).unwrap().unwrap().max_concurrency,
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn official_concurrency_survives_relogin_stale_refresh_and_default_sync() {
+        let dir = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(dir.path().join("accounts"));
+        let home = dir.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let record = OfficialAccountRecord::from_auth(
+            chatgpt_auth("acct-limit", "limit@example.com", "2026-01-01T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        store.upsert(&record).unwrap();
+        let stale = store.get(&record.id).unwrap().unwrap();
+        store
+            .update_route_runtime_settings(&record.id, None, None, Some(7))
+            .unwrap();
+        let mut refreshed = stale.clone();
+        refreshed.auth["tokens"]["access_token"] = json!("refreshed-token");
+        let saved = store
+            .update_credentials_if_current(&stale, &refreshed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.max_concurrency, 7);
+        assert_eq!(saved.auth["tokens"]["access_token"], json!("refreshed-token"));
+
+        // 重新导入或重新登录得到的记录默认是 0，不能覆盖账号已有设置。
+        store.upsert(&record).unwrap();
+        assert_eq!(store.get(&record.id).unwrap().unwrap().max_concurrency, 7);
+        store.activate(&record.id, &home).unwrap();
+        let mut auth = record.auth.clone();
+        auth["tokens"]["access_token"] = json!("codex-refreshed-token");
+        auth["last_refresh"] = json!("2026-01-02T00:00:00Z");
+        fs::write(home.join("auth.json"), serde_json::to_vec(&auth).unwrap()).unwrap();
+        store.sync_default_from_codex_home(&home).unwrap();
+        assert_eq!(store.get(&record.id).unwrap().unwrap().max_concurrency, 7);
+
+        store.remove(&record.id).unwrap();
+        assert!(
+            store
+                .update_credentials_if_current(&stale, &refreshed)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .update_route_runtime_settings(&record.id, None, None, Some(2))
+                .is_err()
+        );
+        assert!(store.get(&record.id).unwrap().is_none());
     }
 
     #[test]

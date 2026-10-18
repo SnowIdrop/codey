@@ -13,6 +13,52 @@ fn named_config(name: &str) -> CodeyConfig {
 }
 
 #[test]
+fn official_concurrency_profile_migrates_and_rejects_invalid_values() {
+    let mut value = serde_json::to_value(ProviderProfile::new("测试线路")).unwrap();
+    value.as_object_mut().unwrap().remove("maxConcurrency");
+    let legacy: ProviderProfile = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(legacy.max_concurrency, 0);
+    for limit in [0, 1, u32::MAX] {
+        value["maxConcurrency"] = serde_json::json!(limit);
+        let profile: ProviderProfile = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(profile.max_concurrency, limit);
+    }
+    for invalid in [
+        serde_json::json!(-1),
+        serde_json::json!(1.5),
+        serde_json::json!(u64::from(u32::MAX) + 1),
+        serde_json::json!("3"),
+        serde_json::json!(true),
+        serde_json::Value::Null,
+    ] {
+        value["maxConcurrency"] = invalid;
+        assert!(serde_json::from_value::<ProviderProfile>(value.clone()).is_err());
+    }
+}
+
+#[test]
+fn official_concurrency_derivation_keeps_legacy_and_account_settings_separate() {
+    let mut legacy = ProviderProfile::new("兼容官方线路");
+    legacy.official_account = true;
+    legacy.max_concurrency = 3;
+    let mut config = CodeyConfig {
+        profiles: vec![legacy.clone()],
+        ..CodeyConfig::default()
+    };
+    let mut derived = legacy.clone();
+    derived.max_concurrency = 0;
+    config.apply_launch_official_profiles(vec![derived.clone()]);
+    assert_eq!(config.profiles[0].max_concurrency, 3);
+    derived.official_account_id = Some("acct-limit".into());
+    derived.max_concurrency = 8;
+    config.apply_launch_official_profiles(vec![derived.clone()]);
+    assert_eq!(config.profiles[0].max_concurrency, 8);
+    derived.max_concurrency = 0;
+    config.apply_launch_official_profiles(vec![derived]);
+    assert_eq!(config.profiles[0].max_concurrency, 0);
+}
+
+#[test]
 fn outbound_api_urls_allow_http_or_https() {
     for accepted in [
         "https://api.example.com/v1",

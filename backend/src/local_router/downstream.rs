@@ -2,6 +2,24 @@ use super::*;
 
 #[async_trait]
 pub(crate) trait ResponsesDownstream: Send {
+    async fn wait_for_admission<T, F>(&mut self, future: F) -> Result<T>
+    where
+        T: Send,
+        F: std::future::Future<Output = T> + Send,
+    {
+        self.wait_for_upstream(future).await
+    }
+
+    async fn write_admission_error(
+        &mut self,
+        status: u16,
+        code: &str,
+        message: String,
+        route: Option<&RouteTarget>,
+    ) -> Result<()> {
+        self.write_error(status, code, message, route).await
+    }
+
     async fn wait_for_upstream<T, F>(&mut self, future: F) -> Result<T>
     where
         T: Send,
@@ -186,6 +204,33 @@ impl<D> ResponsesDownstream for ObservedResponsesDownstream<'_, D>
 where
     D: ResponsesDownstream + ?Sized,
 {
+    async fn wait_for_admission<T, F>(&mut self, future: F) -> Result<T>
+    where
+        T: Send,
+        F: std::future::Future<Output = T> + Send,
+    {
+        self.inner.wait_for_admission(future).await
+    }
+    async fn write_admission_error(
+        &mut self,
+        status: u16,
+        code: &str,
+        message: String,
+        route: Option<&RouteTarget>,
+    ) -> Result<()> {
+        if let Some(probe) = &self.probe {
+            if status == 499 {
+                probe.mark_cancelled(code);
+                probe.finish_cancelled();
+            } else {
+                probe.mark_error(status, code);
+                probe.finish_failed();
+            }
+        }
+        self.inner
+            .write_admission_error(status, code, message, route)
+            .await
+    }
     async fn wait_for_upstream<T, F>(&mut self, future: F) -> Result<T>
     where
         T: Send,
@@ -394,6 +439,22 @@ impl HttpResponsesDownstream {
 
 #[async_trait]
 impl ResponsesDownstream for HttpResponsesDownstream {
+    async fn wait_for_admission<T, F>(&mut self, future: F) -> Result<T>
+    where
+        T: Send,
+        F: std::future::Future<Output = T> + Send,
+    {
+        await_http_admission(&mut self.stream, future).await
+    }
+    async fn write_admission_error(
+        &mut self,
+        status: u16,
+        code: &str,
+        message: String,
+        route: Option<&RouteTarget>,
+    ) -> Result<()> {
+        write_error_response(&mut self.stream, status, code, message, route).await
+    }
     fn event_stream_started(&self) -> bool {
         self.event_stream_started
     }
@@ -506,7 +567,7 @@ impl ResponsesDownstream for HttpResponsesDownstream {
 }
 
 pub(crate) struct WebSocketResponsesDownstream {
-    pub(crate) socket: WebSocketStream<TcpStream>,
+    pub(crate) socket: BudgetedWebSocket,
     pub(crate) upstream: Option<CachedUpstreamWebSocket>,
     pub(crate) websocket_backoffs: Arc<Mutex<UpstreamWebSocketBackoffs>>,
     pub(crate) stream_id: Option<String>,

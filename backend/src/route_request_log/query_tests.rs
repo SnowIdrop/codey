@@ -1225,6 +1225,7 @@ fn query_items_serialize_with_camel_case_fields() {
         upstream_header_ms: None,
         total_duration_ms: 1,
         queue_delay_ms: 0,
+        concurrency_wait_ms: None,
         output_tokens_per_second: None,
         input_tokens: None,
         output_tokens: None,

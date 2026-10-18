@@ -190,6 +190,7 @@ pub(crate) struct LocalRouter {
     pub(crate) endpoint: RuntimeRouterEndpoint,
     pub(crate) bindings: Arc<Mutex<RouteBindings>>,
     pub(crate) snapshot: Arc<RwLock<Arc<RouterSnapshot>>>,
+    pub(crate) official_concurrency: Arc<OfficialConcurrency>,
     pub(crate) websocket_backoffs: Arc<Mutex<UpstreamWebSocketBackoffs>>,
     pub(crate) shutdown: Mutex<Option<oneshot::Sender<()>>>,
     pub(crate) task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -241,6 +242,8 @@ impl LocalRouter {
             requires_openai_auth: config.router_requires_openai_auth(),
         };
         let snapshot = Arc::new(RwLock::new(Arc::new(RouterSnapshot::from_config(config))));
+        let official_concurrency = Arc::new(OfficialConcurrency::default());
+        official_concurrency.update(&snapshot.read().unwrap());
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let official_auth_path = crate::codex_config::codex_home().join("auth.json");
         let websocket_backoffs = Arc::new(Mutex::new(UpstreamWebSocketBackoffs::default()));
@@ -262,6 +265,8 @@ impl LocalRouter {
             token: endpoint.token.clone(),
             bearer_token: format!("Bearer {}", endpoint.token),
             snapshot: Arc::clone(&snapshot),
+            official_concurrency: Arc::clone(&official_concurrency),
+            admitted_connections: Arc::new(Semaphore::new(MAX_ADMITTED_CONNECTIONS)),
             connection_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
             rejection_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_REJECTIONS)),
             request_body_budget: Arc::new(Semaphore::new(REQUEST_BODY_BUDGET_PERMITS)),
@@ -315,7 +320,7 @@ impl LocalRouter {
                                 // 连接会退出，不再一直占着任务。
                                 enable_downstream_keepalive(&stream);
                                 let server = Arc::clone(&server);
-                                let permit = match Arc::clone(&server.connection_limit)
+                                let admitted = match Arc::clone(&server.admitted_connections)
                                     .try_acquire_owned()
                                 {
                                     Ok(permit) => permit,
@@ -351,7 +356,8 @@ impl LocalRouter {
                                 connections.spawn(ROUTER_REQUEST_ID.scope(
                                     request_id.clone(),
                                     ROUTER_REQUEST_STARTED_AT.scope(Instant::now(), async move {
-                                        if let Err(error) = server.handle_connection(stream, permit).await {
+                                        let _admitted = admitted;
+                                        if let Err(error) = server.handle_connection(stream).await {
                                             record_router_failure_nonblocking(
                                                 "local_router_request_failed",
                                                 "handle_local_router_connection",
@@ -410,6 +416,7 @@ impl LocalRouter {
             endpoint,
             bindings,
             snapshot,
+            official_concurrency,
             websocket_backoffs,
             shutdown: Mutex::new(Some(shutdown_tx)),
             task: Mutex::new(Some(task)),
@@ -423,13 +430,13 @@ impl LocalRouter {
 
     pub(crate) fn update_config(&self, config: &CodeyConfig) -> RouterSnapshotSwap {
         let installed = Arc::new(RouterSnapshot::from_config(config));
-        let previous = std::mem::replace(
-            &mut *self
-                .snapshot
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            Arc::clone(&installed),
-        );
+        let mut current = self
+            .snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::mem::replace(&mut *current, Arc::clone(&installed));
+        self.official_concurrency.update(&installed);
+        drop(current);
         self.websocket_backoffs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -451,6 +458,7 @@ impl LocalRouter {
             return false;
         }
         *current = Arc::clone(&swap.previous);
+        self.official_concurrency.update(&swap.previous);
         drop(current);
         self.websocket_backoffs
             .lock()
@@ -635,6 +643,8 @@ pub(crate) struct RouterServer {
     pub(crate) token: String,
     pub(crate) bearer_token: String,
     pub(crate) snapshot: Arc<RwLock<Arc<RouterSnapshot>>>,
+    pub(crate) official_concurrency: Arc<OfficialConcurrency>,
+    pub(crate) admitted_connections: Arc<Semaphore>,
     pub(crate) connection_limit: Arc<Semaphore>,
     pub(crate) rejection_limit: Arc<Semaphore>,
     pub(crate) request_body_budget: Arc<Semaphore>,
@@ -871,6 +881,15 @@ impl RouterSnapshot {
                     .filter(|proxy| !proxy.is_empty()),
                 protocol,
                 official_account: profile.official_account,
+                concurrency_key: profile.official_account.then(|| {
+                    profile
+                        .official_account_id
+                        .as_deref()
+                        .filter(|id| !id.trim().is_empty())
+                        .map(|id| format!("account:{id}"))
+                        .unwrap_or_else(|| format!("provider:{provider_id}"))
+                }),
+                max_concurrency: profile.max_concurrency,
                 // Each stored account reads its own credential document, so
                 // several official routes never share one login.
                 official_auth,
@@ -1214,6 +1233,8 @@ pub(crate) struct RouteTarget {
     pub(crate) upstream_proxy: Option<String>,
     pub(crate) protocol: UpstreamProtocol,
     pub(crate) official_account: bool,
+    pub(crate) concurrency_key: Option<String>,
+    pub(crate) max_concurrency: u32,
     pub(crate) official_auth: Option<OfficialRouteAuth>,
     pub(crate) plugin_transport: Option<plugin_transport::Target>,
     pub(crate) supports_websockets: bool,

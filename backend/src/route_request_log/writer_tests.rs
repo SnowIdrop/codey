@@ -507,6 +507,27 @@ fn sqlite_sink_inserts_one_row_per_request() {
     );
 }
 
+#[test]
+fn sqlite_concurrency_wait_is_independent_from_log_writer_queue_delay() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join(SQLITE_FILE_NAME);
+    let mut sink = SqliteSink::open(&path, 30).unwrap();
+    let mut entry = sample_entry("queued-official");
+    entry.concurrency_wait_ms = Some(1_234);
+    entry.queue_delay_ms = 7;
+    sink.write_batch(&[queued(entry)]).unwrap();
+    sink.finish().unwrap();
+    drop(sink);
+    let page = query_route_request_logs(
+        directory.path(),
+        RouteRequestLogBackend::Sqlite,
+        RouteRequestLogQuery::default(),
+    )
+    .unwrap();
+    assert_eq!(page.items[0].concurrency_wait_ms, Some(1_234));
+    assert_eq!(page.items[0].queue_delay_ms, 7);
+}
+
 #[cfg(unix)]
 #[test]
 fn sqlite_sink_uses_private_file_permissions() {

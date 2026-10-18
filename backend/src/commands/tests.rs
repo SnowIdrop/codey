@@ -4,6 +4,75 @@ use super::*;
 use crate::config::ProviderProfile;
 
 #[tokio::test]
+async fn official_concurrency_command_rejects_invalid_values_before_saving() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState {
+        store: ConfigStore::new(directory.path().join("config.json")),
+        ..AppState::default()
+    });
+    for invalid in [
+        json!(-1),
+        json!(1.5),
+        json!(u64::from(u32::MAX) + 1),
+        json!("2"),
+        json!(true),
+        Value::Null,
+    ] {
+        let error = models::invoke(
+            &state,
+            "save_official_route_models",
+            &json!({
+                "routeId": "route", "models": ["gpt-5.6-sol"], "maxConcurrency": invalid,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("maxConcurrency"), "{error}");
+    }
+    assert!(!state.store.path().exists());
+    assert_eq!(
+        optional_argument::<u32>(&json!({}), "maxConcurrency").unwrap(),
+        None
+    );
+    assert_eq!(
+        optional_argument::<u32>(&json!({"maxConcurrency": 0}), "maxConcurrency").unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        optional_argument::<u32>(&json!({"maxConcurrency": u32::MAX}), "maxConcurrency").unwrap(),
+        Some(u32::MAX)
+    );
+}
+
+#[tokio::test]
+async fn official_concurrency_command_rejects_another_accounts_route() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut profile = ProviderProfile::new("官方账号");
+    profile.official_account = true;
+    profile.official_account_id = Some("acct-one".into());
+    let mut config = CodeyConfig::default();
+    config.apply_launch_official_profiles(vec![profile]);
+    let route_id = config.profiles[0].id.clone();
+    let state = Arc::new(AppState {
+        store: ConfigStore::new(directory.path().join("config.json")),
+        config: RwLock::new(config.clone()),
+        ..AppState::default()
+    });
+    let error = models::invoke(
+        &state,
+        "save_official_route_models",
+        &json!({
+            "routeId": route_id, "models": ["gpt-5.6-sol"], "accountId": "acct-two", "maxConcurrency": 2,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("不匹配"), "{error}");
+    assert_eq!(*state.config.read().await, config);
+    assert!(!state.store.path().exists());
+}
+
+#[tokio::test]
 async fn context_recovery_preserves_other_settings_and_backs_up_the_budget() {
     let directory = tempfile::tempdir().unwrap();
     let mut config = CodeyConfig::default();

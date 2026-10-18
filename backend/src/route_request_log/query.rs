@@ -382,6 +382,11 @@ fn query_sqlite_route_request_logs(
     } else {
         "NULL"
     };
+    let concurrency_wait_column = if optional_columns.concurrency_wait {
+        "concurrency_wait_ms"
+    } else {
+        "NULL"
+    };
     let select_sql = format!(
         "SELECT
             request_id, trace_id, timestamp_unix_ms, provider, provider_name,
@@ -399,7 +404,7 @@ fn query_sqlite_route_request_logs(
             codex_session_id, codex_session_is_parent, {tier_columns},
             upstream_request_headers, {account_column}, {request_shape_columns},
             {response_header_column}, {response_model_column},
-            {OUTPUT_SPEED_SQL} AS output_tokens_per_second
+            {OUTPUT_SPEED_SQL} AS output_tokens_per_second, {concurrency_wait_column}
          FROM route_request_logs{where_clause}
          ORDER BY timestamp_unix_ms DESC, request_id DESC
          {pagination}"
@@ -827,6 +832,7 @@ struct RouteRequestLogOptionalColumns {
     response_headers: bool,
     /// 上游回报的实际使用模型列随 schema 版本 12 加入。
     response_model: bool,
+    concurrency_wait: bool,
 }
 
 /// These columns are added by the writer at open time and never dropped, so a
@@ -841,22 +847,30 @@ fn sqlite_optional_columns(
     static SHAPED_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     static RESPONSE_HEADER_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     static RESPONSE_MODEL_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    static CONCURRENCY_WAIT_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     let tiers_known = sqlite_path_known(&TIERED_PATHS, path);
     let official_known = sqlite_path_known(&ACCOUNTED_PATHS, path);
     let shape_known = sqlite_path_known(&SHAPED_PATHS, path);
     let headers_known = sqlite_path_known(&RESPONSE_HEADER_PATHS, path);
     let model_known = sqlite_path_known(&RESPONSE_MODEL_PATHS, path);
-    if tiers_known && official_known && shape_known && headers_known && model_known {
+    let wait_known = sqlite_path_known(&CONCURRENCY_WAIT_PATHS, path);
+    if tiers_known && official_known && shape_known && headers_known && model_known && wait_known {
         return Ok(RouteRequestLogOptionalColumns {
             tiers: true,
             official_account: true,
             request_shape: true,
             response_headers: true,
             response_model: true,
+            concurrency_wait: true,
         });
     }
     let columns = table_columns(connection, "route_request_logs")?;
     Ok(RouteRequestLogOptionalColumns {
+        concurrency_wait: sqlite_remember_column(
+            &CONCURRENCY_WAIT_PATHS,
+            path,
+            columns.contains("concurrency_wait_ms"),
+        ),
         tiers: sqlite_remember_column(&TIERED_PATHS, path, columns.contains("service_tier")),
         official_account: sqlite_remember_column(
             &ACCOUNTED_PATHS,
@@ -930,6 +944,7 @@ fn query_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouteRequest
         upstream_header_ms: row_optional_u64(row, 13)?,
         total_duration_ms: row_u64(row, 14)?,
         queue_delay_ms: row_u64(row, 15)?,
+        concurrency_wait_ms: row_optional_u64(row, 58)?,
         input_tokens: row_optional_u64(row, 16)?,
         output_tokens: row_optional_u64(row, 17)?,
         cached_input_tokens: row_optional_u64(row, 18)?,

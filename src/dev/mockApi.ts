@@ -307,6 +307,7 @@ if (import.meta.env.DEV) {
           supportsNativeWebSearch: true,
           supportsAutoReview: true,
           upstreamProxy: account.upstreamProxy ?? "",
+          maxConcurrency: account.maxConcurrency ?? 0,
         };
       });
       previewConfig = {
@@ -936,6 +937,7 @@ if (import.meta.env.DEV) {
           routeShortName: String(args.routeShortName ?? ""),
           baseUrl: String(args.baseUrl ?? ""),
           upstreamProxy: String(args.upstreamProxy ?? ""),
+          maxConcurrency: String(args.maxConcurrency ?? account.maxConcurrency ?? 0),
         }, previewConfig.profiles, previewOfficialAccounts, account.id);
         const error = Object.values(errors).find(Boolean);
         if (error) return { status: "failed", message: error };
@@ -947,6 +949,7 @@ if (import.meta.env.DEV) {
         account.routeShortName = routeOverride(args.routeShortName);
         account.upstreamProxy = routeOverride(args.upstreamProxy);
         account.baseUrl = routeOverride(args.baseUrl);
+        if (args.maxConcurrency !== undefined) account.maxConcurrency = Number(args.maxConcurrency);
         previewDeriveOfficialProfiles();
         return {
           status: "ok",
@@ -1472,6 +1475,7 @@ if (import.meta.env.DEV) {
             routeShortName: String(args.routeShortName ?? ""),
             baseUrl: String(args.baseUrl ?? ""),
             upstreamProxy: String(args.upstreamProxy ?? ""),
+            maxConcurrency: String(args.maxConcurrency ?? targetProfile.maxConcurrency ?? 0),
           }, previewConfig.profiles, previewOfficialAccounts, accountId);
           const error = Object.values(errors).find(Boolean);
           if (error) return { status: "failed", message: error };
@@ -1538,6 +1542,7 @@ if (import.meta.env.DEV) {
           account.routeShortName = routeOverride(args.routeShortName);
           account.upstreamProxy = routeOverride(args.upstreamProxy);
           if ("baseUrl" in args) account.baseUrl = routeOverride(args.baseUrl);
+          if (args.maxConcurrency !== undefined) account.maxConcurrency = Number(args.maxConcurrency);
           previewDeriveOfficialProfiles();
         }
         return {

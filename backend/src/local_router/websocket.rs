@@ -128,7 +128,7 @@ impl IdleDownstreamRegistry {
 
 impl WebSocketResponsesDownstream {
     #[cfg(test)]
-    pub(crate) fn new(socket: WebSocketStream<TcpStream>) -> Self {
+    pub(crate) fn new(socket: BudgetedWebSocket) -> Self {
         Self::with_shared_backoffs(
             socket,
             Arc::new(Mutex::new(UpstreamWebSocketBackoffs::default())),
@@ -138,11 +138,12 @@ impl WebSocketResponsesDownstream {
     }
 
     pub(crate) fn with_shared_backoffs(
-        socket: WebSocketStream<TcpStream>,
+        mut socket: BudgetedWebSocket,
         websocket_backoffs: Arc<Mutex<UpstreamWebSocketBackoffs>>,
         request_body_budget: Arc<Semaphore>,
         idle_registry: Arc<Mutex<IdleDownstreamRegistry>>,
     ) -> Self {
+        socket.set_budget(Arc::clone(&request_body_budget));
         let config_changes = websocket_backoffs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -236,7 +237,11 @@ impl WebSocketResponsesDownstream {
         ) {
             return parse_websocket_message(message, None).await.map(Some);
         }
-        let permit = match acquire_request_body_budget(&self.request_body_budget, message.len()) {
+        let reservation = match self.socket.take_message_permit() {
+            Some(permit) => Ok(Some(permit)),
+            None => acquire_request_body_budget(&self.request_body_budget, message.len()),
+        };
+        let permit = match reservation {
             Ok(permit) => permit,
             Err(error)
                 if error
@@ -246,7 +251,10 @@ impl WebSocketResponsesDownstream {
                 if let WebSocketMessage::Text(text) = &message
                     && text.len() <= MAX_EMERGENCY_INTERRUPT_BYTES
                     && let Ok(body) = serde_json::from_str::<Value>(text.as_str())
-                    && body["type"] == "response.interrupt"
+                    && matches!(
+                        body["type"].as_str(),
+                        Some("response.interrupt" | "response.cancel")
+                    )
                 {
                     return Ok(Some(BudgetedWebSocketMessage {
                         message,
@@ -445,15 +453,17 @@ impl WebSocketResponsesDownstream {
         // 合成 previous_response_id 只存在这条 socket 的历史里，空闲超时不能
         // 关掉它，否则 Codex 复用连接时会丢掉续接。连接数超出上限时另有回收。
         let stateful = self.adapted_history.last.is_some() || self.native_history.has_history();
-        let read = self.socket.next();
-        tokio::pin!(read);
-        let idle = tokio::time::sleep_until(idle_deadline);
-        tokio::pin!(idle);
-        let outcome = tokio::select! {
-            biased;
-            _ = &mut *evict => IdleDownstreamWait::Evicted,
-            message = &mut read => IdleDownstreamWait::Message(message),
-            _ = &mut idle, if !stateful => IdleDownstreamWait::TimedOut,
+        let outcome = {
+            let read = self.socket.next();
+            tokio::pin!(read);
+            let idle = tokio::time::sleep_until(idle_deadline);
+            tokio::pin!(idle);
+            tokio::select! {
+                biased;
+                _ = &mut *evict => IdleDownstreamWait::Evicted,
+                message = &mut read => IdleDownstreamWait::Message(message),
+                _ = &mut idle, if !stateful => IdleDownstreamWait::TimedOut,
+            }
         };
         match outcome {
             IdleDownstreamWait::Evicted => Ok(None),
@@ -1194,19 +1204,20 @@ pub(crate) fn upstream_websocket_endpoint_is_unsupported(error: &anyhow::Error) 
     })
 }
 
-#[async_trait]
-impl ResponsesDownstream for WebSocketResponsesDownstream {
-    async fn wait_for_upstream<T, F>(&mut self, future: F) -> Result<T>
+impl WebSocketResponsesDownstream {
+    async fn wait_response_future<T, F>(&mut self, future: F, admission: bool) -> Result<T>
     where
         T: Send,
         F: std::future::Future<Output = T> + Send,
     {
         tokio::pin!(future);
+        let mut control_messages = 0_u8;
         loop {
             tokio::select! {
+                biased;
                 // Keep the same pinned deadline when Ping or queued requests arrive.
-                result = &mut future => return Ok(result),
-                message = self.socket.next() => {
+                message = self.socket.next(), if control_messages < 16 => {
+                    control_messages += 1;
                     match message {
                         Some(Ok(WebSocketMessage::Ping(payload))) => {
                             self.write_pong(payload).await.map_err(|error| error.context(DownstreamClosed))?;
@@ -1225,7 +1236,14 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
                             if self.handle_steering_message(&message).await? {
                                 continue;
                             }
-                            if message.is_interrupt() {
+                            if message.is_interrupt() || (admission && message.body().is_some_and(|body| body["type"] == "response.cancel")) {
+                                if admission {
+                                    if message.body().and_then(|body| body.get("stream_id")).and_then(Value::as_str)
+                                        .is_some_and(|id| Some(id) != self.stream_id.as_deref()) {
+                                        continue;
+                                    }
+                                    return Err(DownstreamResponseInterrupt.into());
+                                }
                                 if self.interrupt_forwarding {
                                     self.pending_interrupt = Some(message);
                                     return Err(DownstreamResponseInterrupt.into());
@@ -1245,8 +1263,30 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
                         }
                     }
                 }
+                result = &mut future => return Ok(result),
+                _ = tokio::task::yield_now(), if control_messages >= 16 => {
+                    control_messages = 0;
+                }
             }
         }
+    }
+}
+
+#[async_trait]
+impl ResponsesDownstream for WebSocketResponsesDownstream {
+    async fn wait_for_admission<T, F>(&mut self, future: F) -> Result<T>
+    where
+        T: Send,
+        F: std::future::Future<Output = T> + Send,
+    {
+        self.wait_response_future(future, true).await
+    }
+    async fn wait_for_upstream<T, F>(&mut self, future: F) -> Result<T>
+    where
+        T: Send,
+        F: std::future::Future<Output = T> + Send,
+    {
+        self.wait_response_future(future, false).await
     }
     fn is_websocket(&self) -> bool {
         true
@@ -1852,10 +1892,11 @@ mod admission_tests {
     use super::*;
 
     #[tokio::test]
-    async fn exhausted_websocket_budget_rejects_frames_without_queuing_or_ending_response() {
+    async fn exhausted_websocket_budget_rejects_small_messages_without_ending_response() {
         let (socket, mut peer) = local_websocket_pair().await;
         let mut downstream = WebSocketResponsesDownstream::new(socket);
         downstream.request_body_budget = Arc::new(Semaphore::new(0));
+        downstream.socket.set_budget(Arc::clone(&downstream.request_body_budget));
         let (release, released) = oneshot::channel::<()>();
         let waiting = tokio::spawn(async move {
             downstream
@@ -1866,7 +1907,7 @@ mod admission_tests {
             downstream
         });
         peer.send(WebSocketMessage::Text(
-            json!({"type":"response.create","input":"x".repeat(REQUEST_JSON_OFFLOAD_BYTES)})
+            json!({"type":"response.create","input":"x".repeat(1024)})
                 .to_string()
                 .into(),
         ))
@@ -1909,6 +1950,7 @@ mod admission_tests {
             let (socket, mut peer) = local_websocket_pair().await;
             let mut downstream = WebSocketResponsesDownstream::new(socket);
             downstream.request_body_budget = Arc::clone(&budget);
+            downstream.socket.set_budget(Arc::clone(&budget));
             let (release, released) = oneshot::channel::<()>();
             let waiting = tokio::spawn(async move {
                 downstream
@@ -1968,6 +2010,7 @@ mod admission_tests {
             let budget = Arc::new(Semaphore::new(permits));
             let mut downstream = WebSocketResponsesDownstream::new(socket);
             downstream.request_body_budget = Arc::clone(&budget);
+            downstream.socket.set_budget(Arc::clone(&budget));
             downstream.interrupt_forwarding = true;
             for _ in 0..=MAX_PENDING_WEBSOCKET_MESSAGES {
                 peer.feed(WebSocketMessage::Text(
@@ -2020,21 +2063,19 @@ mod admission_tests {
     }
 
     #[tokio::test]
-    async fn emergency_websocket_interrupt_size_is_bounded() {
+    async fn oversized_emergency_interrupt_stops_at_header_when_budget_is_exhausted() {
         let (socket, mut peer) = local_websocket_pair().await;
         let mut downstream = WebSocketResponsesDownstream::new(socket);
         downstream.request_body_budget = Arc::new(Semaphore::new(0));
+        downstream.socket.set_budget(Arc::clone(&downstream.request_body_budget));
         downstream.interrupt_forwarding = true;
-        for padding in ["x".repeat(MAX_EMERGENCY_INTERRUPT_BYTES), String::new()] {
-            peer.feed(WebSocketMessage::Text(
-                json!({"type":"response.interrupt","padding":padding})
-                    .to_string()
-                    .into(),
-            ))
-            .await
-            .unwrap();
-        }
-        peer.flush().await.unwrap();
+        peer.send(WebSocketMessage::Text(
+            json!({"type":"response.interrupt","padding":"x".repeat(MAX_EMERGENCY_INTERRUPT_BYTES)})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
         let error = tokio::time::timeout(
             Duration::from_secs(2),
             downstream.wait_for_upstream(std::future::pending::<()>()),
@@ -2042,17 +2083,12 @@ mod admission_tests {
         .await
         .unwrap()
         .unwrap_err();
-        assert!(
-            error
-                .downcast_ref::<DownstreamResponseInterrupt>()
-                .is_some()
-        );
-        assert_eq!(
-            receive_failure(&mut peer).await["response"]["error"]["code"],
-            "router_memory_busy"
-        );
-        let interrupt = downstream.take_response_interrupt().unwrap();
-        assert_eq!(interrupt.body().unwrap()["padding"], "");
+        assert!(error.downcast_ref::<DownstreamClosed>().is_some());
+        assert!(error.chain().any(|cause| matches!(
+            cause.downcast_ref::<WebSocketError>(),
+            Some(WebSocketError::Io(error)) if error.kind() == std::io::ErrorKind::OutOfMemory
+        )));
+        assert!(downstream.take_response_interrupt().is_none());
         assert!(downstream.pending_messages.is_empty());
     }
 

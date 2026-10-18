@@ -1,25 +1,18 @@
 use super::*;
 
 impl RouterServer {
-    pub(crate) async fn handle_connection(
-        &self,
-        mut stream: TcpStream,
-        connection_permit: OwnedSemaphorePermit,
-    ) -> Result<()> {
+    pub(crate) async fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
         // 协议探测和读取请求头共用这一次超时。慢客户端不能先占满探测窗口，
         // 再单独占满读头窗口。
         let header_started = Instant::now();
         match probe_responses_websocket(&stream).await? {
             ResponsesWebSocketProbe::Upgrade => {
-                return self
-                    .handle_responses_websocket(stream, connection_permit)
-                    .await;
+                return self.handle_responses_websocket(stream).await;
             }
             ResponsesWebSocketProbe::Http => {}
             ResponsesWebSocketProbe::Silent => {
                 // 空闲或半开连接不会发出请求，和普通 HTTP 路径的读取超时一样
                 // 回一个 408 即可；对端可能已经断开，这里只做尽力回复。
-                let _connection_permit = connection_permit;
                 let _ = write_error_response(
                     &mut stream,
                     408,
@@ -31,7 +24,6 @@ impl RouterServer {
                 return Ok(());
             }
         }
-        let _connection_permit = connection_permit;
         let header_budget = REQUEST_READ_TIMEOUT.saturating_sub(header_started.elapsed());
         let pending =
             match tokio::time::timeout(header_budget, read_http_request_head(&mut stream)).await {
@@ -170,6 +162,9 @@ impl RouterServer {
         };
         let route_path = request.path.as_str();
         match (request.method.as_str(), route_path) {
+            ("GET", "/codey/concurrency") => {
+                write_json_response(&mut stream, 200, &self.official_concurrency.status()).await?;
+            }
             ("GET", "/v1/models") | ("GET", "/models") => {
                 let snapshot = Arc::clone(
                     &self
@@ -672,6 +667,18 @@ impl RouterServer {
         if editing {
             upstream_url = format!("{}/edits", upstream_url.trim_end_matches("/generations"));
         }
+        let mut admission_downstream = HttpResponsesDownstream::new(stream);
+        let admission = {
+            let mut observed =
+                ObservedResponsesDownstream::new(&mut admission_downstream, probe.clone());
+            self.admit_official(&route, &mut observed).await
+        };
+        stream = admission_downstream.stream;
+        let _official_permit = match admission {
+            Ok(permit) => permit,
+            Err(error) if error.is::<AdmissionEnded>() => return Ok(()),
+            Err(error) => return Err(error),
+        };
         let headers = match self
             .prepare_upstream_request_headers(&request, &route)
             .await
@@ -988,30 +995,18 @@ impl RouterServer {
     // Tungstenite's handshake callback fixes the error type to an HTTP
     // response value; its size is imposed by the external Callback contract.
     #[allow(clippy::result_large_err)]
-    pub(crate) async fn handle_responses_websocket(
-        &self,
-        stream: TcpStream,
-        connection_permit: OwnedSemaphorePermit,
-    ) -> Result<()> {
-        // 握手完成前一直占着并发名额。空闲等待在循环里释放，避免预连接和
-        // 已结束的回合把名额占满；下一条需要转发的消息会重新获取。
-        let mut connection_permit = Some(connection_permit);
+    pub(crate) async fn handle_responses_websocket(&self, stream: TcpStream) -> Result<()> {
+        // 连接总预算覆盖握手与空闲阶段，生成执行预算在每轮选路后获取。
         let handshake_context = Arc::new(Mutex::new(None));
         let captured_context = Arc::clone(&handshake_context);
         let token = self.token.clone();
         let bearer_token = self.bearer_token.clone();
         let request_id = current_router_request_id();
-        let websocket_config = WebSocketConfig::default()
-            // Responses events are latency-sensitive and already framed. Do
-            // not wait for tungstenite's default 128 KiB write threshold.
-            .write_buffer_size(0)
-            .max_write_buffer_size(MAX_UPSTREAM_RESPONSE_BYTES)
-            .max_message_size(Some(MAX_REQUEST_BYTES))
-            .max_frame_size(Some(MAX_REQUEST_BYTES));
+        let websocket_config = downstream_websocket_config();
         let socket = tokio::time::timeout(
             REQUEST_READ_TIMEOUT,
             accept_hdr_async_with_config(
-                stream,
+                WebSocketIngress::new(stream, Arc::clone(&self.request_body_budget)),
                 move |request: &WebSocketRequest, mut response: WebSocketResponse| {
                     if !RESPONSES_WEBSOCKET_PATHS.contains(&request.uri().path()) {
                         return Err(websocket_handshake_error(
@@ -1054,7 +1049,7 @@ impl RouterServer {
             .take()
             .context("Codey Responses WebSocket 缺少握手上下文")?;
         let mut downstream = WebSocketResponsesDownstream::with_shared_backoffs(
-            socket,
+            BudgetedWebSocket::new(socket),
             Arc::clone(&self.websocket_backoffs),
             Arc::clone(&self.request_body_budget),
             Arc::clone(&self.idle_downstreams),
@@ -1065,7 +1060,6 @@ impl RouterServer {
         );
 
         loop {
-            drop(connection_permit.take());
             let Some(message) = downstream.next_message().await? else {
                 break;
             };
@@ -1081,30 +1075,6 @@ impl RouterServer {
                 parsed_body,
                 permit: body_budget_permit,
             } = message;
-            if matches!(message, WebSocketMessage::Text(_)) {
-                match acquire_connection_permit_within(
-                    &self.connection_limit,
-                    REQUEST_BODY_BUDGET_WAIT,
-                )
-                .await
-                {
-                    Ok(permit) => connection_permit = Some(permit),
-                    Err(ConnectionPermitError::Busy) => {
-                        downstream
-                            .write_error(
-                                503,
-                                "router_busy",
-                                "Codey 本地路由当前请求过多，请稍后重试".to_string(),
-                                None,
-                            )
-                            .await?;
-                        continue;
-                    }
-                    Err(ConnectionPermitError::Closed) => {
-                        anyhow::bail!("等待本地路由连接名额失败");
-                    }
-                }
-            }
             downstream.clear_stream_id();
             match message {
                 WebSocketMessage::Text(text) => {
@@ -1612,10 +1582,20 @@ impl RouterServer {
             .unwrap_or_default()
             .trim()
             .to_string();
-        let mut portable_attempt = match PortableAttempt::acquire(self, &request, compacting, &snapshot) {
-            Ok(attempt) => attempt,
-            Err(error) => return downstream.write_error(409, "portable_compaction_unavailable", error.to_string(), None).await,
-        };
+        let mut portable_attempt =
+            match PortableAttempt::acquire(self, &request, compacting, &snapshot) {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    return downstream
+                        .write_error(
+                            409,
+                            "portable_compaction_unavailable",
+                            error.to_string(),
+                            None,
+                        )
+                        .await;
+                }
+            };
         let model_was_defaulted = requested_model.is_empty();
         let model = if model_was_defaulted {
             snapshot.default_model.trim().to_string()
@@ -1666,9 +1646,12 @@ impl RouterServer {
             let bound_route = bindings.route_for_keys(&binding_keys);
             let resolved = if let Some(attempt) = &portable_attempt {
                 Ok(RouteSelection {
-                    provider_id: attempt.source.provider_id.clone(), protocol: attempt.source.protocol,
-                    requested_model: model.clone(), route: Arc::clone(&attempt.source),
-                    upstream_model: attempt.model.clone(), fallback_reason: None,
+                    provider_id: attempt.source.provider_id.clone(),
+                    protocol: attempt.source.protocol,
+                    requested_model: model.clone(),
+                    route: Arc::clone(&attempt.source),
+                    upstream_model: attempt.model.clone(),
+                    fallback_reason: None,
                 })
             } else {
                 snapshot.target_for_request(&model, route_hint.as_deref(), bound_route.as_deref())
@@ -1687,9 +1670,12 @@ impl RouterServer {
         let route_changed = previous_route
             .as_deref()
             .is_some_and(|provider_id| provider_id != resolved.provider_id)
-            || self.bindings.lock()
+            || self
+                .bindings
+                .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .routes.get(binding_keys.first().map(String::as_str).unwrap_or_default())
+                .routes
+                .get(binding_keys.first().map(String::as_str).unwrap_or_default())
                 .is_some_and(|binding| {
                     !binding.upstream_model.is_empty()
                         && binding.context_config != Some(resolved.route.context_config)
@@ -1786,11 +1772,12 @@ impl RouterServer {
             }
         }
         if compacting && !native_compaction {
-            let metadata = crate::model_catalog::runtime_context_metadata(
-                &crate::codex_config::codex_home(),
-            );
+            let metadata =
+                crate::model_catalog::runtime_context_metadata(&crate::codex_config::codex_home());
             let model_metadata = gateway_compaction_model_metadata(
-                &metadata, &resolved.provider_id, &resolved.upstream_model,
+                &metadata,
+                &resolved.provider_id,
+                &resolved.upstream_model,
             );
             if let Err(error) = gateway_compaction_output_budget(&body, model_metadata)
                 .and_then(|budget| prepare_gateway_compaction(&mut body, budget))
@@ -2074,6 +2061,11 @@ impl RouterServer {
             body_mutated = true;
             encoded_body = None;
         }
+        let _official_permit = match self.admit_official(&resolved.route, downstream).await {
+            Ok(permit) => permit,
+            Err(error) if error.is::<AdmissionEnded>() => return Ok(()),
+            Err(error) => return Err(error),
+        };
         let mut headers = match self
             .prepare_upstream_request_headers(&request, &resolved.route)
             .await

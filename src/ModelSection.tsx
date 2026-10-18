@@ -113,6 +113,7 @@ type ModelSectionProps = {
       routeName: string;
       routeShortName: string;
       baseUrl: string;
+      maxConcurrency: number;
     },
   ) => Promise<boolean>;
   onSetDefaultModel: (routeId: string, model: string) => void;
@@ -161,7 +162,7 @@ type RouteDraftErrors = {
   upstreamProxy: string;
 };
 
-// 官方线路的编辑入口只改线路名、短名称、网关和代理，模型列举交给同步入口。
+// 官方线路的编辑入口调整连接与并发设置，模型列举交给同步入口。
 type OfficialRouteDialogScope = "settings" | "models";
 
 const UPSTREAM_PROXY_TOOLTIP_CONTENT = (
@@ -537,6 +538,7 @@ function ModelSectionComponent({
             routeShortName: routeAccount?.routeShortName || profile.shortName || fallbackRouteShortName(profile.name),
             baseUrl: routeAccount?.baseUrl ?? "",
             upstreamProxy: profile.upstreamProxy ?? "",
+            maxConcurrency: String(profile.maxConcurrency ?? routeAccount?.maxConcurrency ?? 0),
           }
         : null,
     );
@@ -714,6 +716,7 @@ function ModelSectionComponent({
                     routeName: officialRouteDraft.routeName.trim(),
                     routeShortName: officialRouteDraft.routeShortName.trim(),
                     baseUrl: officialRouteDraft.baseUrl.trim(),
+                    maxConcurrency: Number(officialRouteDraft.maxConcurrency.trim()),
                   }
                 : undefined,
             )
@@ -1358,8 +1361,8 @@ function ModelSectionComponent({
                       ? `当前官方账号：${draftOfficialAccountLabel}。未勾选的模型不会在模型目录和选择器中显示。`
                       : "未勾选的模型不会在模型目录和选择器中显示。"
                     : draftOfficialAccount
-                      ? `当前官方账号：${draftOfficialAccountLabel}。此处只调整线路名、短名称、网关地址和上游代理，模型列表请使用线路卡片上的同步按钮。`
-                      : "此处只调整线路名、短名称、网关地址和上游代理，模型列表请使用线路卡片上的同步按钮。"
+                      ? `当前官方账号：${draftOfficialAccountLabel}。调整线路连接与并发设置，模型列表请使用线路卡片上的同步按钮。`
+                      : "调整线路连接与并发设置，模型列表请使用线路卡片上的同步按钮。"
                   : "配置第三方服务的接入信息。保存后可在模型目录中同步模型。"}
               </DialogDescription>
             </DialogHeader>
@@ -1449,6 +1452,31 @@ function ModelSectionComponent({
                       </label>
                     </div>
 
+                    <label className="route-field">
+                      <span>最高并发数</span>
+                      <Input
+                        id="official-route-max-concurrency-input"
+                        aria-label="最高并发数"
+                        type="text"
+                        inputMode="numeric"
+                        autoComplete="off"
+                        value={officialRouteDraft?.maxConcurrency ?? "0"}
+                        disabled={isBusy || !draftOfficialAccount}
+                        aria-invalid={Boolean(officialRouteDraftErrors?.maxConcurrency)}
+                        aria-describedby={officialRouteDraftErrors?.maxConcurrency
+                          ? "official-route-max-concurrency-error official-route-max-concurrency-hint"
+                          : "official-route-max-concurrency-hint"}
+                        onChange={(event) => updateOfficialRouteDraft({ maxConcurrency: event.target.value })}
+                      />
+                      {officialRouteDraftErrors?.maxConcurrency ? (
+                        <small id="official-route-max-concurrency-error" className="text-[var(--codey-red,#d70015)]" role="alert">
+                          {officialRouteDraftErrors.maxConcurrency}
+                        </small>
+                      ) : null}
+                      <small id="official-route-max-concurrency-hint" className="route-field-hint">
+                        0 表示不限制；达到上限后等待。降低上限不影响正在执行的请求。
+                      </small>
+                    </label>
                     <label className="route-field">
                       <span>网关地址（可选）</span>
                       <Input

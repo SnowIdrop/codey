@@ -488,6 +488,7 @@ mod tests {
             upstream_header_ms: None,
             total_duration_ms: 1,
             queue_delay_ms: 0,
+            concurrency_wait_ms: None,
             output_tokens_per_second: Some(87.5),
             token_usage: RequestTokenUsage {
                 input_tokens: Some(1_000),

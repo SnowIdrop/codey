@@ -109,6 +109,7 @@ pub(super) async fn invoke(
             optional_argument::<String>(args, "routeShortName"),
             optional_argument::<String>(args, "upstreamProxy"),
             optional_argument::<String>(args, "baseUrl"),
+            optional_argument::<u32>(args, "maxConcurrency"),
         ) {
             (
                 Ok(account_id),
@@ -116,6 +117,7 @@ pub(super) async fn invoke(
                 Ok(route_short_name),
                 Ok(upstream_proxy),
                 Ok(base_url),
+                Ok(max_concurrency),
             ) => {
                 save_official_account_route_settings(
                     state,
@@ -124,14 +126,16 @@ pub(super) async fn invoke(
                     route_short_name.unwrap_or_default(),
                     upstream_proxy.unwrap_or_default(),
                     base_url.unwrap_or_default(),
+                    max_concurrency,
                 )
                 .await
             }
-            (Err(error), _, _, _, _)
-            | (_, Err(error), _, _, _)
-            | (_, _, Err(error), _, _)
-            | (_, _, _, Err(error), _)
-            | (_, _, _, _, Err(error)) => Err(error),
+            (Err(error), _, _, _, _, _)
+            | (_, Err(error), _, _, _, _)
+            | (_, _, Err(error), _, _, _)
+            | (_, _, _, Err(error), _, _)
+            | (_, _, _, _, Err(error), _)
+            | (_, _, _, _, _, Err(error)) => Err(error),
         },
         _ => Err(format!("未知 Codey API 命令：{command}")),
     }
@@ -835,7 +839,10 @@ pub(super) async fn save_official_account_route_settings(
     route_short_name: String,
     upstream_proxy: String,
     base_url: String,
+    max_concurrency: Option<u32>,
 ) -> Result<Value, String> {
+    // 与模型设置共用提交锁；账号文件锁只在同步写入期间持有。
+    let config_write_guard = state.config_write_lock.lock().await;
     let account_id = write_official_account_route_settings(
         state,
         account_id,
@@ -843,8 +850,10 @@ pub(super) async fn save_official_account_route_settings(
         route_short_name,
         upstream_proxy,
         base_url,
+        max_concurrency,
     )
     .await?;
+    drop(config_write_guard);
     let payload = refresh_official_route_after_account_change(state).await?;
     Ok(merge(
         payload,
@@ -861,6 +870,7 @@ pub(crate) async fn write_official_account_route_settings(
     route_short_name: String,
     upstream_proxy: String,
     base_url: String,
+    max_concurrency: Option<u32>,
 ) -> Result<String, String> {
     let account_id = account_id.trim().to_string();
     if account_id.is_empty() {
@@ -921,12 +931,13 @@ pub(crate) async fn write_official_account_route_settings(
             let label = other.email.as_deref().unwrap_or(other.id.as_str());
             anyhow::bail!("短名称「{short_name}」已被官方账号 {label} 使用");
         }
-        store.update_route_settings(
+        store.update_route_settings_with_concurrency(
             &saved_id,
             saved_name,
             saved_short_name,
             saved_proxy,
             base_url,
+            max_concurrency,
         )?;
         Ok(())
     })

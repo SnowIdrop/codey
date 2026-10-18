@@ -88,7 +88,9 @@ impl ResponsesDownstream for CapturedDownstream {
     }
 }
 
-fn test_server(config: &CodeyConfig) -> RouterServer {
+pub(super) fn test_server(config: &CodeyConfig) -> RouterServer {
+    let official_concurrency = Arc::new(OfficialConcurrency::default());
+    official_concurrency.update(&RouterSnapshot::from_config(config));
     RouterServer {
         endpoint: RuntimeRouterEndpoint {
             base_url: "http://127.0.0.1:9/v1".into(),
@@ -101,6 +103,8 @@ fn test_server(config: &CodeyConfig) -> RouterServer {
         bearer_token: "Bearer test-router".into(),
         snapshot: Arc::new(RwLock::new(Arc::new(RouterSnapshot::from_config(config)))),
         connection_limit: Arc::new(Semaphore::new(4)),
+        official_concurrency,
+        admitted_connections: Arc::new(Semaphore::new(MAX_ADMITTED_CONNECTIONS)),
         rejection_limit: Arc::new(Semaphore::new(4)),
         request_body_budget: Arc::new(Semaphore::new(REQUEST_BODY_BUDGET_PERMITS)),
         bindings: Arc::default(),

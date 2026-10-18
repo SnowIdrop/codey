@@ -388,7 +388,8 @@ impl SqliteSink {
                 upstream_input_items INTEGER,
                 upstream_has_previous_response_id INTEGER,
                 upstream_bytes INTEGER,
-                upstream_response_model TEXT
+                upstream_response_model TEXT,
+                concurrency_wait_ms INTEGER
              );
              CREATE INDEX IF NOT EXISTS idx_route_request_logs_time_id
                 ON route_request_logs(timestamp_unix_ms DESC, request_id DESC);
@@ -421,6 +422,7 @@ impl SqliteSink {
             ("upstream_has_previous_response_id", "INTEGER"),
             ("upstream_bytes", "INTEGER"),
             ("upstream_response_model", "TEXT"),
+            ("concurrency_wait_ms", "INTEGER"),
         ] {
             if !existing_columns.contains(column) {
                 connection.execute_batch(&format!(
@@ -468,14 +470,14 @@ impl SqliteSink {
                     request_has_previous_response_id, request_bytes,
                     upstream_input_state, upstream_input_items,
                     upstream_has_previous_response_id, upstream_bytes,
-                    upstream_response_model
+                    upstream_response_model, concurrency_wait_ms
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                     ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
                     ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
                     ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40,
                     ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50,
-                    ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59
+                    ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60
                 ) ON CONFLICT(request_id) DO NOTHING",
             )?;
             for queued in batch {
@@ -540,6 +542,7 @@ impl SqliteSink {
                     entry.upstream_has_previous_response_id,
                     entry.upstream_bytes.map(to_i64),
                     entry.upstream_response_model,
+                    entry.concurrency_wait_ms.map(to_i64),
                 ])?;
             }
         }

@@ -529,14 +529,22 @@ pub(super) async fn connect_router_websocket_with_headers(
 }
 
 pub(super) async fn local_websocket_pair() -> (
-    WebSocketStream<TcpStream>,
+    BudgetedWebSocket,
     WebSocketStream<MaybeTlsStream<TcpStream>>,
 ) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = async {
         let (stream, _) = listener.accept().await.unwrap();
-        tokio_tungstenite::accept_async(stream).await.unwrap()
+        let stream = WebSocketIngress::new(
+            stream,
+            Arc::new(Semaphore::new(REQUEST_BODY_BUDGET_PERMITS)),
+        );
+        BudgetedWebSocket::new(
+            tokio_tungstenite::accept_async_with_config(stream, Some(downstream_websocket_config()))
+                .await
+                .unwrap(),
+        )
     };
     let client = async {
         connect_async_with_config(format!("ws://{address}/responses"), None, false)
@@ -2781,7 +2789,7 @@ async fn idle_downstream_websockets_do_not_consume_connection_permits() {
 }
 
 #[tokio::test]
-async fn connections_that_have_not_gone_idle_still_report_router_busy() {
+async fn total_admitted_connection_budget_still_reports_router_busy() {
     let (config, _, _) = router_config("http://127.0.0.1:9/v1".into());
     let router = LocalRouter::start(&config).await.unwrap();
     let endpoint = router.endpoint();
@@ -2791,7 +2799,7 @@ async fn connections_that_have_not_gone_idle_still_report_router_busy() {
         "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 100\r\n\r\n",
         endpoint.token
     );
-    for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+    for _ in 0..MAX_ADMITTED_CONNECTIONS {
         let mut stream = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
             .await
             .unwrap();

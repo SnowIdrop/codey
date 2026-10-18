@@ -284,6 +284,14 @@ impl CodeyConfig {
         official_profiles: Vec<ProviderProfile>,
     ) {
         let previous_active_id = self.active_profile_id.clone();
+        // 没有独立账号记录的兼容线路仍从配置保存并发值；已存储账号始终
+        // 使用账号记录中的值，不能被旧配置覆盖。
+        let legacy_max_concurrency = self
+            .profiles
+            .iter()
+            .find(|profile| profile.official_account && profile.official_account_id.is_none())
+            .map(|profile| profile.max_concurrency)
+            .unwrap_or(0);
         let previous_official_profiles = self
             .profiles
             .iter()
@@ -339,7 +347,10 @@ impl CodeyConfig {
                     }
                     // 升级前没有账号记录时保留原有 Provider ID，Codex 仍按官方
                     // 登录直接访问。
-                    None => official_profile.id = DERIVED_OFFICIAL_PROFILE_ID.to_string(),
+                    None => {
+                        official_profile.id = DERIVED_OFFICIAL_PROFILE_ID.to_string();
+                        official_profile.max_concurrency = legacy_max_concurrency;
+                    }
                 }
                 let account_key = account_id.unwrap_or_default();
                 official_profile.enabled = previous_official_profiles
