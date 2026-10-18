@@ -1076,6 +1076,11 @@ impl RouterServer {
             if downstream.handle_idle_response_interrupt(&message)? {
                 continue;
             }
+            let BudgetedWebSocketMessage {
+                message,
+                parsed_body,
+                permit: body_budget_permit,
+            } = message;
             if matches!(message, WebSocketMessage::Text(_)) {
                 match acquire_connection_permit_within(
                     &self.connection_limit,
@@ -1103,32 +1108,8 @@ impl RouterServer {
             downstream.clear_stream_id();
             match message {
                 WebSocketMessage::Text(text) => {
-                    let body_budget_permit = match acquire_request_body_budget_within(
-                        &self.request_body_budget,
-                        text.len(),
-                        REQUEST_BODY_BUDGET_WAIT,
-                    )
-                    .await
+                    let mut body = match parsed_body.expect("admitted text must have a JSON result")
                     {
-                        Ok(permit) => permit,
-                        Err(error)
-                            if error
-                                .downcast_ref::<RequestBodyBudgetUnavailable>()
-                                .is_some() =>
-                        {
-                            downstream
-                                .write_error(
-                                    503,
-                                    "router_memory_busy",
-                                    "Codey 本地路由请求缓冲区已满，请稍后重试".to_string(),
-                                    None,
-                                )
-                                .await?;
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    let mut body = match serde_json::from_str::<Value>(text.as_str()) {
                         Ok(Value::Object(body)) => Value::Object(body),
                         Ok(_) => {
                             downstream
@@ -1155,12 +1136,6 @@ impl RouterServer {
                     };
                     let request_body_bytes = Some(text.len() as u64);
                     drop(text);
-                    if body["type"] == "response.steer" {
-                        let event = downstream.steering.accept(&body, &self.request_body_budget);
-                        downstream.write_steering_event(&event).await?;
-                        downstream.write_steering_notifications().await?;
-                        continue;
-                    }
                     let message_type = body.as_object_mut().and_then(|body| body.remove("type"));
                     if message_type.as_ref().and_then(Value::as_str) != Some("response.create") {
                         // 仅显示有界的协议标识，不把任意字段内容写入错误信息。

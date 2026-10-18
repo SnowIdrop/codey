@@ -1273,7 +1273,11 @@ async fn idle_cached_upstream_heartbeat_confirms_socket_before_next_request() {
         .await
         .unwrap()
         .unwrap();
-    let Some(WebSocketMessage::Text(text)) = message else {
+    let Some(BudgetedWebSocketMessage {
+        message: WebSocketMessage::Text(text),
+        ..
+    }) = message
+    else {
         panic!("expected the downstream request after Pong");
     };
     assert_eq!(text, "next request");
@@ -1310,7 +1314,13 @@ async fn idle_cached_upstream_pong_timeout_drops_socket_before_next_request() {
         .unwrap()
         .unwrap();
 
-    assert!(matches!(message, Some(WebSocketMessage::Text(_))));
+    assert!(matches!(
+        message,
+        Some(BudgetedWebSocketMessage {
+            message: WebSocketMessage::Text(_),
+            ..
+        })
+    ));
     assert!(downstream.upstream.is_none());
 }
 
