@@ -568,7 +568,12 @@ impl WebSocketResponsesDownstream {
         let history_key = self
             .native_history
             .prepare_for_route(route, effective_auth, body);
-        if route.official_account && self.native_history.requires_http() {
+        if route.official_account
+            && self.native_history.requires_http_for_websocket(
+                body,
+                cached_matches && previous_response_key.is_some(),
+            )
+        {
             return Ok(UpstreamWebSocketAttempt::UseHttp(
                 "websocket_history_requires_http",
             ));

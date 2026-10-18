@@ -1665,9 +1665,10 @@ async fn official_web_search_declarations_keep_websocket_for_plain_continuations
 }
 
 #[tokio::test]
-async fn official_opaque_continuation_uses_http_with_complete_history() {
+async fn official_opaque_history_continues_on_current_websocket_and_reconnects_over_http() {
     for output in [
         json!({"type":"web_search_call","status":"completed","action":{"type":"search","query":"test"}}),
+        json!({"type":"file_search_call","status":"completed","queries":["test"]}),
         json!({"type":"compaction","encrypted_content":"encrypted-compaction"}),
     ] {
         let auth_home = tempfile::tempdir().unwrap();
@@ -1690,6 +1691,28 @@ async fn official_opaque_continuation_uses_http_with_complete_history() {
                         "type":"response.completed",
                         "response":{"id":"resp-opaque","status":"completed","output":[output]}
                     })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let WebSocketMessage::Text(text) =
+                tokio::time::timeout(Duration::from_secs(5), websocket.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+            else {
+                panic!("expected continuation on the original upstream socket");
+            };
+            let continuation: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(continuation["previous_response_id"], "resp-opaque");
+            assert_eq!(continuation["input"], "next task");
+            websocket
+                .send(WebSocketMessage::Text(
+                    json!({"type":"response.completed","response":{
+                        "id":"resp-continued","status":"completed","output":[]
+                    }})
                     .to_string()
                     .into(),
                 ))
@@ -1729,38 +1752,50 @@ async fn official_opaque_continuation_uses_http_with_complete_history() {
             accepts_incoming_authorization: false,
         });
         *router.snapshot.write().unwrap() = Arc::new(snapshot);
-        let mut client = connect_router_websocket(&router.endpoint()).await;
+        let headers = [("session-id", "opaque-continuation")];
+        let mut client = connect_router_websocket_with_headers(&router.endpoint(), &headers).await;
         let alias = model_alias(&provider, &model);
         let first = send_router_websocket_request(&mut client, &alias, "first task").await;
         assert_eq!(first.last().unwrap()["response"]["id"], "resp-opaque");
-        client
-            .send(WebSocketMessage::Text(
-                json!({
-                    "type":"response.create", "model":alias,
-                    "previous_response_id":"resp-opaque", "input":"next task"
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
-            .unwrap();
-        let message = tokio::time::timeout(Duration::from_secs(5), client.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        let WebSocketMessage::Text(text) = message else {
-            panic!("expected terminal event")
-        };
-        let event: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(event["type"], "response.completed", "{event}");
+        for (previous, input, response) in [
+            ("resp-opaque", "next task", "resp-continued"),
+            ("resp-continued", "after reconnect", "resp-http"),
+        ] {
+            client
+                .send(WebSocketMessage::Text(
+                    json!({
+                        "type":"response.create", "model":alias,
+                        "previous_response_id":previous, "input":input
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let message = tokio::time::timeout(Duration::from_secs(5), client.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let WebSocketMessage::Text(text) = message else {
+                panic!("expected terminal event");
+            };
+            let event: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(event["type"], "response.completed", "{event}");
+            assert_eq!(event["response"]["id"], response, "{event}");
+            if response == "resp-continued" {
+                client.close(None).await.unwrap();
+                client = connect_router_websocket_with_headers(&router.endpoint(), &headers).await;
+            }
+        }
         let body = upstream_task.await.unwrap();
         assert!(body.get("previous_response_id").is_none());
         assert_eq!(
             body["input"],
             json!([
                 {"role":"user","content":"first task"}, expected_output,
-                {"role":"user","content":"next task"}
+                {"role":"user","content":"next task"},
+                {"role":"user","content":"after reconnect"}
             ])
         );
         client.close(None).await.unwrap();
@@ -1832,10 +1867,21 @@ async fn official_prewarm_generate_false_is_answered_locally_on_http_fallback() 
         accepts_incoming_authorization: false,
     });
     *router.snapshot.write().unwrap() = Arc::new(snapshot);
-    let mut client = connect_router_websocket(&router.endpoint()).await;
+    let mut client = connect_router_websocket_with_headers(
+        &router.endpoint(),
+        &[("session-id", "prewarm-http-fallback")],
+    )
+    .await;
     let alias = model_alias(&provider, &model);
     let first = send_router_websocket_request(&mut client, &alias, "first task").await;
     assert_eq!(first.last().unwrap()["response"]["id"], "resp-opaque");
+    // 断开原连接后，含压缩项的完整历史仍通过 HTTP 恢复。
+    client.close(None).await.unwrap();
+    client = connect_router_websocket_with_headers(
+        &router.endpoint(),
+        &[("session-id", "prewarm-http-fallback")],
+    )
+    .await;
     client
         .send(WebSocketMessage::Text(
             json!({
