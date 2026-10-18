@@ -740,6 +740,12 @@ impl OfficialAccountStore {
         Ok(records)
     }
 
+    /// 线路派生使用同一批账号与默认账号记录；不让账号导入、删除或更新穿插在读取之间。
+    pub(crate) fn route_snapshot(&self) -> Result<(Vec<OfficialAccountRecord>, Option<String>)> {
+        let _guard = self.lock_writes()?;
+        Ok((self.list()?, self.default_account_id()?))
+    }
+
     pub fn get(&self, id: &str) -> Result<Option<OfficialAccountRecord>> {
         Ok(
             read_account_record(&self.account_path(id), "official_accounts.get")?

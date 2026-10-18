@@ -810,16 +810,36 @@ pub(super) async fn prepare_routes_for_current_launch(state: &Arc<AppState>) -> 
     let accounts = state.official_accounts();
     let probe = match state.take_official_account_probe_prewarm().await {
         Some(task) => task,
-        None => tokio::task::spawn_blocking(move || {
-            crate::codex_provider::OfficialAccountLaunch::resolve(&home, &accounts)
-        }),
+        None => {
+            let home = home.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::codex_provider::OfficialAccountLaunch::resolve(&home, &accounts)
+            })
+        }
     };
     let official_launch = probe
         .await
         .map_err(|error| format!("解析默认官方账号的任务异常退出：{error}"))?
         .map_err(|error| format!("解析默认官方账号失败：{error:#}"))?;
 
+    commit_official_launch_routes(state, official_launch, home).await
+}
+
+async fn commit_official_launch_routes(
+    state: &Arc<AppState>,
+    official_launch: crate::codex_provider::OfficialAccountLaunch,
+    home: PathBuf,
+) -> Result<(), String> {
     let _config_write_guard = state.config_write_lock.lock().await;
+    let current_accounts = state.official_accounts();
+    let official_launch = tokio::task::spawn_blocking(move || {
+        let mut official_launch = official_launch;
+        official_launch.reconcile_current_accounts(&home, &current_accounts)?;
+        Ok::<_, anyhow::Error>(official_launch)
+    })
+    .await
+    .map_err(|error| format!("校验官方账号线路任务异常退出：{error}"))?
+    .map_err(|error| format!("校验官方账号线路失败：{error:#}"))?;
     let previous = state.config.read().await.clone();
     if !previous.local_router_enabled {
         let next = read_only_config_for_official_probe(previous, official_launch.status);
