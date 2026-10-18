@@ -1231,6 +1231,8 @@ pub(crate) struct OfficialRouteAuth {
     pub(crate) account_id: String,
     pub(crate) email: Option<String>,
     pub(crate) path: PathBuf,
+    /// 受管账号记录独立于路由快照和凭据缓存；删除后立即拒绝新的授权准备。
+    pub(crate) record_path: PathBuf,
     /// SIWC 直连凭据的物化文件；有值时该线路的对话流量走官方公开 API，
     /// `path` 里的 Codex 凭据只留给 backend-api 专属能力。
     pub(crate) siwc_path: Option<PathBuf>,
@@ -1262,6 +1264,7 @@ fn official_route_auth(profile: &crate::config::ProviderProfile) -> Option<Offic
     let accepts_incoming_authorization =
         siwc_path.is_none() && path == codex_home.join("auth.json");
     Some(OfficialRouteAuth {
+        record_path: store.account_path(&account_id),
         account_id,
         email,
         path,

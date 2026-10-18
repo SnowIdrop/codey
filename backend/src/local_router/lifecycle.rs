@@ -612,6 +612,7 @@ mod tests {
             account_id: "local-account".into(),
             email: Some("member@example.com".into()),
             path: PathBuf::from("/unused/auth.json"),
+            record_path: PathBuf::from("/unused/local-account.json"),
             siwc_path: None,
             accepts_incoming_authorization: false,
         });

@@ -898,6 +898,11 @@ impl RouterServer {
                 .map_err(|message| (401, "plugin_account_unavailable", message));
         }
         if route.official_account {
+            if let Some(auth) = route.official_auth.as_ref() {
+                validate_managed_official_account(auth)
+                    .await
+                    .map_err(|error| (401, "official_account_unavailable", format!("{error:#}")))?;
+            }
             if let Some((siwc_path, account_id)) = route.official_auth.as_ref().and_then(|auth| {
                 auth.siwc_path
                     .as_deref()
@@ -924,19 +929,28 @@ impl RouterServer {
                 headers.insert(AUTHORIZATION, value);
                 strip_siwc_forbidden_headers(&mut headers);
             } else {
-                let (auth_path, accepts_incoming_authorization) = match &route.official_auth {
-                    Some(auth) => (auth.path.as_path(), auth.accepts_incoming_authorization),
-                    None => (self.official_auth_path.as_path(), true),
+                let official_auth = match &route.official_auth {
+                    Some(auth) => {
+                        resolve_managed_official_upstream_auth(
+                            request,
+                            &self.bearer_token,
+                            auth,
+                            &self.official_auth_cache,
+                        )
+                        .await
+                    }
+                    None => {
+                        resolve_official_upstream_auth(
+                            request,
+                            &self.bearer_token,
+                            &self.official_auth_path,
+                            &self.official_auth_cache,
+                            true,
+                        )
+                        .await
+                    }
                 };
-                let official_auth = resolve_official_upstream_auth(
-                    request,
-                    &self.bearer_token,
-                    auth_path,
-                    &self.official_auth_cache,
-                    accepts_incoming_authorization,
-                )
-                .await
-                .ok_or_else(|| {
+                let official_auth = official_auth.ok_or_else(|| {
                     (
                         401,
                         "openai_auth_missing",

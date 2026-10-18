@@ -677,8 +677,16 @@ pub(super) async fn set_default_official_account(
         ));
     }
 
-    // 页头额度跟随默认账号，切换后确保额度显示处于开启状态。
-    {
+    let home = codex_home().to_path_buf();
+    let activate_store = store.clone();
+    let activate_id = account_id.clone();
+    let record = tokio::task::spawn_blocking(move || activate_store.activate(&activate_id, &home))
+        .await
+        .map_err(|error| format!("切换默认官方账号任务异常退出：{error}"))?
+        .map_err(|error| format!("{error:#}"))?;
+
+    // 页头额度跟随默认账号；激活失败时不修改显示设置。
+    let usage_setting = async {
         let _guard = state.config_write_lock.lock().await;
         let mut config = state.config.read().await.clone();
         if !config.show_account_usage_in_header {
@@ -687,24 +695,24 @@ pub(super) async fn set_default_official_account(
             let config = save_config_to_store(state, config).await?;
             *state.config.write().await = config;
         }
+        Ok::<(), String>(())
     }
-
-    let home = codex_home().to_path_buf();
-    let activate_store = store.clone();
-    let activate_record = record.clone();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        OfficialAccountStore::write_codex_login(&home, &activate_record)?;
-        activate_store.set_default_account_id(Some(&activate_record.id))?;
-        Ok(())
-    })
-    .await
-    .map_err(|error| format!("切换默认官方账号任务异常退出：{error}"))?
-    .map_err(|error| format!("{error:#}"))?;
+    .await;
 
     // Usage is cached per auth file fingerprint; the file just changed, so the
     // next read reflects the new account. Route availability is recomputed
     // from the store like at launch.
-    let payload = refresh_official_route_after_account_change(state).await?;
+    let mut payload = refresh_official_route_after_account_change(state)
+        .await
+        .map_err(|error| format!("默认官方账号已切换，但刷新官方线路失败：{error}"))?;
+    if let Err(error) = usage_setting {
+        let warning = format!("默认官方账号已切换，但开启页头额度显示失败：{error}");
+        let warning = match payload.get("warning").and_then(Value::as_str) {
+            Some(previous) => format!("{previous}；{warning}"),
+            None => warning,
+        };
+        payload = merge(payload, json!({ "warning": warning }));
+    }
     Ok(merge(payload, json!({ "accountId": record.id })))
 }
 
@@ -716,8 +724,7 @@ pub(super) async fn remove_official_account(
     if account_id.is_empty() {
         return Err("缺少要移除的官方账号".to_string());
     }
-    // 删除账号前尽力撤销 SIWC 授权；远端不可达不阻塞本地清理，凭据文件
-    // 会随账号记录一起删除。
+    // 先保留撤销需要的凭据，本地删除成功后再尽力撤销远端 SIWC 授权。
     let lookup_store = state.official_accounts();
     let lookup_id = account_id.clone();
     let siwc_credential = tokio::task::spawn_blocking(move || {
@@ -728,26 +735,12 @@ pub(super) async fn remove_official_account(
     .await
     .ok()
     .and_then(|result| result.ok().flatten());
-    if let Some(credential) = siwc_credential
-        && let Err(error) = revoke_siwc_session(&state.http_client, &credential).await
-    {
-        error_log::record_failure(
-            "official_siwc_revoke_failed",
-            "remove_official_account",
-            format!("{error:#}"),
-            json!({ "accountId": account_id }),
-        );
-    }
     let store = state.official_accounts();
     let home = codex_home().to_path_buf();
+    let removal_id = account_id.clone();
     let (removed_default, promoted, accounts_left) =
         tokio::task::spawn_blocking(move || -> anyhow::Result<(bool, Option<String>, bool)> {
-            let was_default = store.default_account_id()?.as_deref() == Some(account_id.as_str());
-            if was_default && let Some(record) = store.get(&account_id)? {
-                OfficialAccountStore::clear_codex_login_if_matches(&home, &record)?;
-            }
-            store.remove(&account_id)?;
-            let mut remaining = store.list()?;
+            let (was_default, mut remaining) = store.remove_with_codex_login(&removal_id, &home)?;
             // 默认账号被移除后把剩下最早的可用账号补上，Codex 仍然有可用的登录
             // 身份；失效账号必须跳过，否则补位会因凭据被拒绝而整个失败。
             let promoted = if was_default {
@@ -768,8 +761,35 @@ pub(super) async fn remove_official_account(
         .await
         .map_err(|error| format!("移除官方账号任务异常退出：{error}"))?
         .map_err(|error| format!("{error:#}"))?;
+    if let Some(credential) = siwc_credential
+        && let Err(error) = revoke_siwc_session(&state.http_client, &credential).await
+    {
+        error_log::record_failure(
+            "official_siwc_revoke_failed",
+            "remove_official_account",
+            format!("{error:#}"),
+            json!({ "accountId": account_id }),
+        );
+    }
     if let Some(promoted) = promoted {
-        let payload = set_default_official_account(state, promoted).await?;
+        let payload = match set_default_official_account(state, promoted).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                // 删除已经提交，补位失败也必须同步路由并明确告知实际结果。
+                let refresh_error = match refresh_official_route_after_account_change(state).await {
+                    Ok(payload) => payload
+                        .get("warning")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    Err(error) => Some(error),
+                };
+                let mut message = format!("账号已移除，但切换默认官方账号失败：{error}");
+                if let Some(error) = refresh_error {
+                    message.push_str(&format!("；刷新官方线路未完成：{error}"));
+                }
+                return Err(message);
+            }
+        };
         return Ok(merge(payload, json!({ "status": "ok" })));
     }
     if removed_default && !accounts_left {

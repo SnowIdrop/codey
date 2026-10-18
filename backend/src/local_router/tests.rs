@@ -1590,6 +1590,7 @@ async fn official_web_search_declarations_keep_websocket_for_plain_continuations
             account_id: "test-account".into(),
             email: None,
             path: auth_path.clone(),
+            record_path: auth_path.clone(),
             siwc_path: None,
             accepts_incoming_authorization: false,
         });
@@ -1701,6 +1702,7 @@ async fn official_opaque_continuation_uses_http_with_complete_history() {
         route.official_auth = Some(OfficialRouteAuth {
             account_id: "test-account".into(),
             email: None,
+            record_path: auth_path.clone(),
             path: auth_path,
             siwc_path: None,
             accepts_incoming_authorization: false,
@@ -1803,6 +1805,7 @@ async fn official_prewarm_generate_false_is_answered_locally_on_http_fallback() 
     route.official_auth = Some(OfficialRouteAuth {
         account_id: "test-account".into(),
         email: None,
+        record_path: auth_path.clone(),
         path: auth_path,
         siwc_path: None,
         accepts_incoming_authorization: false,
@@ -4230,6 +4233,7 @@ fn codex_login_route_outranks_stored_accounts_for_default_quota() {
         account_id: "test-default".into(),
         email: None,
         path: std::path::PathBuf::from("/codex/home/auth.json"),
+        record_path: std::path::PathBuf::from("/codey/accounts/test-default.json"),
         siwc_path: None,
         accepts_incoming_authorization: true,
     };
@@ -4237,6 +4241,7 @@ fn codex_login_route_outranks_stored_accounts_for_default_quota() {
         account_id: "test-idle".into(),
         email: None,
         path: std::path::PathBuf::from("/codey/accounts/test-idle.json"),
+        record_path: std::path::PathBuf::from("/codey/accounts/test-idle.json"),
         siwc_path: None,
         accepts_incoming_authorization: false,
     };
