@@ -467,6 +467,10 @@ impl BudgetedWebSocket {
         self.pending.take().map(Ok)
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "直接转发 tungstenite 错误，保留错误匹配方式并避免额外堆分配"
+    )]
     pub(crate) async fn send(
         &mut self,
         message: WebSocketMessage,
@@ -478,6 +482,10 @@ impl BudgetedWebSocket {
             .await
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "直接转发 tungstenite 错误，保留错误匹配方式并避免额外堆分配"
+    )]
     pub(crate) async fn flush(&mut self) -> std::result::Result<(), WebSocketError> {
         self.socket
             .as_mut()
@@ -486,6 +494,10 @@ impl BudgetedWebSocket {
             .await
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "直接转发 tungstenite 错误，保留错误匹配方式并避免额外堆分配"
+    )]
     pub(crate) async fn close(
         &mut self,
         frame: Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>,
