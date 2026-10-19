@@ -386,7 +386,7 @@ export function SubagentPolicyCardComponent({
               <div className="subagent-group-card codey-card">
                 <div className="subagent-group-header">
                   <div className="subagent-group-title-wrap">
-                    <span className="subagent-group-title">实施角色</span>
+                    <span className="subagent-group-title">开发角色</span>
                     <div className="subagent-stat-badge subagent-stat-badge--write">
                       <span className="subagent-stat-indicator" aria-hidden="true" />
                       <span>{SUBAGENT_ACCESS_LABELS.write}实施</span>
@@ -396,7 +396,7 @@ export function SubagentPolicyCardComponent({
                     </div>
                   </div>
                   <span className="subagent-group-desc">
-                    负责代码修改、文件写入与页面渲染验证，受父任务权限约束
+                    负责前端界面与逻辑实现，受父任务权限约束
                   </span>
                 </div>
                 <div className="subagent-group-items">
@@ -475,12 +475,13 @@ const LAUNCH_PROXY_TOOLTIP_CONTENT = (
       支持协议：<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">http://</code>、<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">https://</code>、<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">socks5://</code>、<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">socks5h://</code>
     </div>
     <div>
-      限制说明：不支持代理认证（不可携带用户名密码）；SOCKS 代理必须指定端口。
+      限制说明：认证可用 http://用户名:密码@主机:端口 形式；SOCKS 代理必须指定端口；https:// 表示用 TLS 连接代理本身。
     </div>
     <div className="pt-0.5">
       <div className="font-semibold text-[11px] opacity-80">常见示例：</div>
       <div className="mt-0.5 space-y-0.5 font-mono text-[11px] opacity-90">
         <div>http://127.0.0.1:7890</div>
+        <div>http://user:pass@127.0.0.1:7890</div>
         <div>socks5://127.0.0.1:1080</div>
       </div>
     </div>

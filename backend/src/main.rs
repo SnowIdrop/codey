@@ -11,9 +11,6 @@ fn main() {
             std::process::exit(1);
         }
     }
-    if let Some(code) = codey_lib::run_elevated_node_options_helper_if_requested() {
-        std::process::exit(code);
-    }
     codey_lib::install_crash_log_hook("codey", "runtime.codey");
     match run() {
         Ok(Some(exit_code)) if exit_code != 0 => std::process::exit(exit_code),
@@ -33,9 +30,6 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<Option<i32>> {
-    if codey_lib::run_node_options_repair_if_requested()? {
-        return Ok(None);
-    }
     if let Some(exit_code) = app_server_proxy::run_helper_if_requested()? {
         return Ok(Some(exit_code));
     }

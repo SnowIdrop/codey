@@ -82,6 +82,7 @@ const PREVIOUS_SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 
 pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] = &[
     SUBAGENT_GUIDANCE,
+    legacy::LEGACY_SUBAGENT_GUIDANCE_PRE_ROLE_TAXONOMY,
     PREVIOUS_SUBAGENT_GUIDANCE,
     legacy::DIRECT_SUBAGENT_GUIDANCE,
     CONSERVATIVE_SUBAGENT_GUIDANCE,
@@ -278,7 +279,7 @@ image_generation = false
 
 pub(crate) const WORKER_AGENT_CONFIG: &str = r#####"name = "codey_worker"
 
-description = "Writable implementation for bounded, reversible, testable, low-to-medium complexity non-visual tasks."
+description = "Implementation for backend, data, algorithm, CLI, scripting and build-tooling logic that does not change user-visible UI."
 sandbox_mode = "workspace-write"
 
 developer_instructions = """
@@ -303,7 +304,7 @@ pub(crate) const COMMENTS_ROLE_USAGE_HINT: &str = "\
 
 pub(crate) const VISUAL_WORKER_AGENT_CONFIG: &str = r#####"name = "codey_visual_worker"
 
-description = "Writable implementation for pages, GUI, PDFs, and tasks that require visual evidence or render verification."
+description = "Frontend implementation for UI, layout, style, component and interaction changes, with render or screenshot evidence when the client can capture it."
 sandbox_mode = "workspace-write"
 
 developer_instructions = """

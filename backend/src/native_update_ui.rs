@@ -217,10 +217,7 @@ mod platform {
             let app = NSApplication::sharedApplication(mtm);
 
             Ok(Self {
-                state: Arc::new(MainThreadBound::new(
-                    RefCell::new(MacUiState { app }),
-                    mtm,
-                )),
+                state: Arc::new(MainThreadBound::new(RefCell::new(MacUiState { app }), mtm)),
             })
         }
 

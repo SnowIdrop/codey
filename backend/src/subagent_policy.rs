@@ -51,6 +51,7 @@ pub(crate) fn reconcile_for_current_provider(
         config.manual_third_party_models(),
         reasoning_efforts.as_ref(),
         Some(&config.subagent_model),
+        &config.codex_app_path,
     )
     .ok();
     reconcile_with_model_state(config, state.as_ref());

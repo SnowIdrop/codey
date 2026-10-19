@@ -179,7 +179,9 @@ impl WorkflowHost {
                 "Codey executable path is not absolute".to_string(),
             ));
         }
-        let port = crate::codex_startup_patch::reserve_loopback_port()
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .and_then(|listener| listener.local_addr())
+            .map(|address| address.port())
             .map_err(|error| WorkflowError::Unavailable(error.to_string()))?;
         let capability_token = format!(
             "{}{}",
