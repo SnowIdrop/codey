@@ -221,10 +221,9 @@ impl ConversationStatsRegistry {
                 .iter()
                 .min_by_key(|(_, request)| request.started_seq)
                 .map(|(id, _)| id.clone())
+            && let Some(removed) = stats.active_requests.remove(&oldest)
         {
-            if let Some(removed) = stats.active_requests.remove(&oldest) {
-                stats.turn.lost_active(removed.started_at_unix_ms);
-            }
+            stats.turn.lost_active(removed.started_at_unix_ms);
         }
         stats
             .active_requests

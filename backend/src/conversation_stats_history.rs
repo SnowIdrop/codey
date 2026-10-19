@@ -1405,7 +1405,11 @@ mod tests {
         assert_eq!(cached_history(home.path(), ID).unwrap().turn_count, Some(3));
         assert_eq!(
             cached_read_metrics(home.path()),
-            (initial.len() as u64, appended.len() as u64, initial.len() as u64)
+            (
+                initial.len() as u64,
+                appended.len() as u64,
+                initial.len() as u64
+            )
         );
         file.write_all(b"\n").unwrap();
         assert_eq!(cached_history(home.path(), ID).unwrap().turn_count, Some(3));
