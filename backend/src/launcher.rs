@@ -662,6 +662,11 @@ fn validated_router_subagent_runtime_config(
         home,
         route_catalog_installed,
         Some(&config.runtime_enabled_model_contexts()),
+        &crate::codex_config::runtime_required_catalog_models(
+            config,
+            home,
+            route_catalog_installed,
+        ),
     )?;
     let runtime = router_subagent_runtime_config(config, catalog_path.is_some())?;
     if let Some(path) = catalog_path {
@@ -955,6 +960,8 @@ async fn prepare_codex_startup_state(
     let stream_max_retries = config.stream_max_retries;
     let runtime_default_model = runtime_default_model(config, use_official_catalog, &model_state);
     let runtime_model_contexts = config.runtime_enabled_model_contexts();
+    let required_catalog_models =
+        crate::codex_config::runtime_required_catalog_models(config, home, use_official_catalog);
     let remote_compaction_models = config.runtime_remote_compaction_model_aliases();
     let fast_context_tools = config.fast_context_tools;
     let mut runtime_subagent_config = config.clone();
@@ -977,6 +984,7 @@ async fn prepare_codex_startup_state(
                 remote_compaction_models: Some(&remote_compaction_models),
                 use_official_catalog,
                 model_contexts: Some(&runtime_model_contexts),
+                required_catalog_models: &required_catalog_models,
                 default_model: runtime_default_model.as_deref(),
                 fast_context_tools,
                 subagent_optimization,
@@ -1802,6 +1810,7 @@ async fn prepare_native_runtime_state(
                 remote_compaction_models: None,
                 use_official_catalog: false,
                 model_contexts: None,
+                required_catalog_models: &[],
                 default_model: None,
                 fast_context_tools,
                 subagent_optimization,

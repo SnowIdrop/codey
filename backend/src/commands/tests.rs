@@ -169,6 +169,7 @@ async fn launch_context_recovery_clears_budgets_only_after_confirmation() {
         directory.path(),
         true,
         Some(&config.runtime_enabled_model_contexts()),
+        &[],
     )
     .unwrap_err()
     .context("准备运行时模型目录失败");
@@ -253,6 +254,7 @@ async fn launch_context_recovery_clears_budgets_only_after_confirmation() {
             directory.path(),
             true,
             Some(&config.runtime_enabled_model_contexts()),
+            &[],
         )
         .unwrap(),
         Some(source.clone())

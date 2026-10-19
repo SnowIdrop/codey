@@ -1443,7 +1443,9 @@ pub async fn clear_route_request_logs(state: &Arc<AppState>) -> Result<Value, St
 }
 
 pub async fn load_codey_config(state: &Arc<AppState>) -> Result<Value, String> {
+    let mut timings = models::ModelOperationTimings::new("load_codey_config");
     let runtime_running = state.runtime.lock().await.is_some();
+    timings.mark("runtimeLockMs");
     if !runtime_running && let Err(error) = prepare_routes_for_current_launch(state).await {
         error_log::record_failure(
             "route_prepare_failed",
@@ -1452,21 +1454,27 @@ pub async fn load_codey_config(state: &Arc<AppState>) -> Result<Value, String> {
             json!({}),
         );
     }
+    timings.mark("prepareRoutesMs");
     let imported = ensure_default_route_imported(state).await;
+    timings.mark("routeImportMs");
     let config = if imported {
         sync_provider_models_for_launch(state, true).await
     } else {
         state.config.read().await.clone()
     };
+    timings.mark("initialModelSyncMs");
     let startup_error = state.startup_error.read().await.clone();
     let provider_status = current_provider_status_async(&config).await?;
+    timings.mark("providerStatusMs");
     let model_state = current_model_state_async(&config).await?;
+    timings.mark("modelStateMs");
     let fast_context_tools_status = current_fast_context_tools_status();
     let mut public_config = redacted_config(&config);
     public_config.fast_context_tools = embedded_fast_context_tools_enabled(
         public_config.fast_context_tools,
         &fast_context_tools_status,
     );
+    timings.mark("publicConfigMs");
     Ok(json!({
         "config": public_config,
         "path": state.store.path().to_string_lossy(),
