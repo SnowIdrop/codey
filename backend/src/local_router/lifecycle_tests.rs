@@ -110,6 +110,7 @@ pub(super) fn test_server(config: &CodeyConfig) -> RouterServer {
         bindings: Arc::default(),
         websocket_backoffs: Arc::default(),
         native_history_cache: Arc::default(),
+        portable_history_cache: Arc::default(),
         idle_downstreams: Arc::default(),
         client: super::server::upstream_http_client_builder()
             .no_proxy()

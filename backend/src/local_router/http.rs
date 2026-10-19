@@ -352,25 +352,35 @@ pub(crate) fn grow_request_body_budget(
     body_budget: &Arc<Semaphore>,
     bytes: usize,
 ) -> Result<()> {
-    let required = request_body_budget_permit_count(bytes)?;
-    let held = permit
-        .as_ref()
-        .map(OwnedSemaphorePermit::num_permits)
-        .unwrap_or(0);
-    let additional = required.saturating_sub(held);
-    if additional == 0 {
+    let Some(additional_permit) =
+        reserve_request_body_budget_growth(permit.as_ref(), body_budget, bytes)?
+    else {
         return Ok(());
-    }
-    let additional = u32::try_from(additional).context("请求体解压预算超出内部上限")?;
-    let additional_permit = Arc::clone(body_budget)
-        .try_acquire_many_owned(additional)
-        .map_err(|_| anyhow::Error::new(RequestBodyBudgetUnavailable))?;
+    };
     if let Some(held) = permit.as_mut() {
         held.merge(additional_permit);
     } else {
         *permit = Some(additional_permit);
     }
     Ok(())
+}
+
+pub(crate) fn reserve_request_body_budget_growth(
+    permit: Option<&OwnedSemaphorePermit>,
+    body_budget: &Arc<Semaphore>,
+    bytes: usize,
+) -> Result<Option<OwnedSemaphorePermit>> {
+    let required = request_body_budget_permit_count(bytes)?;
+    let held = permit.map(OwnedSemaphorePermit::num_permits).unwrap_or(0);
+    let additional = required.saturating_sub(held);
+    if additional == 0 {
+        return Ok(None);
+    }
+    let additional = u32::try_from(additional).context("请求体解压预算超出内部上限")?;
+    Arc::clone(body_budget)
+        .try_acquire_many_owned(additional)
+        .map(Some)
+        .map_err(|_| anyhow::Error::new(RequestBodyBudgetUnavailable))
 }
 
 fn shrink_request_body_budget(

@@ -1706,12 +1706,25 @@ pub(crate) async fn write_json_response(
     status: u16,
     value: &Value,
 ) -> Result<()> {
+    write_json_response_with_retry_after(stream, status, value, None).await
+}
+
+pub(crate) async fn write_json_response_with_retry_after(
+    stream: &mut TcpStream,
+    status: u16,
+    value: &Value,
+    retry_after: Option<&str>,
+) -> Result<()> {
     let mut body = serde_json::to_vec(value).context("序列化 Codey 本地路由响应失败")?;
     body.push(b'\n');
     let reason = reason_phrase(status);
     let request_id_header = router_request_id_header();
+    let retry_header = retry_after
+        .filter(|value| HeaderValue::from_str(value).is_ok())
+        .map(|value| format!("retry-after: {value}\r\n"))
+        .unwrap_or_default();
     let header = format!(
-        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{request_id_header}connection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{request_id_header}{retry_header}connection: close\r\n\r\n",
         body.len()
     );
     write_all_with_timeout(stream, header.as_bytes(), "写入本地路由 JSON 响应头失败").await?;

@@ -574,6 +574,11 @@ impl<D: ResponsesDownstream + ?Sized> ResponsesDownstream for LifecycleDownstrea
         self.error = Some(failure.code.clone());
         self.inner.write_response_failure(failure).await
     }
+    async fn write_json_response_failure(&mut self, failure: &ResponsesFailure) -> Result<()> {
+        self.status = Some(failure.status);
+        self.error = Some(failure.code.clone());
+        self.inner.write_json_response_failure(failure).await
+    }
     async fn write_json(&mut self, status: u16, value: &Value) -> Result<()> {
         self.status = Some(status);
         self.inner.write_json(status, value).await

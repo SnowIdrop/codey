@@ -1634,6 +1634,26 @@ impl RouterServer {
                 }
             };
         body_mutated |= model_was_defaulted;
+        let portable_target_metadata = portable_attempt
+            .as_ref()
+            .and_then(|attempt| attempt.target_metadata(&snapshot));
+        if let Some(attempt) = portable_attempt.as_mut() {
+            let cache = self
+                .portable_history_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .snapshot();
+            if attempt.prepare_target(
+                &mut body,
+                &cache,
+                portable_target_metadata.as_ref(),
+                &mut request._body_budget_permit,
+                &self.request_body_budget,
+            ) {
+                body_mutated = true;
+                encoded_body = None;
+            }
+        }
         let subagent_request = request_is_subagent(&request);
         let binding_keys = request_binding_keys(&request);
         // Resolve against the current binding, but do not replace it until the
@@ -1646,11 +1666,11 @@ impl RouterServer {
             let bound_route = bindings.route_for_keys(&binding_keys);
             let resolved = if let Some(attempt) = &portable_attempt {
                 Ok(RouteSelection {
-                    provider_id: attempt.source.provider_id.clone(),
-                    protocol: attempt.source.protocol,
+                    provider_id: attempt.route().provider_id.clone(),
+                    protocol: attempt.route().protocol,
                     requested_model: model.clone(),
-                    route: Arc::clone(&attempt.source),
-                    upstream_model: attempt.model.clone(),
+                    route: Arc::clone(attempt.route()),
+                    upstream_model: attempt.upstream_model().to_string(),
                     fallback_reason: None,
                 })
             } else {
@@ -1666,6 +1686,23 @@ impl RouterServer {
                     .await?;
                 return Ok(());
             }
+        };
+        // 只保留亲自观测到的完整输入；压缩响应校验成功后才建立对应关系。
+        let portable_checkpoint = if compacting
+            && portable_attempt.is_none()
+            && resolved.route.supports_remote_compaction
+            && resolved.protocol == UpstreamProtocol::OpenAiResponses
+        {
+            portable_request_key(&request).and_then(|key| {
+                let cache = self
+                    .portable_history_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .snapshot();
+                cache.capture(&key, &resolved.route, &resolved.upstream_model, &body)
+            })
+        } else {
+            None
         };
         let route_changed = previous_route
             .as_deref()
@@ -1754,6 +1791,11 @@ impl RouterServer {
             && portable_attempt.is_none()
             && resolved.route.supports_remote_compaction
             && bridge == ProtocolBridge::NativeResponses;
+        let compaction_phase = match portable_attempt.as_ref() {
+            Some(attempt) if attempt.uses_target => GatewayCompactionPhase::TargetRouteHandoff,
+            Some(_) => GatewayCompactionPhase::SourceRouteHandoff,
+            None => GatewayCompactionPhase::GatewaySummary,
+        };
         match restore_codey_compaction_summaries(&mut body) {
             Ok(true) => {
                 body_mutated = true;
@@ -1774,11 +1816,20 @@ impl RouterServer {
         if compacting && !native_compaction {
             let metadata =
                 crate::model_catalog::runtime_context_metadata(crate::codex_config::codex_home());
-            let model_metadata = gateway_compaction_model_metadata(
-                &metadata,
-                &resolved.provider_id,
-                &resolved.upstream_model,
-            );
+            let model_metadata = portable_target_metadata
+                .as_ref()
+                .filter(|_| {
+                    portable_attempt
+                        .as_ref()
+                        .is_some_and(|attempt| attempt.uses_target)
+                })
+                .or_else(|| {
+                    gateway_compaction_model_metadata(
+                        &metadata,
+                        &resolved.provider_id,
+                        &resolved.upstream_model,
+                    )
+                });
             if let Err(error) = gateway_compaction_output_budget(&body, model_metadata)
                 .and_then(|budget| prepare_gateway_compaction(&mut body, budget))
             {
@@ -2515,8 +2566,17 @@ impl RouterServer {
             {
                 Ok(Ok(body)) => body,
                 Ok(Err(error)) | Err(error) if is_upstream_timeout_error(&error) => {
-                    write_upstream_error_body_timeout(downstream, &resolved, compacting, &error)
-                        .await?;
+                    if compacting && !native_compaction {
+                        write_gateway_compaction_response_error(downstream, error,
+                            &resolved.route, compaction_phase, upstream_request_id.as_deref(), retry_advice).await?;
+                    } else {
+                        write_upstream_error_body_timeout(downstream, &resolved, compacting, &error).await?;
+                    }
+                    return Ok(());
+                }
+                Ok(Err(error)) | Err(error) if compacting && !native_compaction => {
+                    write_gateway_compaction_response_error(downstream, error,
+                        &resolved.route, compaction_phase, upstream_request_id.as_deref(), retry_advice).await?;
                     return Ok(());
                 }
                 Ok(Err(error)) | Err(error) => return Err(error),
@@ -2605,7 +2665,18 @@ impl RouterServer {
         // 首次错误正文已经读完且没有重发时，直接把它写回下游。
         let Some(response) = upstream_response else {
             if compacting && !native_compaction {
-                return write_gateway_compaction_http_error(downstream, preloaded_error_body.as_deref().unwrap_or_default(), &resolved.route).await;
+                if let Some(attempt) = portable_attempt.as_mut()
+                    && serde_json::from_slice::<Value>(preloaded_error_body.as_deref().unwrap_or_default())
+                        .ok().is_some_and(|value| is_context_length_error(&value))
+                {
+                    attempt.target_context_rejected();
+                }
+                return write_gateway_compaction_http_error(downstream,
+                    UpstreamHttpErrorResponse { status: upstream_status,
+                        upstream_request_id: upstream_request_id.as_deref(), retry_advice,
+                        body: preloaded_error_body.as_deref().unwrap_or_default() },
+                    &resolved, bridge, request_kind,
+                    compaction_phase).await;
             }
             observe_siwc_upstream_rejection(
                 &resolved.route,
@@ -2640,7 +2711,17 @@ impl RouterServer {
                 {
                     Ok(Ok(body)) => {
                         if compacting && !native_compaction {
-                            return write_gateway_compaction_http_error(downstream, &body, &resolved.route).await;
+                            if let Some(attempt) = portable_attempt.as_mut()
+                                && serde_json::from_slice::<Value>(&body).ok()
+                                    .is_some_and(|value| is_context_length_error(&value))
+                            {
+                                attempt.target_context_rejected();
+                            }
+                            return write_gateway_compaction_http_error(downstream,
+                                UpstreamHttpErrorResponse { status: upstream_status,
+                                    upstream_request_id: upstream_request_id.as_deref(), retry_advice, body: &body },
+                                &resolved, bridge, request_kind,
+                                compaction_phase).await;
                         }
                         observe_siwc_upstream_rejection(&resolved.route, upstream_status, &body);
                         write_upstream_http_error(
@@ -2658,8 +2739,16 @@ impl RouterServer {
                         .await
                     }
                     Ok(Err(error)) | Err(error) if is_upstream_timeout_error(&error) => {
-                        write_upstream_error_body_timeout(downstream, &resolved, compacting, &error)
-                            .await
+                        if compacting && !native_compaction {
+                            write_gateway_compaction_response_error(downstream, error,
+                                &resolved.route, compaction_phase, upstream_request_id.as_deref(), retry_advice).await
+                        } else {
+                            write_upstream_error_body_timeout(downstream, &resolved, compacting, &error).await
+                        }
+                    }
+                    Ok(Err(error)) | Err(error) if compacting && !native_compaction => {
+                        write_gateway_compaction_response_error(downstream, error,
+                            &resolved.route, compaction_phase, upstream_request_id.as_deref(), retry_advice).await
                     }
                     Ok(Err(error)) | Err(error) => Err(error),
                 }
@@ -2667,7 +2756,7 @@ impl RouterServer {
             _ if compacting => {
                 if !native_compaction {
                     write_gateway_compaction(downstream, response, bridge, &resolved.upstream_model,
-                        stream_requested, &resolved.route, &tool_bridge, portable_attempt.as_mut()).await
+                        stream_requested, &resolved.route, &tool_bridge, portable_attempt.as_mut(), compaction_phase).await
                 } else {
                 write_validated_compaction(
                     downstream,
@@ -2681,6 +2770,7 @@ impl RouterServer {
                     },
                     stream_requested,
                     &resolved.route,
+                    portable_checkpoint.map(|checkpoint| (checkpoint, Arc::clone(&self.portable_history_cache))),
                 )
                 .await
                 }
