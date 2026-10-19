@@ -72,7 +72,6 @@ import {
 } from "./routeConnectionImport";
 import { invoke } from "./api";
 import { listOfficialAccounts, rememberOfficialAccounts } from "./officialAccountsRequests";
-import { readHostTheme } from "./overlayTheme";
 import { getRouteCompactionStatus } from "./remoteCompactionStatus";
 
 type ModelSectionProps = {
@@ -856,7 +855,7 @@ function ModelSectionComponent({
                     color="primary"
                     variant="filled"
                     size="sm"
-                    onClick={() => void invoke("open_route_request_logs", { theme: readHostTheme() })}
+                    onClick={() => void invoke("open_route_request_logs")}
                   >
                     <IconFileText size={14} aria-hidden="true" />
                     <span>查看请求日志</span>
