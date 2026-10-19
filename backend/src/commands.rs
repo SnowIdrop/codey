@@ -26,7 +26,7 @@ mod wechat_claw;
 #[cfg(windows)]
 use codey_runtime_core::app_paths::{
     build_codex_executable, normalize_codex_app_path_checked,
-    resolve_codex_app_dir_with_saved_checked,
+    resolve_validated_codex_app_dir_with_saved_checked,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -1594,12 +1594,7 @@ async fn ensure_windows_codex_app_path(state: &Arc<AppState>) -> Result<(), Stri
         // The launcher needs a startable executable, not merely a normalizable
         // path: a stale or third-party directory must be reselected here instead
         // of surfacing later as a bare spawn failure.
-        resolve_codex_app_dir_with_saved_checked(configured_path.as_deref(), None).and_then(|app| {
-            if let Some(path) = &app {
-                codey_runtime_core::app_paths::validate_codex_app_dir(path)?;
-            }
-            Ok(app)
-        })
+        resolve_validated_codex_app_dir_with_saved_checked(configured_path.as_deref(), None)
     })
     .await
     .map_err(|error| format!("检测 Codex 桌面应用目录的任务异常退出：{error}"))?;
