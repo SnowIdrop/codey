@@ -928,7 +928,7 @@ fn webhook_turn_configuration(
     };
     webhook_session_configuration(&configuration.model, &configuration.reasoning_effort)
 }
-async fn webhook_session_name(state: &Arc<AppState>, payload: &Value, session_id: &str) -> String {
+async fn webhook_session_name(state: &Arc<AppState>, session_id: &str) -> String {
     let fallback = state
         .notification_title_cache
         .lock()
@@ -939,18 +939,7 @@ async fn webhook_session_name(state: &Arc<AppState>, payload: &Value, session_id
         let permit = Arc::clone(&state.notification_title_query)
             .try_acquire_owned()
             .map_err(|_| "query_busy")?;
-        if let Some(title) = payload
-            .get("sessionName")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|title| !title.is_empty())
-        {
-            state
-                .session_titles
-                .write()
-                .await
-                .insert(session_id.to_string(), title.to_string());
-        }
+        // 标题只取侧边栏同步和会话元数据，不采信通知载荷中的名称。
         let preferred_title = state.session_titles.read().await.get(session_id).cloned();
         let home = notification_codex_home(state);
         let session_id = session_id.to_string();
@@ -1093,7 +1082,7 @@ async fn notify_webhook_completion(
         return Ok(json!({"status":"duplicate"}));
     }
     let title_started = Instant::now();
-    let session_name = webhook_session_name(state, payload, &session_id).await;
+    let session_name = webhook_session_name(state, &session_id).await;
     let title_ms = elapsed_ms(title_started);
     let enqueue_started = Instant::now();
     let kind = if rollout_error.is_some() {
@@ -1185,7 +1174,7 @@ async fn notify_webhook_waiting(state: &Arc<AppState>, payload: &Value) -> Resul
         return Ok(json!({"status":"duplicate"}));
     }
     let title_started = Instant::now();
-    let session_name = webhook_session_name(state, payload, &session_id).await;
+    let session_name = webhook_session_name(state, &session_id).await;
     let title_ms = elapsed_ms(title_started);
     let enqueue_started = Instant::now();
     let event = NotificationEvent::new(

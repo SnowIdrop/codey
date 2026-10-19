@@ -1,3 +1,19 @@
+async fn hold_session_metadata_lock(
+    state: &Arc<AppState>,
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let state = Arc::clone(state);
+    let (locked_tx, locked_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let task = tokio::task::spawn_blocking(move || {
+        let _metadata = state.session_metadata_cache.lock().unwrap();
+        let _ = locked_tx.send(());
+        // 测试结束或断言失败时，发送端被丢弃也会结束等待并释放锁。
+        let _ = release_rx.blocking_recv();
+    });
+    locked_rx.await.unwrap();
+    (release_tx, task)
+}
+
 #[tokio::test]
 async fn notification_is_enqueued_while_metadata_lock_is_held() {
     let directory = tempfile::tempdir().unwrap();
@@ -10,7 +26,7 @@ async fn notification_is_enqueued_while_metadata_lock_is_held() {
             ..NotificationChannelConfig::default()
         }],
     );
-    let _metadata = state.session_metadata_cache.lock().unwrap();
+    let (release_metadata, metadata_task) = hold_session_metadata_lock(&state).await;
     let result = tokio::time::timeout(
         Duration::from_secs(2),
         notify_webhook_completion(
@@ -35,12 +51,22 @@ async fn notification_is_enqueued_while_metadata_lock_is_held() {
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].event.event, "session.failed");
     assert_eq!(claimed[0].event.session_name, "未命名会话");
+    drop(release_metadata);
+    metadata_task.await.unwrap();
 }
 
 #[tokio::test]
 async fn notification_title_fallback_uses_only_validated_titles() {
     let directory = tempfile::tempdir().unwrap();
-    let state = Arc::new(isolated_test_state(directory.path()));
+    let state = channel_delivery_test_state(
+        directory.path(),
+        vec![NotificationChannelConfig {
+            id: "isolated-title".into(),
+            url: "http://127.0.0.1:9/never-sent".into(),
+            allow_insecure_test_url: true,
+            ..NotificationChannelConfig::default()
+        }],
+    );
     let home = notification_codex_home(&state);
     fs::create_dir_all(&home).unwrap();
     let connection = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
@@ -57,23 +83,35 @@ async fn notification_title_fallback_uses_only_validated_titles() {
         )
         .unwrap();
     drop(connection);
-    assert_eq!(
-        webhook_session_name(
-            &state,
-            &json!({"sessionName":"这是用户的私密提示词"}),
-            "safe-session",
-        )
-        .await,
-        "已验证标题"
+    let queued = notify_webhook_completion(
+        &state,
+        &json!({
+            "sessionId":"safe-session", "turnId":"named-turn",
+            "confirmedByRollout":true, "sessionName":"这是用户的私密提示词",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(queued["status"], "queued");
+    let claimed = delivery::outbox(&state)
+        .await
+        .unwrap()
+        .claim_due(delivery::now_ms(), 1, vec![])
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].event.session_name, "已验证标题");
+    assert!(
+        state
+            .session_titles
+            .read()
+            .await
+            .get("safe-session")
+            .is_none()
     );
-    let _metadata = state.session_metadata_cache.lock().unwrap();
+    let (release_metadata, metadata_task) = hold_session_metadata_lock(&state).await;
     assert_eq!(
-        webhook_session_name(
-            &state,
-            &json!({"sessionName":"未经校验的原始内容"}),
-            "safe-session",
-        )
-        .await,
+        webhook_session_name(&state, "safe-session").await,
         "已验证标题"
     );
     state
@@ -82,13 +120,15 @@ async fn notification_title_fallback_uses_only_validated_titles() {
         .await
         .insert("unknown-session".into(), "缓存的首条提示词".into());
     assert_eq!(
-        webhook_session_name(&state, &json!({}), "unknown-session").await,
+        webhook_session_name(&state, "unknown-session").await,
         "未命名会话"
     );
     assert_eq!(
         state.notification_title_cache.lock().unwrap().titles.len(),
         1
     );
+    drop(release_metadata);
+    metadata_task.await.unwrap();
 }
 
 #[test]
@@ -112,7 +152,7 @@ fn notification_title_queries_remain_bounded_after_timeout() {
         for index in 0..128 {
             let state = Arc::clone(&state);
             queries.spawn(async move {
-                webhook_session_name(&state, &json!({}), &format!("session-{index}")).await
+                webhook_session_name(&state, &format!("session-{index}")).await
             });
         }
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -132,7 +172,7 @@ fn notification_title_queries_remain_bounded_after_timeout() {
                 .is_empty()
         );
         assert_eq!(
-            webhook_session_name(&state, &json!({}), "after-timeout").await,
+            webhook_session_name(&state, "after-timeout").await,
             "未命名会话"
         );
         assert_eq!(state.notification_title_query.available_permits(), 0);
