@@ -1012,13 +1012,13 @@ const REQUEST_GATE_VERIFY_SCRIPT_TEMPLATE: &str = r#"(async () => {
     moduleGate: window.__codeyModelRequestModuleGateInstalled === true,
   });
   for (;;) {
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) {
-      return verdict(false, false, lastMessage || "模型请求校验未就绪");
-    }
     const patch = window.__codeyModelWhitelistPatch;
     if (!patch || typeof patch.ensureRequestGate !== "function") {
       return verdict(false, true, "模型请求补丁未注入");
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      return verdict(false, false, lastMessage || "模型请求校验未就绪");
     }
     polls += 1;
     const timedOut = Symbol("timeout");
@@ -2242,21 +2242,47 @@ assert.equal(nextPage.window.attempts, 1);
 const assert = require('node:assert/strict');
 const vm = require('node:vm');
 const script = JSON.parse(process.argv[1]);
-const run = async (patch, waitMs = 40) => {
-  // 脚本在页内自轮询：vm 里补 setTimeout，并用 __codeyRequestGateWaitMs 把
-  // 等待预算压到几十毫秒，避免测试干等真实降级预算。
-  const context = vm.createContext({ window: {}, console, setTimeout });
+const run = async (patch, waitMs = 40, onPending = () => {}) => {
+  // 只在触发下一个定时器时推进时钟，避免 CI 调度延迟耗尽测试预算。
+  let now = 0;
+  const timers = [];
+  const context = vm.createContext({
+    window: {}, console, Date: { now: () => now },
+    setTimeout(callback, delay) { timers.push({ at: now + delay, callback }); },
+  });
   context.window.__codeyRequestGateWaitMs = waitMs;
   context.window.__codeyModelWhitelistPatch = patch;
-  // 判定以 JSON 字符串返回（Runtime.evaluate 未开 returnByValue 时对象不回传）。
-  return JSON.parse(await vm.runInContext(script, context));
+  let settled = false;
+  let result;
+  let failure;
+  const pending = vm.runInContext(script, context);
+  onPending(context);
+  Promise.resolve(pending).then(
+    (value) => { result = JSON.parse(value); settled = true; },
+    (error) => { failure = error; settled = true; },
+  );
+  while (!settled) {
+    // 先让所有 Promise 回调完成，再运行最近的定时器。
+    await new Promise(setImmediate);
+    if (settled) break;
+    timers.sort((left, right) => left.at - right.at);
+    const timer = timers.shift();
+    assert.ok(timer, 'request-gate verification stalled without a timer');
+    now = timer.at;
+    timer.callback();
+  }
+  if (failure) throw failure;
+  return result;
 };
 (async () => {
-  // 补丁未注入：只有整轮重装能修复。
-  for (const patch of [null, undefined, {}]) {
-    const verdict = await run(patch);
-    assert.equal(verdict.ready, false);
-    assert.equal(verdict.reinstall, true);
+  // 补丁未注入时，即使等待预算已耗尽，也必须要求重装。
+  for (const waitMs of [0, 40]) {
+    for (const patch of [null, undefined, {}]) {
+      const verdict = await run(patch, waitMs);
+      assert.equal(verdict.ready, false);
+      assert.equal(verdict.reinstall, true);
+      assert.equal(verdict.polls, 0);
+    }
   }
   const ready = await run({ ensureRequestGate: () => Promise.resolve(true) });
   assert.equal(ready.ready, true);
@@ -2274,16 +2300,20 @@ const run = async (patch, waitMs = 40) => {
   assert.equal(polled.ready, false);
   assert.equal(polled.reinstall, false);
   assert.equal(polled.message, "当前 Codex 暂不支持模型请求校验");
-  assert.ok(polled.waitedMs >= 40);
+  assert.equal(polled.waitedMs, 40);
+  // 调用一直挂起时，也必须在预算耗尽后返回。
+  const timedOut = await run({ ensureRequestGate: () => new Promise(() => {}) });
+  assert.equal(timedOut.ready, false);
+  assert.equal(timedOut.reinstall, false);
+  assert.equal(timedOut.waitedMs, 40);
+  assert.equal(timedOut.message, "模型请求校验探测超时");
   // 校验等待期间补丁被脚本重放替换：旧实例的失败必须按重装处理。
-  const context = vm.createContext({ window: {}, console, setTimeout });
-  context.window.__codeyRequestGateWaitMs = 40;
-  context.window.__codeyModelWhitelistPatch = {
+  const replaced = await run({
     ensureRequestGate: () => Promise.reject(new Error("模型请求校验已重新加载")),
-  };
-  const pending = vm.runInContext(script, context);
-  context.window.__codeyModelWhitelistPatch = { ensureRequestGate: () => Promise.resolve(true) };
-  assert.equal(JSON.parse(await pending).reinstall, true);
+  }, 40, (context) => {
+    context.window.__codeyModelWhitelistPatch = { ensureRequestGate: () => Promise.resolve(true) };
+  });
+  assert.equal(replaced.reinstall, true);
 })().catch((error) => { console.error(error); process.exit(1); });
 "#;
         let output = std::process::Command::new("node")
