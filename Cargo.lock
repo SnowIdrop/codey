@@ -413,7 +413,6 @@ dependencies = [
  "objc2-foundation",
  "percent-encoding",
  "qrcode",
- "regex",
  "reqwest",
  "rfd",
  "ring",
