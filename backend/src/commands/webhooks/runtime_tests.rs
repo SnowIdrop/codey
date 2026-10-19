@@ -1,0 +1,375 @@
+struct GatedWebhookServer {
+    url: String,
+    gate: Arc<Semaphore>,
+    received: Arc<AtomicUsize>,
+    active: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+    channel_peak: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl GatedWebhookServer {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let gate = Arc::new(Semaphore::new(0));
+        let received = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let channel_peak = Arc::new(AtomicUsize::new(0));
+        let channels = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+        let server_gate = Arc::clone(&gate);
+        let server_received = Arc::clone(&received);
+        let server_active = Arc::clone(&active);
+        let server_peak = Arc::clone(&peak);
+        let server_channel_peak = Arc::clone(&channel_peak);
+        let task = tokio::spawn(async move {
+            let mut requests = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    result = listener.accept() => {
+                        let (mut socket, _) = result.unwrap();
+                        let gate = Arc::clone(&server_gate);
+                        let received = Arc::clone(&server_received);
+                        let active = Arc::clone(&server_active);
+                        let peak = Arc::clone(&server_peak);
+                        let channel_peak = Arc::clone(&server_channel_peak);
+                        let channels = Arc::clone(&channels);
+                        requests.spawn(async move {
+                            use tokio::io::AsyncWriteExt;
+                            let request = read_http_request(&mut socket).await;
+                            let path = request.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_string();
+                            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(current, Ordering::SeqCst);
+                            {
+                                let mut channels = channels.lock().await;
+                                let count = channels.entry(path.clone()).or_default();
+                                *count += 1;
+                                channel_peak.fetch_max(*count, Ordering::SeqCst);
+                            }
+                            received.fetch_add(1, Ordering::SeqCst);
+                            gate.acquire_owned().await.unwrap().forget();
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            *channels.lock().await.get_mut(&path).unwrap() -= 1;
+                            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{\"code\":0}").await;
+                        });
+                    }
+                    _ = requests.join_next(), if !requests.is_empty() => {},
+                }
+            }
+        });
+        Self {
+            url,
+            gate,
+            received,
+            active,
+            peak,
+            channel_peak,
+            task,
+        }
+    }
+
+    fn channel(&self, id: &str) -> NotificationChannelConfig {
+        NotificationChannelConfig {
+            id: id.into(),
+            url: format!("{}/{id}", self.url),
+            allow_insecure_test_url: true,
+            ..NotificationChannelConfig::default()
+        }
+    }
+}
+
+impl Drop for GatedWebhookServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn wait_for_count(count: &AtomicUsize, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while count.load(Ordering::SeqCst) < expected {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("local delivery should make progress");
+}
+
+fn stored_delivery_states(state: &AppState) -> Vec<String> {
+    let db = rusqlite::Connection::open(
+        state
+            .store
+            .path()
+            .with_file_name("notification-outbox.sqlite3"),
+    )
+    .unwrap();
+    db.prepare("SELECT state FROM notification_deliveries ORDER BY state")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+async fn wait_for_delivered(state: &AppState, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let states = stored_delivery_states(state);
+            if states.len() == expected && states.iter().all(|state| state == "delivered") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("delivery results should be durable");
+}
+
+#[tokio::test]
+async fn slow_http_does_not_block_enqueue_and_concurrency_is_global_across_events() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = GatedWebhookServer::start().await;
+    let channels = (0..7)
+        .map(|i| server.channel(&format!("channel-{i}")))
+        .collect();
+    let state = channel_delivery_test_state(directory.path(), channels);
+    let worker = delivery::start(Arc::clone(&state)).await.unwrap();
+    let payload = json!({"sessionId":"session","turnId":"first","sessionName":"First", "confirmedByRollout":true});
+    notify_webhook_completion(&state, &payload).await.unwrap();
+    wait_for_count(&server.received, 4).await;
+    assert_eq!(server.active.load(Ordering::SeqCst), 4);
+    let second = json!({"sessionId":"session","turnId":"second","sessionName":"Second", "confirmedByRollout":true});
+    let queued = tokio::time::timeout(
+        Duration::from_millis(250),
+        notify_webhook_completion(&state, &second),
+    )
+    .await
+    .expect("an unrelated enqueue must not wait for HTTP")
+    .unwrap();
+    assert_eq!(queued["status"], "queued");
+    assert_eq!(server.received.load(Ordering::SeqCst), 4);
+    assert_eq!(stored_delivery_states(&state).len(), 14);
+    server.gate.add_permits(14);
+    wait_for_delivered(&state, 14).await;
+    assert_eq!(server.peak.load(Ordering::SeqCst), 4);
+    assert_eq!(server.channel_peak.load(Ordering::SeqCst), 1);
+    state.notification_delivery_stop.send_replace(true);
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_cancels_active_http_and_leaves_unsent_work_pending() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = GatedWebhookServer::start().await;
+    let channels = vec![server.channel("single")];
+    let state = channel_delivery_test_state(directory.path(), channels.clone());
+    for turn in ["first", "second"] {
+        notify_webhook_completion(
+            &state,
+            &json!({"sessionId":"session","turnId":turn,
+            "sessionName":"Shutdown", "confirmedByRollout":true}),
+        )
+        .await
+        .unwrap();
+    }
+    let worker = delivery::start(Arc::clone(&state)).await.unwrap();
+    wait_for_count(&server.received, 1).await;
+    state.notification_delivery_stop.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(1), worker)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_delivery_states(&state), ["pending", "uncertain"]);
+    assert_eq!(server.received.load(Ordering::SeqCst), 1);
+    drop(state);
+    let restarted = channel_delivery_test_state(directory.path(), channels);
+    server.gate.add_permits(2);
+    let worker = delivery::start(Arc::clone(&restarted)).await.unwrap();
+    wait_for_count(&server.received, 2).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while stored_delivery_states(&restarted) != ["delivered", "uncertain"] {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    restarted.notification_delivery_stop.send_replace(true);
+    worker.await.unwrap();
+    assert_eq!(server.received.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn failed_queue_write_does_not_reserve_waiting_or_acknowledge_terminal() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = MockWebhookServer::start(vec!["200 OK"]).await;
+    let state = channel_delivery_test_state(directory.path(), vec![server.channel("channel")]);
+    fs::create_dir(directory.path().join("notification-outbox.sqlite3")).unwrap();
+    let waiting = json!({"sessionId":"session","turnId":"turn","waitingId":"approval","sessionName":"Failure"});
+    assert!(notify_webhook_waiting(&state, &waiting).await.is_err());
+    assert!(
+        state
+            .persisted_waiting_notifications
+            .lock()
+            .await
+            .is_empty()
+    );
+    let completed = json!({"sessionId":"session","turnId":"turn","sessionName":"Failure","confirmedByRollout":true});
+    assert!(notify_webhook_completion(&state, &completed).await.is_err());
+    fs::remove_dir(directory.path().join("notification-outbox.sqlite3")).unwrap();
+    assert_eq!(
+        notify_webhook_waiting(&state, &waiting).await.unwrap()["status"],
+        "queued"
+    );
+    assert_eq!(
+        notify_webhook_completion(&state, &completed).await.unwrap()["status"],
+        "queued"
+    );
+    assert!(server.requests.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn resolved_waiting_is_cancelled_without_suppressing_a_new_question() {
+    use crate::notifications::outbox::DeliveryOutcome;
+
+    let directory = tempfile::tempdir().unwrap();
+    let server = MockWebhookServer::start(vec!["200 OK"]).await;
+    let state = channel_delivery_test_state(directory.path(), vec![server.channel("waiting")]);
+    for waiting_id in ["answered", "current"] {
+        notify_webhook_waiting(
+            &state,
+            &json!({"sessionId":"session","turnId":"turn",
+            "waitingId":waiting_id,"sessionName":"Waiting"}),
+        )
+        .await
+        .unwrap();
+    }
+    let events = RecentSessionEvents {
+        session_statuses: Arc::new(HashMap::from([(
+            "session".into(),
+            SessionLifecycleStatus::Waiting,
+        )])),
+        pending_approvals: vec![PendingApproval {
+            session_id: "session".into(),
+            turn_id: "turn".into(),
+            waiting_id: "current".into(),
+            duration_ms: 0,
+        }],
+        ..Default::default()
+    };
+    *state.notification_waiting_snapshot.write().await =
+        WaitingNotificationSnapshot::from_events(&events);
+    let mut results = drive_due(&state).await;
+    results.extend(drive_due(&state).await);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|outcome| matches!(outcome, DeliveryOutcome::Cancelled))
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|outcome| matches!(outcome, DeliveryOutcome::Delivered))
+            .count(),
+        1
+    );
+    assert_eq!(server.requests.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn watcher_refreshes_waiting_before_recovery_and_delivers_appended_failure() {
+    use std::io::Write;
+
+    let directory = tempfile::tempdir().unwrap();
+    let server = MockWebhookServer::start(vec!["200 OK"]).await;
+    let state = channel_delivery_test_state(directory.path(), vec![server.channel("channel")]);
+    let home = notification_codex_home(&state);
+    fs::create_dir_all(home.join("sessions")).unwrap();
+    let rollout = home.join("sessions/rollout-session.jsonl");
+    fs::write(
+        &rollout,
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn\"}}\n",
+    )
+    .unwrap();
+    let db = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+    db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, archived INTEGER, updated_at INTEGER);").unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES (?1, ?2, 0, ?3)",
+        rusqlite::params![
+            "session",
+            rollout.to_string_lossy(),
+            unix_timestamp_seconds()
+        ],
+    )
+    .unwrap();
+    drop(db);
+    // 模拟重启时仍在队列中、但当前 rollout 已无对应提问的等待通知。
+    notify_webhook_waiting(
+        &state,
+        &json!({"sessionId":"session","turnId":"turn",
+        "waitingId":"answered","sessionName":"Recovery"}),
+    )
+    .await
+    .unwrap();
+    let scan = start_recent_session_scan_at(Default::default(), home);
+    start_waiting_webhook_watcher(&state, scan).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while stored_delivery_states(&state) != ["cancelled"] {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("startup must reconcile waiting before sending");
+    assert!(server.requests.lock().await.is_empty());
+
+    let mut file = fs::OpenOptions::new().append(true).open(&rollout).unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"event_msg", "timestamp":chrono::Utc::now().to_rfc3339(),
+        "payload":{"type":"task_complete","turn_id":"turn","error":"test failure"}})
+    )
+    .unwrap();
+    // 保持 writer 打开，验证真实文件事件能够推动扫描和投递。
+    file.flush().unwrap();
+    let appended_at = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.requests.lock().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the native write event should reach the local webhook");
+    eprintln!(
+        "open rollout append to local webhook request: {:?}",
+        appended_at.elapsed()
+    );
+    let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+        while stored_delivery_states(&state) != ["cancelled", "delivered"] {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    if delivered.is_err() {
+        let snapshot = pending_approval::RecentSessionEventCache::default()
+            .refresh(&notification_codex_home(&state));
+        panic!(
+            "appended failure was not delivered: states={:?}, snapshot={snapshot:?}, watcher_finished={:?}",
+            stored_delivery_states(&state),
+            state
+                .waiting_watcher_task
+                .lock()
+                .await
+                .as_ref()
+                .map(|task| task.is_finished())
+        );
+    }
+    stop_waiting_webhook_watcher(&state).await;
+    assert_eq!(server.requests.lock().await.len(), 1);
+    assert!(
+        server.requests.lock().await[0]
+            .to_string()
+            .contains("会话失败")
+    );
+}

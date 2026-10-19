@@ -71,8 +71,8 @@ pub(crate) use updates::{
 #[cfg(test)]
 use updates::{UpdateManifest, assess_update_manifest, current_update_arch};
 use webhooks::{
-    WaitingLedgerState, WebhookNotificationState, initial_waiting_notifications,
-    sync_waiting_webhook_watcher, test_notification_channel,
+    WaitingLedgerState, initial_waiting_notifications, sync_waiting_webhook_watcher,
+    test_notification_channel,
 };
 use wechat_claw::{
     WechatClawLoginState, WechatClawSessionGuard, WechatClawSyncHandle,
@@ -133,6 +133,8 @@ pub struct AppState {
     official_proxied_clients: BlockingMutex<HashMap<String, reqwest::Client>>,
     #[cfg(test)]
     pub webhook_http_client_override: Option<reqwest::Client>,
+    #[cfg(test)]
+    notification_codex_home: Option<PathBuf>,
     /// Built on first use: the login/sync client is only needed for WeChat
     /// ClawBot flows, and constructing a reqwest client loads the system root
     /// certificates, which is measurable on the startup path.
@@ -170,8 +172,11 @@ pub struct AppState {
     session_metadata_cache: BlockingMutex<session_metadata::SessionMetadataCache>,
     #[cfg(test)]
     session_metadata_cache_contended: Notify,
-    webhook_notifications: Mutex<WebhookNotificationState>,
     persisted_waiting_notifications: Mutex<WaitingLedgerState>,
+    notification_waiting_snapshot: RwLock<webhooks::WaitingNotificationSnapshot>,
+    notification_outbox: tokio::sync::OnceCell<crate::notifications::outbox::Outbox>,
+    notification_delivery_wake: Notify,
+    notification_delivery_stop: watch::Sender<bool>,
     recent_session_event_cache: Mutex<Option<pending_approval::RecentSessionEventCache>>,
     wechat_claw_logins: Mutex<WechatClawLoginState>,
     wechat_claw_sync: Mutex<Option<WechatClawSyncHandle>>,
@@ -180,7 +185,7 @@ pub struct AppState {
     waiting_watcher_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     waiting_watcher_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     waiting_watcher_sync: Mutex<()>,
-    session_scan_wake: Notify,
+    session_scan_wake: Arc<Notify>,
     restart_settled: Notify,
     #[cfg(test)]
     restart_operation_pending: Notify,
@@ -248,7 +253,12 @@ fn load_config_or_defaults(store: &ConfigStore) -> (CodeyConfig, Option<String>)
 
 impl Default for AppState {
     fn default() -> Self {
-        let store = ConfigStore::default();
+        Self::with_store(ConfigStore::default())
+    }
+}
+
+impl AppState {
+    fn with_store(store: ConfigStore) -> Self {
         let (config, config_load_error) = load_config_or_defaults(&store);
         let protect_crashpad_pending = config.protect_crashpad_pending;
         let persisted_waiting_notifications = initial_waiting_notifications(&store, &[]);
@@ -269,6 +279,8 @@ impl Default for AppState {
             official_proxied_clients: BlockingMutex::new(HashMap::new()),
             #[cfg(test)]
             webhook_http_client_override: None,
+            #[cfg(test)]
+            notification_codex_home: None,
             wechat_claw_login_http_client: std::sync::OnceLock::new(),
             official_account_probe_prewarm: Mutex::new(None),
             official_account_logins: Mutex::new(crate::official_accounts::LoginSessions::default()),
@@ -298,10 +310,11 @@ impl Default for AppState {
             ),
             #[cfg(test)]
             session_metadata_cache_contended: Notify::new(),
-            webhook_notifications: Mutex::new(WebhookNotificationState::from_settled(
-                persisted_waiting_notifications.iter().cloned(),
-            )),
             persisted_waiting_notifications: Mutex::new(persisted_waiting_notifications),
+            notification_waiting_snapshot: RwLock::new(Default::default()),
+            notification_outbox: tokio::sync::OnceCell::new(),
+            notification_delivery_wake: Notify::new(),
+            notification_delivery_stop: watch::channel(false).0,
             recent_session_event_cache: Mutex::new(Some(
                 pending_approval::RecentSessionEventCache::default(),
             )),
@@ -312,7 +325,7 @@ impl Default for AppState {
             waiting_watcher_shutdown: Mutex::new(None),
             waiting_watcher_task: Mutex::new(None),
             waiting_watcher_sync: Mutex::new(()),
-            session_scan_wake: Notify::new(),
+            session_scan_wake: Arc::new(Notify::new()),
             restart_settled: Notify::new(),
             #[cfg(test)]
             restart_operation_pending: Notify::new(),
