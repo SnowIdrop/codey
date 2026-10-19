@@ -81,6 +81,11 @@ pub(crate) trait ResponsesDownstream: Send {
         .await
     }
 
+    /// 非流式 HTTP 保留结构化错误正文；流式传输沿用失败事件契约。
+    async fn write_json_response_failure(&mut self, failure: &ResponsesFailure) -> Result<()> {
+        self.write_response_failure(failure).await
+    }
+
     async fn write_json(&mut self, status: u16, value: &Value) -> Result<()>;
     async fn start_event_stream(&mut self) -> Result<()>;
     async fn write_event(&mut self, event: &Value) -> Result<()>;
@@ -316,6 +321,15 @@ where
         result
     }
 
+    async fn write_json_response_failure(&mut self, failure: &ResponsesFailure) -> Result<()> {
+        if let Some(probe) = self.probe.as_ref() {
+            probe.mark_error(failure.status, &failure.code);
+        }
+        let result = self.inner.write_json_response_failure(failure).await;
+        self.finish_result(&result, "downstream_error_write_failed");
+        result
+    }
+
     async fn write_json(&mut self, status: u16, value: &Value) -> Result<()> {
         if let Some(probe) = self.probe.as_ref() {
             probe.observe_response(status, value);
@@ -524,6 +538,22 @@ impl ResponsesDownstream for HttpResponsesDownstream {
             )
             .await
         }
+    }
+
+    async fn write_json_response_failure(&mut self, failure: &ResponsesFailure) -> Result<()> {
+        if self.streaming_errors || self.event_stream_started {
+            return self.write_response_failure(failure).await;
+        }
+        write_json_response_with_retry_after(
+            &mut self.stream,
+            failure.status,
+            &json!({"error": failure.event["response"]["error"]}),
+            failure
+                .retry_advice
+                .as_ref()
+                .map(|advice| advice.header.as_str()),
+        )
+        .await
     }
 
     async fn write_json(&mut self, status: u16, value: &Value) -> Result<()> {

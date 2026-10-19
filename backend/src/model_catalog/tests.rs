@@ -305,6 +305,110 @@ fn dispatch_ids_use_selected_catalog_not_merged_templates() {
 }
 
 #[test]
+fn catalog_operation_reuses_runtime_resolution_across_refresh_and_state_reads() {
+    let home = tempfile::tempdir().unwrap();
+    write_cache(home.path());
+    let context = CatalogContext::new("");
+    let before = catalog_operation_counts();
+    let read_state = || {
+        selection_state_in_context(home.path(), true, None, &[], &[], None, None, &context).unwrap()
+    };
+    assert!(!read_state().official_models.is_empty());
+    refresh_for_provider_in_context(
+        home.path(),
+        true,
+        None,
+        &[],
+        CapabilityLists::default(),
+        CatalogOverrides {
+            plugin_contexts: &BTreeMap::new(),
+            contexts: &BTreeMap::new(),
+            reasoning_efforts: &BTreeMap::new(),
+            display_names: &BTreeMap::new(),
+        },
+        &context,
+    )
+    .unwrap();
+    assert!(!read_state().official_models.is_empty());
+    assert!(prepare_cached_catalog_in_context(home.path(), &[], &[], &[], &context).unwrap());
+    let after = catalog_operation_counts();
+    assert_eq!(after.0 - before.0, 1);
+}
+
+#[test]
+fn selection_reads_missing_or_outdated_snapshots_without_starting_cli() {
+    let home = tempfile::tempdir().unwrap();
+    write_cache(home.path());
+    let runtime = home.path().join("codex");
+    fs::write(&runtime, "runtime v1").unwrap();
+    let runtime_path = runtime.to_str().unwrap();
+    let before = catalog_operation_counts();
+    for has_snapshot in [false, true] {
+        if has_snapshot {
+            let source = catalog_source_for_app(runtime_path).unwrap();
+            let mut snapshot = official_cache();
+            snapshot["codey_runtime_source"] = serde_json::to_value(source).unwrap();
+            snapshot["codey_account_snapshot"] = json!(true);
+            atomic_write(
+                &home.path().join(DEBUG_CATALOG_RELATIVE_PATH),
+                &serde_json::to_vec(&snapshot).unwrap(),
+            )
+            .unwrap();
+            fs::write(&runtime, "replacement runtime v2").unwrap();
+        }
+        let state = selection_state_with_manual_models(
+            home.path(),
+            true,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            runtime_path,
+        )
+        .unwrap();
+        assert!(!state.official_models.is_empty());
+    }
+    assert_eq!(catalog_operation_counts().1 - before.1, 0);
+}
+
+#[test]
+fn new_catalog_operation_rechecks_runtime_identity_and_rejects_previous_snapshot() {
+    let home = tempfile::tempdir().unwrap();
+    let first_runtime = home.path().join("codex-first");
+    let second_runtime = home.path().join("codex-second");
+    fs::write(&first_runtime, "same runtime bytes").unwrap();
+    fs::write(&second_runtime, "same runtime bytes").unwrap();
+    let first_path = first_runtime.to_str().unwrap();
+    let first = CatalogContext::new(first_path);
+    let snapshot = json!({
+        "models": [{
+            "slug": "account-only-model",
+            "description": "Account model",
+            "base_instructions": "Runtime-specific instructions"
+        }],
+        "codey_account_snapshot": true,
+        "codey_runtime_source": first.source(),
+    });
+    atomic_write(
+        &home.path().join(DEBUG_CATALOG_RELATIVE_PATH),
+        &serde_json::to_vec(&snapshot).unwrap(),
+    )
+    .unwrap();
+    let has_account_model = |context: &CatalogContext<'_>| {
+        read_official_entries_in_context(home.path(), context)
+            .unwrap()
+            .iter()
+            .any(|model| model["slug"] == "account-only-model")
+    };
+    assert!(has_account_model(&first));
+    let second_path = second_runtime.to_str().unwrap();
+    assert!(!has_account_model(&CatalogContext::new(second_path)));
+    fs::write(&first_runtime, "replacement runtime with a new identity").unwrap();
+    assert!(!has_account_model(&CatalogContext::new(first_path)));
+}
+
+#[test]
 fn account_snapshot_exposes_models_unknown_to_the_fallback_list() {
     let home = tempfile::tempdir().unwrap();
     let snapshot = json!({
@@ -3518,11 +3622,11 @@ fn custom_context_overlay_preserves_source_and_uses_immutable_versions() {
             reserve_output_tokens: Some(16_000),
         },
     )]);
-    let first = prepare_context_catalog_overlay(home.path(), &source, &policies).unwrap();
+    let first = prepare_context_catalog_overlay(home.path(), &source, &policies, &[]).unwrap();
     assert_ne!(first, source);
     assert_eq!(
         first,
-        prepare_context_catalog_overlay(home.path(), &source, &policies).unwrap()
+        prepare_context_catalog_overlay(home.path(), &source, &policies, &[]).unwrap()
     );
     let first_bytes = fs::read(&first).unwrap();
     let first_value: Value = serde_json::from_slice(&first_bytes).unwrap();
@@ -3534,18 +3638,18 @@ fn custom_context_overlay_preserves_source_and_uses_immutable_versions() {
         .get_mut("gpt-5.6-sol")
         .unwrap()
         .context_window_tokens = 400_000;
-    let second = prepare_context_catalog_overlay(home.path(), &source, &policies).unwrap();
+    let second = prepare_context_catalog_overlay(home.path(), &source, &policies, &[]).unwrap();
     assert_ne!(first, second);
     assert_eq!(fs::read(&first).unwrap(), first_bytes);
     assert_eq!(
-        prepare_context_catalog_overlay(home.path(), &source, &BTreeMap::new()).unwrap(),
+        prepare_context_catalog_overlay(home.path(), &source, &BTreeMap::new(), &[]).unwrap(),
         source
     );
     assert_eq!(fs::read(&source).unwrap(), source_bytes);
     let mut updated = original;
     updated["models"][0]["base_instructions"] = json!("Updated by user");
     fs::write(&source, serde_json::to_vec(&updated).unwrap()).unwrap();
-    let third = prepare_context_catalog_overlay(home.path(), &source, &policies).unwrap();
+    let third = prepare_context_catalog_overlay(home.path(), &source, &policies, &[]).unwrap();
     assert_ne!(second, third);
     let latest: Value = serde_json::from_slice(&fs::read(third).unwrap()).unwrap();
     assert_eq!(latest["models"][0]["base_instructions"], "Updated by user");
@@ -3555,6 +3659,170 @@ fn custom_context_overlay_preserves_source_and_uses_immutable_versions() {
         assert_eq!(
             fs::metadata(&first).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn custom_context_overlay_supplements_exact_route_models_with_full_metadata() {
+    let home = tempfile::tempdir().unwrap();
+    let source = home.path().join("custom.json");
+    let original = json!({
+        "revision": "user-owned",
+        "models": [{"slug": "other-route/deepseek-v4.1-flash", "custom": [1, 2]}]
+    });
+    let source_bytes = serde_json::to_vec(&original).unwrap();
+    fs::write(&source, &source_bytes).unwrap();
+    let runtime_path = home.path().join(relative_path());
+    fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
+    let mut runtime_model = json!({
+        "slug": "route-mv69jfev-blgrbg/deepseek-v4.1-flash",
+        "description": "Codey route model",
+        "base_instructions": "Keep Codey instructions",
+        "supported_reasoning_levels": [{"effort": "high"}],
+        "input_modalities": ["text", "image"],
+        "custom_field": {"nested": [1, 2]},
+        "context_window": 1000000
+    });
+    let runtime_bytes = serde_json::to_vec(&json!({"models": [runtime_model]})).unwrap();
+    fs::write(&runtime_path, &runtime_bytes).unwrap();
+    let policies = BTreeMap::from([(
+        runtime_model["slug"].as_str().unwrap().to_owned(),
+        crate::config::ModelContextConfig {
+            context_window_tokens: 128_000,
+            auto_compact_token_limit: Some(100_000),
+            reserve_output_tokens: Some(16_000),
+        },
+    )]);
+    let first = prepare_context_catalog_overlay(home.path(), &source, &policies, &[]).unwrap();
+    let first_bytes = fs::read(&first).unwrap();
+    let projected: Value = serde_json::from_slice(&first_bytes).unwrap();
+    let mut expected = original.clone();
+    let mut expected_model = runtime_model.clone();
+    apply_model_context(&mut expected_model, policies.values().next()).unwrap();
+    expected["models"]
+        .as_array_mut()
+        .unwrap()
+        .push(expected_model);
+    assert_eq!(projected, expected);
+    assert_eq!(fs::read(&source).unwrap(), source_bytes);
+    assert_eq!(fs::read(&runtime_path).unwrap(), runtime_bytes);
+    assert_eq!(
+        first.file_name().unwrap().to_string_lossy(),
+        format!("{}.json", crate::fs_util::sha256_hex(&first_bytes))
+    );
+    assert_eq!(
+        first,
+        prepare_context_catalog_overlay(home.path(), &source, &policies, &[]).unwrap()
+    );
+
+    runtime_model["base_instructions"] = json!("Updated Codey instructions");
+    fs::write(
+        &runtime_path,
+        serde_json::to_vec(&json!({"models": [runtime_model]})).unwrap(),
+    )
+    .unwrap();
+    let second = prepare_context_catalog_overlay(home.path(), &source, &policies, &[]).unwrap();
+    assert_ne!(first, second);
+    assert_eq!(fs::read(&first).unwrap(), first_bytes);
+    assert_eq!(fs::read(&source).unwrap(), source_bytes);
+    let latest: Value = serde_json::from_slice(&fs::read(second).unwrap()).unwrap();
+    assert_eq!(
+        latest["models"][1]["base_instructions"],
+        "Updated Codey instructions"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn custom_context_overlay_prefers_source_without_reading_unneeded_fallback() {
+    let home = tempfile::tempdir().unwrap();
+    let source = home.path().join("custom.json");
+    let original = json!({"models": [{
+        "slug": "route/model", "base_instructions": "User instructions", "custom": true
+    }]});
+    let source_bytes = serde_json::to_vec(&original).unwrap();
+    fs::write(&source, &source_bytes).unwrap();
+    let policies = BTreeMap::from([(
+        "route/model".into(),
+        crate::config::ModelContextConfig {
+            context_window_tokens: 128_000,
+            auto_compact_token_limit: None,
+            reserve_output_tokens: None,
+        },
+    )]);
+    let runtime_path = home.path().join(relative_path());
+    fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
+    for fallback in [
+        br#"{"models":[{"slug":"route/model","base_instructions":"Codey instructions","description":"Runtime"}]}"#.as_slice(),
+        br#"{"models":[{"slug":"route/model"},{"slug":"route/model"}]}"#.as_slice(),
+        b"invalid runtime catalog".as_slice(),
+    ] {
+        fs::write(&runtime_path, fallback).unwrap();
+        let overlay = render_context_catalog_overlay(home.path(), &source, &policies, &[])
+            .unwrap()
+            .unwrap();
+        let projected: Value = serde_json::from_slice(&overlay).unwrap();
+        let mut expected = original.clone();
+        apply_model_context(&mut expected["models"][0], policies.values().next()).unwrap();
+        assert_eq!(projected, expected);
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(fs::read(&runtime_path).unwrap(), fallback);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn custom_context_overlay_rejects_missing_or_ambiguous_fallback_models() {
+    let home = tempfile::tempdir().unwrap();
+    let source = home.path().join("custom.json");
+    let original = br#"{"models":[]}"#;
+    fs::write(&source, original).unwrap();
+    let policies = BTreeMap::from([(
+        "route/model".into(),
+        crate::config::ModelContextConfig {
+            context_window_tokens: 128_000,
+            auto_compact_token_limit: None,
+            reserve_output_tokens: None,
+        },
+    )]);
+    let runtime_path = home.path().join(relative_path());
+    fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
+    let candidate = json!({
+        "slug": "route/model", "description": "Runtime", "base_instructions": "Instructions"
+    });
+    let mut differently_cased = candidate.clone();
+    differently_cased["slug"] = json!("ROUTE/MODEL");
+    for (catalog, message) in [
+        (json!({"models": []}), "缺少已启用的预算模型"),
+        (
+            json!({"models": [{"slug": "model"}, {"slug": "other/model"}]}),
+            "缺少已启用的预算模型",
+        ),
+        (
+            json!({"models": [candidate, differently_cased]}),
+            "预算模型重复",
+        ),
+        (
+            json!({"models": [{"slug": "route/model"}]}),
+            "缺少 Codex 必需字段",
+        ),
+        (json!({"models": {}}), "缺少 models 数组"),
+    ] {
+        let runtime_bytes = serde_json::to_vec(&catalog).unwrap();
+        fs::write(&runtime_path, &runtime_bytes).unwrap();
+        let error =
+            prepare_context_catalog_overlay(home.path(), &source, &policies, &[]).unwrap_err();
+        assert!(error.is::<ContextBudgetCatalogError>());
+        assert!(error.to_string().contains(message), "{error}");
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert_eq!(fs::read(&runtime_path).unwrap(), runtime_bytes);
+        assert!(
+            !home
+                .path()
+                .join("model-catalogs/context-overrides")
+                .exists()
         );
     }
 }
@@ -3586,7 +3854,8 @@ fn custom_context_overlay_rejects_missing_ambiguous_or_invalid_models() {
     ] {
         let bytes = serde_json::to_vec(&catalog).unwrap();
         fs::write(&source, &bytes).unwrap();
-        let error = prepare_context_catalog_overlay(home.path(), &source, &policies).unwrap_err();
+        let error =
+            prepare_context_catalog_overlay(home.path(), &source, &policies, &[]).unwrap_err();
         assert!(error.to_string().contains(message), "{error}");
         assert_eq!(
             error.is::<ContextBudgetCatalogError>(),
@@ -3602,10 +3871,10 @@ fn custom_context_overlay_rejects_missing_ambiguous_or_invalid_models() {
         );
     }
     fs::write(&source, b"not json").unwrap();
-    let error = render_context_catalog_overlay(&source, &policies).unwrap_err();
+    let error = render_context_catalog_overlay(home.path(), &source, &policies, &[]).unwrap_err();
     assert!(!error.is::<ContextBudgetCatalogError>());
     assert!(
-        render_context_catalog_overlay(&source, &BTreeMap::new())
+        render_context_catalog_overlay(home.path(), &source, &BTreeMap::new(), &[])
             .unwrap()
             .is_none()
     );
@@ -3616,7 +3885,7 @@ fn custom_context_overlay_rejects_missing_ambiguous_or_invalid_models() {
         .get_mut("route/model")
         .unwrap()
         .auto_compact_token_limit = Some(128_000);
-    let error = prepare_context_catalog_overlay(home.path(), &source, &invalid).unwrap_err();
+    let error = prepare_context_catalog_overlay(home.path(), &source, &invalid, &[]).unwrap_err();
     assert!(error.is::<ContextBudgetCatalogError>());
     assert_eq!(fs::read(&source).unwrap(), original);
     assert!(
@@ -3625,6 +3894,212 @@ fn custom_context_overlay_rejects_missing_ambiguous_or_invalid_models() {
             .join("model-catalogs/context-overrides")
             .exists()
     );
+}
+
+#[test]
+fn custom_context_overlay_keeps_required_models_after_budget_removal() {
+    let home = tempfile::tempdir().unwrap();
+    let source = home.path().join("custom.json");
+    let source_bytes = br#"{"models":[{"slug":"external/model","custom":true}]}"#;
+    fs::write(&source, source_bytes).unwrap();
+    let mut original_model = json!({
+        "slug": "route/model",
+        "description": "Runtime",
+        "base_instructions": "Instructions",
+        "context_window": 320000,
+        "effective_context_window_percent": 91,
+        "codey_context_source": "official_catalog",
+        "custom": [1, 2]
+    });
+    prepare_cached_context_window(&mut original_model);
+    let policies = BTreeMap::from([(
+        "route/model".into(),
+        crate::config::ModelContextConfig {
+            context_window_tokens: 128_000,
+            auto_compact_token_limit: Some(100_000),
+            reserve_output_tokens: Some(16_000),
+        },
+    )]);
+    let mut cached_model = original_model.clone();
+    apply_model_context(&mut cached_model, policies.values().next()).unwrap();
+    let runtime_path = home.path().join(relative_path());
+    fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
+    let runtime_bytes = serde_json::to_vec(&json!({"models": [cached_model]})).unwrap();
+    fs::write(&runtime_path, &runtime_bytes).unwrap();
+    let required = vec!["ROUTE/MODEL".to_string(), "route/model".to_string()];
+
+    let first =
+        prepare_context_catalog_overlay(home.path(), &source, &policies, &required).unwrap();
+    let first_bytes = fs::read(&first).unwrap();
+    let with_budget: Value = serde_json::from_slice(&first_bytes).unwrap();
+    assert_eq!(with_budget["models"].as_array().unwrap().len(), 2);
+    assert_eq!(with_budget["models"][1], cached_model);
+
+    let second =
+        prepare_context_catalog_overlay(home.path(), &source, &BTreeMap::new(), &required).unwrap();
+    let without_budget: Value = serde_json::from_slice(&fs::read(&second).unwrap()).unwrap();
+    assert_eq!(without_budget["models"].as_array().unwrap().len(), 2);
+    assert_eq!(without_budget["models"][1], original_model);
+    assert_ne!(first, second);
+    assert_eq!(fs::read(&first).unwrap(), first_bytes);
+    assert_eq!(fs::read(&source).unwrap(), source_bytes);
+    assert_eq!(fs::read(&runtime_path).unwrap(), runtime_bytes);
+}
+
+#[test]
+fn custom_context_overlay_required_only_preserves_plugin_and_unmarked_metadata() {
+    let home = tempfile::tempdir().unwrap();
+    let source = home.path().join("custom.json");
+    fs::write(&source, br#"{"models":[]}"#).unwrap();
+    let models = vec![
+        json!({
+            "slug": "route/plugin",
+            "description": "Plugin model",
+            "base_instructions": "Plugin instructions",
+            "context_window": 918000,
+            "codey_context_source": "plugin_declared",
+            "codey_context_base": {"context_window": 272000},
+            "custom": {"nested": [1, 2]}
+        }),
+        json!({
+            "slug": "route/unmarked",
+            "description": "Unmarked model",
+            "base_instructions": "Unmarked instructions",
+            "context_window": 1000000,
+            "codey_source": "third_party"
+        }),
+    ];
+    let runtime_path = home.path().join(relative_path());
+    fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
+    fs::write(
+        &runtime_path,
+        serde_json::to_vec(&json!({"models": models})).unwrap(),
+    )
+    .unwrap();
+    let required = vec![
+        "route/plugin".into(),
+        "route/unmarked".into(),
+        "ROUTE/PLUGIN".into(),
+    ];
+
+    let overlay = render_context_catalog_overlay(home.path(), &source, &BTreeMap::new(), &required)
+        .unwrap()
+        .unwrap();
+    let projected: Value = serde_json::from_slice(&overlay).unwrap();
+    assert_eq!(projected["models"], json!(models));
+}
+
+#[test]
+fn custom_context_overlay_complete_required_catalog_reuses_source() {
+    let home = tempfile::tempdir().unwrap();
+    let source = home.path().join("custom.json");
+    let source_bytes = br#"{"models":[{"slug":"route/model","context_window":1000000,"codey_context_source":"user_declared","codey_context_base":{"context_window":272000}}]}"#;
+    fs::write(&source, source_bytes).unwrap();
+    let runtime_path = home.path().join(relative_path());
+    fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
+    fs::write(&runtime_path, b"invalid unused fallback").unwrap();
+    let required = vec!["ROUTE/MODEL".into(), "route/model".into()];
+
+    assert!(
+        render_context_catalog_overlay(home.path(), &source, &BTreeMap::new(), &required)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        prepare_context_catalog_overlay(home.path(), &source, &BTreeMap::new(), &required).unwrap(),
+        source
+    );
+    assert_eq!(fs::read(&source).unwrap(), source_bytes);
+    assert!(
+        !home
+            .path()
+            .join("model-catalogs/context-overrides")
+            .exists()
+    );
+}
+
+#[test]
+fn custom_context_overlay_without_requirements_does_not_read_catalogs() {
+    let home = tempfile::tempdir().unwrap();
+    let source = home.path().join("missing.json");
+    assert!(
+        render_context_catalog_overlay(home.path(), &source, &BTreeMap::new(), &[])
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        prepare_context_catalog_overlay(home.path(), &source, &BTreeMap::new(), &[]).unwrap(),
+        source
+    );
+    assert!(!home.path().join("model-catalogs").exists());
+}
+
+#[test]
+fn custom_context_overlay_required_errors_do_not_offer_budget_recovery() {
+    let home = tempfile::tempdir().unwrap();
+    let source = home.path().join("custom.json");
+    let runtime_path = home.path().join(relative_path());
+    fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
+    let candidate = json!({
+        "slug": "route/model", "description": "Runtime", "base_instructions": "Instructions"
+    });
+    let mut differently_cased = candidate.clone();
+    differently_cased["slug"] = json!("ROUTE/MODEL");
+    let required = vec!["route/model".into()];
+    let policies = BTreeMap::from([(
+        "ROUTE/MODEL".into(),
+        crate::config::ModelContextConfig {
+            context_window_tokens: 128_000,
+            auto_compact_token_limit: None,
+            reserve_output_tokens: None,
+        },
+    )]);
+    for (external_models, fallback_models, message) in [
+        (json!([]), json!([]), "缺少已启用的必需模型"),
+        (
+            json!([]),
+            json!([{"slug": "model"}, {"slug": "other/model"}]),
+            "缺少已启用的必需模型",
+        ),
+        (
+            json!([candidate, differently_cased]),
+            json!([]),
+            "自定义模型目录中的必需模型重复",
+        ),
+        (
+            json!([]),
+            json!([candidate, differently_cased]),
+            "Codey 运行时模型目录中的必需模型重复",
+        ),
+        (
+            json!([]),
+            json!([{"slug": "route/model"}]),
+            "缺少 Codex 必需字段",
+        ),
+        (json!([]), json!({}), "缺少 models 数组"),
+    ] {
+        let source_bytes = serde_json::to_vec(&json!({"models": external_models})).unwrap();
+        let runtime_bytes = serde_json::to_vec(&json!({"models": fallback_models})).unwrap();
+        fs::write(&source, &source_bytes).unwrap();
+        fs::write(&runtime_path, &runtime_bytes).unwrap();
+        let error =
+            prepare_context_catalog_overlay(home.path(), &source, &BTreeMap::new(), &required)
+                .unwrap_err();
+        assert!(!error.is::<ContextBudgetCatalogError>());
+        assert!(format!("{error:#}").contains(message), "{error:#}");
+        let budget_error =
+            prepare_context_catalog_overlay(home.path(), &source, &policies, &required)
+                .unwrap_err();
+        assert!(budget_error.is::<ContextBudgetCatalogError>());
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(fs::read(&runtime_path).unwrap(), runtime_bytes);
+        assert!(
+            !home
+                .path()
+                .join("model-catalogs/context-overrides")
+                .exists()
+        );
+    }
 }
 
 #[cfg(test)]

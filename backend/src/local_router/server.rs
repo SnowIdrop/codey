@@ -187,6 +187,8 @@ pub(super) fn load_or_create_router_token_at(path: &Path) -> String {
 }
 
 pub(crate) struct LocalRouter {
+    #[cfg(test)]
+    pub(crate) portable_history_cache: std::sync::Weak<Mutex<PortableHistoryCache>>,
     pub(crate) endpoint: RuntimeRouterEndpoint,
     pub(crate) bindings: Arc<Mutex<RouteBindings>>,
     pub(crate) snapshot: Arc<RwLock<Arc<RouterSnapshot>>>,
@@ -273,6 +275,7 @@ impl LocalRouter {
             bindings: Arc::clone(&bindings),
             websocket_backoffs: Arc::clone(&websocket_backoffs),
             native_history_cache: Arc::new(Mutex::new(NativeHistoryCache::default())),
+            portable_history_cache: Arc::new(Mutex::new(PortableHistoryCache::default())),
             idle_downstreams: Arc::new(Mutex::new(IdleDownstreamRegistry::default())),
             // 系统证书与代理配置加载是同步操作，不占用路由的异步工作线程。
             client: tokio::task::spawn_blocking(|| upstream_http_client_builder().build())
@@ -289,12 +292,20 @@ impl LocalRouter {
             request_log: Arc::clone(&request_log),
         };
         let server = Arc::new(server);
+        #[cfg(test)]
+        let portable_history_cache = Arc::downgrade(&server.portable_history_cache);
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             let mut consecutive_accept_failures = 0_u32;
+            let mut history_sweep = tokio::time::interval(PORTABLE_HISTORY_SWEEP_INTERVAL);
+            history_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
+                    _ = history_sweep.tick() => {
+                        server.portable_history_cache.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner).prune();
+                    }
                     joined = connections.join_next(), if !connections.is_empty() => {
                         if let Some(Err(error)) = joined
                             && error.is_panic()
@@ -411,8 +422,15 @@ impl LocalRouter {
                 connections.abort_all();
                 while connections.join_next().await.is_some() {}
             }
+            server
+                .portable_history_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
         });
         Ok(Self {
+            #[cfg(test)]
+            portable_history_cache,
             endpoint,
             bindings,
             snapshot,
@@ -653,6 +671,7 @@ pub(crate) struct RouterServer {
     pub(crate) bindings: Arc<Mutex<RouteBindings>>,
     pub(crate) websocket_backoffs: Arc<Mutex<UpstreamWebSocketBackoffs>>,
     pub(crate) native_history_cache: Arc<Mutex<NativeHistoryCache>>,
+    pub(crate) portable_history_cache: Arc<Mutex<PortableHistoryCache>>,
     pub(crate) idle_downstreams: Arc<Mutex<IdleDownstreamRegistry>>,
     pub(crate) client: reqwest::Client,
     /// 按代理地址缓存的线路专用客户端，保留连接池复用。上限内缓存，
@@ -727,6 +746,7 @@ impl ResponsesRequestKind {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RouteBindings {
+    pub(crate) portable_source_retries: HashMap<String, PortableSourceRetry>,
     pub(crate) portable_tickets: HashMap<String, PortableTicket>,
     pub(crate) compacting: HashSet<String>,
     pub(crate) routes: HashMap<String, RouteBinding>,
@@ -813,6 +833,7 @@ impl RouteBindings {
 pub(crate) struct RouterSnapshot {
     pub(crate) subagent_plaintext_messages: bool,
     pub(crate) specialized_agent_roles: Option<Vec<String>>,
+    pub(crate) declared_model_contexts: BTreeMap<String, crate::config::ModelContextConfig>,
     pub(crate) routes: HashMap<String, Arc<RouteTarget>>,
     pub(crate) aliases: HashMap<String, AliasTarget>,
     pub(crate) raw_models: HashMap<String, Vec<AliasTarget>>,
@@ -950,6 +971,7 @@ impl RouterSnapshot {
             .collect::<Vec<_>>();
         model_ids.sort_unstable();
         Self {
+            declared_model_contexts: config.runtime_enabled_model_contexts(),
             routes,
             subagent_plaintext_messages: config.subagent_optimization
                 && config.subagent_plaintext_messages,

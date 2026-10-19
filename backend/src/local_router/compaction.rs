@@ -10,29 +10,21 @@ pub(crate) const CODEY_SUMMARY_PREFIX: &str = "codey-summary-v1:";
 
 pub(crate) async fn write_gateway_compaction_http_error<D: ResponsesDownstream + ?Sized>(
     downstream: &mut D,
-    body: &[u8],
-    route: &RouteTarget,
+    response: UpstreamHttpErrorResponse<'_>,
+    resolved: &RouteSelection,
+    bridge: ProtocolBridge,
+    request_kind: ResponsesRequestKind,
+    phase: GatewayCompactionPhase,
 ) -> Result<()> {
-    let context_error = serde_json::from_slice::<Value>(body)
-        .ok()
-        .is_some_and(|value| is_context_length_error(&value));
-    downstream
-        .write_error(
-            if context_error { 400 } else { 502 },
-            if context_error {
-                CONTEXT_LENGTH_EXCEEDED
-            } else {
-                "invalid_compaction_response"
-            },
-            if context_error {
-                "压缩摘要所需的历史超过上游上下文长度限制"
-            } else {
-                "远程压缩摘要未能完成：上游返回错误响应"
-            }
-            .into(),
-            Some(route),
-        )
-        .await
+    write_upstream_http_error_with_compaction_phase(
+        downstream,
+        response,
+        resolved,
+        bridge,
+        request_kind,
+        Some(phase),
+    )
+    .await
 }
 
 pub(crate) fn codey_summary_message(item: &Value) -> Result<Option<Value>> {
@@ -2552,6 +2544,9 @@ impl SseFrameAccumulator for CompactionAccumulator {
     fn ingest_frame(&mut self, data: &str, trailing: bool) -> Result<()> {
         let event = sse_json_frame(data, Self::PROTOCOL_LABEL, trailing)?;
         check_context_length_error(&event)?;
+        if self.ordinary_response {
+            check_gateway_summary_failure(&event)?;
+        }
         match event.get("type").and_then(Value::as_str) {
             Some("response.output_item.added" | "response.output_item.done") => {
                 let index = event["output_index"]
@@ -2593,7 +2588,9 @@ impl SseFrameAccumulator for CompactionAccumulator {
                 if response.get("status").is_none() {
                     response["status"] = json!("completed");
                 }
-                if !self.ordinary_response {
+                if self.ordinary_response {
+                    check_gateway_summary_failure(&response)?;
+                } else {
                     validate_compaction_result(&response, true)?;
                 }
                 self.response = Some(response);
@@ -2610,6 +2607,26 @@ impl SseFrameAccumulator for CompactionAccumulator {
     }
 }
 
+fn check_gateway_summary_failure(value: &Value) -> Result<()> {
+    check_context_length_error(value)?;
+    if value.get("error").is_some_and(|error| !error.is_null())
+        || value
+            .pointer("/response/error")
+            .is_some_and(|error| !error.is_null())
+        || matches!(
+            value["type"].as_str(),
+            Some("response.failed" | "response.incomplete" | "error")
+        )
+        || matches!(
+            value["status"].as_str(),
+            Some("failed" | "incomplete" | "in_progress" | "cancelled")
+        )
+    {
+        return Err(UpstreamStreamFailure(value.clone()).into());
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_gateway_compaction<D: ResponsesDownstream + ?Sized>(
     downstream: &mut D,
@@ -2619,27 +2636,49 @@ pub(crate) async fn write_gateway_compaction<D: ResponsesDownstream + ?Sized>(
     stream: bool,
     route: &RouteTarget,
     tool_bridge: &ResponsesToolBridge,
-    portable_attempt: Option<&mut PortableAttempt>,
+    mut portable_attempt: Option<&mut PortableAttempt>,
+    phase: GatewayCompactionPhase,
 ) -> Result<()> {
     let probe = downstream.request_log_probe().cloned();
+    let upstream_request_id = upstream_request_id_from_headers(response.headers());
+    let retry_advice = ResponseRetryAdvice::from_headers(response.headers());
     let result = await_upstream(downstream, async {
         let mut prepared = prepare_upstream_response(response, "读取压缩摘要响应失败", probe.as_ref()).await?;
         let value = match bridge {
+            _ if !prepared.is_sse => {
+                let bytes = read_bounded_prepared_upstream_body(&mut prepared, MAX_UPSTREAM_RESPONSE_BYTES, "读取压缩摘要响应失败", probe.as_ref()).await?;
+                let value = match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(value) => value,
+                    Err(_) if bridge == ProtocolBridge::ResponsesToChatCompletions
+                        && (bytes.starts_with(b"data:") || bytes.windows(6).any(|window| window == b"\ndata:")) => {
+                        parse_chat_completion_sse_bytes(&bytes, model)?
+                    }
+                    Err(_) if bridge == ProtocolBridge::ResponsesToAnthropicMessages
+                        && (bytes.starts_with(b"event:") || bytes.starts_with(b"data:")
+                            || bytes.windows(7).any(|window| window == b"\nevent:")
+                            || bytes.windows(6).any(|window| window == b"\ndata:")) => {
+                        parse_anthropic_message_sse_bytes(&bytes, model)?
+                    }
+                    Err(error) => return Err(error).context("压缩摘要返回无效 JSON"),
+                };
+                // 在协议转换前保存失败对象，避免适配器只留下通用解析错误。
+                check_gateway_summary_failure(&value)?;
+                observe_upstream_response_model(probe.as_ref(), &value);
+                match bridge {
+                    ProtocolBridge::ResponsesToChatCompletions => chat_completion_to_responses_body_with_tool_bridge(value, model, tool_bridge)?,
+                    ProtocolBridge::ResponsesToAnthropicMessages => anthropic_message_to_responses_body_with_tool_bridge(&value, model, tool_bridge)?,
+                    _ => value,
+                }
+            }
             ProtocolBridge::ResponsesToChatCompletions => read_chat_completions_as_responses(&mut prepared, model, tool_bridge, probe.as_ref()).await?,
             ProtocolBridge::ResponsesToAnthropicMessages => read_anthropic_messages_as_responses(&mut prepared, model, tool_bridge, probe.as_ref()).await?,
-            _ if prepared.is_sse => {
+            _ => {
                 let mut accumulator = CompactionAccumulator { ordinary_response: true, ..Default::default() };
                 collect_sse_frames(&mut prepared, &mut accumulator, probe.as_ref()).await?;
                 accumulator.response.context("压缩摘要未返回完成事件")?
             }
-            _ => {
-                let bytes = read_bounded_prepared_upstream_body(&mut prepared, MAX_UPSTREAM_RESPONSE_BYTES, "读取压缩摘要响应失败", probe.as_ref()).await?;
-                serde_json::from_slice::<Value>(&bytes).context("压缩摘要返回无效 JSON")?
-            }
         };
-        check_context_length_error(&value)?;
-        anyhow::ensure!(value.get("error").is_none_or(Value::is_null), "压缩摘要上游返回错误");
-        anyhow::ensure!(!matches!(value["status"].as_str(), Some("failed" | "incomplete" | "in_progress")), "压缩摘要上游响应未完成");
+        check_gateway_summary_failure(&value)?;
         let text = value["output"].as_array().into_iter().flatten()
             .filter(|item| item["type"] == "message" && item["role"] == "assistant")
             .flat_map(|item| item["content"].as_array().into_iter().flatten())
@@ -2666,23 +2705,20 @@ pub(crate) async fn write_gateway_compaction<D: ResponsesDownstream + ?Sized>(
             Ok(())
         }
         Err(error) => {
-            let (status, code) = if error.is::<ContextLengthExceeded>() {
-                (400, CONTEXT_LENGTH_EXCEEDED)
-            } else if is_upstream_timeout_error(&error) {
-                (504, "compaction_timeout")
-            } else {
-                (502, "invalid_compaction_response")
-            };
-            let detail = sanitize_upstream_error_text(&format!("{error:#}"), route, 512)
-                .unwrap_or_else(|| "上游未返回可用的压缩摘要".into());
-            downstream
-                .write_error(
-                    status,
-                    code,
-                    format!("远程压缩摘要未能完成：{detail}"),
-                    Some(route),
-                )
-                .await
+            if error.is::<ContextLengthExceeded>()
+                && let Some(attempt) = portable_attempt.as_mut()
+            {
+                attempt.target_context_rejected();
+            }
+            write_gateway_compaction_response_error(
+                downstream,
+                error,
+                route,
+                phase,
+                upstream_request_id.as_deref(),
+                retry_advice,
+            )
+            .await
         }
     }
 }
@@ -2693,6 +2729,7 @@ pub(crate) async fn write_validated_compaction<D: ResponsesDownstream + ?Sized>(
     format: CompactionResponseFormat,
     stream: bool,
     route: &RouteTarget,
+    checkpoint: Option<(PortableHistoryCheckpoint, Arc<Mutex<PortableHistoryCache>>)>,
 ) -> Result<()> {
     let v2 = matches!(format, CompactionResponseFormat::Responses);
     let probe = downstream.request_log_probe().cloned();
@@ -2729,8 +2766,21 @@ pub(crate) async fn write_validated_compaction<D: ResponsesDownstream + ?Sized>(
     })
     .await?;
     match result {
-        Ok(value) if stream => write_responses_response_as_events(downstream, &value).await,
-        Ok(value) => downstream.write_json(200, &value).await,
+        Ok(value) => {
+            if let Some((checkpoint, cache)) = checkpoint
+                && let Some(entry) = checkpoint.finish(&value)
+            {
+                cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(entry);
+            }
+            if stream {
+                write_responses_response_as_events(downstream, &value).await
+            } else {
+                downstream.write_json(200, &value).await
+            }
+        }
         Err(error) => {
             let timeout = is_upstream_timeout_error(&error);
             let (status, code) = if timeout {

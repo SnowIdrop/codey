@@ -692,6 +692,7 @@ fn validated_router_subagent_runtime_config(
             home,
             false,
             Some(&config.runtime_enabled_model_contexts()),
+            &[],
         )?
     };
     let runtime = router_subagent_runtime_config(config, catalog_path.is_some())?;
@@ -992,6 +993,8 @@ async fn prepare_codex_startup_state(
     let stream_max_retries = config.stream_max_retries;
     let runtime_default_model = runtime_default_model(config, use_official_catalog, &model_state);
     let runtime_model_contexts = config.runtime_enabled_model_contexts();
+    let required_catalog_models =
+        crate::codex_config::runtime_required_catalog_models(config, home, use_official_catalog);
     let remote_compaction_models = config.runtime_remote_compaction_model_aliases();
     let fast_context_tools = config.fast_context_tools;
     let mut runtime_subagent_config = config.clone();
@@ -1014,6 +1017,7 @@ async fn prepare_codex_startup_state(
                 remote_compaction_models: Some(&remote_compaction_models),
                 use_official_catalog,
                 model_contexts: Some(&runtime_model_contexts),
+                required_catalog_models: &required_catalog_models,
                 default_model: runtime_default_model.as_deref(),
                 fast_context_tools,
                 subagent_optimization,
@@ -1592,20 +1596,29 @@ struct RuntimeWatcherInputs {
 
 /// Accumulates per-stage durations for `CodeyRuntime::start` and writes one
 /// `launcher.startup_timings` diagnostic record with the total.
-#[derive(Default)]
 struct StartupStageTimings {
-    started: Option<Instant>,
-    previous: Option<Instant>,
+    started: Instant,
+    previous: Instant,
     stages: Vec<(&'static str, u64)>,
+}
+
+impl Default for StartupStageTimings {
+    fn default() -> Self {
+        let started = Instant::now();
+        Self {
+            started,
+            previous: started,
+            stages: Vec::new(),
+        }
+    }
 }
 
 impl StartupStageTimings {
     fn mark(&mut self, stage: &'static str) {
         let now = Instant::now();
-        let started = *self.started.get_or_insert(now);
-        let previous = self.previous.replace(now).unwrap_or(started);
         self.stages
-            .push((stage, now.duration_since(previous).as_millis() as u64));
+            .push((stage, now.duration_since(self.previous).as_millis() as u64));
+        self.previous = now;
     }
 
     fn report(&self) {
@@ -1613,12 +1626,10 @@ impl StartupStageTimings {
         for (stage, millis) in &self.stages {
             detail.insert((*stage).to_string(), serde_json::json!(millis));
         }
-        if let Some(started) = self.started {
-            detail.insert(
-                "totalMs".to_string(),
-                serde_json::json!(started.elapsed().as_millis() as u64),
-            );
-        }
+        detail.insert(
+            "totalMs".to_string(),
+            serde_json::json!(self.started.elapsed().as_millis() as u64),
+        );
         let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
             "launcher.startup_timings",
             serde_json::Value::Object(detail),
@@ -1839,6 +1850,7 @@ async fn prepare_native_runtime_state(
                 remote_compaction_models: None,
                 use_official_catalog: false,
                 model_contexts: None,
+                required_catalog_models: &[],
                 default_model: None,
                 fast_context_tools,
                 subagent_optimization,
@@ -2237,6 +2249,7 @@ impl CodeyRuntime {
         account_usage_cache: Arc<tokio::sync::Mutex<crate::account_usage::AccountUsageCaches>>,
         workflow_proxy: Option<&crate::codex_startup_patch::WorkflowProxyLaunchConfig>,
     ) -> Result<(Self, oneshot::Receiver<()>)> {
+        let mut stage_timings = StartupStageTimings::default();
         if !crate::codex_config::runtime_router_platform_supported() {
             return Err(anyhow::anyhow!(
                 crate::codex_config::unsupported_runtime_platform_message()
@@ -2255,9 +2268,7 @@ impl CodeyRuntime {
             .local_router_enabled
             .then(|| resolve_startup_profile(config))
             .transpose()?;
-        // Stage timings go to the diagnostic log so a slow launch can be
-        // attributed without a debugger; values are milliseconds.
-        let mut stage_timings = StartupStageTimings::default();
+        stage_timings.mark("startupPreparationMs");
         // apply_runtime_router_config installs the live loopback table before
         // Codex starts, so saved codey_router tasks need no provider rewrite.
         if config.local_router_enabled {

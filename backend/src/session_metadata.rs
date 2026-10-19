@@ -57,13 +57,13 @@ impl SessionMetadataCache {
             return FALLBACK_SESSION_NAME.to_string();
         }
 
-        let preferred_title = preferred_title
-            .map(clean_session_name)
-            .filter(|title| !title.is_empty());
+        // 正式标题可以与首条消息同文，按来源识别，不按文本相等关系排除。
+        if let Some(title) = preferred_title.and_then(clean_session_name_candidate) {
+            return title;
+        }
         let mut thread_names = Vec::new();
         let mut catalog_titles = Vec::new();
         let mut legacy_titles = Vec::new();
-        let mut placeholder_titles = HashSet::new();
         for path in self.active_database_paths(home) {
             if !self.ensure_connection(&path) {
                 continue;
@@ -84,13 +84,7 @@ impl SessionMetadataCache {
                 }
             };
 
-            if let Some((name, title, first_user_message, preview)) = metadata.thread {
-                for placeholder in [first_user_message, preview]
-                    .into_iter()
-                    .filter_map(clean_optional_session_name)
-                {
-                    placeholder_titles.insert(placeholder);
-                }
+            if let Some((name, title)) = metadata.thread {
                 if let Some(name) = clean_optional_session_name(name) {
                     thread_names.push(name);
                 }
@@ -106,22 +100,11 @@ impl SessionMetadataCache {
             );
         }
 
-        if let Some(preferred_title) = preferred_title
-            && !placeholder_titles.contains(&preferred_title)
-        {
-            return preferred_title;
-        }
-        if placeholder_titles.is_empty() {
-            // The catalog display title can temporarily mirror the first prompt.
-            // Only trust it when a thread row supplied the values needed to
-            // reject that placeholder form.
-            catalog_titles.clear();
-        }
         thread_names
             .into_iter()
             .chain(catalog_titles)
             .chain(legacy_titles)
-            .find(|title| !placeholder_titles.contains(title))
+            .next()
             .unwrap_or_else(|| FALLBACK_SESSION_NAME.to_string())
     }
 
@@ -263,12 +246,7 @@ pub fn resolve_session_name_with_preferred(
     )
 }
 
-type SessionNameRow = (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-);
+type SessionNameRow = (Option<String>, Option<String>);
 
 #[derive(Debug, Default)]
 struct SessionNameMetadata {
@@ -298,29 +276,14 @@ fn session_name_row(connection: &Connection, session_id: &str) -> Result<Option<
     } else {
         "NULL"
     };
-    let first_user_message = if columns.contains("first_user_message") {
-        "first_user_message"
-    } else {
-        "NULL"
-    };
-    let preview = if columns.contains("preview") {
-        "preview"
-    } else {
-        "NULL"
-    };
     Ok(connection
         .query_row(
-            &format!(
-                "SELECT {name}, {title}, {first_user_message}, {preview} \
-                 FROM threads WHERE id=?1 LIMIT 1"
-            ),
+            &format!("SELECT {name}, {title} FROM threads WHERE id=?1 LIMIT 1"),
             params![session_id],
             |row| {
                 Ok((
                     row.get::<_, Option<String>>(0)?,
                     row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
                 ))
             },
         )
@@ -654,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn ignores_a_catalog_title_without_thread_placeholder_metadata() {
+    fn resolves_a_catalog_title_without_thread_metadata() {
         let home = tempdir().unwrap();
         let sqlite_dir = home.path().join("sqlite");
         fs::create_dir_all(&sqlite_dir).unwrap();
@@ -667,19 +630,19 @@ mod tests {
                     display_title TEXT NOT NULL
                 );
                 INSERT INTO local_thread_catalog VALUES
-                    ('local', 'thread-catalog-only', '可能仍是首条消息');",
+                    ('local', 'thread-catalog-only', '目录会话名称');",
             )
             .unwrap();
         drop(catalog);
 
         assert_eq!(
             resolve_session_name_with_preferred(home.path(), "thread-catalog-only", None),
-            FALLBACK_SESSION_NAME
+            "目录会话名称"
         );
     }
 
     #[test]
-    fn rejects_new_name_sources_that_still_contain_the_first_message() {
+    fn accepts_formal_titles_matching_the_first_message() {
         let home = tempdir().unwrap();
         let state_path = home.path().join("state_5.sqlite");
         let state = Connection::open(state_path).unwrap();
@@ -693,8 +656,10 @@ mod tests {
                     preview TEXT
                 );
                 INSERT INTO threads (id, name, title, first_user_message, preview)
-                VALUES ('thread-placeholder', '帮我处理这个问题', '帮我处理这个问题',
-                        '帮我处理这个问题', '帮我处理这个问题');",
+                VALUES
+                    ('thread-name', '测试123', NULL, '测试123', '测试123'),
+                    ('thread-title', NULL, '测试123', '测试123', '测试123'),
+                    ('thread-catalog', NULL, NULL, '测试123', '测试123');",
             )
             .unwrap();
         drop(state);
@@ -709,19 +674,22 @@ mod tests {
                     display_title TEXT NOT NULL
                 );
                 INSERT INTO local_thread_catalog VALUES
-                    ('thread-placeholder', '帮我处理这个问题');",
+                    ('thread-catalog', '测试123');",
             )
             .unwrap();
         drop(catalog);
 
-        assert_eq!(
-            resolve_session_name_with_preferred(home.path(), "thread-placeholder", None),
-            FALLBACK_SESSION_NAME
-        );
+        for session_id in ["thread-name", "thread-title", "thread-catalog"] {
+            assert_eq!(
+                resolve_session_name_with_preferred(home.path(), session_id, None),
+                "测试123",
+                "formal title source for {session_id} must remain usable"
+            );
+        }
     }
 
     #[test]
-    fn never_uses_the_first_user_message_as_the_title() {
+    fn never_falls_back_to_the_first_user_message_or_preview() {
         let home = tempdir().unwrap();
         let path = home.path().join("state_5.sqlite");
         let connection = Connection::open(path).unwrap();
@@ -740,11 +708,7 @@ mod tests {
             .execute(
                 "INSERT INTO threads (id, title, first_user_message, preview)
                  VALUES (?1, ?2, ?3, ?3)",
-                params![
-                    "thread-2",
-                    "请帮我\n检查  飞书通知",
-                    "请帮我\n检查  飞书通知"
-                ],
+                params!["thread-2", "  ", "请帮我\n检查  飞书通知"],
             )
             .unwrap();
         drop(connection);
@@ -795,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_sidebar_title_that_is_still_the_first_message() {
+    fn accepts_a_sidebar_title_matching_the_first_message() {
         let home = tempdir().unwrap();
         let path = home.path().join("state_5.sqlite");
         let connection = Connection::open(path).unwrap();
@@ -821,7 +785,7 @@ mod tests {
 
         assert_eq!(
             resolve_session_name_with_preferred(home.path(), "thread-4", Some("帮我处理这个问题")),
-            FALLBACK_SESSION_NAME
+            "帮我处理这个问题"
         );
     }
 

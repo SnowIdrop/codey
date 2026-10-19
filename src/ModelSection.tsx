@@ -72,7 +72,6 @@ import {
 } from "./routeConnectionImport";
 import { invoke } from "./api";
 import { listOfficialAccounts, rememberOfficialAccounts } from "./officialAccountsRequests";
-import { readHostTheme } from "./overlayTheme";
 import { getRouteCompactionStatus } from "./remoteCompactionStatus";
 
 type ModelSectionProps = {
@@ -620,7 +619,7 @@ function ModelSectionComponent({
     }
     setRouteImportError(
       clipboardText?.trim()
-        ? "剪贴板内容不是有效的 New API 连接信息，请手动粘贴"
+        ? "剪贴板内容不是有效的线路连接信息，请手动粘贴"
         : "",
     );
     setRouteImportOpen(true);
@@ -632,7 +631,7 @@ function ModelSectionComponent({
     if (info) {
       applyRouteConnectionInfo(info);
     } else {
-      setRouteImportError(value.trim() ? "不是有效的 New API 连接信息" : "");
+      setRouteImportError(value.trim() ? "不是有效的线路连接信息" : "");
     }
   };
   const openHeadersDialog = (profile: Profile) => {
@@ -856,7 +855,7 @@ function ModelSectionComponent({
                     color="primary"
                     variant="filled"
                     size="sm"
-                    onClick={() => void invoke("open_route_request_logs", { theme: readHostTheme() })}
+                    onClick={() => void invoke("open_route_request_logs")}
                   >
                     <IconFileText size={14} aria-hidden="true" />
                     <span>查看请求日志</span>
@@ -1345,7 +1344,7 @@ function ModelSectionComponent({
                     variant="outline"
                     className="ml-auto shrink-0"
                     disabled={isBusy}
-                    title="粘贴 New API「复制连接串」内容，自动填入 URL 与 Key"
+                    title="粘贴 New API JSON 或 Sub2API 的 CC Switch 导入链接，自动填入 URL 与 Key"
                     aria-expanded={routeImportOpen}
                     onClick={() => void handleRouteQuickImport()}
                   >
@@ -1619,9 +1618,9 @@ function ModelSectionComponent({
                 {isNewRouteDraft && routeImportOpen && (
                   <div className="route-import-panel">
                     <label className="route-field">
-                      <span>New API 连接信息</span>
+                      <span>快捷导入连接信息</span>
                       <TextArea
-                        aria-label="New API 连接信息"
+                        aria-label="快捷导入连接信息"
                         aria-invalid={Boolean(routeImportError)}
                         aria-describedby={
                           routeImportError ? "route-import-error" : "route-import-hint"
@@ -1631,7 +1630,7 @@ function ModelSectionComponent({
                         rows={2}
                         autoFocus
                         className="route-import-input font-mono text-xs"
-                        placeholder='{"_type":"newapi_channel_conn","key":"sk-…","url":"https://api.example.com"}'
+                        placeholder="New API JSON 或 Sub2API 的 ccswitch://v1/import?... 链接"
                         onChange={(event) => handleRouteImportTextChange(event.target.value)}
                       />
                       {routeImportError ? (
@@ -1644,7 +1643,7 @@ function ModelSectionComponent({
                         </small>
                       ) : (
                         <small id="route-import-hint" className="route-field-hint">
-                          粘贴 New API 令牌的「复制连接串」内容，识别后自动填入 URL 与 Key
+                          粘贴 New API JSON 或 Sub2API 的 CC Switch 导入链接，自动填入 URL 与 Key
                         </small>
                       )}
                     </label>

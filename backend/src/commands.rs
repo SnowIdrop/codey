@@ -27,7 +27,7 @@ mod workflows;
 #[cfg(windows)]
 use codey_runtime_core::app_paths::{
     build_codex_executable, normalize_codex_app_path_checked,
-    resolve_codex_app_dir_with_saved_checked,
+    resolve_validated_codex_app_dir_with_saved_checked,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -62,14 +62,14 @@ pub(crate) use runtime::{cleanup_failed_runtime_start, reap_runtime_child_before
 pub use runtime::{
     launch_codey_runtime, runtime_status, schedule_restart_codey_runtime, stop_codey_runtime,
 };
-use updates::current_update_platform;
 #[cfg(test)]
-pub(crate) use updates::{UpdateAssetInfo, UpdateCheck};
+pub(crate) use updates::UpdateCheck;
+use updates::current_update_platform;
 #[cfg(test)]
 use updates::{UpdateManifest, assess_update_manifest, current_update_arch};
 use webhooks::{
-    WaitingLedgerState, WebhookNotificationState, initial_waiting_notifications,
-    sync_waiting_webhook_watcher, test_notification_channel,
+    WaitingLedgerState, initial_waiting_notifications, sync_waiting_webhook_watcher,
+    test_notification_channel,
 };
 use wechat_claw::{
     WechatClawLoginState, WechatClawSessionGuard, WechatClawSyncHandle,
@@ -132,6 +132,8 @@ pub struct AppState {
     official_proxied_clients: BlockingMutex<HashMap<String, reqwest::Client>>,
     #[cfg(test)]
     pub webhook_http_client_override: Option<reqwest::Client>,
+    #[cfg(test)]
+    notification_codex_home: Option<PathBuf>,
     /// Built on first use: the login/sync client is only needed for WeChat
     /// ClawBot flows, and constructing a reqwest client loads the system root
     /// certificates, which is measurable on the startup path.
@@ -167,10 +169,15 @@ pub struct AppState {
     runtime_generation: AtomicU64,
     session_titles: RwLock<HashMap<String, String>>,
     session_metadata_cache: BlockingMutex<session_metadata::SessionMetadataCache>,
+    notification_title_cache: BlockingMutex<webhooks::NotificationTitleCache>,
+    notification_title_query: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     session_metadata_cache_contended: Notify,
-    webhook_notifications: Mutex<WebhookNotificationState>,
     persisted_waiting_notifications: Mutex<WaitingLedgerState>,
+    notification_waiting_snapshot: RwLock<webhooks::WaitingNotificationSnapshot>,
+    notification_outbox: tokio::sync::OnceCell<crate::notifications::outbox::Outbox>,
+    notification_delivery_wake: Notify,
+    notification_delivery_stop: watch::Sender<bool>,
     recent_session_event_cache: Mutex<Option<pending_approval::RecentSessionEventCache>>,
     wechat_claw_logins: Mutex<WechatClawLoginState>,
     wechat_claw_sync: Mutex<Option<WechatClawSyncHandle>>,
@@ -179,7 +186,7 @@ pub struct AppState {
     waiting_watcher_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     waiting_watcher_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     waiting_watcher_sync: Mutex<()>,
-    session_scan_wake: Notify,
+    session_scan_wake: Arc<Notify>,
     restart_settled: Notify,
     #[cfg(test)]
     restart_operation_pending: Notify,
@@ -247,7 +254,12 @@ fn load_config_or_defaults(store: &ConfigStore) -> (CodeyConfig, Option<String>)
 
 impl Default for AppState {
     fn default() -> Self {
-        let store = ConfigStore::default();
+        Self::with_store(ConfigStore::default())
+    }
+}
+
+impl AppState {
+    fn with_store(store: ConfigStore) -> Self {
         let (config, config_load_error) = load_config_or_defaults(&store);
         let workflow = WorkflowHost::from_config(&config, store.path());
         let protect_crashpad_pending = config.protect_crashpad_pending;
@@ -270,6 +282,8 @@ impl Default for AppState {
             official_proxied_clients: BlockingMutex::new(HashMap::new()),
             #[cfg(test)]
             webhook_http_client_override: None,
+            #[cfg(test)]
+            notification_codex_home: None,
             wechat_claw_login_http_client: std::sync::OnceLock::new(),
             official_account_probe_prewarm: Mutex::new(None),
             official_account_logins: Mutex::new(crate::official_accounts::LoginSessions::default()),
@@ -297,12 +311,15 @@ impl Default for AppState {
             session_metadata_cache: BlockingMutex::new(
                 session_metadata::SessionMetadataCache::default(),
             ),
+            notification_title_cache: BlockingMutex::new(Default::default()),
+            notification_title_query: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
             session_metadata_cache_contended: Notify::new(),
-            webhook_notifications: Mutex::new(WebhookNotificationState::from_settled(
-                persisted_waiting_notifications.iter().cloned(),
-            )),
             persisted_waiting_notifications: Mutex::new(persisted_waiting_notifications),
+            notification_waiting_snapshot: RwLock::new(Default::default()),
+            notification_outbox: tokio::sync::OnceCell::new(),
+            notification_delivery_wake: Notify::new(),
+            notification_delivery_stop: watch::channel(false).0,
             recent_session_event_cache: Mutex::new(Some(
                 pending_approval::RecentSessionEventCache::default(),
             )),
@@ -313,7 +330,7 @@ impl Default for AppState {
             waiting_watcher_shutdown: Mutex::new(None),
             waiting_watcher_task: Mutex::new(None),
             waiting_watcher_sync: Mutex::new(()),
-            session_scan_wake: Notify::new(),
+            session_scan_wake: Arc::new(Notify::new()),
             restart_settled: Notify::new(),
             #[cfg(test)]
             restart_operation_pending: Notify::new(),
@@ -1124,18 +1141,6 @@ fn persisted_config_changed(previous: &CodeyConfig, next: &CodeyConfig) -> bool 
     previous != next
 }
 
-async fn resolve_session_name_cached(
-    state: &Arc<AppState>,
-    home: PathBuf,
-    session_id: String,
-    preferred_title: Option<String>,
-) -> Result<String, String> {
-    with_session_metadata_cache(state, "读取通知会话名称", move |cache| {
-        cache.resolve_session_name_with_preferred(&home, &session_id, preferred_title.as_deref())
-    })
-    .await
-}
-
 pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Value {
     let result = match command {
         "load_codey_config" => load_codey_config(state).await,
@@ -1457,7 +1462,9 @@ pub async fn clear_route_request_logs(state: &Arc<AppState>) -> Result<Value, St
 }
 
 pub async fn load_codey_config(state: &Arc<AppState>) -> Result<Value, String> {
+    let mut timings = models::ModelOperationTimings::new("load_codey_config");
     let runtime_running = state.runtime.lock().await.is_some();
+    timings.mark("runtimeLockMs");
     if !runtime_running && let Err(error) = prepare_routes_for_current_launch(state).await {
         error_log::record_failure(
             "route_prepare_failed",
@@ -1466,21 +1473,27 @@ pub async fn load_codey_config(state: &Arc<AppState>) -> Result<Value, String> {
             json!({}),
         );
     }
+    timings.mark("prepareRoutesMs");
     let imported = ensure_default_route_imported(state).await;
+    timings.mark("routeImportMs");
     let config = if imported {
         sync_provider_models_for_launch(state, true).await
     } else {
         state.config.read().await.clone()
     };
+    timings.mark("initialModelSyncMs");
     let startup_error = state.startup_error.read().await.clone();
     let provider_status = current_provider_status_async(&config).await?;
+    timings.mark("providerStatusMs");
     let model_state = current_model_state_async(&config).await?;
+    timings.mark("modelStateMs");
     let fast_context_tools_status = current_fast_context_tools_status();
     let mut public_config = redacted_config(&config);
     public_config.fast_context_tools = embedded_fast_context_tools_enabled(
         public_config.fast_context_tools,
         &fast_context_tools_status,
     );
+    timings.mark("publicConfigMs");
     Ok(json!({
         "config": public_config,
         "path": state.store.path().to_string_lossy(),
@@ -1608,12 +1621,7 @@ async fn ensure_windows_codex_app_path(state: &Arc<AppState>) -> Result<(), Stri
         // The launcher needs a startable executable, not merely a normalizable
         // path: a stale or third-party directory must be reselected here instead
         // of surfacing later as a bare spawn failure.
-        resolve_codex_app_dir_with_saved_checked(configured_path.as_deref(), None).and_then(|app| {
-            if let Some(path) = &app {
-                codey_runtime_core::app_paths::validate_codex_app_dir(path)?;
-            }
-            Ok(app)
-        })
+        resolve_validated_codex_app_dir_with_saved_checked(configured_path.as_deref(), None)
     })
     .await
     .map_err(|error| format!("检测 Codex 桌面应用目录的任务异常退出：{error}"))?;

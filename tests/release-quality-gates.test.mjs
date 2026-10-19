@@ -115,6 +115,8 @@ test("local releases run the same locked Rust checks", () => {
   assert.match(releaseScript, /\["fmt", "--all", "--", "--check"\]/);
   assert.match(releaseScript, /\["test", "--workspace", "--locked"\]/);
   assert.match(releaseScript, /\["clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"\]/);
+  assert.match(releaseScript, /\["update", "--workspace"\]/);
+  assert.doesNotMatch(releaseScript, /generate-lockfile/);
 });
 
 test("desktop builds generate embedded overlay assets before Cargo compiles", () => {
