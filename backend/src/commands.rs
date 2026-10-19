@@ -170,6 +170,8 @@ pub struct AppState {
     runtime_generation: AtomicU64,
     session_titles: RwLock<HashMap<String, String>>,
     session_metadata_cache: BlockingMutex<session_metadata::SessionMetadataCache>,
+    notification_title_cache: BlockingMutex<webhooks::NotificationTitleCache>,
+    notification_title_query: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     session_metadata_cache_contended: Notify,
     persisted_waiting_notifications: Mutex<WaitingLedgerState>,
@@ -308,6 +310,8 @@ impl AppState {
             session_metadata_cache: BlockingMutex::new(
                 session_metadata::SessionMetadataCache::default(),
             ),
+            notification_title_cache: BlockingMutex::new(Default::default()),
+            notification_title_query: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
             session_metadata_cache_contended: Notify::new(),
             persisted_waiting_notifications: Mutex::new(persisted_waiting_notifications),
@@ -1134,18 +1138,6 @@ fn persisted_config_changed(previous: &CodeyConfig, next: &CodeyConfig) -> bool 
     previous.official_account_status_this_launch = LaunchOfficialAccountStatus::Unauthenticated;
     next.official_account_status_this_launch = LaunchOfficialAccountStatus::Unauthenticated;
     previous != next
-}
-
-async fn resolve_session_name_cached(
-    state: &Arc<AppState>,
-    home: PathBuf,
-    session_id: String,
-    preferred_title: Option<String>,
-) -> Result<String, String> {
-    with_session_metadata_cache(state, "读取通知会话名称", move |cache| {
-        cache.resolve_session_name_with_preferred(&home, &session_id, preferred_title.as_deref())
-    })
-    .await
 }
 
 pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Value {

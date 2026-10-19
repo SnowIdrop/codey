@@ -683,6 +683,9 @@ mod tests {
             .unwrap();
         writeln!(writer, "{{}}").unwrap();
         writer.flush().unwrap();
+        // Windows 的目录变更通知依赖写缓存刷新；File::flush 本身不会刷新它。
+        #[cfg(windows)]
+        writer.sync_all().unwrap();
         let started = Instant::now();
         wait_for_rollout(&watcher, &wake, &rollout).await;
         assert!(watcher.is_healthy());

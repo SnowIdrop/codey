@@ -333,6 +333,9 @@ async fn watcher_refreshes_waiting_before_recovery_and_delivers_appended_failure
     .unwrap();
     // 保持 writer 打开，验证真实文件事件能够推动扫描和投递。
     file.flush().unwrap();
+    // Windows 的目录变更通知依赖写缓存刷新；File::flush 本身不会刷新它。
+    #[cfg(windows)]
+    file.sync_all().unwrap();
     let appended_at = tokio::time::Instant::now();
     tokio::time::timeout(Duration::from_secs(5), async {
         while server.requests.lock().await.is_empty() {
@@ -372,4 +375,141 @@ async fn watcher_refreshes_waiting_before_recovery_and_delivers_appended_failure
             .to_string()
             .contains("会话失败")
     );
+}
+
+fn open_empty_wal_session_index(path: &Path) -> rusqlite::Connection {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let database = rusqlite::Connection::open(path).unwrap();
+    database.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, archived INTEGER, updated_at INTEGER, thread_source TEXT);",
+    ).unwrap();
+    database
+}
+
+async fn assert_native_new_session_delivery(commit_delay: Duration, two_databases: bool) {
+    use std::io::Write;
+
+    let directory = tempfile::tempdir().unwrap();
+    let server = MockWebhookServer::start(vec!["200 OK"]).await;
+    let state = channel_delivery_test_state(directory.path(), vec![server.channel("new-session")]);
+    let home = notification_codex_home(&state);
+    fs::create_dir_all(home.join("sessions")).unwrap();
+    let mut databases = vec![open_empty_wal_session_index(&home.join("state_5.sqlite"))];
+    if two_databases {
+        databases.push(open_empty_wal_session_index(
+            &home.join("sqlite/sessions.sqlite"),
+        ));
+    }
+    let scan = start_recent_session_scan_at(Default::default(), home.clone());
+    start_waiting_webhook_watcher(&state, scan).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.notification_outbox.get().is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the watcher should finish its startup scan with empty indexes");
+    assert!(server.requests.lock().await.is_empty());
+
+    // 新日期目录和 rollout 均在监听启动后创建，数据库与文件 writer 始终保持打开。
+    let date_directory = home.join("sessions/2026/10/19");
+    fs::create_dir_all(&date_directory).unwrap();
+    let mut writers = Vec::new();
+    for (index, database) in databases.iter().enumerate() {
+        let session_id = format!("new-root-{index}");
+        let rollout = date_directory.join(format!("rollout-{session_id}.jsonl"));
+        let mut writer = fs::File::create(&rollout).unwrap();
+        let error = if index == 0 {
+            None
+        } else {
+            Some("test failure")
+        };
+        for record in [
+            json!({"type":"session_meta", "payload":{"id":session_id, "thread_source":"user"}}),
+            json!({"type":"event_msg", "timestamp":chrono::Utc::now().to_rfc3339(),
+                "payload":{"type":"task_started","turn_id":"new-turn"}}),
+            json!({"type":"event_msg", "timestamp":chrono::Utc::now().to_rfc3339(),
+                "payload":{"type":"task_complete","turn_id":"new-turn","error":error}}),
+        ] {
+            writeln!(writer, "{record}").unwrap();
+        }
+        writer.flush().unwrap();
+        // Windows 需要刷新写缓存，才能及时产生目录变更通知。
+        #[cfg(windows)]
+        writer.sync_all().unwrap();
+        writers.push(writer);
+        database.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        database
+            .execute(
+                "INSERT INTO threads VALUES (?1, ?2, 0, ?3, 'user')",
+                rusqlite::params![
+                    session_id,
+                    rollout.to_string_lossy(),
+                    unix_timestamp_seconds()
+                ],
+            )
+            .unwrap();
+    }
+    // 先产生文件提示，再提交索引，覆盖第一次发现时还读不到新会话的情况。
+    tokio::time::sleep(commit_delay).await;
+    assert!(server.requests.lock().await.is_empty());
+    let committed_at = tokio::time::Instant::now();
+    for database in &databases {
+        database.execute_batch("COMMIT;").unwrap();
+    }
+    let delivered = tokio::time::timeout(Duration::from_secs(2), async {
+        while server.requests.lock().await.len() < databases.len() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    let latency = committed_at.elapsed();
+    if delivered.is_ok() {
+        wait_for_delivered(&state, databases.len()).await;
+    }
+    // 失败时也回收原生监听和发送任务，然后报告实际收到的请求数。
+    stop_waiting_webhook_watcher(&state).await;
+    let requests = server.requests.lock().await;
+    assert!(
+        delivered.is_ok(),
+        "new indexed sessions did not reach the local webhook within 2 s: requests={}, indexes={}, states={:?}",
+        requests.len(),
+        databases.len(),
+        stored_delivery_states(&state)
+    );
+    assert_eq!(requests.len(), databases.len());
+    assert!(
+        requests
+            .iter()
+            .any(|request| request["card"]["header"]["title"]["content"] == "Codex会话完成")
+    );
+    if two_databases {
+        assert!(
+            requests
+                .iter()
+                .any(|request| request["card"]["header"]["title"]["content"] == "Codex会话失败")
+        );
+    }
+    eprintln!(
+        "new session native delivery: indexes={}, commit_delay={commit_delay:?}, latency={latency:?}",
+        databases.len()
+    );
+    drop(writers);
+    drop(databases);
+}
+
+#[tokio::test]
+async fn native_new_date_directory_and_open_wal_deliver_new_session() {
+    assert_native_new_session_delivery(Duration::ZERO, false).await;
+}
+
+#[tokio::test]
+async fn native_new_session_discovery_survives_dirty_hint_before_wal_commit() {
+    assert_native_new_session_delivery(Duration::from_millis(150), false).await;
+}
+
+#[tokio::test]
+async fn native_home_and_sqlite_indexes_deliver_success_and_failure_after_delayed_commits() {
+    assert_native_new_session_delivery(Duration::from_millis(150), true).await;
 }

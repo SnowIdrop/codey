@@ -932,6 +932,8 @@ mod tests {
         );
         let path = directory.path().to_path_buf();
         tokio::task::spawn_blocking(move || {
+            // 先关闭队列，释放 Windows 上会阻止文件读取的独占锁。
+            drop(outbox);
             for entry in fs::read_dir(path).unwrap() {
                 let bytes = fs::read(entry.unwrap().path()).unwrap();
                 let content = String::from_utf8_lossy(&bytes);

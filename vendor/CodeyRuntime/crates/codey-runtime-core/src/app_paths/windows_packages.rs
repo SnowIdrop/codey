@@ -374,7 +374,7 @@ mod tests {
             } else {
                 assert_eq!(
                     snapshot.all_install_locations().unwrap(),
-                    [canonical.clone()]
+                    std::slice::from_ref(&canonical)
                 );
             }
             std::fs::remove_dir(&location).unwrap();

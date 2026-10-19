@@ -616,15 +616,35 @@ fn query_recent_codey_rollouts(
     recent_after: i64,
 ) -> rusqlite::Result<Vec<(String, PathBuf)>> {
     let mut rollouts = Vec::new();
+    let has_thread_source = {
+        let mut statement = connection.prepare_cached("PRAGMA table_info(threads)")?;
+        let mut columns = statement.query([])?;
+        let mut found = false;
+        while let Some(column) = columns.next()? {
+            if column.get::<_, String>(1)? == "thread_source" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
     // SQLite columns can contain values that violate their declared affinity.
     // Ignore only malformed rows here; prepare/query failures still invalidate
     // the cached connection so a replaced database is reopened next poll.
-    let mut statement = connection.prepare_cached(
+    // 明确的子代理不能占用用户会话的数量上限；旧索引和未知来源仍由 rollout 核验。
+    let query = if has_thread_source {
         "SELECT id, rollout_path FROM threads \
          WHERE archived=0 AND updated_at >= ?1 \
            AND typeof(id)='text' AND typeof(rollout_path)='text' \
-         ORDER BY updated_at DESC LIMIT ?2",
-    )?;
+           AND (thread_source IS NULL OR thread_source <> 'subagent') \
+         ORDER BY updated_at DESC LIMIT ?2"
+    } else {
+        "SELECT id, rollout_path FROM threads \
+         WHERE archived=0 AND updated_at >= ?1 \
+           AND typeof(id)='text' AND typeof(rollout_path)='text' \
+         ORDER BY updated_at DESC LIMIT ?2"
+    };
+    let mut statement = connection.prepare_cached(query)?;
     let rows = statement.query_map(params![recent_after, MAX_RECENT_SESSIONS], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
@@ -689,6 +709,97 @@ mod tests {
 
         connection.execute_batch("DROP TABLE threads;").unwrap();
         assert!(query_recent_codey_rollouts(&connection, home, 0).is_err());
+    }
+
+    #[test]
+    fn recent_rollout_query_excludes_explicit_subagents_before_the_limit() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE threads(id TEXT, rollout_path TEXT, archived INTEGER, updated_at INTEGER, thread_source TEXT);",
+        ).unwrap();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for index in 0..=MAX_RECENT_SESSIONS {
+            connection
+                .execute(
+                    "INSERT INTO threads VALUES (?1, ?2, 0, ?3, 'subagent')",
+                    params![
+                        format!("child-{index}"),
+                        format!("child-{index}.jsonl"),
+                        now
+                    ],
+                )
+                .unwrap();
+        }
+        for (id, source) in [
+            ("root", Some("user")),
+            ("legacy", None),
+            ("unknown", Some("future-source")),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO threads VALUES (?1, ?2, 0, ?3, ?4)",
+                    params![id, format!("{id}.jsonl"), now - 60, source],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO threads VALUES ('archived', 'archived.jsonl', 1, ?1, 'user')",
+                [now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads VALUES ('old', 'old.jsonl', 0, ?1, 'user')",
+                [now - 90_000],
+            )
+            .unwrap();
+
+        let ids = query_recent_codey_rollouts(&connection, Path::new("home"), now - 86_400)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            ids,
+            HashSet::from(["root".into(), "legacy".into(), "unknown".into()])
+        );
+    }
+
+    #[test]
+    fn recent_session_cache_keeps_nine_roots_among_fifty_five_subagents() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = create_session_database(temp.path());
+        database
+            .execute_batch("ALTER TABLE threads ADD COLUMN thread_source TEXT;")
+            .unwrap();
+        for index in 0..64 {
+            let id = format!("session-{index}");
+            let path = temp.path().join(format!("{id}.jsonl"));
+            let source = if index < 55 { "subagent" } else { "user" };
+            fs::write(&path, format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"thread_source\":\"{source}\"}}}}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn\"}}}}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"turn\"}}}}\n"
+            )).unwrap();
+            index_rollout(&database, &id, &path);
+            database
+                .execute(
+                    "UPDATE threads SET thread_source=?1 WHERE id=?2",
+                    params![source, id],
+                )
+                .unwrap();
+        }
+        let snapshot = RecentSessionEventCache::default().refresh(temp.path());
+        assert_eq!(snapshot.session_statuses.len(), 9);
+        assert_eq!(snapshot.completed_turns.len(), 9);
+        assert!(
+            snapshot
+                .completed_turns
+                .iter()
+                .all(|turn| turn.session_id[8..].parse::<usize>().unwrap() >= 55)
+        );
     }
 
     #[test]
