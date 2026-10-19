@@ -26,6 +26,8 @@ async fn notification_is_enqueued_while_metadata_lock_is_held() {
             ..NotificationChannelConfig::default()
         }],
     );
+    // 建库与元数据锁无关，先完成初始化再验证持锁期间的入队行为。
+    delivery::outbox(&state).await.unwrap();
     let (release_metadata, metadata_task) = hold_session_metadata_lock(&state).await;
     let result = tokio::time::timeout(
         Duration::from_secs(2),

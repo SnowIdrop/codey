@@ -60,11 +60,15 @@ impl Default for Limits {
     }
 }
 
+type OpenSlot = Mutex<Weak<Inner>>;
+
 struct Inner {
     connection: Mutex<Connection>,
     limits: Limits,
     // 阻止其他进程重置本进程正在发送的记录。
     _process_lock: File,
+    // 队列仍在使用时，保留同一路径的初始化锁和共享连接入口。
+    _open_slot: Arc<OpenSlot>,
 }
 
 #[derive(Clone)]
@@ -459,8 +463,22 @@ fn private_file(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 
+fn open_slot(path: &Path) -> Result<Arc<OpenSlot>, String> {
+    static OPEN: OnceLock<Mutex<HashMap<PathBuf, Weak<OpenSlot>>>> = OnceLock::new();
+    let mut registry = OPEN
+        .get_or_init(Mutex::default)
+        .lock()
+        .map_err(|_| "通知队列初始化锁损坏".to_string())?;
+    registry.retain(|_, value| value.strong_count() > 0);
+    if let Some(slot) = registry.get(path).and_then(Weak::upgrade) {
+        return Ok(slot);
+    }
+    let slot = Arc::new(Mutex::new(Weak::new()));
+    registry.insert(path.to_path_buf(), Arc::downgrade(&slot));
+    Ok(slot)
+}
+
 fn open_blocking(path: PathBuf, limits: Limits) -> Result<Outbox, String> {
-    static OPEN: OnceLock<Mutex<HashMap<PathBuf, Weak<Inner>>>> = OnceLock::new();
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -482,12 +500,12 @@ fn open_blocking(path: PathBuf, limits: Limits) -> Result<Outbox, String> {
         .file_name()
         .ok_or_else(|| "通知队列文件名无效".to_string())?;
     let path = parent.join(filename);
-    let mut registry = OPEN
-        .get_or_init(Mutex::default)
+    // 仅同一路径串行初始化，避免独立队列等待其他数据库的磁盘同步。
+    let slot = open_slot(&path)?;
+    let mut registered = slot
         .lock()
         .map_err(|_| "通知队列初始化锁损坏".to_string())?;
-    registry.retain(|_, value| value.strong_count() > 0);
-    if let Some(inner) = registry.get(&path).and_then(Weak::upgrade) {
+    if let Some(inner) = registered.upgrade() {
         return Ok(Outbox { inner });
     }
     let mut lock_name = filename.to_os_string();
@@ -513,6 +531,7 @@ fn open_blocking(path: PathBuf, limits: Limits) -> Result<Outbox, String> {
         "PRAGMA foreign_keys = ON;
          PRAGMA journal_mode = DELETE;
          PRAGMA synchronous = FULL;
+         BEGIN IMMEDIATE;
          CREATE TABLE IF NOT EXISTS notification_events (
             event_key TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at_ms INTEGER NOT NULL, settled_at_ms INTEGER
          );
@@ -533,7 +552,8 @@ fn open_blocking(path: PathBuf, limits: Limits) -> Result<Outbox, String> {
          CREATE INDEX IF NOT EXISTS notification_deliveries_active ON notification_deliveries(state)
             WHERE state IN ('pending', 'inflight');
          CREATE INDEX IF NOT EXISTS notification_deliveries_channel ON notification_deliveries(channel_id, state);
-         CREATE INDEX IF NOT EXISTS notification_deliveries_event ON notification_deliveries(event_key, state);"
+         CREATE INDEX IF NOT EXISTS notification_deliveries_event ON notification_deliveries(event_key, state);
+         COMMIT;"
     ).map_err(db_error)?;
     recover_inflight(
         &mut connection,
@@ -543,8 +563,9 @@ fn open_blocking(path: PathBuf, limits: Limits) -> Result<Outbox, String> {
         connection: Mutex::new(connection),
         limits,
         _process_lock: process_lock,
+        _open_slot: Arc::clone(&slot),
     });
-    registry.insert(path, Arc::downgrade(&inner));
+    *registered = Arc::downgrade(&inner);
     Ok(Outbox { inner })
 }
 
@@ -676,6 +697,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state(&reopened, "a").await.0, "delivered");
+    }
+
+    #[tokio::test]
+    async fn concurrent_opens_share_the_same_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("notifications.db");
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let mut opens = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            opens.spawn(async move {
+                barrier.wait().await;
+                Outbox::open(path).await.unwrap()
+            });
+        }
+        let first = opens.join_next().await.unwrap().unwrap();
+        while let Some(opened) = opens.join_next().await {
+            assert!(Arc::ptr_eq(&first.inner, &opened.unwrap().inner));
+        }
+    }
+
+    #[tokio::test]
+    async fn initializing_one_path_does_not_block_another_queue() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let busy_path = parent.join("busy.db");
+        let slot = open_slot(&busy_path).unwrap();
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let initializer = tokio::task::spawn_blocking(move || {
+            let _slot = slot.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.blocking_recv();
+        });
+        locked_rx.await.unwrap();
+        let waiting = tokio::spawn(Outbox::open(busy_path));
+        let independent = tokio::time::timeout(
+            Duration::from_secs(2),
+            Outbox::open(parent.join("independent.db")),
+        )
+        .await;
+        drop(release_tx);
+        initializer.await.unwrap();
+        waiting.await.unwrap().unwrap();
+        independent
+            .expect("another queue must open while the first path remains locked")
+            .unwrap();
     }
 
     #[tokio::test]

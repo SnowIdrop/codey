@@ -1,5 +1,5 @@
-use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 
 use super::*;
 use crate::notifications::outbox::{DeliveryOutcome, DeliveryTarget, Outbox, OutboxDelivery};
@@ -93,7 +93,7 @@ async fn wait_until(due: Option<i64>) {
 }
 
 async fn run(state: Arc<AppState>, queue: Outbox, mut stop: watch::Receiver<bool>) {
-    let mut active = FuturesUnordered::new();
+    let mut active = JoinSet::new();
     let mut busy = HashSet::new();
     loop {
         if *stop.borrow() {
@@ -114,7 +114,8 @@ async fn run(state: Arc<AppState>, queue: Outbox, mut stop: watch::Receiver<bool
             };
             for delivery in deliveries {
                 busy.insert(delivery.target.channel_id.clone());
-                active.push(deliver(Arc::clone(&state), delivery));
+                // 落盘等待期间，其他请求仍需及时读取响应并结束 HTTP 超时计时。
+                active.spawn(deliver(Arc::clone(&state), delivery));
             }
         }
         if *stop.borrow() {
@@ -134,7 +135,11 @@ async fn run(state: Arc<AppState>, queue: Outbox, mut stop: watch::Receiver<bool
         tokio::select! {
             biased;
             _ = stopped(&mut stop) => break,
-            Some((delivery, outcome, elapsed_ms)) = active.next(), if !active.is_empty() => {
+            Some(result) = active.join_next(), if !active.is_empty() => {
+                let Ok((delivery, outcome, elapsed_ms)) = result else {
+                    // 任务异常退出时停止投递，由下方统一处理未确认的认领。
+                    break;
+                };
                 record_delivery(&delivery, outcome, elapsed_ms);
                 if queue.finish(&delivery, outcome, now_ms()).await.is_err() {
                     record_storage_failure();
@@ -146,8 +151,9 @@ async fn run(state: Arc<AppState>, queue: Outbox, mut stop: watch::Receiver<bool
             _ = wait_until(due) => {},
         }
     }
-    // 先取消网络 future，再提交不确定状态；成功落盘失败也绝不能自动重发。
-    drop(active);
+    // 等网络任务全部退出后再提交不确定状态，避免取消期间继续发送。
+    active.abort_all();
+    while active.join_next().await.is_some() {}
     if queue.mark_inflight_uncertain(now_ms()).await.is_err() {
         record_storage_failure();
     }

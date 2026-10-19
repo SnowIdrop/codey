@@ -95,26 +95,29 @@ async fn wait_for_count(count: &AtomicUsize, expected: usize) {
     .expect("local delivery should make progress");
 }
 
-fn stored_delivery_states(state: &AppState) -> Vec<String> {
-    let db = rusqlite::Connection::open(
-        state
-            .store
-            .path()
-            .with_file_name("notification-outbox.sqlite3"),
-    )
-    .unwrap();
-    db.prepare("SELECT state FROM notification_deliveries ORDER BY state")
-        .unwrap()
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap()
+async fn stored_delivery_states(state: &AppState) -> Vec<String> {
+    let path = state
+        .store
+        .path()
+        .with_file_name("notification-outbox.sqlite3");
+    // SQLite 等待写事务时仍让 HTTP 模拟服务和投递任务继续运行。
+    tokio::task::spawn_blocking(move || {
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.prepare("SELECT state FROM notification_deliveries ORDER BY state")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    })
+    .await
+    .unwrap()
 }
 
 async fn wait_for_delivered(state: &AppState, expected: usize) {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            let states = stored_delivery_states(state);
+            let states = stored_delivery_states(state).await;
             if states.len() == expected && states.iter().all(|state| state == "delivered") {
                 break;
             }
@@ -148,13 +151,64 @@ async fn slow_http_does_not_block_enqueue_and_concurrency_is_global_across_event
     .unwrap();
     assert_eq!(queued["status"], "queued");
     assert_eq!(server.received.load(Ordering::SeqCst), 4);
-    assert_eq!(stored_delivery_states(&state).len(), 14);
+    assert_eq!(stored_delivery_states(&state).await.len(), 14);
     server.gate.add_permits(14);
     wait_for_delivered(&state, 14).await;
     assert_eq!(server.peak.load(Ordering::SeqCst), 4);
     assert_eq!(server.channel_peak.load(Ordering::SeqCst), 1);
     state.notification_delivery_stop.send_replace(true);
     worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn successful_http_responses_progress_while_delivery_storage_is_locked() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = GatedWebhookServer::start().await;
+    let channels = (0..4)
+        .map(|index| server.channel(&format!("channel-{index}")))
+        .collect();
+    let state = channel_delivery_test_state(directory.path(), channels);
+    notify_webhook_completion(
+        &state,
+        &json!({"sessionId":"session", "turnId":"turn", "confirmedByRollout":true}),
+    )
+    .await
+    .unwrap();
+    let worker = delivery::start(Arc::clone(&state)).await.unwrap();
+    wait_for_count(&server.received, 4).await;
+
+    let path = state
+        .store
+        .path()
+        .with_file_name("notification-outbox.sqlite3");
+    let (locked_tx, locked_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let storage = tokio::task::spawn_blocking(move || {
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        locked_tx.send(()).unwrap();
+        let _ = release_rx.blocking_recv();
+        db.execute_batch("COMMIT;").unwrap();
+    });
+    locked_rx.await.unwrap();
+    server.gate.add_permits(4);
+    // 响应已放行，磁盘锁持续超过测试 HTTP 客户端的 2 秒超时。
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    drop(release_tx);
+    storage.await.unwrap();
+    let delivered = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let states = stored_delivery_states(&state).await;
+            if states.iter().all(|state| state != "inflight") {
+                break states;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    state.notification_delivery_stop.send_replace(true);
+    worker.await.unwrap();
+    assert_eq!(delivered.unwrap(), vec!["delivered"; 4]);
 }
 
 #[tokio::test]
@@ -179,7 +233,10 @@ async fn shutdown_cancels_active_http_and_leaves_unsent_work_pending() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(stored_delivery_states(&state), ["pending", "uncertain"]);
+    assert_eq!(
+        stored_delivery_states(&state).await,
+        ["pending", "uncertain"]
+    );
     assert_eq!(server.received.load(Ordering::SeqCst), 1);
     drop(state);
     let restarted = channel_delivery_test_state(directory.path(), channels);
@@ -187,7 +244,7 @@ async fn shutdown_cancels_active_http_and_leaves_unsent_work_pending() {
     let worker = delivery::start(Arc::clone(&restarted)).await.unwrap();
     wait_for_count(&server.received, 2).await;
     tokio::time::timeout(Duration::from_secs(2), async {
-        while stored_delivery_states(&restarted) != ["delivered", "uncertain"] {
+        while stored_delivery_states(&restarted).await != ["delivered", "uncertain"] {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
@@ -315,7 +372,7 @@ async fn watcher_refreshes_waiting_before_recovery_and_delivers_appended_failure
     let scan = start_recent_session_scan_at(Default::default(), home);
     start_waiting_webhook_watcher(&state, scan).await;
     tokio::time::timeout(Duration::from_secs(5), async {
-        while stored_delivery_states(&state) != ["cancelled"] {
+        while stored_delivery_states(&state).await != ["cancelled"] {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
@@ -349,7 +406,7 @@ async fn watcher_refreshes_waiting_before_recovery_and_delivers_appended_failure
         appended_at.elapsed()
     );
     let delivered = tokio::time::timeout(Duration::from_secs(5), async {
-        while stored_delivery_states(&state) != ["cancelled", "delivered"] {
+        while stored_delivery_states(&state).await != ["cancelled", "delivered"] {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
@@ -359,7 +416,7 @@ async fn watcher_refreshes_waiting_before_recovery_and_delivers_appended_failure
             .refresh(&notification_codex_home(&state));
         panic!(
             "appended failure was not delivered: states={:?}, snapshot={snapshot:?}, watcher_finished={:?}",
-            stored_delivery_states(&state),
+            stored_delivery_states(&state).await,
             state
                 .waiting_watcher_task
                 .lock()
@@ -476,7 +533,7 @@ async fn assert_native_new_session_delivery(commit_delay: Duration, two_database
         "new indexed sessions did not reach the local webhook within 2 s: requests={}, indexes={}, states={:?}",
         requests.len(),
         databases.len(),
-        stored_delivery_states(&state)
+        stored_delivery_states(&state).await
     );
     assert_eq!(requests.len(), databases.len());
     assert!(
