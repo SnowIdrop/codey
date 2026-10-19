@@ -212,9 +212,7 @@ impl PortableHistoryCheckpoint {
             return None;
         }
         // compact 旧接口没有 status，Responses 终态则必须由调用者先行确认。
-        let Some(output) = response.get("output").and_then(Value::as_array) else {
-            return None;
-        };
+        let output = response.get("output").and_then(Value::as_array)?;
         if output
             .iter()
             .filter(|item| item["type"] == "compaction")
@@ -225,15 +223,9 @@ impl PortableHistoryCheckpoint {
         {
             return None;
         }
-        let Some(output_bytes) = serialized_size(output, PORTABLE_HISTORY_BYTES) else {
-            return None;
-        };
-        let Some(bytes) = self.reservation.bytes.checked_add(output_bytes) else {
-            return None;
-        };
-        if self.reservation.resize(bytes).is_none() {
-            return None;
-        }
+        let output_bytes = serialized_size(output, PORTABLE_HISTORY_BYTES)?;
+        let bytes = self.reservation.bytes.checked_add(output_bytes)?;
+        self.reservation.resize(bytes)?;
         // 完整 output 字面窗口用于后续匹配，不先规范化或单独提取密文。
         Some(PortableHistoryEntry {
             checkpoint: self,

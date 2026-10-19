@@ -362,6 +362,32 @@ test("managed platform builds inject claimed versions before Rust caches without
   assert.doesNotMatch(legacy, /prepare-version/);
 });
 
+test("tag publication forwards explicit Latest and prerelease metadata", async () => {
+  const workflow = await readFile(new URL("../.github/workflows/build-desktop.yml", import.meta.url), "utf8");
+  const publish = workflow.slice(workflow.indexOf("\n  publish:"), workflow.indexOf("\n  managed-publish:"));
+  const script = publish.match(/node --input-type=module <<'NODE'\r?\n([\s\S]*?)\r?\n\s*NODE\r?\n/)?.[1];
+  assert.ok(script, "release metadata script must be present");
+  assert.ok(publish.includes("prerelease: ${{ steps.release-metadata.outputs.prerelease == 'true' }}"));
+  assert.ok(publish.includes("make_latest: ${{ steps.release-metadata.outputs.make_latest }}"));
+  const directory = await mkdtemp(join(tmpdir(), "codey-release-metadata-"));
+  try {
+    for (const [version, prerelease, makeLatest, name] of [
+      ["1.2.3", "false", "true", "正式版 v1.2.3"],
+      ["1.2.4-beta.1", "true", "false", "实验版 v1.2.4-beta.1"],
+    ]) {
+      const output = join(directory, version);
+      await promisify(execFile)(process.execPath, ["--input-type=module", "-e", script], {
+        cwd: new URL("../", import.meta.url),
+        env: { ...process.env, GITHUB_REF_NAME: `v${version}`, GITHUB_OUTPUT: output },
+      });
+      const metadata = Object.fromEntries((await readFile(output, "utf8")).trim().split(/\r?\n/).map(line => line.split("=")));
+      assert.deepEqual(metadata, { name, prerelease, make_latest: makeLatest, tag: `v${version}` });
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("delete maintenance uses the same lock and has no R2 credentials", async () => {
   const workflow = await readFile(new URL("../.github/workflows/release-maintenance.yml", import.meta.url), "utf8");
   assert.match(workflow, /group: codey-release-automation\s+cancel-in-progress: false/);

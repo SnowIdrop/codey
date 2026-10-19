@@ -616,7 +616,7 @@ jobs:
           import { appendFileSync } from 'node:fs';
           import { releaseIdentity } from './scripts/release-policy.mjs';
           const identity = releaseIdentity(process.env.GITHUB_REF_NAME.slice(1));
-          appendFileSync(process.env.GITHUB_OUTPUT, `name=${identity.name}\nprerelease=${identity.prerelease}\ntag=${identity.tag}\n`);
+          appendFileSync(process.env.GITHUB_OUTPUT, `name=${identity.name}\nprerelease=${identity.prerelease}\nmake_latest=${identity.makeLatest}\ntag=${identity.tag}\n`);
           NODE
 
       - name: Publish release assets
@@ -626,6 +626,7 @@ jobs:
           name: ${{ steps.release-metadata.outputs.name }}
           tag_name: ${{ steps.release-metadata.outputs.tag }}
           prerelease: ${{ steps.release-metadata.outputs.prerelease == 'true' }}
+          make_latest: ${{ steps.release-metadata.outputs.make_latest }}
           files: release-assets/*
 
       - name: Explain skipped Cloudflare R2 update sync
